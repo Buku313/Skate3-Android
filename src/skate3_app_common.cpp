@@ -1,5 +1,6 @@
 #include "skate3_app_common.h"
 
+#include "skate3_demo_path.h"
 #include "skate3_fov.h"
 #include "skate3_iso_installer.h"
 #include "skate3_title_update_installer.h"
@@ -120,6 +121,16 @@ REXCVAR_DEFINE_DOUBLE(skate3_ultrawide_target_aspect, 0.0, "Skate 3",
     .range(0.0, 8.0);
 
 namespace {
+
+void ApplyDemoPathProfileOverride() {
+  if (!rex::cvar::Query<bool>("skate3_demo_path") &&
+      !rex::cvar::Query<bool>("skate3_demo_path_probe")) {
+    return;
+  }
+
+  rex::cvar::SetFlagByName("user_profile_signed_in", "false");
+  rex::cvar::SetFlagByName("user_live_signed_in", "false");
+}
 
 #if defined(__linux__) || defined(__APPLE__)
 std::vector<std::string> CurrentProcessArgumentsForRestart(
@@ -599,6 +610,7 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   skate3::EnsureUsableProfileStore(profiles, "Player");
   if (auto* profile = skate3::FindSelectedProfile(profiles)) {
     skate3::ApplyProfileCvars(*profile);
+    ApplyDemoPathProfileOverride();
   }
 
   const bool has_config_file = std::filesystem::exists(defaults.config_path);
@@ -727,6 +739,7 @@ void Skate3BaseApp::OnPostSetup() {
 #endif
 
   auto* dispatcher = runtime()->function_dispatcher();
+  skate3::demo_path::InstallHooks(dispatcher);
   if (dispatcher->InitializeFunctionTable(eawebkit_PPCImageConfig.code_base,
                                           eawebkit_PPCImageConfig.code_size,
                                           eawebkit_PPCImageConfig.image_base,
@@ -797,6 +810,7 @@ void Skate3BaseApp::ToggleSimpleSettings() {
     store.selected_profile = profile.id;
     skate3::SaveProfiles(profiles_path_, store);
     skate3::ApplyProfileCvars(profile);
+    ApplyDemoPathProfileOverride();
     ApplySelectedProfileToRuntime();
   };
   auto close_settings = [this]() { ApplyGameplayCursorMode(); };
@@ -984,6 +998,7 @@ void Skate3BaseApp::ApplySelectedProfileToRuntime() {
   auto profiles = skate3::LoadProfiles(profiles_path_);
   if (auto* profile = skate3::FindSelectedProfile(profiles)) {
     skate3::ApplyProfileCvars(*profile);
+    ApplyDemoPathProfileOverride();
     runtime()->kernel_state()->user_profile()->SetIdentity(profile->xuid, profile->gamertag);
   }
 }

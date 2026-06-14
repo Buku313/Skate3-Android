@@ -86,3 +86,45 @@ endforeach()
 if(NOT _fov_patched)
   message(FATAL_ERROR "Failed to apply Skate 3 generated projection FOV patch; projection FOV anchor not found")
 endif()
+
+set(_demo_path_movie_patched FALSE)
+foreach(_file IN LISTS _skate3_recomp_files)
+  file(READ "${_file}" _contents)
+  if(_contents MATCHES "ShouldForceIntroMovieComplete")
+    set(_demo_path_movie_patched TRUE)
+    break()
+  endif()
+
+  set(_demo_path_movie_site
+"	// bl 0x825d60c8
+	ctx.lr = 0x825E05A0;
+	sub_825D60C8(ctx, base);")
+  if(NOT _contents MATCHES "ctx\\.lr = 0x825E05A0;")
+    continue()
+  endif()
+  if(NOT _contents MATCHES "DEFINE_REX_FUNC\\(sub_825E0510\\)")
+    continue()
+  endif()
+  string(FIND "${_contents}" "${_demo_path_movie_site}" _demo_path_movie_anchor)
+  if(_demo_path_movie_anchor EQUAL -1)
+    continue()
+  endif()
+
+  set(_demo_path_movie_patch
+"	if (skate3::demo_path::ShouldForceIntroMovieComplete()) {
+		ctx.r3.u64 = 0;
+	} else {
+		// bl 0x825d60c8
+		ctx.lr = 0x825E05A0;
+		sub_825D60C8(ctx, base);
+	}")
+  string(REPLACE "${_demo_path_movie_site}" "${_demo_path_movie_patch}" _contents "${_contents}")
+  _skate3_add_include(_contents "skate3_demo_path.h")
+  file(WRITE "${_file}" "${_contents}")
+  set(_demo_path_movie_patched TRUE)
+  message(STATUS "Applied Skate 3 demo path intro movie patch in ${_file}")
+  break()
+endforeach()
+if(NOT _demo_path_movie_patched)
+  message(FATAL_ERROR "Failed to apply Skate 3 demo path intro movie patch; FEMoviePlayer::Update anchor not found")
+endif()
