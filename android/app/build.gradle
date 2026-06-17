@@ -1,0 +1,52 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace = "chat.buku.skate3"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "chat.buku.skate3"
+        minSdkVersion 33          // built against android-33 (RG406V = Android 13)
+        targetSdkVersion 35
+        versionCode 1
+        versionName "1.0"
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    // Prebuilt native libraries are cross-compiled out of band (see
+    // tools/build_android_libs.sh) and dropped into src/main/jniLibs.
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    // The recompiled game libs are huge; extract them at install so the dynamic
+    // linker can load them (compressed in-APK loading is unreliable at this size).
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    buildTypes {
+        debug {
+            // Debuggable, no minification — the native side carries the weight.
+            applicationIdSuffix ".dev"
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug   // debug-signed for sideloading
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

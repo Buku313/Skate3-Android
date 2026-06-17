@@ -1,0 +1,32 @@
+# Skate 3 — Mali-G57 (RG406V) max-performance dev config.
+# Copy to the app's private dir as skate3.toml:
+#   adb push android/skate3-maxperf.toml /data/local/tmp/skate3.toml
+#   adb shell run-as chat.buku.skate3.dev cp /data/local/tmp/skate3.toml files/skate3.toml
+# NOTE: resolution_scale / vsync / present modes live in files/user/settings.toml
+#       (skate3 user settings override this file for those keys) — keep that at
+#       resolution_scale=1, vsync=false.
+#
+# All keys below are hot-reload or apply on restart. Flip the EXPERIMENTAL ones
+# one at a time and watch for regressions; everything here keeps a working build.
+
+# --- Confirmed-safe perf settings (recommended ON) ---
+native_2x_msaa = false                 # Mali has no native 2x MSAA anyway
+anisotropic_override = 1               # force AF off (1x) — cheaper texture sampling
+swap_post_effect = "none"             # no full-screen FXAA pass
+vulkan_skip_inert_no_pixel_draws = true  # skip draws that produce no pixels
+
+# --- EXPERIMENTAL perf (test one at a time; revert if glitchy) ---
+vulkan_mali_resolve_relax = true       # MSAA 32bpp resolves use the fast direct path
+occlusion_query_enable = false         # removes GPU->CPU occlusion-query sync stalls
+                                       #   (may draw more geometry; A/B it)
+# texture_cache_memory_limit_render_to_texture = 64  # trim RT cache on low-RAM device
+
+# --- Diagnostics (turn on to measure, off for normal play) ---
+vulkan_resolve_stats = false           # logs direct-vs-fallback resolve ratio every 300
+vulkan_frame_stats = false             # logs render-pass-breaks/frame (TBDR cost metric)
+vulkan_present_timing_log = false      # logs avg frame time (us) every 60 frames
+
+# --- Shader/pipeline (keep) ---
+store_shaders = true                   # persists guest shaders + host pipeline cache
+async_shader_compilation = false       # compile in-place (no placeholder black frames)
+vulkan_async_skip_incomplete_frames = false

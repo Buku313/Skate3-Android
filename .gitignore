@@ -1,0 +1,56 @@
+# ============================================================================
+# Game data — NEVER commit. Players must supply their own legally-dumped copy.
+# ============================================================================
+/game/
+*.iso
+*.xex
+*.xexp
+TU_*
+
+# Recompiled game sources + build output (derived from the game, do not publish)
+/out/
+/build/
+/generated/
+/generated.backup-*/
+
+# ============================================================================
+# Android build output + built native libraries (libskate3.so contains the
+# recompiled game — build artifacts, never committed).
+# ============================================================================
+**/build/
+**/.gradle/
+**/.cxx/
+*.apk
+*.aab
+*.so
+*.a
+*.o
+local.properties
+
+# Keep the source build scripts/tools though:
+!android/tools/**
+
+# ============================================================================
+# Local runtime/config overrides + diagnostics
+# ============================================================================
+skate3.toml
+skate3_ultrawide_targets*.toml
+CMakeUserPresets.json
+*.log
+*.dmp
+*.wpix
+*_gpu_events.csv
+*_gpu_screenshot.png
+*.pdb
+*.ilk
+*.map
+
+# Editor / CMake scratch
+/.vs/
+/.vscode/
+/.cache/
+.DS_Store
+
+# Upstream local-only dev scripts
+/tools/
+/scripts/
