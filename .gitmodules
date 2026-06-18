@@ -1,5 +1,5 @@
 [submodule "third_party/rexglue-sdk"]
 	path = third_party/rexglue-sdk
-	url = https://github.com/Buku313/rexglue-skate3.git
+	url = https://github.com/Buku313/rexglue-skate3-android.git
 	branch = android-arm64
 
