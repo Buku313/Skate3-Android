@@ -30,6 +30,8 @@ still runs, but is GPU‑bound — see [Status](#status).
 
 > ⚠️ **No game files are included.** You must provide your own legally‑dumped copy of Skate 3 (Xbox 360).
 
+<p align="center"><img src="docs/img/demo.gif" width="70%"></p>
+
 ## Screenshots
 
 <p align="center">

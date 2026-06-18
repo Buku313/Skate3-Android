@@ -54,3 +54,6 @@ CMakeUserPresets.json
 # Upstream local-only dev scripts
 /tools/
 /scripts/
+
+# Marketing/strategy notes (local only)
+/marketing/
