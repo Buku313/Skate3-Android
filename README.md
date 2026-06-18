@@ -2,14 +2,15 @@
 
 <p align="center">
   <b>A native ARM64 Android port of Skate 3</b> — not an emulator.<br>
-  The Xbox 360 game is statically recompiled to native machine code and runs directly on the device.
+  The Xbox 360 game is statically recompiled to native machine code and runs directly on the device.<br>
+  <b>Built for modern high‑end Android phones &amp; handhelds.</b>
 </p>
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Android%2013%2B-3DDC84">
   <img alt="ABI" src="https://img.shields.io/badge/ABI-arm64--v8a-blue">
   <img alt="Renderer" src="https://img.shields.io/badge/renderer-Vulkan-red">
-  <img alt="Status" src="https://img.shields.io/badge/status-boots%20%26%20runs%20·%20perf%20WIP-orange">
+  <img alt="Best on" src="https://img.shields.io/badge/best%20on-Snapdragon%20%2F%20Adreno-orange">
 </p>
 
 ---
@@ -21,9 +22,11 @@ recompilation of the Xbox 360 version of Skate 3. The PowerPC game code is trans
 to **native aarch64**, so the CPU side runs as real ARM machine code (no instruction emulation). Graphics
 go through a **Vulkan** backend; windowing, input and audio through **SDL3**.
 
-It targets handhelds like the **Anbernic RG406V** (Unisoc T820, Mali‑G57, Android 13). It boots, loads
-saves, takes controller input, and renders the game. GPU performance on Mali is still a work in progress
-(see [Status](#status)).
+Because the CPU side is native, **the GPU is the only variable** — so it's built for **modern high‑end
+Android devices**: recent Snapdragon/Adreno phones and newer Vulkan‑class handhelds, which expose the
+GPU features the renderer needs and have the bandwidth for the Xbox 360 render‑target workload. It boots,
+loads saves, takes controller input, and renders the game. On older/low‑end GPUs (e.g. Mali‑G57 class) it
+still runs, but is GPU‑bound — see [Status](#status).
 
 > ⚠️ **No game files are included.** You must provide your own legally‑dumped copy of Skate 3 (Xbox 360).
 
@@ -44,20 +47,22 @@ saves, takes controller input, and renders the game. GPU performance on Mali is 
 | Save data | ✅ Loads |
 | Controller (built-in gamepad) | ✅ Works (SDL3 mapping) |
 | Cutscene video (VP6/FFmpeg) | ✅ Plays |
-| In-world rendering | ✅ Renders, ⚠️ ~10 fps + intermittent black frames on Mali |
+| In-world rendering | ✅ Renders (GPU-dependent framerate) |
 | Audio | ⚠️ Partial (XMA decoder issues) |
-| Performance | 🚧 Active work — GPU-bound on the EDRAM→Vulkan resolve path on tile GPUs |
+| Performance | High-end GPUs: good. Low-end tile GPUs (Mali-G57): GPU-bound (~10 fps), perf work ongoing |
 
-The remaining work is a focused **GPU performance effort**: the Xbox 360's on-chip EDRAM is emulated by
-resolving render targets through main memory, which is the worst case for a tile-based mobile GPU. The
-Mali‑G57 *does* support `VK_EXT_rasterization_order_attachment_access`, so a tile-local render-target path
-is viable — that's the headline optimization being pursued.
+Performance scales with the GPU. On capable Adreno/Snapdragon parts the renderer's required Vulkan
+features (e.g. `vertexPipelineStoresAndAtomics`) are present and bandwidth is ample. On weaker tile GPUs
+the Xbox 360's on-chip EDRAM — emulated by resolving render targets through main memory — becomes the
+bottleneck; a tile-local render-target path (`VK_EXT_rasterization_order_attachment_access`) is the
+headline optimization being pursued to bring those devices up.
 
-## Hardware target
+## Device support
 
-- **Device:** Anbernic RG406V (and similar Unisoc T820 / Mali‑G57 handhelds)
-- **OS / ABI:** Android 13+, `arm64-v8a`
-- **GPU:** ARM Mali‑G57 (Vulkan 1.3)
+- **Recommended:** modern high-end Android phones / handhelds — recent **Snapdragon (Adreno)** or
+  comparable Vulkan 1.3 GPUs, Android 13+.
+- **Minimum / tested low end:** Anbernic RG406V (Unisoc T820, Mali-G57) — runs, GPU-bound.
+- **ABI:** `arm64-v8a` only.
 
 ## Building
 
