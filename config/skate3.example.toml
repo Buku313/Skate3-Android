@@ -51,6 +51,16 @@ host_present_from_non_ui_thread = true
 presenter_strict_guest_output_backpressure = false
 presenter_strict_guest_output_backpressure_timeout_ms = 100
 vulkan_async_placeholder_max_consecutive_skips = 120
+# Push descriptors were added as a CPU-side optimization in v1.0.4, but some
+# drivers may handle them slowly enough to starve the GPU.
+vulkan_push_constants_descriptors = false
+# New Vulkan resolve-clear deferral can improve some drivers, but has caused
+# frame-time regressions on others. Leave disabled unless testing it explicitly.
+vulkan_deferred_resolve_clears = false
+# Scaled-resolve texture load fast paths introduced in v1.0.4 can be faster on
+# some drivers, but they increase pressure on scaled resolve buffers.
+vulkan_texel_buffer_texture_loads = false
+vulkan_storage_image_texture_loads = false
 
 present_letterbox = true
 present_safe_area_x = 100
