@@ -1,3 +1,6 @@
+setjmp_address = 0x82F6FAA0
+longjmp_address = 0x82F4FEB0
+
 [functions]
 
 "0x82B34D60" = { end = 0x82B34E08 }
