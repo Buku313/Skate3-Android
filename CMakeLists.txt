@@ -69,21 +69,51 @@ set(SKATE3_GAME_DATA_ROOT
 set(SKATE3_TITLE_UPDATE_PACKAGE
     ""
     CACHE FILEPATH "Optional Skate 3 title update STFS package used for codegen")
+option(SKATE3_ENABLE_X86_64_V3
+    "Build x86_64 desktop binaries for x86-64-v3 CPUs (AVX2/BMI2)"
+    OFF)
 
 if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        add_compile_options(-march=x86-64-v3)
-        set(SNAPPY_REQUIRE_AVX2 ON CACHE BOOL
-            "Match Snappy feature detection to the project x86-64-v3 target" FORCE)
-        set(SNAPPY_HAVE_SSSE3 1 CACHE INTERNAL
-            "x86-64-v3 requires SSSE3; Snappy checks do not see directory compile options" FORCE)
-        set(SNAPPY_HAVE_X86_CRC32 1 CACHE INTERNAL
-            "x86-64-v3 requires SSE4.2 CRC32; Snappy checks do not see directory compile options" FORCE)
-        set(SNAPPY_HAVE_BMI2 1 CACHE INTERNAL
-            "x86-64-v3 requires BMI2; Snappy checks do not see directory compile options" FORCE)
-    elseif(MSVC)
-        add_compile_options(/arch:AVX2)
+    if(SKATE3_ENABLE_X86_64_V3)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            add_compile_options(-march=x86-64-v3)
+            set(SNAPPY_REQUIRE_AVX2 ON CACHE BOOL
+                "Match Snappy feature detection to the project x86-64-v3 target" FORCE)
+            set(SNAPPY_HAVE_SSSE3 1 CACHE INTERNAL
+                "x86-64-v3 requires SSSE3; Snappy checks do not see directory compile options" FORCE)
+            set(SNAPPY_HAVE_X86_CRC32 1 CACHE INTERNAL
+                "x86-64-v3 requires SSE4.2 CRC32; Snappy checks do not see directory compile options" FORCE)
+            set(SNAPPY_HAVE_BMI2 1 CACHE INTERNAL
+                "x86-64-v3 requires BMI2; Snappy checks do not see directory compile options" FORCE)
+        elseif(MSVC)
+            add_compile_options(/arch:AVX2)
+        endif()
+    else()
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            add_compile_options(-mssse3)
+        endif()
+        set(SNAPPY_REQUIRE_AVX OFF CACHE BOOL
+            "Do not require AVX for non-AVX x86_64 release builds" FORCE)
+        set(SNAPPY_REQUIRE_AVX2 OFF CACHE BOOL
+            "Do not require AVX2 for non-AVX x86_64 release builds" FORCE)
+        set(SNAPPY_HAVE_SSSE3 0 CACHE INTERNAL
+            "Keep Snappy on its scalar path for non-AVX x86_64 release builds" FORCE)
+        set(SNAPPY_HAVE_X86_CRC32 0 CACHE INTERNAL
+            "Non-AVX x86_64 release builds must not require SSE4.2 CRC32" FORCE)
+        set(SNAPPY_HAVE_BMI2 0 CACHE INTERNAL
+            "Non-AVX x86_64 release builds must not require BMI2" FORCE)
     endif()
+else()
+    set(SNAPPY_REQUIRE_AVX OFF CACHE BOOL
+        "Do not require AVX for generic release builds" FORCE)
+    set(SNAPPY_REQUIRE_AVX2 OFF CACHE BOOL
+        "Do not require AVX2 for generic release builds" FORCE)
+    set(SNAPPY_HAVE_SSSE3 0 CACHE INTERNAL
+        "Generic release builds must not require SSSE3" FORCE)
+    set(SNAPPY_HAVE_X86_CRC32 0 CACHE INTERNAL
+        "Generic release builds must not require SSE4.2 CRC32" FORCE)
+    set(SNAPPY_HAVE_BMI2 0 CACHE INTERNAL
+        "Generic release builds must not require BMI2" FORCE)
 endif()
 
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" SKATE3_SOURCE_DIR_CONFIG)
