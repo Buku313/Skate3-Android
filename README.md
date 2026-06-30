@@ -20,6 +20,12 @@ Gameplay (click to go to YouTube):
 
 ## How Do I Play?
 
+Notes:
+
+- The Windows version is the most tested, followed by Linux, and then macOS.
+- On some hardware configurations, you may have a better experience running the Windows version through a translation layer like Proton rather than the native Linux build itself.
+- The macOS ARM build is very experimental and therefore much more prone to issues.
+
 ### Windows
 
 1. Download the latest release Skate3Recomp-Windows.zip from the releases page.

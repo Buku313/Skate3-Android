@@ -90,7 +90,7 @@ if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
         endif()
     else()
         if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-            add_compile_options(-mssse3)
+            add_compile_options(-march=x86-64 -mtune=generic -mssse3)
         endif()
         set(SNAPPY_REQUIRE_AVX OFF CACHE BOOL
             "Do not require AVX for non-AVX x86_64 release builds" FORCE)
