@@ -227,6 +227,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_demo_path.cpp
     src/skate3_fov.cpp
     src/skate3_iso_installer.cpp
+    src/skate3_native_render.cpp
     src/skate3_title_update_installer.cpp
     src/skate3_user_settings.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp

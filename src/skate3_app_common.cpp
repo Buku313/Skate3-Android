@@ -3,6 +3,7 @@
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
 #include "skate3_iso_installer.h"
+#include "skate3_native_render.h"
 #include "skate3_title_update_installer.h"
 #include "skate3_user_settings.h"
 
@@ -739,6 +740,7 @@ void Skate3BaseApp::OnPostSetup() {
 #endif
 
   auto* dispatcher = runtime()->function_dispatcher();
+  skate3::native_render::Install();
   skate3::demo_path::InstallHooks(dispatcher);
   if (dispatcher->InitializeFunctionTable(eawebkit_PPCImageConfig.code_base,
                                           eawebkit_PPCImageConfig.code_size,
