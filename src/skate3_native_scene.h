@@ -21,6 +21,8 @@ struct DrawEntry {
 
 struct DrawItem {
   uint32_t mesh;      // guest mesh object address (resource cache key)
+  uint32_t vb_obj;    // guest renderengine::VertexBuffer object (draw matching)
+  uint32_t ib_obj;    // guest renderengine::IndexBuffer object (draw matching)
   uint32_t vb_addr;   // guest address of raw vertex data
   uint32_t ib_addr;   // guest address of raw index data (u16 big-endian)
   uint32_t vb_bytes;
@@ -32,13 +34,34 @@ struct DrawItem {
   uint16_t uv2_offset;
   uint16_t bw_offset;  // blend weights (u8x4), valid when skinned
   uint16_t bi_offset;  // blend indices (u8x4), valid when skinned
+  uint16_t normal_offset;  // usage-3 vertex normal (0 fmt = none)
   uint8_t stride;
   uint8_t pos_fmt;    // xenos vertex format (26 s16x4, 32 half4, 57 float3)
   uint8_t uv_fmt;     // xenos vertex format of the first texcoord (0 = none)
   uint8_t uv2_fmt;    // xenos vertex format of the second texcoord (0 = none)
+  uint8_t normal_fmt;  // 16 = k_10_11_11 packed (0 = none, face-normal fallback)
+  // sky.* materials draw fullbright: per-facet lighting turns the multi-km
+  // sky dome into visibly shaded rectangular panels.
+  bool unlit;
   bool skinned;
-  // Bone palette snapshot (row-vector 4x4 matrices) taken on the game thread
-  // - the guest bone array lives in a transient per-frame arena.
+  // Grayscale-tinted material (CAS hair): the shader multiplies the diffuse
+  // by a per-character color staged in the PIXEL constant bank. Detected via
+  // the AttribulatorMaterialName channel; tint captured with the palette.
+  bool hair;
+  float tint[4];  // rgb + enable flag in w
+  // The item's per-draw state (bone palette for skinned, world matrix for
+  // rigid model-space props) was not available at capture time; deferred
+  // meshes draw AFTER the submit call, and world sort-list captures happen
+  // before any draw. Cleared by the post-draw (ib,vb) fixup; items still
+  // pending at frame end are dropped (wrong state renders garbage).
+  bool pending;
+  // Cloth patch (non-indexed quad list, CPU-simulated absolute world-space
+  // float3 verts): the renderer synthesizes quad->triangle indices instead
+  // of reading a guest index buffer.
+  bool cloth_quads;
+  // Bone palette snapshot taken on the game thread: raw staged rows, 3
+  // float4s per bone (column-vector affine [R | t], model -> world). The
+  // guest staging bank is reused draw to draw, hence the copy.
   std::vector<float> bones;
   // Content fingerprint of the guest payloads. Streaming reuses arena
   // addresses and pages fill in after the mesh is first submitted, so cached
@@ -71,16 +94,58 @@ bool Enabled();
 // renderengine::Texture object.
 void OnRegisterTexture(uint64_t guid, uint32_t texture);
 
-// Called from the D3D::SetPending_AluConstants hook (guest render thread).
-// Large vertex-bank uploads are bone palettes staged for the next skinned
-// RenderMesh; the staging bank is reused, so contents are snapshotted here.
-void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr);
+// Called from the D3D::SetPending_AluConstants hook (guest render thread,
+// invoked from inside the Draw* functions). Records the location of the
+// device's positional 256-register VS constant shadow bank.
+void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr,
+                        uint32_t device);
 
-// Called from the RenderMesh hook for dynamic entities. Snapshots the
-// context's instance matrix (ctx+0x10 points into a transient per-frame
-// arena; it must be read now, not at frame end) and the pending bone
-// palette. Returns a dynamic-state index (+1), 0 on failure.
-uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx);
+// Guest buffer-binding trackers + post-draw state fixup: each
+// DrawIndexedVertices whose bound IB/VB match a pending item fills that
+// item's bone palette / world matrix from the constant bank (FIFO one-shot
+// per buffer key; clones share mesh assets and draw in submit order).
+void OnSetIndices(uint32_t ib_obj);
+void OnSetStreamSource(uint32_t stream, uint32_t vb_obj, uint32_t offset, uint32_t stride);
+// func: 0 = DrawIndexedVertices (also runs the pending fixup),
+// 1 = DrawVertices, 2 = BeginVertices (inline/cloth vertex path).
+void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t r6,
+                uint32_t r7);
+
+// Offline-analysis recording, armed alongside the guest-memory snapshot:
+// captures every draw's bound buffers + full VS constant bank, plus the
+// per-frame captured items and final scene, every `stride` frames. Written
+// as <stem>.scene.jsonl and <stem>.draws.bin next to the .gsnap.
+void StartRecording(uint32_t stride);
+void WriteRecording(const char* dir, const char* stem);
+
+// Called post-call from the DrawVertices hook for cloth patch draws
+// (r6 == 0x80000000 signature): reads the bound dynamic buffer's vertex
+// fetch block and builds a world-space quad-list item. Returns a
+// dynamic-state index (+1), 0 when the draw is not a cloth patch;
+// *out_key receives the garment's stable identity (the buffer object).
+uint32_t CaptureClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6,
+                          uint32_t r7, uint32_t* out_key);
+
+// Total guest draws completed (any draw function). The RenderMesh hook
+// samples this around the original call to detect deferred meshes: if no
+// draw ran inside, the constant bank still belongs to an earlier mesh and
+// the item's transform/palette must come from the post-draw fixup.
+uint64_t DrawSequence();
+
+// Called from the RenderMesh hook (dynamic entities) and the world per-mesh
+// draw hook (sub_827FAEA8), AFTER the original call returns (the mesh's
+// constants are only flushed to the shadow bank by its own draws). Builds
+// the complete DrawItem: geometry from the transient per-frame arena plus
+// world matrix / bone palette read live from the shadow bank. drew_inside
+// says whether any guest draw ran during the original call; when false the
+// bank is stale and the transform is left pending for the post-draw fixup.
+// With world_path, bails out early for meshes that need no per-draw
+// transform (absolute fmt-57 geometry, handled at frame end) and captures
+// only skinned meshes and rigid model-space props (vending machines and
+// other movables reach the frame ONLY through the sort lists). Returns a
+// dynamic-state index (+1), 0 on failure/skip.
+uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path = false,
+                             bool drew_inside = false);
 
 // Called on the guest render thread at frame end with the frame's records.
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count);

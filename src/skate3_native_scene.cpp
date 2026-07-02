@@ -3,14 +3,26 @@
 #include "generated/skate3_init.h"
 
 #include <atomic>
+#include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
+#include <rex/graphics/ultrawide_debug.h>
 #include <rex/logging.h>
 
 #if defined(REX_HAS_D3D12) && REX_HAS_D3D12
@@ -39,12 +51,43 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_debug, 0, "Skate 3",
                      "3=limit to 20 items, 4=depth test disabled")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 4, "Skate 3",
+                     "MSAA sample count for the native scene (1 = off, 2/4/8). Distant "
+                     "thin geometry (railings, wires) shimmers without it; mipmaps only "
+                     "fix texture aliasing.")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_quadlists, false, "Skate 3",
+                    "Render captured non-indexed quad-list draws. Off by default: every "
+                    "quad-list capture seen so far is a PARTICLE system (disjoint 2-4cm "
+                    "sprites), which renders as floating white squares without the game's "
+                    "sprite textures and blending.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_mesh_decode_budget, 8, "Skate 3",
+                     "Max new mesh decodes per rendered frame (0 = unlimited). Each decode "
+                     "converts vertices and creates GPU upload resources on the render "
+                     "thread; panning streams dozens of new meshes into view at once and "
+                     "unbounded decoding hitches the frame. Deferred meshes pop in a few "
+                     "frames later.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_texture_decode_budget, 4, "Skate 3",
+                     "Max new texture decodes per rendered frame (0 = unlimited). CPU "
+                     "untile + mip upload is expensive; deferred textures render white "
+                     "for the few frames until their turn.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
+                    "Record the draw stream on every recorded frame instead of 2 of every "
+                    "60 (large .draws.bin; for targeted investigations)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_scene {
 namespace {
 
 // Verified guest structure offsets.
-constexpr uint32_t kCtxMatrix = 0x10;
+constexpr uint32_t kCtxEffectList = 0x04;
+constexpr uint32_t kEffectListPassCount = 0x44;
 constexpr uint32_t kCtxDrawCountU16 = 0x38;
 constexpr uint32_t kCtxDrawList = 0x48;
 constexpr uint32_t kMeshMaterial = 0x24;
@@ -70,37 +113,321 @@ constexpr uint64_t kGuidMask = 0x7FFFFFFFFFFFFFFFull;
 std::mutex g_texture_map_mutex;
 std::unordered_map<uint64_t, uint32_t> g_texture_map;
 
-// Bone palette snapshots. The guest uploads palettes as large VS constant
-// kicks (4x3 matrices, 3 float4 rows per bone, translation at floats 3/7/11)
-// right before the skinned RenderMesh calls that use them; the staging bank
-// is reused so the data is copied at hook time. "Sticky": one character's
-// palette serves all of its body-part contexts.
-struct PaletteSnapshot {
-  std::vector<float> rows;  // raw staged float4 rows (LE)
-};
-// Per-dynamic-entity state captured at RenderMesh hook time: the instance
-// matrix (already transposed into row-vector convention) and the palette in
-// effect. Both live in transient arenas/banks and are stale by frame end.
-struct DynamicState {
-  float world[16];
-  uint32_t palette_index;  // +1 into g_frame_palettes, 0 = none
-};
+// VS constant staging bank (bank id 0x4000, device+1920).
+// D3D::SetPending_AluConstants(device, dirty group mask, bank, ptr) is
+// called from inside the guest Draw* functions; ptr is the device's
+// positional 256-register shadow (partial uploads leave the rest intact).
+// Two verified layouts: pre-pass keeps the per-draw transform / bone
+// palette at c4; main-pass keeps camera at c4, palette at c7, rigid world
+// at c8..c11 (see BankPaletteBase / BankRigidWorld). Because the dynamic
+// capture runs right after RenderMesh returns, the bank holds exactly that
+// mesh's constants when its draws ran inline.
+std::atomic<uint32_t> g_vs_bank{0};
+// Pixel constant shadow bank (bank id 0x4400, device+6016): material colors
+// (e.g. the CAS hair tint) are staged here per draw.
+std::atomic<uint32_t> g_ps_bank{0};
+// Dynamic entities (characters, movable props) live entirely in transient
+// per-frame arenas: the context, its record, mesh pointers, transforms and
+// bone palettes are all recycled before frame end. The complete DrawItem is
+// therefore built at RenderMesh hook time and stored here.
 std::mutex g_palette_mutex;
-std::vector<PaletteSnapshot> g_frame_palettes;
-std::vector<DynamicState> g_frame_dynstates;
-PaletteSnapshot g_pending_palette;
-uint32_t g_pending_palette_index = 0;  // index+1 into g_frame_palettes, 0 = none
+std::vector<DrawItem> g_frame_dynitems;
+// (ib_obj << 32 | vb_obj) -> indices of pending items in g_frame_dynitems,
+// for the post-draw state fixup (deferred / world-path captures draw after
+// their capture; the fixup fills palette or world from the actual draw).
+std::unordered_multimap<uint64_t, size_t> g_frame_pending_by_buffers;
+std::atomic<uint32_t> g_cur_ib{0};
+std::atomic<uint32_t> g_cur_vb{0};
+std::atomic<uint32_t> g_cur_vb_offset{0};
+std::atomic<uint32_t> g_cur_vb_stride{0};
+// Guest D3D::CDevice: the fetch-constant shadow lives at device+0x480,
+// 6 dwords per fetch group (from recompiled SetPending_FetchConstants).
+std::atomic<uint32_t> g_device{0};
+// All four vertex streams (vb, offset, stride); cloth binds its simulated
+// vertices on a stream other than 0.
+std::atomic<uint32_t> g_cur_streams[4][3];
+
+// Offline-analysis recording (see StartRecording/WriteRecording): the full
+// per-draw constant bank stream is the ground truth for what the game's
+// shaders saw; the per-frame item lists are what our pipeline made of it.
+struct RecordedDraw {
+  uint32_t frame;
+  uint32_t func;  // 0 = DrawIndexedVertices, 1 = DrawVertices, 2 = BeginVertices
+  uint32_t ib;
+  uint32_t vb;
+  uint32_t vb_offset;      // stream-0 OffsetInBytes at bind time
+  uint32_t vb_stride;      // stream-0 stride at bind time
+  uint32_t streams[4][3];  // all streams: {vb, offset, stride}
+  uint32_t vfetch[12];     // fetch-constant shadow groups 0-1 (device+0x480)
+  uint32_t args[4];
+  float bank[1024];  // VS c0..c255
+  float ps[256];     // PS c0..c63 (material colors, e.g. CAS hair tint)
+};
+struct RecordedFrame {
+  uint64_t generation;
+  float view_proj[16];
+  float cam_pos[3];
+  std::vector<DrawItem> dynitems;
+  std::vector<DrawItem> items;
+};
+// Dynamic meshes live in streaming arenas that are recycled DURING a long
+// recording; the end-of-window .gsnap holds garbage for them. Dump each
+// captured buffer payload once per content fingerprint so offline tools
+// decode exactly what the game used.
+struct RecordedBuffer {
+  uint32_t vb_addr;
+  uint32_t ib_addr;
+  uint64_t fingerprint;
+  std::vector<uint8_t> vb;
+  std::vector<uint8_t> ib;
+};
+std::mutex g_record_mutex;
+std::atomic<bool> g_recording{false};
+uint32_t g_record_frame = 0;   // index of the NEXT recorded frame
+uint32_t g_record_stride = 1;  // record every Nth frame
+uint32_t g_frames_seen = 0;    // frames completed since StartRecording
+std::vector<std::unique_ptr<RecordedDraw>> g_recorded_draws;
+std::vector<RecordedFrame> g_recorded_frames;
+std::vector<RecordedBuffer> g_recorded_buffers;
+std::unordered_set<uint64_t> g_recorded_buffer_keys;
+size_t g_recorded_buffer_bytes = 0;
 std::atomic<uint64_t> g_vs_uploads{0};
-std::atomic<uint64_t> g_vs_uploads_large{0};
 std::atomic<uint64_t> g_palette_snapshots{0};
+// Palettes captured at base+1 (the cloth/morph VS layout with an extra
+// parameter row before the palette, see RefinePaletteBase).
+std::atomic<uint64_t> g_palette_base_plus1{0};
 std::atomic<uint64_t> g_skinned_items{0};
 std::atomic<uint64_t> g_skinned_skipped{0};
+// Rigid items whose transform had to wait for the post-draw fixup (deferred
+// draws), and those still pending at frame end (dropped).
+std::atomic<uint64_t> g_rigid_pending{0};
+std::atomic<uint64_t> g_rigid_dropped{0};
+// Model-space props in the world sort lists, excluded from the identity
+// world path (their placed copies come from the kind-2 capture).
+std::atomic<uint64_t> g_world_props{0};
+std::atomic<uint64_t> g_rej_no_dynstate{0};
+std::atomic<uint64_t> g_rej_dyn_range{0};
+// Render-side silent-skip diagnostics: a scene item that decodes badly or
+// loses its bone binding produces no (or wrong) pixels with no other trace.
+std::atomic<uint64_t> g_rr_decode_fail{0};
+std::atomic<uint64_t> g_rr_no_bones{0};
+// Decodes pushed past the per-frame budget (item/texture appears a few
+// frames late instead of hitching the render thread).
+std::atomic<uint64_t> g_rr_mesh_deferred{0};
+std::atomic<uint64_t> g_rr_tex_deferred{0};
+std::atomic<uint64_t> g_rej_chain{0};
+std::atomic<uint64_t> g_rej_geom{0};
+std::atomic<uint64_t> g_rej_draws{0};
+std::atomic<uint64_t> g_rej_bbox{0};
 
 bool SceneEnabled() { return REXCVAR_GET(skate3_native_render_scene); }
 
 float LoadGuestF32(uint8_t* base, uint32_t addr) {
   const uint32_t bits = REX_LOAD_U32(addr);
   return std::bit_cast<float>(bits);
+}
+
+// Draws completed since startup (any guest draw function). The RenderMesh
+// hook samples it around the original call: an unchanged sequence means the
+// mesh's draws were deferred by the dispatcher and the constant bank still
+// belongs to some earlier mesh; its transform must come from the post-draw
+// fixup, never from the bank at submit-exit (a leftover identity matrix at
+// c4 validates as a plausible world and renders the prop at the origin).
+std::atomic<uint64_t> g_draw_seq{0};
+
+// Where does this bank keep its bone palette? Pre-pass layout: c4 (bone 0's
+// affine rows right after viewproj). Main-pass layout: camera position at
+// c4, two parameter rows, palette at c7. A camera-position row is easily
+// told from a bone rotation row by its norm (hundreds vs ~1). Returns the
+// base register, or 0 when neither location holds plausible bone rows.
+uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
+  const auto bone_at = [&](uint32_t reg) -> bool {
+    for (int r = 0; r < 3; ++r) {
+      float f[4];
+      for (int i = 0; i < 4; ++i) {
+        f[i] = LoadGuestF32(base, bank + ((reg + r) * 4 + i) * 4);
+        if (!(f[i] > -1e7f && f[i] < 1e7f)) return false;
+      }
+      const float n = f[0] * f[0] + f[1] * f[1] + f[2] * f[2];
+      if (!(n > 0.0025f && n < 400.0f)) return false;
+      if (!(f[3] > -20000.f && f[3] < 20000.f)) return false;
+    }
+    return true;
+  };
+  if (bone_at(4)) return 4;
+  if (bone_at(7)) return 7;
+  return 0;
+}
+
+float GuestHalfToFloat(uint16_t h) {
+  const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+  const uint32_t exp = (h >> 10) & 0x1F;
+  const uint32_t man = h & 0x3FF;
+  if (exp == 0) return std::bit_cast<float>(sign);  // denorms ~0
+  if (exp == 31) return std::bit_cast<float>(sign | 0x7F800000u);
+  return std::bit_cast<float>(sign | ((exp + 112) << 23) | (man << 13));
+}
+
+// The cloth/morph skinned VS variant (skating-NPC torsos) keeps ONE extra
+// parameter row between the viewproj and the bone palette: observed live,
+// c4 = (1,0,0,0) with the palette at c5 (pre-pass) / c8 (main-pass). A
+// palette read one register early hands every bone [neighbor row, row0,
+// row1]; each row is still a perfectly plausible bone row, so the norm
+// checks in BankPaletteBase cannot catch it, and the mesh skins to
+// component-rotated coordinates ~300 m off in the sky. That was the
+// invisible-NPC-torso bug: the torso was captured, non-pending, palette and
+// texture resolved, and rendered far outside the view.
+//
+// Discriminate by skinning a few sample vertices with both candidate bases
+// and projecting them with the pass's own viewproj (bank c0..c3,
+// column-vector rows): the game drew this mesh with these constants, so
+// only the correct base puts the samples inside the clip volume (validated
+// offline across every skinned draw of an F10 capture: correct base 1.00,
+// wrong base <= ~0.3). Only +1 is tested: a +3 shift (whole-bone
+// misalignment) also projects fine and no such layout has been seen.
+uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
+                           const DrawItem& item) {
+  if (item.bw_offset == 0 || item.bi_offset == 0 || item.stride == 0) {
+    return palette_base;
+  }
+  const uint32_t count = item.vb_bytes / item.stride;
+  if (count < 2) {
+    return palette_base;
+  }
+  float vp[16];
+  for (int i = 0; i < 16; ++i) {
+    vp[i] = LoadGuestF32(base, bank + i * 4);
+    if (!(vp[i] > -1e9f && vp[i] < 1e9f)) return palette_base;
+  }
+  constexpr uint32_t kSamples = 6;
+  const auto score = [&](uint32_t pb) -> int {
+    int ok = 0;
+    int n = 0;
+    for (uint32_t s = 0; s < kSamples; ++s) {
+      const uint32_t v = item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
+      float p[3];
+      const uint32_t pa = v + item.pos_offset;
+      switch (item.pos_fmt) {
+        case 57:
+          for (int a = 0; a < 3; ++a) p[a] = LoadGuestF32(base, pa + a * 4);
+          break;
+        case 32:
+          for (int a = 0; a < 3; ++a) {
+            p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
+          }
+          break;
+        case 26: {
+          constexpr float kScale = 2.0f / 32767.0f;
+          for (int a = 0; a < 3; ++a) {
+            p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale + (a == 1 ? 0.8f : 0.0f);
+          }
+          break;
+        }
+        default:
+          return -1;
+      }
+      // u8x4 attributes are big-endian per 32-bit word: component k is byte
+      // (24 - 8k) of the host-order load.
+      const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
+      const uint32_t bi = REX_LOAD_U32(v + item.bi_offset);
+      uint32_t total = 0;
+      float q[3] = {0.0f, 0.0f, 0.0f};
+      for (int k = 0; k < 4; ++k) {
+        const uint32_t w = (bw >> (24 - 8 * k)) & 0xFF;
+        if (w == 0) continue;
+        const uint32_t bone = (bi >> (24 - 8 * k)) & 0xFF;
+        const uint32_t r0 = pb + 3 * bone;
+        if (r0 + 3 > 256) continue;
+        total += w;
+        for (int a = 0; a < 3; ++a) {
+          float row[4];
+          for (int i = 0; i < 4; ++i) {
+            row[i] = LoadGuestF32(base, bank + ((r0 + a) * 4 + i) * 4);
+          }
+          q[a] += float(w) * (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]);
+        }
+      }
+      if (total == 0) continue;
+      for (int a = 0; a < 3; ++a) q[a] /= float(total);
+      float clip[4];
+      for (int r = 0; r < 4; ++r) {
+        clip[r] = vp[r * 4] * q[0] + vp[r * 4 + 1] * q[1] + vp[r * 4 + 2] * q[2] +
+                  vp[r * 4 + 3];
+      }
+      const float aw = std::abs(clip[3]) < 1.0f ? 1.0f : std::abs(clip[3]);
+      ++n;
+      if (std::abs(clip[0]) <= 1.5f * aw && std::abs(clip[1]) <= 1.5f * aw) {
+        ++ok;
+      }
+    }
+    return n == 0 ? -1 : (ok * 16) / n;
+  };
+  const int s_std = score(palette_base);
+  const int s_plus = score(palette_base + 1);
+  if (s_plus > s_std) {
+    g_palette_base_plus1.fetch_add(1, std::memory_order_relaxed);
+    return palette_base + 1;
+  }
+  return palette_base;
+}
+
+// Rigid transform validation: the game uses (at least) two VS constant
+// layouts, verified from recorded draw streams: the pre-pass layout has a
+// row-vector 4x4 world at c4..c7 (rotation rows end in 0, translation in
+// c7); the main-pass layout has the camera position at c4 and the world
+// 4x4 at c8..c11. Older meshes use a column-vector affine 4x3 at c4..c6.
+// Sanity-check rows so a camera-position or parameter block is never
+// mistaken for a matrix.
+bool TryRow4x4(uint8_t* base, uint32_t bank, uint32_t reg, float* out) {
+  float f[16];
+  for (int i = 0; i < 16; ++i) {
+    f[i] = LoadGuestF32(base, bank + (reg * 4 + i) * 4);
+    if (!(f[i] > -1e7f && f[i] < 1e7f)) return false;
+  }
+  if (f[3] != 0.0f || f[7] != 0.0f || f[11] != 0.0f || f[15] != 1.0f) return false;
+  for (int r = 0; r < 3; ++r) {
+    const float n = f[r * 4] * f[r * 4] + f[r * 4 + 1] * f[r * 4 + 1] +
+                    f[r * 4 + 2] * f[r * 4 + 2];
+    if (!(n > 0.0025f && n < 400.0f)) return false;
+  }
+  if (!(f[12] > -20000.f && f[12] < 20000.f && f[13] > -20000.f && f[13] < 20000.f &&
+        f[14] > -20000.f && f[14] < 20000.f)) {
+    return false;
+  }
+  std::memcpy(out, f, 16 * sizeof(float));
+  return true;
+}
+
+bool TryColAffine(uint8_t* base, uint32_t bank, uint32_t reg, float* out) {
+  float f[12];
+  for (int i = 0; i < 12; ++i) {
+    f[i] = LoadGuestF32(base, bank + (reg * 4 + i) * 4);
+    if (!(f[i] > -1e7f && f[i] < 1e7f)) return false;
+  }
+  for (int r = 0; r < 3; ++r) {
+    const float n = f[r * 4] * f[r * 4] + f[r * 4 + 1] * f[r * 4 + 1] +
+                    f[r * 4 + 2] * f[r * 4 + 2];
+    if (!(n > 0.0025f && n < 400.0f)) return false;
+    if (!(f[r * 4 + 3] > -20000.f && f[r * 4 + 3] < 20000.f)) return false;
+  }
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      out[i * 4 + j] = f[j * 4 + i];
+    }
+    out[i * 4 + 3] = 0.0f;
+  }
+  out[12] = f[3];
+  out[13] = f[7];
+  out[14] = f[11];
+  out[15] = 1.0f;
+  return true;
+}
+
+// Fill a rigid item's world matrix from a constant bank, whichever layout
+// the staging draw used.
+bool BankRigidWorld(uint8_t* base, uint32_t bank, float* out) {
+  return TryRow4x4(base, bank, 4, out) || TryRow4x4(base, bank, 8, out) ||
+         TryColAffine(base, bank, 4, out);
 }
 
 bool GuestReadableApprox(uint8_t* base, uint32_t addr) {
@@ -110,23 +437,72 @@ bool GuestReadableApprox(uint8_t* base, uint32_t addr) {
   return addr >= 0x10000;
 }
 
-// Walk one MeshContext into a DrawItem. Returns false if any pointer in the
-// chain is implausible. dyn: hook-time state snapshot for dynamic entities
-// (instance matrix + bone palette; both live in transient arenas and are
-// stale by frame end). World geometry passes null and renders with identity
-// (absolute coordinates).
-bool BuildItem(uint8_t* base, uint32_t ctx, const DynamicState* dyn,
-               const PaletteSnapshot* palette, DrawItem& item) {
-  const uint32_t record = REX_LOAD_U32(ctx);
-  if (!GuestReadableApprox(base, record)) return false;
-  const uint32_t mesh = REX_LOAD_U32(record);
-  if (!GuestReadableApprox(base, mesh)) return false;
+// Lock-free guarded bulk copy for render-thread reads of guest payloads.
+// GuestRangeReadable's VirtualQuery loop takes the process VAD lock, which
+// the guest streaming threads hammer exactly while panning streams the world
+// in; every render-thread decode then queues behind them (multi-ms stalls;
+// same lock as the 3 fps PERF TRAP). An SEH-guarded memcpy costs nothing in
+// the good case and fails cleanly if streaming decommitted the range between
+// capture and decode. Own function, no C++ objects: SEH cannot share a frame
+// with unwinding.
+#if defined(_WIN32)
+bool GuestTryCopy(void* dst, const void* src, size_t size) {
+  __try {
+    std::memcpy(dst, src, size);
+    return true;
+  } __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+               GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR)
+                  ? EXCEPTION_EXECUTE_HANDLER
+                  : EXCEPTION_CONTINUE_SEARCH) {  // NOLINT
+    return false;
+  }
+}
+#else
+bool GuestTryCopy(void* dst, const void* src, size_t size) {
+  std::memcpy(dst, src, size);
+  return true;
+}
+#endif
 
+// Committed-page check for bulk reads (transient ring memory can be
+// partially uncommitted, and resources may be released between the game
+// thread capturing an address and the render thread reading it; a blind
+// memcpy would fault).
+bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t size) {
+#if defined(_WIN32)
+  uint8_t* p = base + addr;
+  uint8_t* end = p + size;
+  while (p < end) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(p, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
+        (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+      return false;
+    }
+    p = static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize;
+  }
+  return true;
+#else
+  (void)base;
+  (void)addr;
+  (void)size;
+  return false;
+#endif
+}
+
+// Walk one MeshContext into a DrawItem (geometry, material and draw list;
+// world left as identity). Returns false if any pointer in the chain is
+// implausible. For dynamic entities this MUST run at RenderMesh hook time;
+// the whole chain lives in transient per-frame arenas.
+// Parse a guest mesh struct (vertex descriptor, buffers, bbox, material
+// channels, payload fingerprint) into the item. The draw list and world
+// transform are the caller's responsibility (world starts as identity).
+bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   const uint32_t vdesc = REX_LOAD_U32(mesh + kMeshVertexDescriptor);
   const uint32_t ib = REX_LOAD_U32(mesh + kMeshIndexBuffer);
   const uint32_t vb = REX_LOAD_U32(mesh + kMeshVertexBuffer);
   if (!GuestReadableApprox(base, vdesc) || !GuestReadableApprox(base, ib) ||
       !GuestReadableApprox(base, vb)) {
+    g_rej_chain.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
@@ -143,6 +519,8 @@ bool BuildItem(uint8_t* base, uint32_t ctx, const DynamicState* dyn,
   item.uv2_fmt = 0;
   item.bw_offset = 0;
   item.bi_offset = 0;
+  item.normal_offset = 0;
+  item.normal_fmt = 0;
   item.skinned = false;
   for (uint32_t i = 0; i < num_elements; ++i) {
     const uint32_t e = vdesc + 0x10 + i * 16;
@@ -153,6 +531,12 @@ bool BuildItem(uint8_t* base, uint32_t ctx, const DynamicState* dyn,
       item.pos_offset = REX_LOAD_U16(e + 2);
       item.pos_fmt = uint8_t(REX_LOAD_U32(e + 4) & 0x3F);
       have_pos = true;
+    } else if (usage == 3 && item.normal_fmt == 0) {
+      const uint8_t fmt = uint8_t(REX_LOAD_U32(e + 4) & 0x3F);
+      if (fmt == 16) {  // k_10_11_11 packed normal
+        item.normal_offset = REX_LOAD_U16(e + 2);
+        item.normal_fmt = fmt;
+      }
     } else if (usage == 5 && item.uv_fmt == 0) {
       item.uv_offset = REX_LOAD_U16(e + 2);
       item.uv_fmt = uint8_t(REX_LOAD_U32(e + 4) & 0x3F);
@@ -167,16 +551,23 @@ bool BuildItem(uint8_t* base, uint32_t ctx, const DynamicState* dyn,
       have_bi = (REX_LOAD_U32(e + 4) & 0x3F) == 6;
     }
   }
-  if (!have_pos) return false;
+  if (!have_pos) {
+    g_rej_geom.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
   item.skinned = have_bw && have_bi;
   item.stride = REX_LOAD_U8(vdesc + (num_elements + 1) * 16);
-  if (item.stride == 0) return false;
+  if (item.stride == 0) {
+    g_rej_geom.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
 
   // Mesh BBox = two Vector4s at +0x00/+0x10. Reject NaN/absurd bounds.
   for (int axis = 0; axis < 3; ++axis) {
     const float lo = LoadGuestF32(base, mesh + axis * 4);
     const float hi = LoadGuestF32(base, mesh + 0x10 + axis * 4);
     if (!(hi - lo < 50000.0f)) {
+      g_rej_bbox.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
     item.bbox_min[axis] = lo;
@@ -184,35 +575,27 @@ bool BuildItem(uint8_t* base, uint32_t ctx, const DynamicState* dyn,
   }
 
   item.mesh = mesh;
+  item.pending = false;
+  item.cloth_quads = false;
+  item.vb_obj = vb;
+  item.ib_obj = ib;
   item.vb_addr = REX_LOAD_U32(vb + kBufferPhysAddr) & 0xFFFFFFFC;
   item.vb_bytes = REX_LOAD_U32(vb + kVbBytes);
   item.ib_addr = REX_LOAD_U32(ib + kBufferPhysAddr) & 0xFFFFFFFC;
   item.ib_count = REX_LOAD_U32(ib + kIbCount);
   if (item.vb_addr == 0 || item.ib_addr == 0 || item.vb_bytes == 0 ||
       item.ib_count == 0 || item.vb_bytes % item.stride != 0) {
+    g_rej_geom.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
-
-  // Culled island draw list from the context.
-  const uint32_t draw_count = REX_LOAD_U16(ctx + kCtxDrawCountU16);
-  const uint32_t draw_list = REX_LOAD_U32(ctx + kCtxDrawList);
-  if (draw_count == 0 || draw_count > 512 || !GuestReadableApprox(base, draw_list)) {
-    return false;
-  }
-  item.draws.reserve(draw_count);
-  for (uint32_t i = 0; i < draw_count; ++i) {
-    const uint32_t d = draw_list + i * 16;
-    DrawEntry entry{REX_LOAD_U32(d), REX_LOAD_U32(d + 4), REX_LOAD_U32(d + 8),
-                    REX_LOAD_U32(d + 12)};
-    if (entry.index_count == 0 || entry.index_count > item.ib_count) continue;
-    item.draws.push_back(entry);
-  }
-  if (item.draws.empty()) return false;
 
   // Material channels: resolve the "diffuse" and "lightmap" texture guids to
   // registered texture objects.
   item.diffuse_tex = 0;
   item.lightmap_tex = 0;
+  item.hair = false;
+  item.unlit = false;
+  item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
   const uint32_t material = REX_LOAD_U32(mesh + kMeshMaterial);
   if (GuestReadableApprox(base, material)) {
     const uint32_t num_channels = REX_LOAD_U32(material);
@@ -232,14 +615,45 @@ bool BuildItem(uint8_t* base, uint32_t ctx, const DynamicState* dyn,
           slot = &item.diffuse_tex;
         } else if (std::memcmp(text, "lightmap", 9) == 0) {
           slot = &item.lightmap_tex;
+        } else if (std::memcmp(text, "Attribul", 8) == 0) {
+          // AttribulatorMaterialName: chan+0x18 is the material name string.
+          // "character.hair" marks the grayscale hair that needs the
+          // per-character tint from the pixel constant bank; "sky.*" draws
+          // fullbright.
+          const uint32_t s = REX_LOAD_U32(chan + 0x18);
+          if (GuestReadableApprox(base, s)) {
+            char mat_name[16] = {};
+            for (int k = 0; k < 15; ++k) {
+              mat_name[k] = char(REX_LOAD_U8(s + k));
+              if (mat_name[k] == '\0') break;
+            }
+            item.hair = std::memcmp(mat_name, "character.hair", 15) == 0;
+            item.unlit = std::memcmp(mat_name, "sky.", 4) == 0;
+          }
+          continue;
         }
         if (slot != nullptr && *slot == 0) {
-          const uint64_t guid =
-              (uint64_t(REX_LOAD_U32(chan + 0x10)) << 32) | REX_LOAD_U32(chan + 0x14);
-          std::lock_guard<std::mutex> lock(g_texture_map_mutex);
-          auto it = g_texture_map.find(guid & kGuidMask);
-          if (it != g_texture_map.end()) {
-            *slot = it->second;
+          // Prefer the channel's live stream record (chan+0x1C -> word 0 =
+          // the renderengine::Texture actually bound): runtime-composed
+          // customization textures (CAS face/skin, shoes, deck, wheels)
+          // are never registered under an asset GUID. Validate via the
+          // fetch-constant type bits before trusting the pointer.
+          const uint32_t stream = REX_LOAD_U32(chan + 0x1C);
+          if (GuestReadableApprox(base, stream)) {
+            const uint32_t tex = REX_LOAD_U32(stream);
+            if (GuestReadableApprox(base, tex) &&
+                (REX_LOAD_U32(tex + 7 * 4) & 3u) == 2u) {
+              *slot = tex;
+            }
+          }
+          if (*slot == 0) {
+            const uint64_t guid =
+                (uint64_t(REX_LOAD_U32(chan + 0x10)) << 32) | REX_LOAD_U32(chan + 0x14);
+            std::lock_guard<std::mutex> lock(g_texture_map_mutex);
+            auto it = g_texture_map.find(guid & kGuidMask);
+            if (it != g_texture_map.end()) {
+              *slot = it->second;
+            }
           }
         }
         if (item.diffuse_tex != 0 && item.lightmap_tex != 0) {
@@ -273,41 +687,44 @@ bool BuildItem(uint8_t* base, uint32_t ctx, const DynamicState* dyn,
   // Transform (identity for world geometry, instance matrix for props;
   // characters get their bone array's first matrix, which roughly places
   // them until skinning is implemented).
-  if (dyn != nullptr) {
-    std::memcpy(item.world, dyn->world, sizeof(item.world));
-    if (item.skinned && palette != nullptr && !palette->rows.empty()) {
-      // Convert the staged 4x3 palette (3 float4 rows per bone, column-vector
-      // affine) into 4x4 row-vector matrices. The palette maps model space to
-      // world space directly, so world stays identity.
-      const uint32_t num_bones = uint32_t(palette->rows.size() / 12);
-      item.bones.resize(size_t(num_bones) * 16);
-      for (uint32_t b = 0; b < num_bones; ++b) {
-        const float* m = palette->rows.data() + size_t(b) * 12;
-        float* out = item.bones.data() + size_t(b) * 16;
-        for (int i = 0; i < 3; ++i) {
-          for (int j = 0; j < 3; ++j) {
-            out[i * 4 + j] = m[j * 4 + i];
-          }
-          out[i * 4 + 3] = 0.0f;
-        }
-        out[12] = m[3];
-        out[13] = m[7];
-        out[14] = m[11];
-        out[15] = 1.0f;
-      }
-      std::memset(item.world, 0, sizeof(item.world));
-      item.world[0] = item.world[5] = item.world[10] = item.world[15] = 1.0f;
-      g_skinned_items.fetch_add(1, std::memory_order_relaxed);
-    } else if (item.skinned) {
-      // A skinned mesh without its palette renders as bind-pose limbs
-      // sprawling from the model origin; skip it instead.
-      g_skinned_skipped.fetch_add(1, std::memory_order_relaxed);
-      return false;
-    }
-  } else {
-    std::memset(item.world, 0, sizeof(item.world));
-    item.world[0] = item.world[5] = item.world[10] = item.world[15] = 1.0f;
-    item.skinned = false;
+  std::memset(item.world, 0, sizeof(item.world));
+  item.world[0] = item.world[5] = item.world[10] = item.world[15] = 1.0f;
+  return true;
+}
+
+bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
+  const uint32_t record = REX_LOAD_U32(ctx);
+  if (!GuestReadableApprox(base, record)) {
+    g_rej_chain.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  const uint32_t mesh = REX_LOAD_U32(record);
+  if (!GuestReadableApprox(base, mesh)) {
+    g_rej_chain.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (!BuildItemFromMesh(base, mesh, item)) {
+    return false;
+  }
+
+  // Culled island draw list from the context.
+  const uint32_t draw_count = REX_LOAD_U16(ctx + kCtxDrawCountU16);
+  const uint32_t draw_list = REX_LOAD_U32(ctx + kCtxDrawList);
+  if (draw_count == 0 || draw_count > 512 || !GuestReadableApprox(base, draw_list)) {
+    g_rej_draws.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  item.draws.reserve(draw_count);
+  for (uint32_t i = 0; i < draw_count; ++i) {
+    const uint32_t d = draw_list + i * 16;
+    DrawEntry entry{REX_LOAD_U32(d), REX_LOAD_U32(d + 4), REX_LOAD_U32(d + 8),
+                    REX_LOAD_U32(d + 12)};
+    if (entry.index_count == 0 || entry.index_count > item.ib_count) continue;
+    item.draws.push_back(entry);
+  }
+  if (item.draws.empty()) {
+    g_rej_draws.fetch_add(1, std::memory_order_relaxed);
+    return false;
   }
   return true;
 }
@@ -324,91 +741,428 @@ void OnRegisterTexture(uint64_t guid, uint32_t texture) {
   g_texture_map[guid & kGuidMask] = texture;
 }
 
-void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr) {
-  if (!SceneEnabled() || bank != 0x4000 || ptr == 0) {
+void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr,
+                        uint32_t device) {
+  (void)base;
+  (void)mask;
+  if (device != 0) {
+    g_device.store(device, std::memory_order_relaxed);
+  }
+  if (!SceneEnabled() || ptr == 0) {
+    return;
+  }
+  if (bank == 0x4400) {
+    g_ps_bank.store(ptr, std::memory_order_relaxed);
+    return;
+  }
+  if (bank != 0x4000) {
     return;
   }
   g_vs_uploads.fetch_add(1, std::memory_order_relaxed);
-  const uint32_t registers = uint32_t(std::popcount(mask)) * 4;
-  if (registers < 30) {
-    return;
-  }
-  g_vs_uploads_large.fetch_add(1, std::memory_order_relaxed);
-
-  // ptr is the positional 256-register staging bank (partial uploads leave
-  // the rest of the bank intact). The bone palette is a run of consecutive
-  // 4x3 affine matrices (3 registers per bone: rotation rows of plausible
-  // scale, translation in component 3). Find the longest such run.
-  const auto valid_bone = [&](uint32_t reg) -> bool {
-    float m[12];
-    for (int i = 0; i < 12; ++i) {
-      m[i] = LoadGuestF32(base, ptr + (reg * 4 + i) * 4);
-      if (!(m[i] > -1e6f && m[i] < 1e6f)) return false;
-    }
-    for (int r = 0; r < 3; ++r) {
-      const float n =
-          m[r * 4] * m[r * 4] + m[r * 4 + 1] * m[r * 4 + 1] + m[r * 4 + 2] * m[r * 4 + 2];
-      if (!(n > 0.05f && n < 20.0f)) return false;
-      if (!(m[r * 4 + 3] > -20000.f && m[r * 4 + 3] < 20000.f)) return false;
-    }
-    return true;
-  };
-  uint32_t best_start = 0;
-  uint32_t best_len = 0;
-  uint32_t reg = 0;
-  while (reg + 3 <= 256) {
-    if (!valid_bone(reg)) {
-      ++reg;
-      continue;
-    }
-    uint32_t run_start = reg;
-    uint32_t run_len = 0;
-    while (reg + 3 <= 256 && valid_bone(reg)) {
-      ++run_len;
-      reg += 3;
-    }
-    if (run_len > best_len) {
-      best_len = run_len;
-      best_start = run_start;
-    }
-  }
-  if (best_len < 8) {
-    return;
-  }
-  const uint32_t bones = best_len < 96 ? best_len : 96;
-  std::lock_guard<std::mutex> lock(g_palette_mutex);
-  g_pending_palette.rows.resize(size_t(bones) * 12);
-  for (uint32_t i = 0; i < bones * 12; ++i) {
-    g_pending_palette.rows[i] = LoadGuestF32(base, ptr + (best_start * 4 + i) * 4);
-  }
-  g_pending_palette_index = 0;  // not yet published
-  g_palette_snapshots.fetch_add(1, std::memory_order_relaxed);
+  g_vs_bank.store(ptr, std::memory_order_relaxed);
 }
 
-uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx) {
-  const uint32_t mtx = REX_LOAD_U32(ctx + kCtxMatrix);
-  if (mtx == 0 || !GuestReadableApprox(base, mtx)) {
+// The character.hair pixel shader keeps the per-character hair color at PS
+// c17 (fixed layout for that shader; verified from recorded PS banks;
+// c16/c17 hold the dark ambient/diffuse hair color pair while other
+// registers carry lighting globals). Used as captured.
+void CaptureHairTint(uint8_t* base, DrawItem& item) {
+  const uint32_t ps = g_ps_bank.load(std::memory_order_relaxed);
+  if (ps == 0) {
+    return;
+  }
+  float rgb[3];
+  for (int i = 0; i < 3; ++i) {
+    rgb[i] = LoadGuestF32(base, ps + (17 * 4 + i) * 4);
+    if (!(rgb[i] >= 0.0f && rgb[i] <= 4.0f)) {
+      return;  // implausible bank contents; keep the previous/no tint
+    }
+  }
+  for (int i = 0; i < 3; ++i) {
+    item.tint[i] = rgb[i];
+  }
+  item.tint[3] = 1.0f;
+}
+
+// Copy the staged bone palette (and, for hair, the tint) out of the shadow
+// banks into the item. The banks are reused draw to draw, hence the copy.
+// The base from BankPaletteBase is refined by +1 for the cloth/morph VS
+// layout (extra parameter row before the palette); the mesh's own sample
+// vertices projected with the bank's viewproj decide (RefinePaletteBase).
+void CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
+                         DrawItem& item) {
+  palette_base = RefinePaletteBase(base, bank, palette_base, item);
+  constexpr uint32_t kPaletteFloats = 84 * 12;  // c4..c255 = up to 84 bones
+  item.bones.resize(kPaletteFloats);
+  for (uint32_t i = 0; i < kPaletteFloats; ++i) {
+    const float f = LoadGuestF32(base, bank + (palette_base * 4 + i) * 4);
+    item.bones[i] = (f > -1e7f && f < 1e7f) ? f : 0.0f;
+  }
+  if (item.hair) {
+    CaptureHairTint(base, item);
+  }
+}
+
+uint64_t DrawSequence() { return g_draw_seq.load(std::memory_order_relaxed); }
+
+uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
+                             bool drew_inside) {
+  if (!SceneEnabled()) {
     return 0;
   }
-  DynamicState state;
-  // Guest matrices store translation in column 3; transpose to row-vector.
-  for (int r = 0; r < 4; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      state.world[r * 4 + c] = LoadGuestF32(base, mtx + (c * 4 + r) * 4);
+  const uint32_t bank = g_vs_bank.load(std::memory_order_relaxed);
+  if (bank == 0) {
+    return 0;
+  }
+  if (world_path) {
+    // Cheap pre-check so the world path (~800 calls/frame) only pays the
+    // full capture for the meshes that need per-draw transforms: skinned
+    // (LOD pedestrians, jointed props) and rigid MODEL-SPACE props (position
+    // fmt 32/26). Movable props (vending machines) can reach the frame ONLY
+    // through the sort lists, rendered as absolute world geometry they
+    // collapse at the origin. Absolute meshes (fmt 57) stay on the identity
+    // world path.
+    const uint32_t record = REX_LOAD_U32(ctx);
+    if (!GuestReadableApprox(base, record)) return 0;
+    const uint32_t mesh = REX_LOAD_U32(record);
+    if (!GuestReadableApprox(base, mesh)) return 0;
+    const uint32_t vdesc = REX_LOAD_U32(mesh + kMeshVertexDescriptor);
+    if (!GuestReadableApprox(base, vdesc)) return 0;
+    const uint32_t num_elements = REX_LOAD_U16(vdesc + 8);
+    if (num_elements == 0 || num_elements > 32) return 0;
+    bool have_bw = false;
+    bool have_bi = false;
+    uint32_t pos_fmt = 0;
+    bool have_pos = false;
+    for (uint32_t i = 0; i < num_elements; ++i) {
+      const uint32_t e = vdesc + 0x10 + i * 16;
+      if (REX_LOAD_U16(e) != 0) continue;
+      const uint32_t usage = REX_LOAD_U8(e + 9);
+      if (usage == 0 && !have_pos) {
+        pos_fmt = REX_LOAD_U32(e + 4) & 0x3F;
+        have_pos = true;
+      }
+      if (usage == 1 && (REX_LOAD_U32(e + 4) & 0x3F) == 6) have_bw = true;
+      if (usage == 2 && (REX_LOAD_U32(e + 4) & 0x3F) == 6) have_bi = true;
+    }
+    const bool skinned = have_bw && have_bi;
+    const bool model_space = pos_fmt == 32 || pos_fmt == 26;
+    if (!skinned && !model_space) {
+      return 0;
+    }
+  }
+  DrawItem item;
+  if (!BuildItemGeometry(base, ctx, item)) {
+    return 0;
+  }
+  // Rigid transform: the bank only holds this mesh's constants if its own
+  // draws ran inside the submit call. Deferred (multi-pass) rigid props draw
+  // later; the bank belongs to some earlier mesh, and a leftover identity
+  // matrix at c4 VALIDATES as a plausible world (verified from recorded
+  // draw streams: 4 of 6 vending-machine clones captured exact identity and
+  // rendered invisibly at the origin). Defer those to the post-draw fixup,
+  // like skinned palettes.
+  if (!item.skinned) {
+    if (!drew_inside || !BankRigidWorld(base, bank, item.world)) {
+      item.pending = true;
+      g_rigid_pending.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  if (item.skinned) {
+    // Copy the whole possible palette span (c4..c255 = 84 bones) verbatim:
+    // 3 float4 rows per bone, column-vector affine [R | t], model space
+    // directly to world space (verified live: bone translations match the
+    // camera focus). The shader applies rows with explicit dot products,
+    // sidestepping HLSL matrix packing. Registers beyond the mesh's real
+    // bone count hold stale bank data but are never indexed. World stays
+    // identity.
+    //
+    // The bank only holds this mesh's palette at c4 if its own draws ran
+    // inside the call AND used the pre-pass layout. Multi-pass (deferred)
+    // meshes draw later, and main-pass-layout banks have the camera at c4;
+    // in both cases leave the palette pending for the post-draw fixup.
+    const uint32_t effect_list = REX_LOAD_U32(ctx + kCtxEffectList);
+    uint32_t passes = 1;
+    if (GuestReadableApprox(base, effect_list)) {
+      passes = REX_LOAD_U32(effect_list + kEffectListPassCount);
+    }
+    const uint32_t palette_base = BankPaletteBase(base, bank);
+    // World-path captures come from the sort-list hook BEFORE any of the
+    // mesh's draws ran; the bank belongs to some other mesh; always defer
+    // to the post-draw fixup. Same when no draw ran inside the submit call
+    // (deferred mesh): a stale bank can still hold plausible bone rows.
+    item.pending = world_path || !drew_inside || (passes > 1 && passes < 16) ||
+                   palette_base == 0;
+    if (!item.pending) {
+      CaptureSkinnedState(base, bank, palette_base, item);
+      g_palette_snapshots.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_skinned_items.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (g_recording.load(std::memory_order_relaxed)) {
+    // Preserve the buffer payload for offline decode (streaming arenas are
+    // recycled long before the end-of-window memory snapshot).
+    std::lock_guard<std::mutex> lock(g_record_mutex);
+    const uint64_t key = uint64_t(item.vb_addr) * 1099511628211ull ^ item.fingerprint;
+    if (item.vb_bytes <= (1u << 20) && g_recorded_buffer_bytes < (512u << 20) &&
+        g_recorded_buffer_keys.insert(key).second) {
+      RecordedBuffer buf;
+      buf.vb_addr = item.vb_addr;
+      buf.ib_addr = item.ib_addr;
+      buf.fingerprint = item.fingerprint;
+      buf.vb.resize(item.vb_bytes);
+      std::memcpy(buf.vb.data(), base + item.vb_addr, item.vb_bytes);
+      buf.ib.resize(size_t(item.ib_count) * 2);
+      std::memcpy(buf.ib.data(), base + item.ib_addr, buf.ib.size());
+      g_recorded_buffer_bytes += buf.vb.size() + buf.ib.size();
+      g_recorded_buffers.push_back(std::move(buf));
     }
   }
   std::lock_guard<std::mutex> lock(g_palette_mutex);
-  if (!g_pending_palette.rows.empty() && g_pending_palette_index == 0) {
-    g_frame_palettes.push_back(g_pending_palette);
-    g_pending_palette_index = uint32_t(g_frame_palettes.size());
+  g_frame_dynitems.push_back(std::move(item));
+  const size_t index = g_frame_dynitems.size() - 1;
+  if (g_frame_dynitems[index].pending) {
+    const DrawItem& d = g_frame_dynitems[index];
+    g_frame_pending_by_buffers.emplace((uint64_t(d.ib_obj) << 32) | d.vb_obj, index);
   }
-  state.palette_index = g_pending_palette_index;
-  g_frame_dynstates.push_back(state);
-  return uint32_t(g_frame_dynstates.size());
+  return uint32_t(index + 1);
+}
+
+uint32_t CaptureClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6,
+                          uint32_t r7, uint32_t* out_key) {
+  (void)r4;
+  (void)r7;
+  if (!SceneEnabled() || r6 != 0x80000000u ||
+      !REXCVAR_GET(skate3_native_render_scene_quadlists)) {
+    return 0;
+  }
+  // Quad-list draw: stream 0 is a dynamic ping-pong object whose vertex
+  // fetch block (+0x18 dword0 = base|flags, +0x20 = size in bytes) points at
+  // the CPU-simulated vertices for this frame: stride 24 = {float3 world
+  // position (BE), packed normal, float2 uv}, quad-list topology (verified
+  // offline from recorded payloads). NOTE: every capture examined so far is
+  // a PARTICLE system (disjoint 2-4cm sprites), which is why rendering is
+  // gated off by default; see the cvar.
+  const uint32_t vb_obj = g_cur_vb.load(std::memory_order_relaxed);
+  if (!GuestReadableApprox(base, vb_obj)) {
+    return 0;
+  }
+  const uint32_t addr = REX_LOAD_U32(vb_obj + 0x18) & 0xFFFFFFFC;
+  const uint32_t size = REX_LOAD_U32(vb_obj + 0x20);
+  constexpr uint32_t kStride = 24;
+  if (addr < 0x10000 || size < kStride * 4 || size > (1u << 20) || size % kStride != 0) {
+    return 0;
+  }
+  // The garment's live vertices start at the buffer head; r5 is the live
+  // vertex count (verified offline: the zero-fill run starts exactly at r5
+  // for every garment). Ring slack past it must not be drawn.
+  uint32_t verts = size / kStride;
+  if (r5 >= 4 && r5 <= verts) {
+    verts = r5;
+  }
+  const uint32_t quads = verts / 4;
+  if (quads == 0) {
+    return 0;
+  }
+  const uint32_t start = 0;
+
+  const uint32_t garment_key = vb_obj ^ (start * 2654435761u);
+  DrawItem item{};
+  item.mesh = garment_key;
+  item.vb_obj = vb_obj;
+  item.ib_obj = 0;
+  item.vb_addr = addr;
+  item.vb_bytes = verts * kStride;
+  item.ib_addr = 0;
+  item.ib_count = quads * 6;
+  item.diffuse_tex = 0;
+  item.lightmap_tex = 0;
+  item.pos_offset = 0;
+  item.pos_fmt = 57;  // float3
+  item.uv_offset = 16;
+  item.uv_fmt = 38;  // float2
+  item.uv2_offset = 0;
+  item.uv2_fmt = 0;
+  item.bw_offset = 0;
+  item.bi_offset = 0;
+  item.stride = kStride;
+  item.skinned = false;
+  item.pending = false;
+  item.cloth_quads = true;
+  std::memset(item.world, 0, sizeof(item.world));
+  item.world[0] = item.world[5] = item.world[10] = item.world[15] = 1.0f;
+  for (int axis = 0; axis < 3; ++axis) {
+    item.bbox_min[axis] = -20000.0f;
+    item.bbox_max[axis] = 20000.0f;
+  }
+  item.draws.push_back({4, 0, 0, quads * 6});
+
+  // Content fingerprint (simulation output changes every frame -> the
+  // renderer re-decodes each frame).
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  mix(addr);
+  mix(item.vb_bytes);
+  for (uint32_t k = 0; k < 16; ++k) {
+    const uint32_t off = uint32_t(uint64_t(item.vb_bytes - 8) * k / 15u) & ~7u;
+    mix(REX_LOAD_U64(addr + off));
+  }
+  item.fingerprint = h;
+
+  // Distinct draw ranges within one ring buffer are distinct garments.
+  *out_key = garment_key;
+  std::lock_guard<std::mutex> lock(g_palette_mutex);
+  g_frame_dynitems.push_back(std::move(item));
+  return uint32_t(g_frame_dynitems.size());
+}
+
+void OnSetIndices(uint32_t ib_obj) { g_cur_ib.store(ib_obj, std::memory_order_relaxed); }
+
+void OnSetStreamSource(uint32_t stream, uint32_t vb_obj, uint32_t offset, uint32_t stride) {
+  if (stream == 0) {
+    g_cur_vb.store(vb_obj, std::memory_order_relaxed);
+    g_cur_vb_offset.store(offset, std::memory_order_relaxed);
+    g_cur_vb_stride.store(stride, std::memory_order_relaxed);
+  }
+  if (stream < 4) {
+    g_cur_streams[stream][0].store(vb_obj, std::memory_order_relaxed);
+    g_cur_streams[stream][1].store(offset, std::memory_order_relaxed);
+    g_cur_streams[stream][2].store(stride, std::memory_order_relaxed);
+  }
+}
+
+void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t r6,
+                uint32_t r7) {
+  g_draw_seq.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t bank = g_vs_bank.load(std::memory_order_relaxed);
+  if (bank == 0) {
+    return;
+  }
+  const uint32_t cur_ib = g_cur_ib.load(std::memory_order_relaxed);
+  const uint32_t cur_vb = g_cur_vb.load(std::memory_order_relaxed);
+  if (g_recording.load(std::memory_order_relaxed)) {
+    // Sample the full draw stream on a couple of recorded frames out of
+    // every 60, spread across the window (ground-truth coverage for the
+    // whole recording), and only for frames that are themselves recorded.
+    std::lock_guard<std::mutex> lock(g_record_mutex);
+    const bool frame_recorded = (g_frames_seen + 1) % g_record_stride == 0;
+    const bool all_draws = REXCVAR_GET(skate3_native_render_snapshot_all_draws);
+    const size_t draw_cap = all_draws ? 200000 : 32768;
+    if (frame_recorded && (all_draws || (g_record_frame % 60) < 2) &&
+        g_recorded_draws.size() < draw_cap) {
+      auto rec = std::make_unique<RecordedDraw>();
+      rec->func = func;
+      rec->ib = cur_ib;
+      rec->vb = cur_vb;
+      rec->vb_offset = g_cur_vb_offset.load(std::memory_order_relaxed);
+      rec->vb_stride = g_cur_vb_stride.load(std::memory_order_relaxed);
+      for (int s = 0; s < 4; ++s) {
+        for (int k = 0; k < 3; ++k) {
+          rec->streams[s][k] = g_cur_streams[s][k].load(std::memory_order_relaxed);
+        }
+      }
+      const uint32_t device = g_device.load(std::memory_order_relaxed);
+      for (int i = 0; i < 12; ++i) {
+        rec->vfetch[i] = device != 0 ? REX_LOAD_U32(device + 0x480 + i * 4) : 0;
+      }
+      rec->args[0] = r4;
+      rec->args[1] = r5;
+      rec->args[2] = r6;
+      rec->args[3] = r7;
+      for (uint32_t i = 0; i < 1024; ++i) {
+        rec->bank[i] = LoadGuestF32(base, bank + i * 4);
+      }
+      const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+      for (uint32_t i = 0; i < 256; ++i) {
+        rec->ps[i] = ps_bank != 0 ? LoadGuestF32(base, ps_bank + i * 4) : 0.0f;
+      }
+      rec->frame = g_record_frame;
+      if (func == 1 && cur_vb != 0) {
+        // Non-indexed (cloth) draw: the bound object holds two ping-pong
+        // vertex fetch blocks whose ring payloads are recycled long before
+        // frame end; dump both now, keyed back to this draw via rec->ib.
+        const uint32_t dump_id = uint32_t(g_recorded_buffers.size());
+        for (uint32_t block = 0; block < 2; ++block) {
+          const uint32_t fetch0 = REX_LOAD_U32(cur_vb + 0x18 + block * 0x30);
+          const uint32_t addr = fetch0 & 0xFFFFFFFC;
+          if (addr < 0x10000) continue;
+          uint32_t bytes = REX_LOAD_U32(cur_vb + 0x20 + block * 0x30);
+          if (bytes < 64 || bytes > (256u << 10)) bytes = 128u << 10;
+          if (g_recorded_buffer_bytes + bytes > (512u << 20)) break;
+          while (bytes >= 4096 && !GuestRangeReadable(base, addr, bytes)) {
+            bytes /= 2;
+          }
+          if (bytes < 4096) continue;
+          RecordedBuffer buf;
+          buf.vb_addr = addr;
+          buf.ib_addr = 0;
+          buf.fingerprint = (uint64_t(g_record_frame) << 32) | dump_id | (block << 30);
+          buf.vb.resize(bytes);
+          std::memcpy(buf.vb.data(), base + addr, bytes);
+          g_recorded_buffer_bytes += bytes;
+          g_recorded_buffers.push_back(std::move(buf));
+        }
+        rec->ib = 0x80000000u | dump_id;
+      }
+      g_recorded_draws.push_back(std::move(rec));
+    }
+  }
+  if (func != 0) {
+    return;  // palette fixup below matches indexed draws only
+  }
+  const uint64_t key = (uint64_t(cur_ib) << 32) | cur_vb;
+  std::lock_guard<std::mutex> lock(g_palette_mutex);
+  auto range = g_frame_pending_by_buffers.equal_range(key);
+  if (range.first == range.second) {
+    return;
+  }
+  // This draw's constants belong to the OLDEST pending item with these
+  // buffers (clones share mesh assets; the deferred list draws in submit
+  // order, so FIFO one-shot pairing keeps clones' palettes apart). This is
+  // the only draw that ever stages a deferred mesh's bones/world.
+  auto oldest = range.first;
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second < oldest->second) {
+      oldest = it;
+    }
+  }
+  DrawItem& d = g_frame_dynitems[oldest->second];
+  if (d.skinned) {
+    // Locate the palette for this draw's layout; a bank without plausible
+    // bone rows (parameter blocks, camera rows) must not be consumed; that
+    // was the source of screen-wide stretched characters.
+    const uint32_t palette_base = BankPaletteBase(base, bank);
+    if (palette_base == 0) {
+      return;
+    }
+    CaptureSkinnedState(base, bank, palette_base, d);
+  } else {
+    // Deferred rigid prop: the world matrix is wherever this draw's layout
+    // keeps it (pre-pass c4..c7, main-pass c8..c11). Not plausible -> wait
+    // for a later draw with these buffers.
+    if (!BankRigidWorld(base, bank, d.world)) {
+      return;
+    }
+  }
+  d.pending = false;
+  g_frame_pending_by_buffers.erase(oldest);
 }
 
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
-  if (!SceneEnabled() || count == 0) {
+  if (!SceneEnabled()) {
+    return;
+  }
+  // Take this frame's hook-time dynamic items regardless of how we exit,
+  // leaving them in place across an early return (no perspective view, empty
+  // frame) would desynchronize the indices stored in the records.
+  std::vector<DrawItem> dynitems;
+  {
+    std::lock_guard<std::mutex> lock(g_palette_mutex);
+    dynitems.swap(g_frame_dynitems);
+    g_frame_pending_by_buffers.clear();
+  }
+  if (count == 0) {
     return;
   }
   g_guest_base.store(base, std::memory_order_relaxed);
@@ -442,6 +1196,15 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   FrameScene scene;
   scene.items.reserve(count);
   std::unordered_set<uint32_t> seen;
+  // Dynamic contexts are submitted several times per frame (once per pass);
+  // each submission carries that pass's culled island list. Keep the fullest
+  // one; a shadow-pass list can be missing body parts the main view needs.
+  std::unordered_map<uint32_t, size_t> dyn_slot;
+  const auto total_indices = [](const DrawItem& d) {
+    uint64_t n = 0;
+    for (const DrawEntry& e : d.draws) n += e.index_count;
+    return n;
+  };
   for (size_t i = 0; i < count; ++i) {
     const SubmitRecord& r = records[i];
     // Primary opaque list of the chosen view only; other lists (shadow
@@ -450,35 +1213,60 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     if (r.kind == 1 && (r.c != view || r.b != 20160)) {
       continue;
     }
+    if (r.kind == 2 && r.b != view) {
+      // World-path capture from another view (shadow cascade): rendering it
+      // duplicates the entity as a ghost.
+      seen.insert(r.a);
+      continue;
+    }
+    if (r.kind == 0 || r.kind == 2 || r.kind == 3) {
+      // Dynamic entity (kind 0), main-view world-path capture (kind 2) or
+      // quad-list capture (kind 3): the complete item was built at hook time.
+      seen.insert(r.a);
+      if (r.c == 0) {
+        g_rej_no_dynstate.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      if (r.c > dynitems.size()) {
+        g_rej_dyn_range.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      const DrawItem& cand = dynitems[r.c - 1];
+      if (cand.pending) {
+        // Deferred mesh whose draw never came: no valid palette/transform.
+        (cand.skinned ? g_skinned_skipped : g_rigid_dropped)
+            .fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      auto [slot, inserted] = dyn_slot.try_emplace(r.a, scene.items.size());
+      if (inserted) {
+        scene.items.push_back(cand);
+      } else if (total_indices(cand) > total_indices(scene.items[slot->second])) {
+        scene.items[slot->second] = cand;
+      }
+      continue;
+    }
     if (!seen.insert(r.a).second) {
       continue;
     }
-    const DynamicState* dyn = nullptr;
-    const PaletteSnapshot* palette = nullptr;
-    if (r.kind == 0) {
-      if (r.c == 0) {
-        continue;  // no hook-time state captured; transform unknown
-      }
-      std::lock_guard<std::mutex> lock(g_palette_mutex);
-      if (r.c <= g_frame_dynstates.size()) {
-        dyn = &g_frame_dynstates[r.c - 1];
-        if (dyn->palette_index != 0 && dyn->palette_index <= g_frame_palettes.size()) {
-          palette = &g_frame_palettes[dyn->palette_index - 1];
-        }
-      } else {
+    DrawItem item;
+    if (BuildItemGeometry(base, r.a, item)) {
+      if (item.skinned) {
+        // Skinned meshes reached through the world sort lists (flags,
+        // banners) have no captured palette, bind-pose garbage; skip.
+        g_skinned_skipped.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
-    }
-    DrawItem item;
-    if (BuildItem(base, r.a, dyn, palette, item)) {
+      if (item.pos_fmt != 57) {
+        // Model-space prop (vending machines, dispensers): its vertices need
+        // the per-draw transform, which only the kind-2 hook-time capture
+        // has; rendered here with identity it collapses at the world
+        // origin. The capture handles it (or it is dropped when pending).
+        g_world_props.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
       scene.items.push_back(std::move(item));
     }
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_palette_mutex);
-    g_frame_palettes.clear();
-    g_frame_dynstates.clear();
-    g_pending_palette_index = 0;
   }
   if (scene.items.empty()) {
     return;
@@ -502,9 +1290,136 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // correct D3D NDC orientation; use the view*proj matrix as captured.
   // (Negating column 0 here mirrors the image left-right.)
 
+  if (g_recording.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(g_record_mutex);
+    if (++g_frames_seen % g_record_stride == 0) {
+      RecordedFrame rf;
+      rf.generation = g_generation + 1;
+      std::memcpy(rf.view_proj, scene.view_proj, sizeof(rf.view_proj));
+      std::memcpy(rf.cam_pos, scene.cam_pos, sizeof(rf.cam_pos));
+      rf.dynitems = dynitems;
+      rf.items = scene.items;
+      g_recorded_frames.push_back(std::move(rf));
+      ++g_record_frame;
+    }
+  }
+
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;
   g_scene = std::move(scene);
+}
+
+void StartRecording(uint32_t stride) {
+  std::lock_guard<std::mutex> lock(g_record_mutex);
+  g_recorded_draws.clear();
+  g_recorded_frames.clear();
+  g_recorded_buffers.clear();
+  g_recorded_buffer_keys.clear();
+  g_recorded_buffer_bytes = 0;
+  g_record_frame = 0;
+  g_frames_seen = 0;
+  g_record_stride = stride == 0 ? 1 : stride;
+  g_recording.store(true, std::memory_order_relaxed);
+}
+
+void WriteRecording(const char* dir, const char* stem) {
+  g_recording.store(false, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(g_record_mutex);
+  const std::filesystem::path base_path = std::filesystem::path(dir) / stem;
+
+  // Binary draw stream: header "SK3DRAW6", fixed records {u32 frame, u32
+  // func, u32 ib, u32 vb, u32 vb_offset, u32 vb_stride, u32 streams[4][3],
+  // u32 vfetch[12], u32 args[4], f32 vs_bank[1024], f32 ps_bank[256]}
+  // (little-endian). func: 0 DrawIndexedVertices, 1 DrawVertices,
+  // 2 BeginVertices.
+  {
+    std::ofstream out(base_path.string() + ".draws.bin", std::ios::binary);
+    out.write("SK3DRAW6", 8);
+    for (const auto& d : g_recorded_draws) {
+      out.write(reinterpret_cast<const char*>(&d->frame), 4);
+      out.write(reinterpret_cast<const char*>(&d->func), 4);
+      out.write(reinterpret_cast<const char*>(&d->ib), 4);
+      out.write(reinterpret_cast<const char*>(&d->vb), 4);
+      out.write(reinterpret_cast<const char*>(&d->vb_offset), 4);
+      out.write(reinterpret_cast<const char*>(&d->vb_stride), 4);
+      out.write(reinterpret_cast<const char*>(d->streams), 48);
+      out.write(reinterpret_cast<const char*>(d->vfetch), 48);
+      out.write(reinterpret_cast<const char*>(d->args), 16);
+      out.write(reinterpret_cast<const char*>(d->bank), 4096);
+      out.write(reinterpret_cast<const char*>(d->ps), 1024);
+    }
+  }
+
+  // Captured buffer payloads: header "SK3BUFS1", then records {u32 vb_addr,
+  // u32 ib_addr, u64 fingerprint, u32 vb_len, u32 ib_len, raw vb, raw ib}.
+  {
+    std::ofstream out(base_path.string() + ".buffers.bin", std::ios::binary);
+    out.write("SK3BUFS1", 8);
+    for (const RecordedBuffer& b : g_recorded_buffers) {
+      const uint32_t vb_len = uint32_t(b.vb.size());
+      const uint32_t ib_len = uint32_t(b.ib.size());
+      out.write(reinterpret_cast<const char*>(&b.vb_addr), 4);
+      out.write(reinterpret_cast<const char*>(&b.ib_addr), 4);
+      out.write(reinterpret_cast<const char*>(&b.fingerprint), 8);
+      out.write(reinterpret_cast<const char*>(&vb_len), 4);
+      out.write(reinterpret_cast<const char*>(&ib_len), 4);
+      out.write(reinterpret_cast<const char*>(b.vb.data()), vb_len);
+      out.write(reinterpret_cast<const char*>(b.ib.data()), ib_len);
+    }
+  }
+
+  // Per-frame item dump.
+  {
+    std::ofstream out(base_path.string() + ".scene.jsonl");
+    const auto write_item = [&out](const DrawItem& d) {
+      out << "{\"mesh\":\"" << std::hex << d.mesh << "\",\"ib_obj\":\"" << d.ib_obj
+          << "\",\"vb_obj\":\"" << d.vb_obj << "\",\"vb_addr\":\"" << d.vb_addr
+          << "\",\"ib_addr\":\"" << d.ib_addr << "\",\"diffuse\":\"" << d.diffuse_tex
+          << "\",\"fp\":\"" << d.fingerprint
+          << "\"" << std::dec << ",\"vb_bytes\":" << d.vb_bytes << ",\"ib_count\":"
+          << d.ib_count << ",\"stride\":" << int(d.stride) << ",\"pos_fmt\":"
+          << int(d.pos_fmt) << ",\"pos_off\":" << d.pos_offset << ",\"bw_off\":"
+          << d.bw_offset << ",\"bi_off\":" << d.bi_offset << ",\"skinned\":"
+          << (d.skinned ? 1 : 0) << ",\"pending\":" << (d.pending ? 1 : 0)
+          << ",\"world\":[";
+      for (int i = 0; i < 16; ++i) out << (i ? "," : "") << d.world[i];
+      out << "],\"draws\":[";
+      for (size_t i = 0; i < d.draws.size(); ++i) {
+        const DrawEntry& e = d.draws[i];
+        out << (i ? "," : "") << "[" << e.prim << "," << e.base_vertex << ","
+            << e.start_index << "," << e.index_count << "]";
+      }
+      out << "],\"bones\":[";
+      for (size_t i = 0; i < d.bones.size(); ++i) out << (i ? "," : "") << d.bones[i];
+      out << "]}";
+    };
+    for (const RecordedFrame& rf : g_recorded_frames) {
+      out << "{\"generation\":" << rf.generation << ",\"cam\":[" << rf.cam_pos[0] << ","
+          << rf.cam_pos[1] << "," << rf.cam_pos[2] << "],\"view_proj\":[";
+      for (int i = 0; i < 16; ++i) out << (i ? "," : "") << rf.view_proj[i];
+      out << "],\"dynitems\":[";
+      for (size_t i = 0; i < rf.dynitems.size(); ++i) {
+        if (i) out << ",";
+        write_item(rf.dynitems[i]);
+      }
+      out << "],\"items\":[";
+      for (size_t i = 0; i < rf.items.size(); ++i) {
+        if (i) out << ",";
+        write_item(rf.items[i]);
+      }
+      out << "]}\n";
+    }
+  }
+  REXLOG_INFO(
+      "native-scene: recording written ({} draws, {} frames, {} buffers {} MiB) -> "
+      "{}.draws.bin/.scene.jsonl/.buffers.bin",
+      g_recorded_draws.size(), g_recorded_frames.size(), g_recorded_buffers.size(),
+      g_recorded_buffer_bytes >> 20, base_path.string());
+  g_recorded_draws.clear();
+  g_recorded_frames.clear();
+  g_recorded_buffers.clear();
+  g_recorded_buffer_keys.clear();
+  g_recorded_buffer_bytes = 0;
 }
 
 }  // namespace skate3::native_scene
@@ -624,39 +1539,27 @@ void SwapGuestEndian(uint8_t* data, uint32_t size, xenos::Endian endian) {
   }
 }
 
-bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t size) {
-#if defined(_WIN32)
-  uint8_t* p = base + addr;
-  uint8_t* end = p + size;
-  while (p < end) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(p, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
-        (info.Protect & PAGE_GUARD) != 0 || (info.Protect & PAGE_NOACCESS) != 0) {
-      return false;
-    }
-    p = static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize;
-  }
-  return true;
-#else
-  (void)base;
-  (void)addr;
-  (void)size;
-  return false;
-#endif
-}
-
 struct RendererState {
   ID3D12Device* device = nullptr;
   ID3D12RootSignature* root_signature = nullptr;
   ID3D12PipelineState* pso = nullptr;
   ID3D12PipelineState* pso_nodepth = nullptr;
   DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
-  ID3D12DescriptorHeap* rtv_heap = nullptr;
+  ID3D12DescriptorHeap* rtv_heap = nullptr;  // slot 0 = output, slot 1 = MSAA
   ID3D12DescriptorHeap* dsv_heap = nullptr;
   ID3D12Resource* depth = nullptr;
   uint32_t depth_width = 0;
   uint32_t depth_height = 0;
   ID3D12Resource* rtv_resource = nullptr;
+  // MSAA: the scene draws into msaa_color (+ MSAA depth) and a fullscreen
+  // pass averages the samples into the guest output texture (the deferred
+  // command list has no ResolveSubresource).
+  uint32_t msaa = 1;
+  ID3D12Resource* msaa_color = nullptr;
+  ID3D12PipelineState* resolve_pso = nullptr;
+  uint32_t msaa_srv_slot = 0;
+  bool msaa_srv_allocated = false;
+  uint32_t rtv_size = 0;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // Buffers replaced by re-decode, kept alive until the GPU has finished the
   // submission that last referenced them.
@@ -690,37 +1593,55 @@ cbuffer C : register(b0) {
   row_major float4x4 mvp;
   float4 tint;
   float4 cam_pos;
+  // Per-material color multiplier (w > 0 enables): CAS hair is a grayscale
+  // texture times the character's hair color.
+  float4 mat_tint;
 };
 Texture2D<float4> diffuse : register(t0);
 Texture2D<float4> lightmap : register(t1);
-StructuredBuffer<float4x4> bones : register(t2);
+// Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
+// applied with explicit dots (StructuredBuffer<float4x4> default packing is
+// column-major and would silently transpose the matrices).
+StructuredBuffer<float4> bones : register(t2);
 SamplerState smp : register(s0);
 struct VSOut {
   float4 pos : SV_Position;
   float3 rpos : TEXCOORD0;
   float2 uv : TEXCOORD1;
   float2 uv2 : TEXCOORD2;
+  float3 nrm : TEXCOORD3;
 };
 VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1,
-              float4 bw : BLENDWEIGHT0, uint4 bi : BLENDINDICES0) {
+              float4 bw : BLENDWEIGHT0, uint4 bi : BLENDINDICES0,
+              float3 nrm : NORMAL0) {
   VSOut o;
   float4 mp = float4(p, 1.0);
+  float3 n = nrm;
   // tint.g > 0 marks a skinned item: the bone palette (row-vector matrices)
   // maps model space to world space; mvp is then just view*proj.
   float wsum = dot(bw, float4(1, 1, 1, 1));
   if (tint.g > 0.0 && wsum > 0.001) {
-    float4 skinned = float4(0, 0, 0, 0);
-    // Guest blend indices are pre-multiplied by 3 (VS constant register
-    // index; one bone = 3 float4 registers).
+    float3 skinned = float3(0, 0, 0);
+    float3 sn = float3(0, 0, 0);
+    // Guest blend indices are plain bone numbers (verified live: byte
+    // streams like 02 00 03 01); bone k = palette rows 3k..3k+2.
     [unroll] for (int k = 0; k < 4; ++k) {
-      skinned += bw[k] * mul(mp, bones[bi[k] / 3u]);
+      uint row = bi[k] * 3u;
+      skinned += bw[k] * float3(dot(mp, bones[row]), dot(mp, bones[row + 1]),
+                                dot(mp, bones[row + 2]));
+      sn += bw[k] * float3(dot(n, bones[row].xyz), dot(n, bones[row + 1].xyz),
+                           dot(n, bones[row + 2].xyz));
     }
-    mp = float4(skinned.xyz / wsum, 1.0);
+    mp = float4(skinned / wsum, 1.0);
+    n = sn;
+  } else {
+    n = mul(n, (float3x3)world);
   }
   o.pos = mul(mp, mvp);
   o.rpos = mul(mp, world).xyz - cam_pos.xyz;
   o.uv = uv;
   o.uv2 = uv2;
+  o.nrm = n;
   return o;
 }
 float4 ps_main(VSOut i) : SV_Target {
@@ -736,14 +1657,41 @@ float4 ps_main(VSOut i) : SV_Target {
   // tint.r > 0 marks items with a lightmap bound (2x baked lighting);
   // otherwise fall back to derivative face shading.
   float3 lit;
-  if (tint.r > 0.0) {
+  if (tint.b > 0.0) {
+    lit = albedo.rgb;  // unlit (sky dome)
+  } else if (tint.r > 0.0) {
     lit = albedo.rgb * lightmap.Sample(smp, i.uv2).rgb * 2.0;
   } else {
-    float3 n = normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+    // Smooth per-vertex normal when the mesh has one; face normal from
+    // position derivatives otherwise.
+    float3 n = dot(i.nrm, i.nrm) > 0.01 ? normalize(i.nrm)
+                                        : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
     float l = abs(dot(n, normalize(float3(0.4, 0.8, 0.3)))) * 0.35 + 0.75;
     lit = albedo.rgb * l;
   }
+  if (mat_tint.w > 0.0) {
+    lit *= mat_tint.rgb;
+  }
   return float4(lit, 1.0);
+}
+)";
+
+// Fullscreen MSAA resolve: the deferred command list has no
+// ResolveSubresource, so average the samples in a pixel shader (SAMPLES is
+// injected as a compile-time macro).
+const char kResolveShaderSource[] = R"(
+Texture2DMS<float4> src : register(t0);
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+  float2 uv = float2((id << 1) & 2, id & 2);
+  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+  int2 p = int2(pos.xy);
+  float4 c = 0;
+  [unroll] for (int k = 0; k < SAMPLES; ++k) {
+    c += src.Load(p, k);
+  }
+  return c / SAMPLES;
 }
 )";
 
@@ -796,12 +1744,28 @@ uint32_t SwapU32(uint32_t v) {
 }
 
 // Decode guest vertices into {float3 position, float2 uv, float2 uv2,
-// unorm4 blend weights, u8x4 blend indices} (36-byte stride).
+// unorm4 blend weights, u8x4 blend indices, float3 normal} (48-byte stride).
 bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
                 MeshBuffers& out) {
   const uint32_t num_verts = item.vb_bytes / item.stride;
   if (num_verts == 0) return false;
-  ID3D12Resource* vb = CreateUploadBuffer(device, size_t(num_verts) * 36);
+  // This runs on the render thread; the guest payloads were valid on the
+  // game thread this frame but streaming can decommit them in between.
+  // Copy them out with the lock-free guarded copy (never VirtualQuery here:
+  // the VAD lock stalls behind the guest streaming threads while panning).
+  static thread_local std::vector<uint8_t> vb_scratch;
+  static thread_local std::vector<uint8_t> ib_scratch;
+  vb_scratch.resize(item.vb_bytes);
+  if (!GuestTryCopy(vb_scratch.data(), base + item.vb_addr, item.vb_bytes)) {
+    return false;
+  }
+  if (!item.cloth_quads) {
+    ib_scratch.resize(size_t(item.ib_count) * 2);
+    if (!GuestTryCopy(ib_scratch.data(), base + item.ib_addr, size_t(item.ib_count) * 2)) {
+      return false;
+    }
+  }
+  ID3D12Resource* vb = CreateUploadBuffer(device, size_t(num_verts) * 48);
   ID3D12Resource* ib = CreateUploadBuffer(device, size_t(item.ib_count) * 2);
   if (!vb || !ib) {
     if (vb) vb->Release();
@@ -809,9 +1773,11 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     return false;
   }
 
-  const uint8_t* src_vb = base + item.vb_addr;
+  const uint8_t* src_vb = vb_scratch.data();
   float* dst = nullptr;
   uint32_t garbage = 0;
+  int min_bi = 255;
+  int max_bi = -1;
   vb->Map(0, nullptr, reinterpret_cast<void**>(&dst));
   for (uint32_t v = 0; v < num_verts; ++v) {
     const uint8_t* p = src_vb + size_t(v) * item.stride + item.pos_offset;
@@ -877,11 +1843,11 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
           break;
       }
     };
-    dst[v * 9 + 0] = x;
-    dst[v * 9 + 1] = y;
-    dst[v * 9 + 2] = z;
-    decode_uv(item.uv_fmt, item.uv_offset, dst[v * 9 + 3], dst[v * 9 + 4]);
-    decode_uv(item.uv2_fmt, item.uv2_offset, dst[v * 9 + 5], dst[v * 9 + 6]);
+    dst[v * 12 + 0] = x;
+    dst[v * 12 + 1] = y;
+    dst[v * 12 + 2] = z;
+    decode_uv(item.uv_fmt, item.uv_offset, dst[v * 12 + 3], dst[v * 12 + 4]);
+    decode_uv(item.uv2_fmt, item.uv2_offset, dst[v * 12 + 5], dst[v * 12 + 6]);
     // Blend weights (unorm bytes) and indices (raw bytes). Guest u8x4
     // attributes are stored big-endian per 32-bit word; swap so component k
     // in the shader matches guest component k.
@@ -892,11 +1858,47 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
                                                       item.bw_offset));
       bi = SwapU32(*reinterpret_cast<const uint32_t*>(src_vb + size_t(v) * item.stride +
                                                       item.bi_offset));
+      for (int k = 0; k < 4; ++k) {
+        const uint8_t weight = uint8_t(bw >> (k * 8));
+        const uint8_t index = uint8_t(bi >> (k * 8));
+        if (weight != 0) {
+          if (index < min_bi) min_bi = index;
+          if (index > max_bi) max_bi = index;
+        }
+      }
     }
-    std::memcpy(&dst[v * 9 + 7], &bw, 4);
-    std::memcpy(&dst[v * 9 + 8], &bi, 4);
+    std::memcpy(&dst[v * 12 + 7], &bw, 4);
+    std::memcpy(&dst[v * 12 + 8], &bi, 4);
+    // Vertex normal: k_10_11_11 packed (x 11 bits, y 11 bits, z 10 bits,
+    // LSB to MSB, signed). Zero when absent -> derivative face-normal
+    // fallback in the shader.
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    if (item.normal_fmt == 16) {
+      const uint32_t word = SwapU32(*reinterpret_cast<const uint32_t*>(
+          src_vb + size_t(v) * item.stride + item.normal_offset));
+      const int32_t ix = int32_t(word << 21) >> 21;
+      const int32_t iy = int32_t((word >> 11) << 21) >> 21;
+      const int32_t iz = int32_t((word >> 22) << 22) >> 22;
+      nx = float(ix) / 1023.0f;
+      ny = float(iy) / 1023.0f;
+      nz = float(iz) / 511.0f;
+    }
+    dst[v * 12 + 9] = nx;
+    dst[v * 12 + 10] = ny;
+    dst[v * 12 + 11] = nz;
   }
   vb->Unmap(0, nullptr);
+  // Blend indices outside the captured palette read garbage rows and mangle
+  // the vertex. Indices are plain bone numbers, bone k = palette rows 3k.
+  if (item.skinned && max_bi >= 0) {
+    const uint32_t palette_bones = uint32_t(item.bones.size() / 12);
+    if (uint32_t(max_bi) >= palette_bones) {
+      REXLOG_WARN(
+          "native-scene: skinned mesh {:08X} blend index range {}..{} exceeds "
+          "captured palette of {} bones",
+          item.mesh, min_bi, max_bi, palette_bones);
+    }
+  }
   if (garbage != 0) {
     REXLOG_WARN(
         "native-scene: mesh {:08X} decoded {} of {} verts outside bbox "
@@ -906,17 +1908,33 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
         item.vb_addr);
   }
 
-  const uint16_t* src_ib = reinterpret_cast<const uint16_t*>(base + item.ib_addr);
   uint16_t* dst_ib = nullptr;
   ib->Map(0, nullptr, reinterpret_cast<void**>(&dst_ib));
-  for (uint32_t i = 0; i < item.ib_count; ++i) {
-    dst_ib[i] = SwapU16(src_ib[i]);
+  if (item.cloth_quads) {
+    // Quad-list topology with no guest index buffer (live vertex range
+    // already exact from the draw args): two triangles per quad.
+    const uint32_t quads = item.ib_count / 6;
+    for (uint32_t q = 0; q < quads; ++q) {
+      const uint16_t v = uint16_t(q * 4);
+      uint16_t* o = dst_ib + q * 6;
+      o[0] = v;
+      o[1] = uint16_t(v + 1);
+      o[2] = uint16_t(v + 2);
+      o[3] = v;
+      o[4] = uint16_t(v + 2);
+      o[5] = uint16_t(v + 3);
+    }
+  } else {
+    const uint16_t* src_ib = reinterpret_cast<const uint16_t*>(ib_scratch.data());
+    for (uint32_t i = 0; i < item.ib_count; ++i) {
+      dst_ib[i] = SwapU16(src_ib[i]);
+    }
   }
   ib->Unmap(0, nullptr);
 
   out.vb = vb;
   out.ib = ib;
-  out.vb_view = {vb->GetGPUVirtualAddress(), num_verts * 36u, 36u};
+  out.vb_view = {vb->GetGPUVirtualAddress(), num_verts * 48u, 48u};
   out.ib_view = {ib->GetGPUVirtualAddress(), item.ib_count * 2u, DXGI_FORMAT_R16_UINT};
   return true;
 }
@@ -927,11 +1945,14 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
 bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* base,
                         uint32_t tex_ptr, GuestTexture& out) {
   uint32_t words[6] = {};
-  if (!GuestRangeReadable(base, tex_ptr + 7 * 4, 6 * 4)) {
-    return false;
-  }
-  for (uint32_t i = 0; i < 6; ++i) {
-    words[i] = REX_LOAD_U32(tex_ptr + (7 + i) * 4);
+  {
+    uint32_t raw[6];
+    if (!GuestTryCopy(raw, base + tex_ptr + 7 * 4, sizeof(raw))) {
+      return false;
+    }
+    for (uint32_t i = 0; i < 6; ++i) {
+      words[i] = SwapU32(raw[i]);
+    }
   }
   std::memcpy(out.fetch_words, words, sizeof(words));
 
@@ -953,11 +1974,9 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   if (!GetHostTextureFormat(info.format, host)) {
     return false;
   }
-  const uint32_t guest_data_address = 0xA0000000u | info.memory.base_address;
   if (info.dimension != xenos::DataDimension::k2DOrStacked || info.is_stacked ||
       info.width >= 8192 || info.height >= 8192 || info.memory.base_address == 0 ||
-      info.memory.base_size == 0 || info.memory.base_size > 64u * 1024u * 1024u ||
-      !GuestRangeReadable(base, guest_data_address, info.memory.base_size)) {
+      info.memory.base_size == 0 || info.memory.base_size > 64u * 1024u * 1024u) {
     return false;
   }
 
@@ -969,13 +1988,84 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   const uint32_t bytes_per_block_log2 = uint32_t(std::countr_zero(bytes_per_block));
   const uint32_t width = info.width + 1u;
   const uint32_t height = info.height + 1u;
-  const uint32_t block_columns =
-      (width + format_info->block_width - 1) / format_info->block_width;
-  const uint32_t block_rows =
-      (height + format_info->block_height - 1) / format_info->block_height;
-  const uint32_t pitch_blocks = info.extent.block_pitch_h;
-  const uint32_t host_width = block_columns * format_info->block_width;
-  const uint32_t host_height = block_rows * format_info->block_height;
+  const uint32_t block_w = format_info->block_width;
+  const uint32_t block_h = format_info->block_height;
+  const uint32_t host_width = ((width + block_w - 1) / block_w) * block_w;
+  const uint32_t host_height = ((height + block_h - 1) / block_h) * block_h;
+
+  // Upload the guest MIP CHAIN, not just mip 0; sampling mip 0 at distance
+  // is the source of the grass "TV static" and flickering floor/window
+  // lines. Power-of-two sizes only (everything the game ships) so BC block
+  // alignment holds on every level.
+  const bool pow2 = (width & (width - 1)) == 0 && (height & (height - 1)) == 0;
+  uint32_t mip_count = 1;
+  if (pow2 && info.memory.mip_address != 0) {
+    const uint32_t avail = std::min(info.mip_levels(), info.GetMaxMipLevels());
+    while (mip_count < avail && (width >> mip_count) >= 4 && (height >> mip_count) >= 4) {
+      uint32_t ox = 0, oy = 0;
+      if (info.GetMipLocation(mip_count, &ox, &oy, true) == 0) {
+        break;
+      }
+      ++mip_count;
+    }
+  }
+
+  // Copy the whole guest mip chain out up front with the lock-free guarded
+  // copy (never VirtualQuery on the render thread: the VAD lock stalls
+  // behind the guest streaming threads exactly while panning streams
+  // textures in), truncating the chain at the first unreadable level.
+  struct MipSrc {
+    uint32_t addr, scratch_off, size, pitch_blocks, ox, oy;
+  };
+  MipSrc srcs[16] = {};
+  static thread_local std::vector<uint8_t> tex_scratch;
+  uint32_t scratch_total = 0;
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    uint32_t ox = 0, oy = 0;
+    const uint32_t mip_addr =
+        m == 0 ? info.memory.base_address : info.GetMipLocation(m, &ox, &oy, true);
+    const auto ext = info.GetMipExtent(m, true);
+    MipSrc& s = srcs[m];
+    s.addr = mip_addr;
+    s.pitch_blocks = m == 0 ? info.extent.block_pitch_h : ext.block_pitch_h;
+    s.size = m == 0 ? info.memory.base_size : ext.all_blocks() * bytes_per_block;
+    s.ox = ox;
+    s.oy = oy;
+    s.scratch_off = scratch_total;
+    scratch_total += s.size;
+  }
+  tex_scratch.resize(scratch_total);
+  uint32_t mips_copied = 0;
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    if (!GuestTryCopy(tex_scratch.data() + srcs[m].scratch_off,
+                      base + (0xA0000000u | srcs[m].addr), srcs[m].size)) {
+      break;
+    }
+    ++mips_copied;
+  }
+  if (mips_copied == 0) {
+    return false;
+  }
+  mip_count = mips_copied;
+
+  // Per-mip upload footprints (D3D12 alignment rules).
+  struct MipPlan {
+    uint32_t offset, pitch, cols, rows;
+  };
+  MipPlan plans[16] = {};
+  uint32_t upload_size = 0;
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    const uint32_t mw = std::max(width >> m, 1u);
+    const uint32_t mh = std::max(height >> m, 1u);
+    MipPlan& p = plans[m];
+    p.cols = (mw + block_w - 1) / block_w;
+    p.rows = (mh + block_h - 1) / block_h;
+    p.pitch = (p.cols * bytes_per_block + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+              ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    p.offset = (upload_size + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
+               ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+    upload_size = p.offset + p.pitch * p.rows;
+  }
 
   ID3D12Device* device = context.d3d12.device;
   D3D12_HEAP_PROPERTIES heap{};
@@ -985,7 +2075,7 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   desc.Width = host_width;
   desc.Height = host_height;
   desc.DepthOrArraySize = 1;
-  desc.MipLevels = 1;
+  desc.MipLevels = UINT16(mip_count);
   desc.Format = host.resource_format;
   desc.SampleDesc.Count = 1;
   if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
@@ -993,10 +2083,7 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
                                              IID_PPV_ARGS(&out.texture)))) {
     return false;
   }
-  const uint32_t row_bytes = block_columns * bytes_per_block;
-  const uint32_t upload_pitch = (row_bytes + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-                                ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-  out.upload = CreateUploadBuffer(device, size_t(upload_pitch) * block_rows);
+  out.upload = CreateUploadBuffer(device, upload_size);
   if (!out.upload) {
     out.texture->Release();
     out.texture = nullptr;
@@ -1004,54 +2091,67 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   }
   uint8_t* mapping = nullptr;
   out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
-  const uint8_t* guest = base + guest_data_address;
   const bool swap_rb_565 =
       rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_5_6_5;
-  for (uint32_t by = 0; by < block_rows; ++by) {
-    uint8_t* out_row = mapping + size_t(by) * upload_pitch;
-    for (uint32_t bx = 0; bx < block_columns; ++bx) {
-      uint32_t source_offset;
-      if (info.is_tiled) {
-        source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
-            int32_t(bx), int32_t(by), pitch_blocks, bytes_per_block_log2));
-      } else {
-        source_offset = (by * pitch_blocks + bx) * bytes_per_block;
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    const MipPlan& p = plans[m];
+    const uint32_t ox = srcs[m].ox;
+    const uint32_t oy = srcs[m].oy;
+    const uint32_t src_pitch_blocks = srcs[m].pitch_blocks;
+    const uint32_t src_size = srcs[m].size;
+    const uint8_t* guest = tex_scratch.data() + srcs[m].scratch_off;
+    const uint32_t row_bytes = p.cols * bytes_per_block;
+    for (uint32_t by = 0; by < p.rows; ++by) {
+      uint8_t* out_row = mapping + p.offset + size_t(by) * p.pitch;
+      for (uint32_t bx = 0; bx < p.cols; ++bx) {
+        uint32_t source_offset;
+        if (info.is_tiled) {
+          source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+              int32_t(bx + ox), int32_t(by + oy), src_pitch_blocks, bytes_per_block_log2));
+        } else {
+          source_offset = ((by + oy) * src_pitch_blocks + bx + ox) * bytes_per_block;
+        }
+        if (source_offset + bytes_per_block > src_size) {
+          std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+          continue;
+        }
+        std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + source_offset,
+                    bytes_per_block);
       }
-      if (source_offset + bytes_per_block > info.memory.base_size) {
-        std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
-        continue;
-      }
-      std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + source_offset,
-                  bytes_per_block);
-    }
-    SwapGuestEndian(out_row, row_bytes, info.endianness);
-    if (swap_rb_565) {
-      for (uint32_t i = 0; i + 2 <= row_bytes; i += 2) {
-        uint16_t value;
-        std::memcpy(&value, out_row + i, sizeof(value));
-        value = uint16_t((value & 0x07E0u) | ((value >> 11) & 0x1Fu) |
-                         ((value & 0x1Fu) << 11));
-        std::memcpy(out_row + i, &value, sizeof(value));
+      SwapGuestEndian(out_row, row_bytes, info.endianness);
+      if (swap_rb_565) {
+        for (uint32_t i = 0; i + 2 <= row_bytes; i += 2) {
+          uint16_t value;
+          std::memcpy(&value, out_row + i, sizeof(value));
+          value = uint16_t((value & 0x07E0u) | ((value >> 11) & 0x1Fu) |
+                           ((value & 0x1Fu) << 11));
+          std::memcpy(out_row + i, &value, sizeof(value));
+        }
       }
     }
   }
   out.upload->Unmap(0, nullptr);
 
-  // Record the upload copy into the deferred command list.
+  // Record the upload copies into the deferred command list.
   auto* command_processor = context.d3d12.command_processor;
   auto& list = command_processor->GetDeferredCommandList();
-  D3D12_TEXTURE_COPY_LOCATION dst{};
-  dst.pResource = out.texture;
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  D3D12_TEXTURE_COPY_LOCATION src{};
-  src.pResource = out.upload;
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint.Footprint.Format = host.resource_format;
-  src.PlacedFootprint.Footprint.Width = host_width;
-  src.PlacedFootprint.Footprint.Height = host_height;
-  src.PlacedFootprint.Footprint.Depth = 1;
-  src.PlacedFootprint.Footprint.RowPitch = upload_pitch;
-  list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    const MipPlan& p = plans[m];
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = out.texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = m;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = out.upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = p.offset;
+    src.PlacedFootprint.Footprint.Format = host.resource_format;
+    src.PlacedFootprint.Footprint.Width = std::max(host_width >> m, 1u);
+    src.PlacedFootprint.Footprint.Height = std::max(host_height >> m, 1u);
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = p.pitch;
+    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
   context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
                                         out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
                                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1065,7 +2165,7 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   srv.Format = host.srv_format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
-  srv.Texture2D.MipLevels = 1;
+  srv.Texture2D.MipLevels = mip_count;
   D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
   slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
   device->CreateShaderResourceView(out.texture, &srv, slot);
@@ -1082,7 +2182,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 40;
+    params[0].Constants.Num32BitValues = 44;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_DESCRIPTOR_RANGE srv_range[2] = {};
     srv_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1100,7 +2200,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     params[3].Descriptor.ShaderRegister = 2;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.Filter = D3D12_FILTER_ANISOTROPIC;
+    sampler.MaxAnisotropy = 8;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -1122,6 +2223,22 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   }
 
   if (!g_r.pso || g_r.rtv_format != context.d3d12.guest_output_format) {
+    // MSAA level: the requested count, reduced to what the output format
+    // supports (1 disables and renders directly into the guest output).
+    const int32_t req = REXCVAR_GET(skate3_native_render_scene_msaa);
+    uint32_t msaa = req >= 8 ? 8u : req >= 4 ? 4u : req >= 2 ? 2u : 1u;
+    while (msaa > 1) {
+      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{
+          context.d3d12.guest_output_format, msaa, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+      if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                &q, sizeof(q))) &&
+          q.NumQualityLevels > 0) {
+        break;
+      }
+      msaa /= 2;
+    }
+    g_r.msaa = msaa;
+
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3DBlob* errors = nullptr;
@@ -1134,7 +2251,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
-    D3D12_INPUT_ELEMENT_DESC input[5] = {
+    D3D12_INPUT_ELEMENT_DESC input[6] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12,
@@ -1144,6 +2261,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
         {"BLENDWEIGHT", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 28,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 32,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 36,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
     pso.pRootSignature = g_r.root_signature;
@@ -1157,12 +2276,12 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     pso.DepthStencilState.DepthEnable = TRUE;
     pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    pso.InputLayout = {input, 5};
+    pso.InputLayout = {input, 6};
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pso.NumRenderTargets = 1;
     pso.RTVFormats[0] = context.d3d12.guest_output_format;
     pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    pso.SampleDesc.Count = 1;
+    pso.SampleDesc.Count = g_r.msaa;
     const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso));
     pso.DepthStencilState.DepthEnable = FALSE;
     pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
@@ -1177,16 +2296,61 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
+
+    if (g_r.msaa > 1) {
+      char samples[8];
+      std::snprintf(samples, sizeof(samples), "%u", g_r.msaa);
+      const D3D_SHADER_MACRO macros[] = {{"SAMPLES", samples}, {nullptr, nullptr}};
+      ID3DBlob* rvs = nullptr;
+      ID3DBlob* rps = nullptr;
+      ID3DBlob* rerrors = nullptr;
+      if (FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
+                            "native_resolve", macros, nullptr, "vs_main", "vs_5_0", 0, 0,
+                            &rvs, &rerrors)) ||
+          FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
+                            "native_resolve", macros, nullptr, "ps_main", "ps_5_0", 0, 0,
+                            &rps, &rerrors))) {
+        REXLOG_ERROR(
+            "native-scene: resolve shader compile failed: {}",
+            rerrors ? static_cast<const char*>(rerrors->GetBufferPointer()) : "?");
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC rp{};
+      rp.pRootSignature = g_r.root_signature;
+      rp.VS = {rvs->GetBufferPointer(), rvs->GetBufferSize()};
+      rp.PS = {rps->GetBufferPointer(), rps->GetBufferSize()};
+      rp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      rp.SampleMask = UINT_MAX;
+      rp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      rp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      rp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      rp.NumRenderTargets = 1;
+      rp.RTVFormats[0] = context.d3d12.guest_output_format;
+      rp.SampleDesc.Count = 1;
+      const HRESULT hr3 =
+          device->CreateGraphicsPipelineState(&rp, IID_PPV_ARGS(&g_r.resolve_pso));
+      rvs->Release();
+      rps->Release();
+      if (rerrors) rerrors->Release();
+      if (FAILED(hr3)) {
+        REXLOG_ERROR("native-scene: resolve PSO creation failed {:08X}", uint32_t(hr3));
+        g_r.failed = true;
+        return false;
+      }
+    }
+    REXLOG_INFO("native-scene: pipelines created (MSAA x{})", g_r.msaa);
     g_r.rtv_format = context.d3d12.guest_output_format;
   }
 
   if (!g_r.rtv_heap) {
-    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_r.rtv_heap)))) {
       g_r.failed = true;
       return false;
     }
+    g_r.rtv_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_r.dsv_heap)))) {
       g_r.failed = true;
@@ -1286,7 +2450,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_D32_FLOAT;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = g_r.msaa;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear{};
     clear.Format = DXGI_FORMAT_D32_FLOAT;
@@ -1301,6 +2465,46 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     g_r.depth_height = height;
     device->CreateDepthStencilView(g_r.depth, nullptr,
                                    g_r.dsv_heap->GetCPUDescriptorHandleForHeapStart());
+
+    if (g_r.msaa > 1) {
+      // MSAA color target (RTV heap slot 1) + its Texture2DMS SRV for the
+      // fullscreen resolve pass. Lives in RENDER_TARGET state between frames.
+      if (g_r.msaa_color) {
+        g_r.retired.emplace_back(g_r.msaa_color,
+                                 context.d3d12.command_processor->GetCurrentSubmission());
+        g_r.msaa_color = nullptr;
+      }
+      D3D12_RESOURCE_DESC cdesc = desc;
+      cdesc.Format = context.d3d12.guest_output_format;
+      cdesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      D3D12_CLEAR_VALUE cclear{};
+      cclear.Format = cdesc.Format;
+      cclear.Color[0] = 0.25f;
+      cclear.Color[1] = 0.35f;
+      cclear.Color[2] = 0.55f;
+      cclear.Color[3] = 1.0f;
+      if (FAILED(g_r.device->CreateCommittedResource(
+              &heap, D3D12_HEAP_FLAG_NONE, &cdesc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+              &cclear, IID_PPV_ARGS(&g_r.msaa_color)))) {
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_CPU_DESCRIPTOR_HANDLE msaa_rtv =
+          g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      msaa_rtv.ptr += g_r.rtv_size;
+      device->CreateRenderTargetView(g_r.msaa_color, nullptr, msaa_rtv);
+      if (!g_r.msaa_srv_allocated) {
+        g_r.msaa_srv_slot = g_r.srv_next++;
+        g_r.msaa_srv_allocated = true;
+      }
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = cdesc.Format;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+      slot.ptr += size_t(g_r.msaa_srv_slot) * g_r.srv_size;
+      device->CreateShaderResourceView(g_r.msaa_color, &srv, slot);
+    }
   }
 
   if (g_r.rtv_resource != context.d3d12.guest_output_resource) {
@@ -1314,6 +2518,24 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
   if (!SceneEnabled() || context.backend != NativeGuestOutputBackend::kD3D12) {
     return false;
+  }
+  // While the game reports menus / pause / loading (presence context 0x8001
+  // == 0), yield to the emulated output: the native scene neither renders
+  // the 2D UI (the pause menu was invisible) nor the menu's world backdrop
+  // materials (everything drew untextured white). The emulated frame is
+  // complete and correct there; native rendering resumes on unpause.
+  {
+    static bool s_in_menus = false;
+    const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
+    if (in_menus != s_in_menus) {
+      s_in_menus = in_menus;
+      REXLOG_INFO("native-scene: {} (presence context)",
+                  in_menus ? "menus/pause - yielding to emulated output"
+                           : "gameplay - rendering natively");
+    }
+    if (in_menus) {
+      return false;
+    }
   }
   uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
   if (base == nullptr) {
@@ -1356,23 +2578,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     });
   }
 
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        context.d3d12.guest_output_resource,
-                                        context.d3d12.guest_output_initial_state,
-                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
-  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  // The scene draws into the MSAA target when enabled (resolved into the
+  // guest output at the end of the pass), or straight into the guest output.
+  const bool msaa_on = g_r.msaa > 1 && g_r.msaa_color != nullptr && g_r.resolve_pso != nullptr;
+  const D3D12_CPU_DESCRIPTOR_HANDLE output_rtv =
+      g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_CPU_DESCRIPTOR_HANDLE scene_rtv = output_rtv;
+  if (msaa_on) {
+    scene_rtv.ptr += g_r.rtv_size;
+  } else {
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          context.d3d12.guest_output_resource,
+                                          context.d3d12.guest_output_initial_state,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  }
 
-  const int32_t debug_mode_early = REXCVAR_GET(skate3_native_render_scene_debug);
-  const bool use_depth = debug_mode_early != 4;
-  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
+  const bool use_depth = debug_mode != 4;
   const D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_r.dsv_heap->GetCPUDescriptorHandleForHeapStart();
   const FLOAT clear_color[4] = {0.25f, 0.35f, 0.55f, 1.0f};
-  list.D3DClearRenderTargetView(rtv, clear_color, 0, nullptr);
+  list.D3DClearRenderTargetView(scene_rtv, clear_color, 0, nullptr);
   if (use_depth) {
     list.D3DClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    list.D3DOMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, &dsv);
   } else {
-    list.D3DOMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, nullptr);
   }
 
   D3D12_VIEWPORT viewport{0.0f,
@@ -1392,7 +2623,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // heap binding is safe.
   list.SetDescriptorHeaps(g_r.srv_heap, nullptr);
 
-  const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
   // Reset this frame's bone ring region.
   const uint64_t frame_number = g_frames_rendered.load(std::memory_order_relaxed);
   const uint32_t bone_region =
@@ -1401,6 +2631,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   g_r.bone_ring_offset = 0;
   uint32_t drawn = 0;
   uint32_t item_index = 0;
+  // Per-frame decode budgets: panning/streaming can surface dozens of new
+  // meshes and textures in one frame, and each decode does CPU conversion +
+  // CreateCommittedResource on the render thread; unbounded, that is a
+  // visible hitch. Over-budget work is deferred; at native frame rates the
+  // pop-in lasts a few tens of milliseconds.
+  const int32_t mesh_budget = REXCVAR_GET(skate3_native_render_scene_mesh_decode_budget);
+  const int32_t tex_budget = REXCVAR_GET(skate3_native_render_scene_texture_decode_budget);
+  uint32_t mesh_decodes = 0;
+  uint32_t tex_decodes = 0;
   for (const DrawItem& item : scene.items) {
     const uint32_t index = item_index++;
     if (debug_mode == 1) {
@@ -1418,8 +2657,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       it = g_r.meshes.end();
     }
     if (it == g_r.meshes.end()) {
+      if (mesh_budget > 0 && mesh_decodes >= uint32_t(mesh_budget)) {
+        g_rr_mesh_deferred.fetch_add(1, std::memory_order_relaxed);
+        continue;  // decodes on a later frame
+      }
+      ++mesh_decodes;
       MeshBuffers buffers;
       if (!DecodeMesh(g_r.device, base, item, buffers)) {
+        g_rr_decode_fail.fetch_add(1, std::memory_order_relaxed);
+        static std::unordered_set<uint32_t> logged;
+        if (logged.size() < 32 && logged.insert(item.mesh).second) {
+          REXLOG_WARN("native-scene: DecodeMesh FAILED mesh={:08X} vb={:08X} fmt={} stride={}",
+                      item.mesh, item.vb_addr, item.pos_fmt, item.stride);
+        }
         continue;
       }
       buffers.fingerprint = item.fingerprint;
@@ -1429,7 +2679,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
     // Resolve guest textures (white fallback). Cached decodes revalidate
     // against the live fetch words; streaming reuses texture objects. The
-    // object addresses were readable on the game thread this frame.
+    // object addresses were readable on the game thread this frame; NO
+    // VirtualQuery here; it takes the process VAD lock, which the guest
+    // streaming threads hammer, and ~2 calls per item stalled the whole
+    // renderer to 3 fps.
     const auto resolve_texture = [&](uint32_t tex_ptr) -> const GuestTexture* {
       if (tex_ptr == 0) {
         return &g_r.white;
@@ -1452,6 +2705,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
       if (tit == g_r.textures.end()) {
+        if (tex_budget > 0 && tex_decodes >= uint32_t(tex_budget)) {
+          g_rr_tex_deferred.fetch_add(1, std::memory_order_relaxed);
+          return &g_r.white;  // decodes on a later frame
+        }
+        ++tex_decodes;
         GuestTexture gt;
         EnsureGuestTexture(context, base, tex_ptr, gt);
         // Remember the live words even for failed decodes so they are not
@@ -1463,6 +2721,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             }
           }
           gt.retry_after_frame = frame_number + 120;
+          // Failed decodes render white: log each once (capped) so white
+          // meshes are always attributable to a specific texture.
+          static std::unordered_set<uint32_t> logged_failed;
+          if (logged_failed.size() < 64 && logged_failed.insert(tex_ptr).second) {
+            REXLOG_INFO(
+                "native-scene: texture decode FAILED obj={:08X} fetch=[{:08X} {:08X} "
+                "{:08X} {:08X} {:08X} {:08X}]",
+                tex_ptr, gt.fetch_words[0], gt.fetch_words[1], gt.fetch_words[2],
+                gt.fetch_words[3], gt.fetch_words[4], gt.fetch_words[5]);
+          }
         }
         // Flush the COPY_DEST -> PIXEL_SHADER_RESOURCE barrier before the
         // draw that samples the new texture.
@@ -1480,10 +2748,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       lightmap = nullptr;
     }
 
-    // constants = world + mvp (world * view_proj, row-vector) + tint + cam.
-    // tint.a > 0 selects debug solid colors; tint.r > 0 marks a bound
-    // lightmap in the normal path.
-    float constants[40];
+    // constants = world + mvp (world * view_proj, row-vector) + tint + cam
+    // + material tint. tint.a > 0 selects debug solid colors; tint.r > 0
+    // marks a bound lightmap in the normal path.
+    float constants[44];
     std::memcpy(constants, item.world, sizeof(item.world));
     float* mvp = constants + 16;
     for (int r = 0; r < 4; ++r) {
@@ -1509,24 +2777,34 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     if (!bones_bound) {
+      if (item.skinned && !item.bones.empty()) {
+        // Ring exhausted: this item renders bind-pose at identity,
+        // effectively invisible. Must never happen silently.
+        g_rr_no_bones.fetch_add(1, std::memory_order_relaxed);
+      }
       list.D3DSetGraphicsRootShaderResourceView(3, g_r.bone_ring->GetGPUVirtualAddress());
     }
 
     if (debug_mode >= 2) {
-      constants[32] = float((index * 37u) % 255u) / 255.0f;
-      constants[33] = float((index * 73u) % 255u) / 255.0f;
-      constants[34] = float((index * 151u) % 255u) / 255.0f;
+      // Stable per-object colors: hash the mesh address, not the (sort-order
+      // dependent) item index.
+      const uint32_t hash = (item.mesh >> 4) * 2654435761u;
+      constants[32] = float((hash >> 0) & 0xFF) / 255.0f;
+      constants[33] = float((hash >> 8) & 0xFF) / 255.0f;
+      constants[34] = float((hash >> 16) & 0xFF) / 255.0f;
       constants[35] = 1.0f;
     } else {
       constants[32] = lightmap != nullptr ? 1.0f : 0.0f;
       constants[33] = bones_bound ? 1.0f : 0.0f;
-      constants[34] = constants[35] = 0.0f;
+      constants[34] = item.unlit ? 1.0f : 0.0f;
+      constants[35] = 0.0f;
     }
     constants[36] = scene.cam_pos[0];
     constants[37] = scene.cam_pos[1];
     constants[38] = scene.cam_pos[2];
     constants[39] = 0.0f;
-    list.D3DSetGraphicsRoot32BitConstants(0, 40, constants, 0);
+    std::memcpy(constants + 40, item.tint, 4 * sizeof(float));
+    list.D3DSetGraphicsRoot32BitConstants(0, 44, constants, 0);
 
     const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
         g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
@@ -1555,6 +2833,31 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
+  if (msaa_on) {
+    // Resolve: average the MSAA samples into the guest output with a
+    // fullscreen pass, then restore steady-state resource states.
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          g_r.msaa_color, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          context.d3d12.guest_output_resource,
+                                          context.d3d12.guest_output_initial_state,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+    list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+    list.D3DSetPipelineState(g_r.resolve_pso);
+    D3D12_GPU_DESCRIPTOR_HANDLE msaa_srv =
+        g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+    msaa_srv.ptr += size_t(g_r.msaa_srv_slot) * g_r.srv_size;
+    context.d3d12.set_graphics_root_descriptor_table(
+        context.d3d12.command_processor_user_data, 1, msaa_srv);
+    list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list.D3DDrawInstanced(3, 1, 0, 0);
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          g_r.msaa_color,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+  }
   context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
                                         context.d3d12.guest_output_resource,
                                         D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -1565,10 +2868,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (frames % 600 == 0) {
     REXLOG_INFO(
         "native-scene: frame {} items={} draws={} cached_meshes={} textures={} "
-        "vs_uploads={} large={} palettes={} skinned={} skinned_skipped={}",
+        "vs_uploads={} palettes={} palette_base_plus1={} skinned={} skinned_skipped={} "
+        "rigid[pending={} dropped={} worldprops={}] "
+        "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
+        "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}]",
         frames, scene.items.size(), drawn, g_r.meshes.size(), g_r.textures.size(),
-        g_vs_uploads.load(), g_vs_uploads_large.load(), g_palette_snapshots.load(),
-        g_skinned_items.load(), g_skinned_skipped.load());
+        g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
+        g_skinned_items.load(),
+        g_skinned_skipped.load(), g_rigid_pending.load(), g_rigid_dropped.load(),
+        g_world_props.load(),
+        g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
+        g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
+        g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
+        g_rr_tex_deferred.load());
   }
   return true;
 }
