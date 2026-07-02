@@ -25,9 +25,21 @@ struct DrawItem {
   uint32_t ib_addr;   // guest address of raw index data (u16 big-endian)
   uint32_t vb_bytes;
   uint32_t ib_count;
+  uint32_t diffuse_tex;   // guest renderengine::Texture address (0 = none)
+  uint32_t lightmap_tex;  // guest renderengine::Texture address (0 = none)
   uint16_t pos_offset;
+  uint16_t uv_offset;
+  uint16_t uv2_offset;
+  uint16_t bw_offset;  // blend weights (u8x4), valid when skinned
+  uint16_t bi_offset;  // blend indices (u8x4), valid when skinned
   uint8_t stride;
   uint8_t pos_fmt;    // xenos vertex format (26 s16x4, 32 half4, 57 float3)
+  uint8_t uv_fmt;     // xenos vertex format of the first texcoord (0 = none)
+  uint8_t uv2_fmt;    // xenos vertex format of the second texcoord (0 = none)
+  bool skinned;
+  // Bone palette snapshot (row-vector 4x4 matrices) taken on the game thread
+  // - the guest bone array lives in a transient per-frame arena.
+  std::vector<float> bones;
   // Content fingerprint of the guest payloads. Streaming reuses arena
   // addresses and pages fill in after the mesh is first submitted, so cached
   // GPU copies must be revalidated against this every frame.
@@ -54,6 +66,21 @@ struct SubmitRecord {
 };
 
 bool Enabled();
+
+// Called from the cProcessArenaAsset::RegisterTexture hook: guid -> guest
+// renderengine::Texture object.
+void OnRegisterTexture(uint64_t guid, uint32_t texture);
+
+// Called from the D3D::SetPending_AluConstants hook (guest render thread).
+// Large vertex-bank uploads are bone palettes staged for the next skinned
+// RenderMesh; the staging bank is reused, so contents are snapshotted here.
+void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr);
+
+// Called from the RenderMesh hook for dynamic entities. Snapshots the
+// context's instance matrix (ctx+0x10 points into a transient per-frame
+// arena; it must be read now, not at frame end) and the pending bone
+// palette. Returns a dynamic-state index (+1), 0 on failure.
+uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx);
 
 // Called on the guest render thread at frame end with the frame's records.
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count);

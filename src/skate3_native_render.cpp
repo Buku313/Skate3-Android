@@ -173,9 +173,10 @@ bool WriteMetadata(const std::filesystem::path& path,
   return static_cast<bool>(out);
 }
 
-void OnRenderMesh(uint32_t mesh_context, uint32_t vertex_program_state) {
+void OnRenderMesh(uint8_t* base, uint32_t mesh_context, uint32_t vertex_program_state) {
+  const uint32_t dyn = skate3::native_scene::CaptureDynamicState(base, mesh_context);
   std::lock_guard<std::mutex> lock(g_mutex);
-  g_current_frame.push_back({0, mesh_context, vertex_program_state, 0});
+  g_current_frame.push_back({0, mesh_context, vertex_program_state, dyn});
 }
 
 // SceneRenderView draw-list renderer sub_827FAF50(view, sort_vec, first, count):
@@ -286,7 +287,7 @@ void Install() {
 // r3 = MeshContext*, r4 = renderengine::VertexProgramState*.
 extern "C" REX_FUNC(sub_82795AD8) {
   if (skate3::native_render::Enabled()) {
-    skate3::native_render::OnRenderMesh(ctx.r3.u32, ctx.r4.u32);
+    skate3::native_render::OnRenderMesh(base, ctx.r3.u32, ctx.r4.u32);
   }
   __imp__sub_82795AD8(ctx, base);
 }
@@ -309,4 +310,24 @@ extern "C" REX_FUNC(sub_82B82E08) {
     skate3::native_render::OnFrameEnd(base);
   }
   __imp__sub_82B82E08(ctx, base);
+}
+
+// cProcessArenaAsset::RegisterTexture(cAssetList*, cAssetID,
+// renderengine::Texture*, rw::Resource&): r4 = 64-bit asset guid,
+// r5 = texture object.
+extern "C" REX_FUNC(sub_82C9A618) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnRegisterTexture(ctx.r4.u64, ctx.r5.u32);
+  }
+  __imp__sub_82C9A618(ctx, base);
+}
+
+// D3D::SetPending_AluConstants(device, u64 dirty_group_mask, bank, ptr):
+// bank 0x4000 = vertex constants. Bone palettes are staged through here
+// right before the skinned RenderMesh calls that consume them.
+extern "C" REX_FUNC(sub_82B83FE0) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnVsConstantUpload(base, ctx.r4.u64, ctx.r5.u32, ctx.r6.u32);
+  }
+  __imp__sub_82B83FE0(ctx, base);
 }
