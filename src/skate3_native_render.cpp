@@ -1,5 +1,7 @@
 #include "skate3_native_render.h"
 
+#include "skate3_native_scene.h"
+
 #include "generated/skate3_init.h"
 
 #include <atomic>
@@ -47,12 +49,7 @@ namespace {
 // One per-mesh submission. kind 0 = RenderMesh (dynamic entities: r3 is the
 // MeshContext itself, b = VertexProgramState). kind 1 = SceneRenderView draw
 // list entry (world geometry: a = MeshContext, b = sort key, c = view).
-struct RenderMeshRecord {
-  uint32_t kind;
-  uint32_t a;
-  uint32_t b;
-  uint32_t c;
-};
+using RenderMeshRecord = skate3::native_scene::SubmitRecord;
 
 struct FrameRecords {
   uint64_t frame_index;
@@ -193,13 +190,15 @@ void OnSceneDrawList(uint8_t* base, uint32_t view, uint32_t sort_vec, uint32_t f
   if (entries == 0) {
     return;
   }
+  // b = which of the view's sort lists this came from (sort_vec - view), so
+  // the scene builder can select the primary opaque list (+20160).
+  const uint32_t list_offset = sort_vec - view;
   std::lock_guard<std::mutex> lock(g_mutex);
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t entry = entries + (first + i) * 8;
-    const uint32_t key = REX_LOAD_U32(entry);
     const uint32_t mesh_context = REX_LOAD_U32(entry + 4);
     if (mesh_context != 0) {
-      g_current_frame.push_back({1, mesh_context, key, view});
+      g_current_frame.push_back({1, mesh_context, list_offset, view});
     }
   }
 }
@@ -221,6 +220,9 @@ void OnFrameEnd(uint8_t* base) {
   std::lock_guard<std::mutex> lock(g_mutex);
   ++g_frame_index;
   const size_t mesh_count = g_current_frame.size();
+
+  skate3::native_scene::BuildFrameScene(base, g_current_frame.data(),
+                                        g_current_frame.size());
 
   const int32_t log_interval = REXCVAR_GET(skate3_native_render_log_interval);
   if (log_interval > 0 && g_frame_index % static_cast<uint64_t>(log_interval) == 0) {
@@ -274,6 +276,7 @@ void Install() {
         REXCVAR_GET(skate3_native_render_snapshot_min_meshes),
         REXCVAR_GET(skate3_native_render_snapshot_frames));
   }
+  skate3::native_scene::Install();
 }
 
 }  // namespace skate3::native_render

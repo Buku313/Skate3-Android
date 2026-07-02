@@ -228,6 +228,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_fov.cpp
     src/skate3_iso_installer.cpp
     src/skate3_native_render.cpp
+    src/skate3_native_scene.cpp
     src/skate3_title_update_installer.cpp
     src/skate3_user_settings.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
@@ -257,6 +258,7 @@ target_include_directories(skate3 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/include
+    ${REXSDK_DIR}/thirdparty/xxHash
 )
 target_compile_definitions(skate3 PRIVATE SKATE3_BUILD_CONFIG="$<CONFIG>")
 if(NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
@@ -293,7 +295,7 @@ if(APPLE)
 endif()
 
 if(WIN32)
-    target_link_libraries(skate3 PRIVATE comdlg32 winhttp)
+    target_link_libraries(skate3 PRIVATE comdlg32 winhttp d3dcompiler)
 endif()
 
 add_custom_target(skate3_stage_runtime_library
