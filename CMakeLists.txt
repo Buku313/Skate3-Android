@@ -229,6 +229,8 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_iso_installer.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
+    src/skate3_screenshot.cpp
+    src/skate3_shader_disasm.cpp
     src/skate3_title_update_installer.cpp
     src/skate3_user_settings.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
@@ -295,7 +297,7 @@ if(APPLE)
 endif()
 
 if(WIN32)
-    target_link_libraries(skate3 PRIVATE comdlg32 winhttp d3dcompiler)
+    target_link_libraries(skate3 PRIVATE comdlg32 winhttp d3dcompiler gdiplus)
 endif()
 
 add_custom_target(skate3_stage_runtime_library

@@ -2,6 +2,7 @@
 
 #include "generated/skate3_init.h"
 
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <bit>
@@ -39,8 +40,9 @@
 
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene, false, "Skate 3",
                     "Render the game scene natively from the hooked MeshContext stream, "
-                    "replacing the emulated GPU output (requires skate3_native_render)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "replacing the emulated GPU output (requires skate3_native_render). "
+                    "Hot-toggles live between the native and emulated renderers (F5).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmaps, false, "Skate 3",
                     "Sample guest lightmap textures in the native scene renderer. Off by "
                     "default: Skate 3 lightpages are composed at runtime on the GPU, so "
@@ -57,6 +59,15 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 4, "Skate 3",
                      "fix texture aliasing.")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_2d, true, "Skate 3",
+                    "Replay the game's 2D/APT (Flash HUD) draws as a native overlay pass "
+                    "on top of the 3D scene")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_splines, true, "Skate 3",
+                    "Replay the game's in-world neon spline draws (waypoint arrows, "
+                    "marker beams; spline_darken/spline_default shaders) inside the "
+                    "native scene pass")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_quadlists, false, "Skate 3",
                     "Render captured non-indexed quad-list draws. Off by default: every "
                     "quad-list capture seen so far is a PARTICLE system (disjoint 2-4cm "
@@ -81,6 +92,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
                     "60 (large .draws.bin; for targeted investigations)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Hook layer master switch, defined in skate3_native_render.cpp. The runtime
+// toggle refuses to flip the scene on without it: the hooks that feed the
+// scene are only installed when it was set at boot.
+REXCVAR_DECLARE(bool, skate3_native_render);
 
 namespace skate3::native_scene {
 namespace {
@@ -143,6 +159,78 @@ std::atomic<uint32_t> g_cur_vb_stride{0};
 // Guest D3D::CDevice: the fetch-constant shadow lives at device+0x480,
 // 6 dwords per fetch group (from recompiled SetPending_FetchConstants).
 std::atomic<uint32_t> g_device{0};
+// 2D/APT phase depth counters (see On2dPhase). All HUD/menu 2D elements are
+// Flash SWFs converted to APT; draws issued inside these brackets are the 2D
+// draw stream.
+std::atomic<uint32_t> g_phase2d_depth[6];
+std::atomic<uint64_t> g_draws_2d{0};
+// 2D draws seen through paths the overlay does not replay yet
+// (DrawIndexedVertices / DrawVertices in the 2D phase; gameplay HUD uses
+// only the BeginVertices inline path, verified by capture).
+std::atomic<uint64_t> g_draws_2d_other{0};
+std::atomic<uint64_t> g_draws_2d_dropped{0};
+
+// One captured 2D draw (verified layout): BeginVertices
+// inline vertices, stride 24 = {float x, y, z, w; float u, v} in 1280x720
+// APT movie space; VS c0..c3 = ortho projection rows, c4..c7 = the
+// element's 2D transform, c8 = color multiplier; diffuse texture in fetch
+// shadow slot 0. Vertex payload is written by the CPU after BeginVertices
+// returns, so it is read at frame end (addr) rather than at capture.
+// NOTE on render-to-texture: in gameplay the ENTIRE HUD renders inside
+// AptRenderingIntegration::UpdateRenderToTexture (bracket bit 3) into a
+// screen-sized overlay texture, at true screen coordinates; the game
+// composites that overlay over the 3D frame in a later (emulated,
+// suppressed) pass. Replaying the draws directly onto the native output IS
+// that composite, so bit 3 is diagnostic only, not a routing signal. The
+// overlay content is straight-alpha art (verified by decoding the clock
+// face/needle/sheen textures offline).
+struct Draw2d {
+  uint32_t prim;    // xenos primitive: 4 trilist, 5 tristrip, 13 quadlist
+  uint32_t count;   // vertex count
+  uint32_t stride;  // bytes per vertex at capture (see publish normalization)
+  uint32_t addr;    // guest inline-ring write pointer
+  uint32_t flags;   // bracket bits at capture (layout disambiguation)
+  uint32_t fetch[6];  // texture fetch constant (shadow slot 0)
+  float consts[36];   // VS c0..c8
+  std::vector<uint8_t> verts;  // filled at frame end (little-endian dwords)
+};
+std::mutex g_2d_mutex;
+std::vector<Draw2d> g_frame_2d;  // capture in submission order
+std::vector<Draw2d> g_scene_2d;  // published at frame end
+uint64_t g_scene_2d_generation = 0;
+
+// One captured in-world neon spline draw (waypoint arrows / marker beams;
+// decoded from a live capture + the game's own spline.fx source): a
+// DrawVertices triangle strip whose 12-byte float3 "vertices" are only
+// parameters: x = control-point index + fractional t, y = U texcoord,
+// z = side flag (0/1) selecting the extrusion offset and V texcoord. The
+// guest VS (43309A8C) evaluates a uniform cubic B-spline through i_cp[]
+// (VS c7..) transformed by world columns c4..c6, adds the world-rotated
+// extrusion offset c[151 + z], projects by VP columns c0..c3, and fades by
+// clip-z against i_clipvalues (c150) with i_intensity (c149) as the pass
+// gain. Two passes per element: spline_darkenPS (straight alpha) then
+// spline_defaultPS (additive glow), both depth-tested with no z-write,
+// replayed inside the native scene pass with the spline evaluated on the
+// CPU at publish time.
+struct SplineDraw {
+  uint32_t pass;      // 1 = darken (straight alpha), 2 = default (additive)
+  uint32_t count;     // strip vertex count
+  uint32_t fetch[6];  // texture fetch slot 3 (the neon gradient)
+  float consts[153 * 4];  // VS c0..c152 as staged
+  // capture: raw big-endian float3 params; publish: evaluated little-endian
+  // {float4 clip_pos, float2 uv, float fade} (28-byte stride).
+  std::vector<uint8_t> verts;
+};
+std::vector<SplineDraw> g_frame_spline;  // guarded by g_2d_mutex
+std::vector<SplineDraw> g_scene_spline;
+std::atomic<uint64_t> g_draws_spline{0};
+// Current guest shader objects and render-state shadow bank, for the 2D
+// recon recording (grouping the stream by shader / reading blend state).
+std::atomic<uint32_t> g_cur_ps_obj{0};
+std::atomic<uint32_t> g_cur_vs_obj{0};
+std::atomic<uint32_t> g_rs_bank{0};
+std::atomic<uint32_t> g_cur_viewport[6];
+std::atomic<uint32_t> g_cur_scissor[4];
 // All four vertex streams (vb, offset, stride); cloth binds its simulated
 // vertices on a stream other than 0.
 std::atomic<uint32_t> g_cur_streams[4][3];
@@ -162,6 +250,16 @@ struct RecordedDraw {
   uint32_t args[4];
   float bank[1024];  // VS c0..c255
   float ps[256];     // PS c0..c63 (material colors, e.g. CAS hair tint)
+  // 2D recon fields (SK3DRAW7):
+  uint32_t flags2d;      // bit per active 2D bracket (see On2dPhase)
+  uint32_t ps_obj;       // current guest pixel/vertex shader objects
+  uint32_t vs_obj;
+  uint32_t viewport[6];  // last SetViewport payload (raw guest dwords)
+  uint32_t scissor[4];   // last SetScissorRect payload
+  uint32_t rstates[256];    // render-state shadow snapshot (blend/depth)
+  uint32_t vfetch_all[192];  // full 32-slot texture fetch shadow
+  uint32_t vb_dump;  // index into buffers.bin for this draw's payloads
+  uint32_t ib_dump;  // (~0u = none)
 };
 struct RecordedFrame {
   uint64_t generation;
@@ -191,6 +289,19 @@ std::vector<RecordedFrame> g_recorded_frames;
 std::vector<RecordedBuffer> g_recorded_buffers;
 std::unordered_set<uint64_t> g_recorded_buffer_keys;
 size_t g_recorded_buffer_bytes = 0;
+// BeginVertices (inline ring) payloads are written by the CPU AFTER the
+// call returns; dump them at frame end, when the writes are complete but
+// the ring has not yet wrapped. draw_index links the dump back to its
+// RecordedDraw.
+struct PendingInlineDump {
+  uint32_t addr;
+  uint32_t bytes;
+  size_t draw_index;
+};
+std::vector<PendingInlineDump> g_pending_inline_dumps;
+// One payload dump per (guest address, frame): 2D dynamic buffers hold many
+// draws' vertices; the repeated full-buffer dump would be pure duplication.
+std::unordered_map<uint64_t, uint32_t> g_frame_dump_ids;
 std::atomic<uint64_t> g_vs_uploads{0};
 std::atomic<uint64_t> g_palette_snapshots{0};
 // Palettes captured at base+1 (the cloth/morph VS layout with an extra
@@ -225,6 +336,10 @@ bool SceneEnabled() { return REXCVAR_GET(skate3_native_render_scene); }
 float LoadGuestF32(uint8_t* base, uint32_t addr) {
   const uint32_t bits = REX_LOAD_U32(addr);
   return std::bit_cast<float>(bits);
+}
+
+uint32_t BSwap32(uint32_t v) {
+  return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
 }
 
 // Draws completed since startup (any guest draw function). The RenderMesh
@@ -733,6 +848,35 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
 
 bool Enabled() { return SceneEnabled(); }
 
+bool ToggleSceneEnabled() {
+  if (!REXCVAR_GET(skate3_native_render)) {
+    REXLOG_WARN(
+        "native-scene: renderer toggle ignored; the skate3_native_render hook layer "
+        "is off (set it and restart; it installs the capture hooks the scene needs)");
+    return false;
+  }
+  const bool enabled = !SceneEnabled();
+  if (enabled) {
+    // Capture idles while the emulated renderer is active, so anything still
+    // published is from before the switch away (stale camera). Drop it:
+    // RenderScene yields to the emulated frame until the capture hooks
+    // publish a fresh scene (the next frame).
+    {
+      std::lock_guard<std::mutex> lock(g_scene_mutex);
+      g_scene = FrameScene{};
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_2d_mutex);
+      g_scene_2d.clear();
+      g_scene_spline.clear();
+    }
+  }
+  REXCVAR_SET(skate3_native_render_scene, enabled);
+  REXLOG_INFO("native-scene: switched to the {} renderer (runtime toggle)",
+              enabled ? "NATIVE" : "EMULATED");
+  return enabled;
+}
+
 void OnRegisterTexture(uint64_t guid, uint32_t texture) {
   if (texture == 0) {
     return;
@@ -760,6 +904,77 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
   }
   g_vs_uploads.fetch_add(1, std::memory_order_relaxed);
   g_vs_bank.store(ptr, std::memory_order_relaxed);
+}
+
+void On2dPhase(uint32_t bit, bool enter) {
+  if (bit >= 6) {
+    return;
+  }
+  if (enter) {
+    g_phase2d_depth[bit].fetch_add(1, std::memory_order_relaxed);
+  } else {
+    g_phase2d_depth[bit].fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+
+uint32_t Phase2dFlags() {
+  uint32_t flags = 0;
+  for (uint32_t bit = 0; bit < 6; ++bit) {
+    if (g_phase2d_depth[bit].load(std::memory_order_relaxed) != 0) {
+      flags |= 1u << bit;
+    }
+  }
+  return flags;
+}
+
+
+void OnSetShader(bool pixel, uint32_t obj) {
+  (pixel ? g_cur_ps_obj : g_cur_vs_obj).store(obj, std::memory_order_relaxed);
+}
+
+void OnRenderStateUpload(uint64_t mask, uint32_t bank, uint32_t ptr) {
+  (void)mask;
+  if (ptr == 0) {
+    return;
+  }
+  // Log each distinct bank id once, the AluConstants analog of discovering
+  // 0x4000/0x4400. Tiny lock-free seen-set (at most a handful of banks).
+  static std::atomic<uint32_t> seen[8];
+  for (auto& slot : seen) {
+    uint32_t cur = slot.load(std::memory_order_relaxed);
+    if (cur == bank) {
+      break;
+    }
+    if (cur == 0) {
+      uint32_t expected = 0;
+      if (slot.compare_exchange_strong(expected, bank, std::memory_order_relaxed)) {
+        REXLOG_INFO("native-scene: render-state bank id={:#x} ptr={:08X}", bank, ptr);
+        break;
+      }
+      if (expected == bank) {
+        break;
+      }
+    }
+  }
+  g_rs_bank.store(ptr, std::memory_order_relaxed);
+}
+
+void OnSetViewport(uint8_t* base, uint32_t viewport_ptr) {
+  if (viewport_ptr == 0) {
+    return;
+  }
+  for (int i = 0; i < 6; ++i) {
+    g_cur_viewport[i].store(REX_LOAD_U32(viewport_ptr + i * 4), std::memory_order_relaxed);
+  }
+}
+
+void OnSetScissor(uint8_t* base, uint32_t rect_ptr) {
+  if (rect_ptr == 0) {
+    return;
+  }
+  for (int i = 0; i < 4; ++i) {
+    g_cur_scissor[i].store(REX_LOAD_U32(rect_ptr + i * 4), std::memory_order_relaxed);
+  }
 }
 
 // The character.hair pixel shader keeps the per-character hair color at PS
@@ -1017,6 +1232,40 @@ uint32_t CaptureClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6,
   return uint32_t(g_frame_dynitems.size());
 }
 
+namespace {
+
+// Guest shader objects carry their compiled-source debug path at +0x54
+// ("D:\P4\xbox2-ww-f\...\spline_darkenPS.updb"); the spline renderer's pixel
+// shaders identify the in-world neon guide elements. Cached per object;
+// the current pixel/vertex object trackers are checked both ways because the
+// hook labels are swapped relative to the real shader types.
+uint32_t ClassifySplineShader(uint8_t* base, uint32_t obj) {
+  if (obj < 0x10000) {
+    return 0;
+  }
+  static std::mutex mu;
+  static std::unordered_map<uint32_t, uint32_t> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = cache.find(obj);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  char path[97] = {};
+  uint32_t kind = 0;
+  if (GuestTryCopy(path, base + obj + 0x54, 96)) {
+    path[96] = '\0';
+    if (std::strstr(path, "spline_darken") != nullptr) {
+      kind = 1;
+    } else if (std::strstr(path, "spline_default") != nullptr) {
+      kind = 2;
+    }
+  }
+  cache.emplace(obj, kind);
+  return kind;
+}
+
+}  // namespace
+
 void OnSetIndices(uint32_t ib_obj) { g_cur_ib.store(ib_obj, std::memory_order_relaxed); }
 
 void OnSetStreamSource(uint32_t stream, uint32_t vb_obj, uint32_t offset, uint32_t stride) {
@@ -1035,9 +1284,81 @@ void OnSetStreamSource(uint32_t stream, uint32_t vb_obj, uint32_t offset, uint32
 void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t r6,
                 uint32_t r7) {
   g_draw_seq.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t flags2d = Phase2dFlags();
+  if (flags2d != 0) {
+    g_draws_2d.fetch_add(1, std::memory_order_relaxed);
+  }
   const uint32_t bank = g_vs_bank.load(std::memory_order_relaxed);
   if (bank == 0) {
     return;
+  }
+  // Live 2D overlay capture: the HUD renders exclusively through the
+  // BeginVertices inline path (func 2). Vertex payloads are read at frame
+  // end; everything else (transform constants, texture fetch) is staged now.
+  if (flags2d != 0 && SceneEnabled() && REXCVAR_GET(skate3_native_render_scene_2d)) {
+    if (func == 2) {
+      const uint32_t device = g_device.load(std::memory_order_relaxed);
+      if (device != 0 && r7 >= 0x10000 && r5 != 0 && r5 <= 65536 && r6 >= 8 &&
+          r6 <= 256 && (r6 & 3) == 0) {
+        Draw2d d;
+        d.prim = r4;
+        d.count = r5;
+        d.stride = r6;
+        d.addr = r7;
+        d.flags = flags2d;
+        for (int i = 0; i < 6; ++i) {
+          d.fetch[i] = REX_LOAD_U32(device + 0x480 + i * 4);
+        }
+        for (int i = 0; i < 36; ++i) {
+          d.consts[i] = LoadGuestF32(base, bank + i * 4);
+        }
+        std::lock_guard<std::mutex> lock(g_2d_mutex);
+        if (g_frame_2d.size() < 4096) {
+          g_frame_2d.push_back(std::move(d));
+        } else {
+          g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    } else {
+      g_draws_2d_other.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  // In-world neon spline capture (see SplineDraw): a DrawVertices strip of
+  // 12-byte float3 params on the spline shaders, bound VB object carrying
+  // the payload fetch block (+0x18 base | flags, +0x20 size).
+  if (func == 1 && flags2d == 0 && SceneEnabled() &&
+      REXCVAR_GET(skate3_native_render_scene_splines) && r5 >= 4 && r5 <= 8192) {
+    uint32_t kind = ClassifySplineShader(base, g_cur_ps_obj.load(std::memory_order_relaxed));
+    if (kind == 0) {
+      kind = ClassifySplineShader(base, g_cur_vs_obj.load(std::memory_order_relaxed));
+    }
+    const uint32_t vb_obj = g_cur_vb.load(std::memory_order_relaxed);
+    if (kind != 0 && GuestReadableApprox(base, vb_obj)) {
+      const uint32_t addr = REX_LOAD_U32(vb_obj + 0x18) & 0xFFFFFFFCu;
+      const uint32_t size = REX_LOAD_U32(vb_obj + 0x20);
+      if (addr >= 0x10000 && size >= r5 * 12) {
+        SplineDraw s;
+        s.pass = kind;
+        s.count = r5;
+        s.verts.resize(size_t(r5) * 12);
+        if (GuestTryCopy(s.verts.data(), base + addr, s.verts.size())) {
+          const uint32_t device = g_device.load(std::memory_order_relaxed);
+          for (int i = 0; i < 6; ++i) {
+            // The gradient texture lives in fetch shadow slot 3 (24 bytes
+            // per slot; the spline PS samples tf3).
+            s.fetch[i] = device != 0 ? REX_LOAD_U32(device + 0x480 + 3 * 24 + i * 4) : 0;
+          }
+          for (int i = 0; i < 153 * 4; ++i) {
+            s.consts[i] = LoadGuestF32(base, bank + i * 4);
+          }
+          g_draws_spline.fetch_add(1, std::memory_order_relaxed);
+          std::lock_guard<std::mutex> lock(g_2d_mutex);
+          if (g_frame_spline.size() < 64) {
+            g_frame_spline.push_back(std::move(s));
+          }
+        }
+      }
+    }
   }
   const uint32_t cur_ib = g_cur_ib.load(std::memory_order_relaxed);
   const uint32_t cur_vb = g_cur_vb.load(std::memory_order_relaxed);
@@ -1045,11 +1366,13 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     // Sample the full draw stream on a couple of recorded frames out of
     // every 60, spread across the window (ground-truth coverage for the
     // whole recording), and only for frames that are themselves recorded.
+    // 2D-phase draws are recorded on EVERY recorded frame; the HUD stream
+    // is small and is exactly what the 2D reconstruction needs.
     std::lock_guard<std::mutex> lock(g_record_mutex);
     const bool frame_recorded = (g_frames_seen + 1) % g_record_stride == 0;
     const bool all_draws = REXCVAR_GET(skate3_native_render_snapshot_all_draws);
     const size_t draw_cap = all_draws ? 200000 : 32768;
-    if (frame_recorded && (all_draws || (g_record_frame % 60) < 2) &&
+    if (frame_recorded && (all_draws || flags2d != 0 || (g_record_frame % 60) < 2) &&
         g_recorded_draws.size() < draw_cap) {
       auto rec = std::make_unique<RecordedDraw>();
       rec->func = func;
@@ -1078,7 +1401,76 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         rec->ps[i] = ps_bank != 0 ? LoadGuestF32(base, ps_bank + i * 4) : 0.0f;
       }
       rec->frame = g_record_frame;
-      if (func == 1 && cur_vb != 0) {
+      rec->flags2d = flags2d;
+      rec->ps_obj = g_cur_ps_obj.load(std::memory_order_relaxed);
+      rec->vs_obj = g_cur_vs_obj.load(std::memory_order_relaxed);
+      for (int i = 0; i < 6; ++i) {
+        rec->viewport[i] = g_cur_viewport[i].load(std::memory_order_relaxed);
+      }
+      for (int i = 0; i < 4; ++i) {
+        rec->scissor[i] = g_cur_scissor[i].load(std::memory_order_relaxed);
+      }
+      const uint32_t rs_bank = g_rs_bank.load(std::memory_order_relaxed);
+      for (int i = 0; i < 256; ++i) {
+        rec->rstates[i] = rs_bank != 0 ? REX_LOAD_U32(rs_bank + i * 4) : 0;
+      }
+      for (int i = 0; i < 192; ++i) {
+        rec->vfetch_all[i] = device != 0 ? REX_LOAD_U32(device + 0x480 + i * 4) : 0;
+      }
+      rec->vb_dump = ~0u;
+      rec->ib_dump = ~0u;
+      if (flags2d != 0) {
+        // 2D payload capture. The 2D pass runs on transient dynamic buffers
+        // (glyph/shape vertices regenerated per frame); dump them now.
+        // One dump per (guest address, frame); recording mode, so the
+        // GuestRangeReadable VAD cost is acceptable.
+        const auto dump_buffer = [&](uint32_t obj, uint32_t size_off) -> uint32_t {
+          if (obj == 0) {
+            return ~0u;
+          }
+          const uint32_t addr = REX_LOAD_U32(obj + 0x18) & 0xFFFFFFFCu;
+          if (addr < 0x10000) {
+            return ~0u;
+          }
+          uint32_t bytes = REX_LOAD_U32(obj + size_off);
+          if (bytes < 4 || bytes > (8u << 20)) {
+            return ~0u;
+          }
+          const uint64_t key = (uint64_t(g_record_frame) << 32) | addr;
+          auto it = g_frame_dump_ids.find(key);
+          if (it != g_frame_dump_ids.end()) {
+            return it->second;
+          }
+          if (g_recorded_buffer_bytes + bytes > (512u << 20) ||
+              !GuestRangeReadable(base, addr, bytes)) {
+            return ~0u;
+          }
+          RecordedBuffer buf;
+          buf.vb_addr = addr;
+          buf.ib_addr = 0;
+          buf.fingerprint = key;
+          buf.vb.resize(bytes);
+          std::memcpy(buf.vb.data(), base + addr, bytes);
+          const uint32_t dump_id = uint32_t(g_recorded_buffers.size());
+          g_recorded_buffer_bytes += bytes;
+          g_recorded_buffers.push_back(std::move(buf));
+          g_frame_dump_ids.emplace(key, dump_id);
+          return dump_id;
+        };
+        if (func == 0) {
+          rec->vb_dump = dump_buffer(cur_vb, 0x20);
+          rec->ib_dump = dump_buffer(cur_ib, 0x1C);
+        } else if (func == 1) {
+          rec->vb_dump = dump_buffer(cur_vb, 0x20);
+        } else if (func == 2 && r7 >= 0x10000 && r5 != 0 && r6 != 0 &&
+                   uint64_t(r5) * r6 <= (4u << 20)) {
+          // Inline-ring vertices (r5 = count, r6 = stride, r7 = the write
+          // pointer BeginVertices returned): the CPU writes them after the
+          // call; dump at frame end.
+          g_pending_inline_dumps.push_back({r7, r5 * r6, g_recorded_draws.size()});
+        }
+      }
+      if (func == 1 && cur_vb != 0 && flags2d == 0) {
         // Non-indexed (cloth) draw: the bound object holds two ping-pong
         // vertex fetch blocks whose ring payloads are recycled long before
         // frame end; dump both now, keyed back to this draw via rec->ib.
@@ -1152,6 +1544,232 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
+  }
+  if (g_recording.load(std::memory_order_relaxed)) {
+    // Flush this frame's deferred inline-ring payloads (2D BeginVertices
+    // draws): the CPU has finished writing them by frame end, and the ring
+    // has not yet been reused.
+    std::lock_guard<std::mutex> lock(g_record_mutex);
+    for (const PendingInlineDump& p : g_pending_inline_dumps) {
+      if (p.draw_index >= g_recorded_draws.size() ||
+          g_recorded_buffer_bytes + p.bytes > (512u << 20) ||
+          !GuestRangeReadable(base, p.addr, p.bytes)) {
+        continue;
+      }
+      RecordedBuffer buf;
+      buf.vb_addr = p.addr;
+      buf.ib_addr = 0;
+      buf.fingerprint = (uint64_t(g_recorded_draws[p.draw_index]->frame) << 32) | p.addr;
+      buf.vb.resize(p.bytes);
+      std::memcpy(buf.vb.data(), base + p.addr, p.bytes);
+      g_recorded_draws[p.draw_index]->vb_dump = uint32_t(g_recorded_buffers.size());
+      g_recorded_buffer_bytes += p.bytes;
+      g_recorded_buffers.push_back(std::move(buf));
+    }
+    g_pending_inline_dumps.clear();
+  }
+  // Publish this frame's 2D overlay draws (before any early return: menu
+  // and empty frames still carry 2D). The inline-ring vertex payloads are
+  // complete by frame end; convert them to little-endian and expand quad
+  // lists into triangle lists so the render side stays trivial.
+  {
+    std::vector<Draw2d> frame_2d;
+    {
+      std::lock_guard<std::mutex> lock(g_2d_mutex);
+      frame_2d.swap(g_frame_2d);
+    }
+    static thread_local std::vector<uint8_t> scratch_2d;
+    std::vector<Draw2d> published;
+    published.reserve(frame_2d.size());
+    for (Draw2d& d : frame_2d) {
+      const uint32_t bytes = d.count * d.stride;
+      scratch_2d.resize(bytes);
+      if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
+        continue;
+      }
+      // Guest dwords are big-endian.
+      for (size_t i = 0; i + 4 <= scratch_2d.size(); i += 4) {
+        uint32_t v;
+        std::memcpy(&v, scratch_2d.data() + i, 4);
+        v = BSwap32(v);
+        std::memcpy(scratch_2d.data() + i, &v, 4);
+      }
+      // Verified capture-side vertex layouts, all normalized to one 28-byte
+      // renderer layout {float4 pos, float2 uv, u32 rgba}:
+      //   24-byte {float4 pos, float2 uv}          - APT elements
+      //   20-byte {float3 pos, float2 uv}          - glyph text (bit 4)
+      //   20-byte {float4 pos, u32 color}          - SimpleDraw untextured
+      //   28-byte {float4 pos, u32 color, float2 uv} - SimpleDraw textured
+      // (SimpleDraw = bit 5; its DrawParameters ctor orders colours before
+      // texcoords.)
+      {
+        static thread_local std::vector<uint8_t> norm_2d;
+        norm_2d.resize(size_t(d.count) * 28);
+        const float one = 1.0f;
+        const float zero = 0.0f;
+        const uint32_t white = 0xFFFFFFFFu;
+        const bool font = (d.flags & 0x10u) != 0;
+        const bool simple = (d.flags & 0x20u) != 0;
+        bool ok = true;
+        for (uint32_t v = 0; v < d.count && ok; ++v) {
+          uint8_t* dst = norm_2d.data() + size_t(v) * 28;
+          const uint8_t* src = scratch_2d.data() + size_t(v) * d.stride;
+          if (d.stride == 24) {  // APT: pos4 + uv (with or without the
+            // SimpleDraw bracket; the compass needle/icons are 24-byte
+            // quads issued through SimpleDraw::Draw inside the HUD pass,
+            // same simpledraw_SimpleDrawUVSC shader as plain APT elements;
+            // requiring !simple here dropped them, a regression from adding
+            // bracket bit 5)
+            std::memcpy(dst, src, 24);
+            std::memcpy(dst + 24, &white, 4);
+          } else if (d.stride == 20 && font) {  // glyphs: pos3 + uv
+            std::memcpy(dst, src, 12);
+            std::memcpy(dst + 12, &one, 4);
+            std::memcpy(dst + 16, src + 12, 8);
+            std::memcpy(dst + 24, &white, 4);
+          } else if (d.stride == 20 && simple) {  // SimpleDraw: pos4 + color
+            std::memcpy(dst, src, 16);
+            std::memcpy(dst + 16, &zero, 4);
+            std::memcpy(dst + 20, &zero, 4);
+            // The dword byteswap reversed the color's guest byte order
+            // (r,g,b,a); restore it for R8G8B8A8_UNORM.
+            dst[24] = src[19];
+            dst[25] = src[18];
+            dst[26] = src[17];
+            dst[27] = src[16];
+          } else if (d.stride == 28 && simple) {  // SimpleDraw: pos4+color+uv
+            std::memcpy(dst, src, 16);
+            std::memcpy(dst + 16, src + 20, 8);
+            dst[24] = src[19];
+            dst[25] = src[18];
+            dst[26] = src[17];
+            dst[27] = src[16];
+          } else {
+            ok = false;
+          }
+        }
+        if (!ok) {
+          g_draws_2d_other.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        scratch_2d = norm_2d;
+        d.stride = 28;
+      }
+      if (d.prim == 13 && d.count % 4 == 0) {
+        // Quad list -> triangle list (v0,v1,v2)(v0,v2,v3).
+        const uint32_t quads = d.count / 4;
+        d.verts.resize(size_t(quads) * 6 * d.stride);
+        static constexpr uint32_t kOrder[6] = {0, 1, 2, 0, 2, 3};
+        for (uint32_t q = 0; q < quads; ++q) {
+          for (uint32_t t = 0; t < 6; ++t) {
+            std::memcpy(d.verts.data() + (size_t(q) * 6 + t) * d.stride,
+                        scratch_2d.data() + (size_t(q) * 4 + kOrder[t]) * d.stride,
+                        d.stride);
+          }
+        }
+        d.prim = 4;
+        d.count = quads * 6;
+      } else if (d.prim == 4 || d.prim == 5) {
+        d.verts.assign(scratch_2d.begin(), scratch_2d.end());
+      } else {
+        continue;
+      }
+      published.push_back(std::move(d));
+    }
+    std::lock_guard<std::mutex> lock(g_2d_mutex);
+    g_scene_2d = std::move(published);
+    ++g_scene_2d_generation;
+  }
+  // Publish this frame's in-world spline draws: evaluate the guest B-spline
+  // VS on the CPU (see SplineDraw for the decoded algorithm) into final
+  // clip-space strip vertices so the render side is a passthrough draw.
+  {
+    std::vector<SplineDraw> frame_spline;
+    {
+      std::lock_guard<std::mutex> lock(g_2d_mutex);
+      frame_spline.swap(g_frame_spline);
+    }
+    std::vector<SplineDraw> published;
+    published.reserve(frame_spline.size());
+    for (SplineDraw& s : frame_spline) {
+      const float* c = s.consts;
+      const auto row = [&](int r) { return c + r * 4; };
+      std::vector<uint8_t> out(size_t(s.count) * 28);
+      float* dst = reinterpret_cast<float*>(out.data());
+      const uint8_t* src = s.verts.data();
+      bool ok = true;
+      for (uint32_t v = 0; v < s.count; ++v, src += 12, dst += 7) {
+        float p[3];
+        for (int k = 0; k < 3; ++k) {
+          uint32_t w;
+          std::memcpy(&w, src + k * 4, 4);
+          w = BSwap32(w);
+          std::memcpy(&p[k], &w, 4);
+        }
+        if (!(p[0] >= 0.0f && p[0] < 142.0f)) {
+          ok = false;
+          break;
+        }
+        const int idx = int(p[0]);
+        const float t = p[0] - float(idx);
+        const int side = p[2] >= 0.5f ? 1 : 0;
+        // Uniform cubic B-spline basis (matches the shader's embedded
+        // coefficients exactly).
+        const float t2 = t * t;
+        const float t3 = t2 * t;
+        const float wgt[4] = {1.0f - 3.0f * t + 3.0f * t2 - t3,
+                              3.0f * t3 - 6.0f * t2 + 4.0f,
+                              -3.0f * t3 + 3.0f * t2 + 3.0f * t + 1.0f, t3};
+        // Blend the world-transformed control points (world columns c4..c6,
+        // translation in .w), /6, plus the world-rotated extrusion offset.
+        float wp[3] = {0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < 4; ++k) {
+          const float* cp = row(7 + idx + k);
+          for (int a = 0; a < 3; ++a) {
+            const float* wr = row(4 + a);
+            wp[a] += wgt[k] *
+                     (wr[0] * cp[0] + wr[1] * cp[1] + wr[2] * cp[2] + wr[3] * cp[3]);
+          }
+        }
+        const float* off = row(151 + side);
+        for (int a = 0; a < 3; ++a) {
+          const float* wr = row(4 + a);
+          wp[a] = wp[a] * (1.0f / 6.0f) +
+                  (wr[0] * off[0] + wr[1] * off[1] + wr[2] * off[2] + wr[3] * off[3]);
+        }
+        float clip[4];
+        for (int a = 0; a < 4; ++a) {
+          const float* pr = row(a);
+          clip[a] = pr[0] * wp[0] + pr[1] * wp[1] + pr[2] * wp[2] + pr[3];
+        }
+        // Near/far fade against i_clipvalues (clip-space z, pre-divide). A
+        // zero range degenerates to a step, like the shader's rcp(0) = inf.
+        const float* cv = row(150);
+        const auto ramp = [](float z, float start, float range) {
+          if (range > 1e-20f || range < -1e-20f) {
+            const float r = (z - start) / range;
+            return r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+          }
+          return z - start > 0.0f ? 1.0f : 0.0f;
+        };
+        const float fade =
+            std::min(ramp(clip[2], cv[0], cv[1]), 1.0f - ramp(clip[2], cv[2], cv[3]));
+        dst[0] = clip[0];
+        dst[1] = clip[1];
+        dst[2] = clip[2];
+        dst[3] = clip[3];
+        dst[4] = p[1];
+        dst[5] = p[2];
+        dst[6] = fade;
+      }
+      if (!ok) {
+        continue;
+      }
+      s.verts.swap(out);
+      published.push_back(std::move(s));
+    }
+    std::lock_guard<std::mutex> lock(g_2d_mutex);
+    g_scene_spline = std::move(published);
   }
   // Take this frame's hook-time dynamic items regardless of how we exit,
   // leaving them in place across an early return (no perspective view, empty
@@ -1316,6 +1934,8 @@ void StartRecording(uint32_t stride) {
   g_recorded_buffers.clear();
   g_recorded_buffer_keys.clear();
   g_recorded_buffer_bytes = 0;
+  g_pending_inline_dumps.clear();
+  g_frame_dump_ids.clear();
   g_record_frame = 0;
   g_frames_seen = 0;
   g_record_stride = stride == 0 ? 1 : stride;
@@ -1327,14 +1947,18 @@ void WriteRecording(const char* dir, const char* stem) {
   std::lock_guard<std::mutex> lock(g_record_mutex);
   const std::filesystem::path base_path = std::filesystem::path(dir) / stem;
 
-  // Binary draw stream: header "SK3DRAW6", fixed records {u32 frame, u32
+  // Binary draw stream: header "SK3DRAW7", fixed records {u32 frame, u32
   // func, u32 ib, u32 vb, u32 vb_offset, u32 vb_stride, u32 streams[4][3],
-  // u32 vfetch[12], u32 args[4], f32 vs_bank[1024], f32 ps_bank[256]}
+  // u32 vfetch[12], u32 args[4], f32 vs_bank[1024], f32 ps_bank[256],
+  // u32 flags2d, u32 ps_obj, u32 vs_obj, u32 viewport[6], u32 scissor[4],
+  // u32 rstates[256], u32 vfetch_all[192], u32 vb_dump, u32 ib_dump}
   // (little-endian). func: 0 DrawIndexedVertices, 1 DrawVertices,
-  // 2 BeginVertices.
+  // 2 BeginVertices. flags2d: bit0 FrontEndManager::Render2D, bit1
+  // AptMovieIntegration::Render, bit2 DrawRenderingUnit. vb_dump/ib_dump
+  // index into buffers.bin records (~0u = none).
   {
     std::ofstream out(base_path.string() + ".draws.bin", std::ios::binary);
-    out.write("SK3DRAW6", 8);
+    out.write("SK3DRAW7", 8);
     for (const auto& d : g_recorded_draws) {
       out.write(reinterpret_cast<const char*>(&d->frame), 4);
       out.write(reinterpret_cast<const char*>(&d->func), 4);
@@ -1347,6 +1971,15 @@ void WriteRecording(const char* dir, const char* stem) {
       out.write(reinterpret_cast<const char*>(d->args), 16);
       out.write(reinterpret_cast<const char*>(d->bank), 4096);
       out.write(reinterpret_cast<const char*>(d->ps), 1024);
+      out.write(reinterpret_cast<const char*>(&d->flags2d), 4);
+      out.write(reinterpret_cast<const char*>(&d->ps_obj), 4);
+      out.write(reinterpret_cast<const char*>(&d->vs_obj), 4);
+      out.write(reinterpret_cast<const char*>(d->viewport), 24);
+      out.write(reinterpret_cast<const char*>(d->scissor), 16);
+      out.write(reinterpret_cast<const char*>(d->rstates), 1024);
+      out.write(reinterpret_cast<const char*>(d->vfetch_all), 768);
+      out.write(reinterpret_cast<const char*>(&d->vb_dump), 4);
+      out.write(reinterpret_cast<const char*>(&d->ib_dump), 4);
     }
   }
 
@@ -1420,6 +2053,8 @@ void WriteRecording(const char* dir, const char* stem) {
   g_recorded_buffers.clear();
   g_recorded_buffer_keys.clear();
   g_recorded_buffer_bytes = 0;
+  g_pending_inline_dumps.clear();
+  g_frame_dump_ids.clear();
 }
 
 }  // namespace skate3::native_scene
@@ -1578,6 +2213,21 @@ struct RendererState {
   ID3D12Resource* bone_ring = nullptr;
   uint8_t* bone_ring_cpu = nullptr;
   uint32_t bone_ring_offset = 0;
+  // 2D overlay (HUD/APT replay): alpha-blended depth-less pipeline drawing
+  // the captured inline vertices from a per-frame upload ring.
+  ID3D12PipelineState* pso_2d = nullptr;
+  // In-world neon splines, drawn inside the MSAA scene pass (depth test on,
+  // no z-write): darken = straight alpha, default = additive glow.
+  ID3D12PipelineState* pso_spline_darken = nullptr;
+  ID3D12PipelineState* pso_spline_default = nullptr;
+  static constexpr uint32_t kUiRegionSize = 1u << 20;
+  static constexpr uint32_t kUiRegions = 4;
+  ID3D12Resource* ui_ring = nullptr;
+  uint8_t* ui_ring_cpu = nullptr;
+  // Textures resolved from raw fetch-constant words: the 2D path binds its
+  // textures through the device fetch shadow, not renderengine objects.
+  // Keyed by an FNV hash of the 6 fetch words.
+  std::unordered_map<uint64_t, GuestTexture> textures_2d;
   bool failed = false;
   bool announced = false;
 };
@@ -1692,6 +2342,90 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
     c += src.Load(p, k);
   }
   return c / SAMPLES;
+}
+)";
+
+// 2D/APT overlay shader. Verified against a captured HUD draw stream:
+// vertices are {float4 pos, float2 uv} in 1280x720
+// APT movie space; the game's VS constants apply as clip = ortho * (world *
+// pos) with c0..c3 the ortho rows, c4..c7 the element's transform rows and
+// c8 the color multiplier, used exactly as staged.
+const char kShader2dSource[] = R"(
+cbuffer C : register(b0) {
+  float4 m[10];  // m[0..3] proj rows, m[4..7] world rows, m[8] color,
+                 // m[9].x = apply D3D9 half-pixel (2D ortho draws only)
+};
+Texture2D<float4> tex : register(t0);
+SamplerState smp : register(s1);
+struct VSOut {
+  float4 pos : SV_Position;
+  float2 uv : TEXCOORD0;
+  float4 color : COLOR0;
+};
+VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float4 color : COLOR0) {
+  float4 wp = float4(dot(p, m[4]), dot(p, m[5]), dot(p, m[6]), dot(p, m[7]));
+  VSOut o;
+  o.pos = float4(dot(wp, m[0]), dot(wp, m[1]), dot(wp, m[2]), dot(wp, m[3]));
+  // D3D9 half-pixel convention: the art bakes half-texel UVs expecting
+  // pixel centers at integer coordinates; without this the clock-face
+  // quadrant tiles show their wrapped border rows as dark seam lines.
+  // Scaled for the 2D ortho; must not apply to 3D (world-space
+  // SimpleDraw markers), where m[0].x is a projection scale.
+  if (m[9].x > 0.0) {
+    o.pos.x -= 0.5 * m[0].x * o.pos.w;
+    o.pos.y -= 0.5 * m[1].y * o.pos.w;
+  }
+  o.uv = uv;
+  o.color = color;
+  return o;
+}
+float4 ps_main(VSOut i) : SV_Target {
+  return tex.Sample(smp, i.uv) * m[8] * i.color;
+}
+)";
+
+// In-world neon spline shader (waypoint arrows / marker beams). The guest
+// B-spline VS is evaluated on the CPU at publish time, so the VS here is a
+// clip-space passthrough; the two PS variants transcribe the game's own
+// spline.fx (Skate-Shaders repo): "default" = additive glow with the
+// squared-gamma trick, "darken" = straight-alpha backdrop dimming. The
+// gradient texture uses the wrap/aniso sampler like the original i_diffuse
+// (U runs 0..N along the band).
+const char kShaderSplineSource[] = R"(
+cbuffer C : register(b0) {
+  float4 intensity;  // i_intensity as staged (x = default gain, y = darken gain)
+};
+Texture2D<float4> tex : register(t0);
+SamplerState smp : register(s0);
+struct VSOut {
+  float4 pos : SV_Position;
+  float2 uv : TEXCOORD0;
+  float fade : TEXCOORD1;
+};
+VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float fade : TEXCOORD1) {
+  VSOut o;
+  o.pos = p;
+  o.uv = uv;
+  o.fade = fade;
+  return o;
+}
+// Exact transcription of the Skate 3 spline pixel shaders (disassembled
+// ucode, NOT the older Skate 2 spline.fx source: EA added in-shader sqrt
+// gamma compensation). default: oC0.rgb = sqrt(rgb^2 * i.x * fade / a);
+// darken: oC0.rgb = sqrt(rgb^2 * i.y), oC0.a = sqrt(a * i.y * fade).
+// Getting this wrong is visible: a linear 1/a over-brightens the low-alpha
+// glow fringe (fuzzy, blown-out edges) and a linear darken alpha weakens the
+// backdrop dimming that makes the neon read as solid.
+float4 ps_default(VSOut i) : SV_Target {
+  float4 c = tex.Sample(smp, i.uv);
+  float3 sq = c.rgb * c.rgb * (intensity.x * i.fade / max(c.a, 1.0 / 255.0));
+  return float4(sqrt(abs(sq)), 1.0);
+}
+float4 ps_darken(VSOut i) : SV_Target {
+  float4 c = tex.Sample(smp, i.uv);
+  float3 rgb = sqrt(abs(c.rgb * c.rgb * intensity.y));
+  float a = sqrt(abs(c.a * intensity.y * i.fade));
+  return float4(rgb, a);
 }
 )";
 
@@ -1939,22 +2673,15 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
   return true;
 }
 
-// Decode a guest texture (v1-verified path: fetch constant at renderengine::
-// Texture words [7..12], CPU untile block by block through the 0xA0000000
-// physical mirror, endian swap) and create its SRV in the staging heap.
-bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* base,
-                        uint32_t tex_ptr, GuestTexture& out) {
-  uint32_t words[6] = {};
-  {
-    uint32_t raw[6];
-    if (!GuestTryCopy(raw, base + tex_ptr + 7 * 4, sizeof(raw))) {
-      return false;
-    }
-    for (uint32_t i = 0; i < 6; ++i) {
-      words[i] = SwapU32(raw[i]);
-    }
-  }
-  std::memcpy(out.fetch_words, words, sizeof(words));
+// Decode a guest texture from its 6 fetch-constant words (host-endian),
+// the v1-verified path: CPU untile block by block through the 0xA0000000
+// physical mirror, endian swap, and create its SRV in the staging heap.
+// The 3D path reads the words from renderengine::Texture objects; the 2D
+// path passes the device fetch-shadow words directly.
+bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
+                                 uint8_t* base, const uint32_t words[6],
+                                 GuestTexture& out) {
+  std::memcpy(out.fetch_words, words, 6 * sizeof(uint32_t));
 
   xenos::xe_gpu_texture_fetch_t fetch = {};
   fetch.dword_0 = words[0];
@@ -2015,7 +2742,7 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   // behind the guest streaming threads exactly while panning streams
   // textures in), truncating the chain at the first unreadable level.
   struct MipSrc {
-    uint32_t addr, scratch_off, size, pitch_blocks, ox, oy;
+    uint32_t addr, scratch_off, size, min_size, pitch_blocks, ox, oy;
   };
   MipSrc srcs[16] = {};
   static thread_local std::vector<uint8_t> tex_scratch;
@@ -2029,6 +2756,20 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
     s.addr = mip_addr;
     s.pitch_blocks = m == 0 ? info.extent.block_pitch_h : ext.block_pitch_h;
     s.size = m == 0 ? info.memory.base_size : ext.all_blocks() * bytes_per_block;
+    s.min_size = s.size;
+    if (info.is_tiled) {
+      // Tiled addressing swizzles across 32x32-BLOCK macro tiles, so a small
+      // texture with a macro-aligned fetch pitch stores blocks far beyond its
+      // naive linear size (the 32x32 DXT5 HUD compass icons, pitch 128
+      // texels: last block at offset 5952 vs base_size 1024; the size guard
+      // zeroed 48 of 64 blocks, "icons sliced off"). Copy whole macro rows;
+      // if that over-reaches the committed allocation the copy loop below
+      // falls back to the reported size.
+      const uint32_t mh = std::max(height >> m, 1u);
+      const uint32_t rows = (mh + block_h - 1) / block_h + oy;
+      const uint32_t padded_rows = (rows + 31u) & ~31u;
+      s.size = std::max(s.size, padded_rows * s.pitch_blocks * bytes_per_block);
+    }
     s.ox = ox;
     s.oy = oy;
     s.scratch_off = scratch_total;
@@ -2037,9 +2778,15 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   tex_scratch.resize(scratch_total);
   uint32_t mips_copied = 0;
   for (uint32_t m = 0; m < mip_count; ++m) {
-    if (!GuestTryCopy(tex_scratch.data() + srcs[m].scratch_off,
-                      base + (0xA0000000u | srcs[m].addr), srcs[m].size)) {
-      break;
+    MipSrc& s = srcs[m];
+    if (!GuestTryCopy(tex_scratch.data() + s.scratch_off,
+                      base + (0xA0000000u | s.addr), s.size)) {
+      if (s.min_size >= s.size ||
+          !GuestTryCopy(tex_scratch.data() + s.scratch_off,
+                        base + (0xA0000000u | s.addr), s.min_size)) {
+        break;
+      }
+      s.size = s.min_size;
     }
     ++mips_copied;
   }
@@ -2173,6 +2920,22 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   return true;
 }
 
+// Fetch-constant read from a renderengine::Texture object (words [7..12]).
+bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* base,
+                        uint32_t tex_ptr, GuestTexture& out) {
+  uint32_t words[6] = {};
+  {
+    uint32_t raw[6];
+    if (!GuestTryCopy(raw, base + tex_ptr + 7 * 4, sizeof(raw))) {
+      return false;
+    }
+    for (uint32_t i = 0; i < 6; ++i) {
+      words[i] = SwapU32(raw[i]);
+    }
+  }
+  return EnsureGuestTextureFromWords(context, base, words, out);
+}
+
 bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   if (g_r.failed) return false;
   ID3D12Device* device = context.d3d12.device;
@@ -2199,20 +2962,32 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[3].Descriptor.ShaderRegister = 2;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_ANISOTROPIC;
-    sampler.MaxAnisotropy = 8;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderRegister = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
+    samplers[0].Filter = D3D12_FILTER_ANISOTROPIC;
+    samplers[0].MaxAnisotropy = 8;
+    samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
+    samplers[0].ShaderRegister = 0;
+    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // s1: bilinear CLAMP for the 2D overlay. The HUD fetch constants carry
+    // clamp_x/clamp_y = 2 (clamp-to-edge), and the clock face is built from
+    // MIRRORED quadrant tiles whose outer-edge UVs run past 1.0; wrap
+    // sampling pulls the opposite edge of the art in as 1px seam lines
+    // (bright rim row across the middle, dark center column at the edges).
+    samplers[1] = samplers[0];
+    samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    samplers[1].MaxAnisotropy = 1;
+    samplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC desc{};
     desc.NumParameters = 4;
     desc.pParameters = params;
-    desc.NumStaticSamplers = 1;
-    desc.pStaticSamplers = &sampler;
+    desc.NumStaticSamplers = 2;
+    desc.pStaticSamplers = samplers;
     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     if (!context.d3d12.create_root_signature(context.d3d12.command_processor_user_data,
                                              &desc, &g_r.root_signature)) {
@@ -2339,12 +3114,151 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
         return false;
       }
     }
+    {
+      // 2D overlay pipeline: standard alpha blend, no depth, drawn into the
+      // resolved guest output (sample count 1).
+      ID3DBlob* uvs = nullptr;
+      ID3DBlob* ups = nullptr;
+      ID3DBlob* uerrors = nullptr;
+      if (FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
+                            nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &uvs,
+                            &uerrors)) ||
+          FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
+                            nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &ups,
+                            &uerrors))) {
+        REXLOG_ERROR("native-scene: 2D shader compile failed: {}",
+                     uerrors ? static_cast<const char*>(uerrors->GetBufferPointer())
+                             : "?");
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_INPUT_ELEMENT_DESC input2d[3] = {
+          {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+          {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
+           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+          {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24,
+           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC up{};
+      up.pRootSignature = g_r.root_signature;
+      up.VS = {uvs->GetBufferPointer(), uvs->GetBufferSize()};
+      up.PS = {ups->GetBufferPointer(), ups->GetBufferSize()};
+      auto& rt = up.BlendState.RenderTarget[0];
+      rt.BlendEnable = TRUE;
+      // Straight (non-premultiplied) alpha, verified against the decoded
+      // HUD clock art: the glass-sheen texture is white RGB at low alpha
+      // (premultiplied blending blows it out into an opaque white blob).
+      rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+      rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+      rt.BlendOp = D3D12_BLEND_OP_ADD;
+      rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+      rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+      rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+      rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      up.SampleMask = UINT_MAX;
+      up.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      up.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      up.InputLayout = {input2d, 3};
+      up.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      up.NumRenderTargets = 1;
+      up.RTVFormats[0] = context.d3d12.guest_output_format;
+      up.SampleDesc.Count = 1;
+      const HRESULT hr4 = device->CreateGraphicsPipelineState(&up, IID_PPV_ARGS(&g_r.pso_2d));
+      uvs->Release();
+      ups->Release();
+      if (uerrors) uerrors->Release();
+      if (FAILED(hr4)) {
+        REXLOG_ERROR("native-scene: 2D PSO creation failed {:08X}", uint32_t(hr4));
+        g_r.failed = true;
+        return false;
+      }
+    }
+    {
+      // In-world spline pipelines: drawn inside the scene pass (MSAA sample
+      // count, depth test LESS_EQUAL, no z-write) with the game's own blend
+      // states (spline.xml): darken = straight alpha, default = additive.
+      ID3DBlob* svs = nullptr;
+      ID3DBlob* spd = nullptr;
+      ID3DBlob* spk = nullptr;
+      ID3DBlob* serrors = nullptr;
+      if (FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
+                            "native_spline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
+                            &svs, &serrors)) ||
+          FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
+                            "native_spline", nullptr, nullptr, "ps_default", "ps_5_0", 0,
+                            0, &spd, &serrors)) ||
+          FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
+                            "native_spline", nullptr, nullptr, "ps_darken", "ps_5_0", 0,
+                            0, &spk, &serrors))) {
+        REXLOG_ERROR("native-scene: spline shader compile failed: {}",
+                     serrors ? static_cast<const char*>(serrors->GetBufferPointer())
+                             : "?");
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_INPUT_ELEMENT_DESC input_spline[3] = {
+          {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+          {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
+           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+          {"TEXCOORD", 1, DXGI_FORMAT_R32_FLOAT, 0, 24,
+           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC sp{};
+      sp.pRootSignature = g_r.root_signature;
+      sp.VS = {svs->GetBufferPointer(), svs->GetBufferSize()};
+      sp.SampleMask = UINT_MAX;
+      sp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      sp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      sp.RasterizerState.DepthClipEnable = TRUE;
+      sp.DepthStencilState.DepthEnable = TRUE;
+      sp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+      sp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+      sp.InputLayout = {input_spline, 3};
+      sp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      sp.NumRenderTargets = 1;
+      sp.RTVFormats[0] = context.d3d12.guest_output_format;
+      sp.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+      sp.SampleDesc.Count = g_r.msaa;
+      auto& srt = sp.BlendState.RenderTarget[0];
+      srt.BlendEnable = TRUE;
+      srt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      srt.BlendOp = D3D12_BLEND_OP_ADD;
+      srt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+      // darken pass: straight alpha.
+      sp.PS = {spk->GetBufferPointer(), spk->GetBufferSize()};
+      srt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+      srt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+      srt.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
+      srt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+      const HRESULT hr5 =
+          device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_darken));
+      // default pass: additive glow.
+      sp.PS = {spd->GetBufferPointer(), spd->GetBufferSize()};
+      srt.SrcBlend = D3D12_BLEND_ONE;
+      srt.DestBlend = D3D12_BLEND_ONE;
+      srt.SrcBlendAlpha = D3D12_BLEND_ONE;
+      srt.DestBlendAlpha = D3D12_BLEND_ONE;
+      const HRESULT hr6 =
+          device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_default));
+      svs->Release();
+      spd->Release();
+      spk->Release();
+      if (serrors) serrors->Release();
+      if (FAILED(hr5) || FAILED(hr6)) {
+        REXLOG_ERROR("native-scene: spline PSO creation failed {:08X}/{:08X}",
+                     uint32_t(hr5), uint32_t(hr6));
+        g_r.failed = true;
+        return false;
+      }
+    }
     REXLOG_INFO("native-scene: pipelines created (MSAA x{})", g_r.msaa);
     g_r.rtv_format = context.d3d12.guest_output_format;
   }
 
   if (!g_r.rtv_heap) {
-    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2,
+    // Slots 0/1 = guest output / MSAA color; 2+ = APT render-to-texture
+    // targets.
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_r.rtv_heap)))) {
       g_r.failed = true;
@@ -2373,6 +3287,17 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     if (!g_r.bone_ring ||
         FAILED(g_r.bone_ring->Map(0, nullptr,
                                   reinterpret_cast<void**>(&g_r.bone_ring_cpu)))) {
+      g_r.failed = true;
+      return false;
+    }
+  }
+
+  if (!g_r.ui_ring) {
+    g_r.ui_ring = CreateUploadBuffer(
+        device, size_t(RendererState::kUiRegionSize) * RendererState::kUiRegions);
+    if (!g_r.ui_ring ||
+        FAILED(g_r.ui_ring->Map(0, nullptr,
+                                reinterpret_cast<void**>(&g_r.ui_ring_cpu)))) {
       g_r.failed = true;
       return false;
     }
@@ -2833,6 +3758,77 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
+  // Guest-texture resolver shared by the spline pass (pre-resolve, in the
+  // scene pass) and the HUD pass (post-resolve); both allocate strip/quad
+  // vertices from the same per-frame ui_ring region.
+  const auto resolve_2d_texture = [&](const uint32_t fetch[6]) -> const GuestTexture* {
+    if ((fetch[0] & 0x3u) != 2 || fetch[1] == 0) {
+      return &g_r.white;
+    }
+    uint64_t key = 1469598103934665603ull;
+    for (int k = 0; k < 6; ++k) {
+      key ^= fetch[k];
+      key *= 1099511628211ull;
+    }
+    auto it = g_r.textures_2d.find(key);
+    if (it == g_r.textures_2d.end()) {
+      GuestTexture gt;
+      EnsureGuestTextureFromWords(context, base, fetch, gt);
+      if (!gt.valid) {
+        static std::unordered_set<uint64_t> logged;
+        if (logged.size() < 32 && logged.insert(key).second) {
+          REXLOG_INFO(
+              "native-scene: 2D texture decode FAILED fetch=[{:08X} {:08X} {:08X} "
+              "{:08X} {:08X} {:08X}]",
+              fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
+        }
+      }
+      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      it = g_r.textures_2d.emplace(key, gt).first;
+    }
+    return it->second.valid ? &it->second : &g_r.white;
+  };
+  const uint32_t ui_region =
+      uint32_t(frame_number % RendererState::kUiRegions) * RendererState::kUiRegionSize;
+  uint32_t ui_offset = 0;
+
+  // In-world neon splines (waypoint arrows / marker beams): replayed inside
+  // the scene pass, depth-tested against the world like the emulated frame,
+  // in submission order (darken backdrop passes precede the additive glow).
+  uint32_t drawn_spline = 0;
+  if (REXCVAR_GET(skate3_native_render_scene_splines) &&
+      g_r.pso_spline_default != nullptr && g_r.ui_ring_cpu != nullptr) {
+    std::vector<SplineDraw> scene_spline;
+    {
+      std::lock_guard<std::mutex> lock(g_2d_mutex);
+      scene_spline = g_scene_spline;
+    }
+    for (const SplineDraw& s : scene_spline) {
+      const uint32_t bytes = uint32_t(s.verts.size());
+      if (bytes == 0 || ui_offset + bytes > RendererState::kUiRegionSize) {
+        continue;
+      }
+      std::memcpy(g_r.ui_ring_cpu + ui_region + ui_offset, s.verts.data(), bytes);
+      const uint32_t srv_slot = resolve_2d_texture(s.fetch)->srv_slot;
+      list.D3DSetPipelineState(s.pass == 1 ? g_r.pso_spline_darken
+                                           : g_r.pso_spline_default);
+      // Root constants: i_intensity as staged (c149).
+      list.D3DSetGraphicsRoot32BitConstants(0, 4, s.consts + 149 * 4, 0);
+      D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu =
+          g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+      srv_gpu.ptr += size_t(srv_slot) * g_r.srv_size;
+      context.d3d12.set_graphics_root_descriptor_table(
+          context.d3d12.command_processor_user_data, 1, srv_gpu);
+      D3D12_VERTEX_BUFFER_VIEW vbv{
+          g_r.ui_ring->GetGPUVirtualAddress() + ui_region + ui_offset, bytes, 28};
+      list.D3DIASetVertexBuffers(0, 1, &vbv);
+      list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      list.D3DDrawInstanced(s.count, 1, 0, 0);
+      ui_offset += bytes;
+      ++drawn_spline;
+    }
+  }
+
   if (msaa_on) {
     // Resolve: average the MSAA samples into the guest output with a
     // fullscreen pass, then restore steady-state resource states.
@@ -2858,6 +3854,71 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
   }
+
+  // 2D overlay (HUD/APT): replay the frame's captured 2D draws over the
+  // resolved output, in submission order, with the game's own transform
+  // constants and textures. In gameplay these draws compose the game's
+  // full-screen HUD overlay texture at true screen coordinates; drawing
+  // them here IS the composite the (suppressed) emulated pass used to do.
+  uint32_t drawn_2d = 0;
+  if (REXCVAR_GET(skate3_native_render_scene_2d) && g_r.pso_2d != nullptr &&
+      g_r.ui_ring_cpu != nullptr) {
+    std::vector<Draw2d> scene_2d;
+    {
+      std::lock_guard<std::mutex> lock(g_2d_mutex);
+      scene_2d = g_scene_2d;
+    }
+    if (!scene_2d.empty()) {
+      list.D3DSetPipelineState(g_r.pso_2d);
+      // One shared draw routine for both the RTT passes and the screen pass.
+      // ui_region/ui_offset continue after the spline pass's allocations.
+      const auto emit_draw = [&](const Draw2d& d) {
+        const uint32_t bytes = uint32_t(d.verts.size());
+        if (bytes == 0 || d.stride != 28) {
+          return;
+        }
+        if (ui_offset + bytes > RendererState::kUiRegionSize) {
+          g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        std::memcpy(g_r.ui_ring_cpu + ui_region + ui_offset, d.verts.data(), bytes);
+        const uint32_t srv_slot = resolve_2d_texture(d.fetch)->srv_slot;
+        float constants[40];
+        std::memcpy(constants, d.consts, sizeof(d.consts));
+        // 2D ortho draws have no translation row in the projection (c3 ==
+        // (0,0,0,1)); perspective view-proj rows do. Half-pixel applies to
+        // the former only.
+        const bool ortho = d.consts[12] == 0.0f && d.consts[13] == 0.0f &&
+                           d.consts[14] == 0.0f && d.consts[15] == 1.0f;
+        constants[36] = ortho ? 1.0f : 0.0f;
+        constants[37] = 0.0f;
+        constants[38] = 0.0f;
+        constants[39] = 0.0f;
+        list.D3DSetGraphicsRoot32BitConstants(0, 40, constants, 0);
+        D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu =
+            g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+        srv_gpu.ptr += size_t(srv_slot) * g_r.srv_size;
+        context.d3d12.set_graphics_root_descriptor_table(
+            context.d3d12.command_processor_user_data, 1, srv_gpu);
+        D3D12_VERTEX_BUFFER_VIEW vbv{
+            g_r.ui_ring->GetGPUVirtualAddress() + ui_region + ui_offset, bytes, d.stride};
+        list.D3DIASetVertexBuffers(0, 1, &vbv);
+        list.D3DIASetPrimitiveTopology(d.prim == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+                                                   : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list.D3DDrawInstanced(d.count, 1, 0, 0);
+        ui_offset += bytes;
+        ++drawn_2d;
+      };
+
+      list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+      list.RSSetViewport(viewport);
+      list.RSSetScissorRect(scissor);
+      for (const Draw2d& d : scene_2d) {
+        emit_draw(d);
+      }
+    }
+  }
+
   context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
                                         context.d3d12.guest_output_resource,
                                         D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -2867,12 +3928,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   const uint64_t frames = g_frames_rendered.fetch_add(1) + 1;
   if (frames % 600 == 0) {
     REXLOG_INFO(
-        "native-scene: frame {} items={} draws={} cached_meshes={} textures={} "
+        "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
+        "splines[{}/{}] "
+        "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
         "vs_uploads={} palettes={} palette_base_plus1={} skinned={} skinned_skipped={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}]",
-        frames, scene.items.size(), drawn, g_r.meshes.size(), g_r.textures.size(),
+        frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
+        drawn_spline, g_draws_spline.load(),
+        g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
+        g_r.meshes.size(), g_r.textures.size(),
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
         g_skinned_items.load(),
         g_skinned_skipped.load(), g_rigid_pending.load(), g_rigid_dropped.load(),
@@ -2888,11 +3954,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 }  // namespace
 
 void Install() {
-  if (!SceneEnabled()) {
-    return;
-  }
+  // Registered even when the scene cvar starts off: RenderScene yields to the
+  // emulated output while disabled, and the runtime toggle (F5) can flip the
+  // cvar live at any point after boot.
   rex::graphics::SetNativeGuestOutputRenderer(&RenderScene, nullptr);
-  REXLOG_INFO("native-scene: guest output renderer registered");
+  REXLOG_INFO("native-scene: guest output renderer registered (scene {})",
+              SceneEnabled() ? "on" : "off");
 }
 
 }  // namespace skate3::native_scene

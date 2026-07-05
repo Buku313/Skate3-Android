@@ -502,6 +502,117 @@ extern "C" REX_FUNC(sub_82B7A458) {
   }
 }
 
+// ---- 2D / APT (Flash-converted HUD) reconnaissance hooks -----------------
+// Every HUD/menu 2D element is a Flash SWF converted to EA APT, rendered by
+// Sk8::FE::AptRenderingIntegration through the same guest D3D draw functions
+// hooked above. These brackets tag draws issued inside the 2D pass so the
+// recorder can capture and the future native 2D pass can replay them.
+
+// Sk8::FE::FrontEndManager::Render2D(unsigned int): the game's whole 2D
+// pass (FE movies + HUD).
+extern "C" REX_FUNC(sub_825D9168) {
+  const bool enabled = skate3::native_render::Enabled();
+  if (enabled) skate3::native_scene::On2dPhase(0, true);
+  __imp__sub_825D9168(ctx, base);
+  if (enabled) skate3::native_scene::On2dPhase(0, false);
+}
+
+// Sk8::FE::AptMovieIntegration::Render(unsigned int): one APT movie.
+extern "C" REX_FUNC(sub_825D67D8) {
+  const bool enabled = skate3::native_render::Enabled();
+  if (enabled) skate3::native_scene::On2dPhase(1, true);
+  __imp__sub_825D67D8(ctx, base);
+  if (enabled) skate3::native_scene::On2dPhase(1, false);
+}
+
+// Sk8::FE::AptRenderingIntegration::DrawRenderingUnit(void*, AptRenderInfo
+// const*): one APT display-list element (texture quad / vector shape).
+extern "C" REX_FUNC(sub_825D4490) {
+  const bool enabled = skate3::native_render::Enabled();
+  if (enabled) skate3::native_scene::On2dPhase(2, true);
+  __imp__sub_825D4490(ctx, base);
+  if (enabled) skate3::native_scene::On2dPhase(2, false);
+}
+
+// Sk8::FE::AptRenderingIntegration::UpdateRenderToTexture(unsigned int):
+// in gameplay this renders the whole HUD into a screen-sized overlay
+// texture at true screen coordinates (the game composites it later through
+// the suppressed emulated pass). Diagnostic bracket only.
+extern "C" REX_FUNC(sub_825D4E50) {
+  const bool enabled = skate3::native_render::Enabled();
+  if (enabled) skate3::native_scene::On2dPhase(3, true);
+  __imp__sub_825D4E50(ctx, base);
+  if (enabled) skate3::native_scene::On2dPhase(3, false);
+}
+
+// Sk8::Render::cFont::DrawstringLocal<char> / <unsigned short>: the glyph
+// text emitter (trick names, scores). Text can flush OUTSIDE the APT
+// brackets, so it gets its own bit.
+extern "C" REX_FUNC(sub_82808388) {
+  const bool enabled = skate3::native_render::Enabled();
+  if (enabled) skate3::native_scene::On2dPhase(4, true);
+  __imp__sub_82808388(ctx, base);
+  if (enabled) skate3::native_scene::On2dPhase(4, false);
+}
+
+extern "C" REX_FUNC(sub_82808708) {
+  const bool enabled = skate3::native_render::Enabled();
+  if (enabled) skate3::native_scene::On2dPhase(4, true);
+  __imp__sub_82808708(ctx, base);
+  if (enabled) skate3::native_scene::On2dPhase(4, false);
+}
+
+// Sk8::Render::SimpleDraw::DrawParameters::Draw: the game's immediate-mode
+// quad/tri utility (chase arrows, in-world guide markers/beams, debug
+// draws). Bottoms out in BeginVertices like the APT path.
+extern "C" REX_FUNC(sub_82804168) {
+  const bool enabled = skate3::native_render::Enabled();
+  if (enabled) skate3::native_scene::On2dPhase(5, true);
+  __imp__sub_82804168(ctx, base);
+  if (enabled) skate3::native_scene::On2dPhase(5, false);
+}
+
+// D3DDevice_SetPixelShader / SetVertexShader (r4 = guest shader object):
+// recorded per draw to group the 2D stream by shader variant.
+extern "C" REX_FUNC(sub_82B7F408) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnSetShader(true, ctx.r4.u32);
+  }
+  __imp__sub_82B7F408(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82B7F150) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnSetShader(false, ctx.r4.u32);
+  }
+  __imp__sub_82B7F150(ctx, base);
+}
+
+// D3D::SetPending_RenderStates(device, u64 dirty mask, bank, ptr): the
+// render-state shadow bank (blend/depth state for 2D draws lives here).
+extern "C" REX_FUNC(sub_82B83C48) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnRenderStateUpload(ctx.r4.u64, ctx.r5.u32, ctx.r6.u32);
+  }
+  __imp__sub_82B83C48(ctx, base);
+}
+
+// D3DDevice_SetViewport(device, D3DVIEWPORT*) / SetScissorRect(device,
+// RECT*): recorded per draw (render-to-texture APT passes and mask rects).
+extern "C" REX_FUNC(sub_82B74310) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnSetViewport(base, ctx.r4.u32);
+  }
+  __imp__sub_82B74310(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82B769C0) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnSetScissor(base, ctx.r4.u32);
+  }
+  __imp__sub_82B769C0(ctx, base);
+}
+
 // D3DDevice_BeginVertices: inline (write-through-ring) vertex path; the
 // CPU writes computed vertices directly. Post-call r3 = guest write pointer.
 extern "C" REX_FUNC(sub_82B79FC0) {

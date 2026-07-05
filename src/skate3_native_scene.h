@@ -100,6 +100,35 @@ void OnRegisterTexture(uint64_t guid, uint32_t texture);
 void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr,
                         uint32_t device);
 
+// 2D/APT phase bracket (the HUD and every other 2D element is a Flash SWF
+// converted to EA APT, rendered through FE::AptRenderingIntegration). Guest
+// draws issued while inside a bracket are 2D draws. bit: 0 =
+// FrontEndManager::Render2D, 1 = AptMovieIntegration::Render, 2 =
+// AptRenderingIntegration::DrawRenderingUnit, 3 =
+// AptRenderingIntegration::UpdateRenderToTexture (in gameplay the whole HUD
+// renders inside bit 3 into a screen-sized overlay texture at true screen
+// coordinates; replaying those draws directly is the composite), 4 =
+// Sk8::Render::cFont::DrawstringLocal (glyph text: trick names/scores;
+// text can flush outside the APT brackets), 5 =
+// Sk8::Render::SimpleDraw::DrawParameters::Draw (immediate-mode quads:
+// chase arrows, in-world markers/beams).
+void On2dPhase(uint32_t bit, bool enter);
+
+// Current guest shader objects (D3DDevice_SetPixelShader/SetVertexShader),
+// recorded per draw so offline analysis can group the 2D draw stream by
+// shader variant.
+void OnSetShader(bool pixel, uint32_t obj);
+
+// D3D::SetPending_RenderStates(device, mask, bank, ptr): the render-state
+// shadow bank (blend/depth state for the 2D pass lives here).
+void OnRenderStateUpload(uint64_t mask, uint32_t bank, uint32_t ptr);
+
+// D3DDevice_SetViewport / SetRenderState_ScissorTestEnable-adjacent scissor
+// tracking, recorded per draw (render-to-texture APT passes show up as
+// non-fullscreen viewports).
+void OnSetViewport(uint8_t* base, uint32_t viewport_ptr);
+void OnSetScissor(uint8_t* base, uint32_t rect_ptr);
+
 // Guest buffer-binding trackers + post-draw state fixup: each
 // DrawIndexedVertices whose bound IB/VB match a pending item fills that
 // item's bone palette / world matrix from the constant bank (FIFO one-shot
@@ -153,5 +182,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count);
 // Registers the native guest output renderer with the SDK. Safe to call once
 // at startup regardless of cvar state.
 void Install();
+
+// Runtime renderer switch (bound to F5): flips skate3_native_render_scene
+// live. Capture hooks, scene build, guest-output replacement and
+// emulated-draw suppression all re-check the cvar every frame, so the swap
+// between the native renderer and the emulated GPU is seamless. Returns the
+// new state; refuses (returns false) when the skate3_native_render hook
+// layer was not enabled at boot.
+bool ToggleSceneEnabled();
 
 }  // namespace skate3::native_scene

@@ -4,6 +4,9 @@
 #include "skate3_fov.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
+#include "skate3_native_scene.h"
+#include "skate3_screenshot.h"
+#include "skate3_shader_disasm.h"
 #include "skate3_title_update_installer.h"
 #include "skate3_user_settings.h"
 
@@ -60,6 +63,7 @@
 #include <rex/system.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/window.h>
 #include <rex/ui/overlay/simple_settings_overlay.h>
 #include <rex/ui/overlay/ultrawide_targets_overlay.h>
 
@@ -695,6 +699,15 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   rex::ui::RegisterBind("bind_skate3_menu_alt", "F1", "Skate 3 settings alternate", [this] {
     ToggleSimpleSettings();
   });
+  rex::ui::RegisterBind("bind_skate3_screenshot", "F6",
+                        "Save screenshot to screenshots/", [this] {
+                          skate3::screenshot::CaptureWindow(
+                              window() ? window()->GetNativeWindowHandle() : nullptr);
+                        });
+  rex::ui::RegisterBind("bind_skate3_native_render_toggle", "F5",
+                        "Toggle native/emulated renderer", [] {
+                          skate3::native_scene::ToggleSceneEnabled();
+                        });
   rex::ui::RegisterBind("bind_skate3_ultrawide_targets", "F7",
                         "Skate 3 ultrawide targets", [this] {
                           ToggleUltrawideTargets();
@@ -714,6 +727,7 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 }
 
 void Skate3BaseApp::OnPostSetup() {
+  skate3::shader_disasm::RunIfRequested();
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
 
