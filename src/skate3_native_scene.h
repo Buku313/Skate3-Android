@@ -113,6 +113,13 @@ struct FrameScene {
   // main-pass draw of a frame). Consumed by environment.transparent items.
   float fog_ramp[4] = {0.0f, 0.0f, 1.0f, 0.0f};
   float fog_color[4] = {};
+  // Dynamic-shadow (CSM) receiver constants, captured once per frame from a
+  // world-material draw's PIXEL constant bank: raw rows c0..c8
+  // (c0/c3/c4 = light-space X/Y/depth rows, c1/c2 = cascade 1/2 scale+offset,
+  // c5.x = depth bias, c8 = shadow color + floor; c6 = sun dir, c7 = camera,
+  // captured for validation only).
+  bool shadow_valid = false;
+  float shadow_rows[36] = {};
   std::vector<DrawItem> items;
 };
 

@@ -95,6 +95,18 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
                     "60 (large .draws.bin; for targeted investigations)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadows, true, "Skate 3",
+                    "Render the game's dynamic CSM shadows natively (skater, NPCs, "
+                    "movable props onto the world). "
+                    "Cascade matrices are captured per frame from the game's own "
+                    "material constants.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 1024, "Skate 3",
+                     "Shadow cascade tile resolution. The game renders 512, but the "
+                     "emulated baseline renders the pass resolution-scaled; 1024 "
+                     "matches the edge crispness players currently see.")
+    .range(256, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // Hook layer master switch, defined in skate3_native_render.cpp. The runtime
 // toggle refuses to flip the scene on without it: the hooks that feed the
@@ -155,6 +167,14 @@ float g_fog_cam[3] = {};
 float g_fog_rows[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 bool g_fog_have = false;
 bool g_fog_frame_done = false;
+// Dynamic-shadow receiver rows (see FrameScene::shadow_rows): world-material
+// PIXEL banks keep the CSM constants at c0..c8, pass-global (identical on
+// every environment-family draw of the pass; character/hair/tree PSes
+// allocate differently and are rejected by the sanity gate). Captured on the
+// same camera-keyed main-pass draws as the fog rows.
+float g_shadow_rows[36] = {};
+bool g_shadow_have = false;
+bool g_shadow_frame_done = false;
 // Dynamic entities (characters, movable props) live entirely in transient
 // per-frame arenas: the context, its record, mesh pointers, transforms and
 // bone palettes are all recycled before frame end. The complete DrawItem is
@@ -1525,28 +1545,65 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   }
   // Fog rows: grab c5/c6 from the first 3D draw whose bank c4 row matches
   // the last built scene's camera (main-pass layout; tolerant of one frame
-  // of camera motion). See g_fog_rows.
-  if (!g_fog_frame_done && func == 0 && flags2d == 0 && SceneEnabled() &&
+  // of camera motion). See g_fog_rows. The same camera-keyed draws also
+  // carry the frame's CSM shadow constants in the PIXEL bank (c0..c8,
+  // pass-global on environment-family draws), captured here with an
+  // independent done-flag: the first main-pass draw can be a character/tree
+  // whose PS allocates differently (rejected by the sanity gate below).
+  if ((!g_fog_frame_done || !g_shadow_frame_done) && func == 0 && flags2d == 0 &&
+      SceneEnabled() &&
       (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
     const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
     const float dy = LoadGuestF32(base, bank + 17 * 4) - g_fog_cam[1];
     const float dz = LoadGuestF32(base, bank + 18 * 4) - g_fog_cam[2];
     if (dx * dx + dy * dy + dz * dz < 25.0f) {
-      float rows[8];
-      for (int i = 0; i < 8; ++i) {
-        rows[i] = LoadGuestF32(base, bank + (20 + i) * 4);
+      if (!g_fog_frame_done) {
+        float rows[8];
+        for (int i = 0; i < 8; ++i) {
+          rows[i] = LoadGuestF32(base, bank + (20 + i) * 4);
+        }
+        // Sanity-gate before trusting the layout: ramp scale is a tiny
+        // per-meter slope, the exponent is a small power, the fog color is a
+        // dim linear-space rgb and the transmittance scale a small factor.
+        const bool sane = rows[0] >= 0.0f && rows[0] < 0.1f && std::fabs(rows[1]) < 16.0f &&
+                          rows[2] > 0.0f && rows[2] <= 8.0f && rows[4] >= 0.0f &&
+                          rows[4] <= 4.0f && rows[5] >= 0.0f && rows[5] <= 4.0f &&
+                          rows[6] >= 0.0f && rows[6] <= 4.0f && std::fabs(rows[7]) <= 1.0f;
+        if (sane) {
+          std::memcpy(g_fog_rows, rows, sizeof(rows));
+          g_fog_have = true;
+          g_fog_frame_done = true;
+        }
       }
-      // Sanity-gate before trusting the layout: ramp scale is a tiny
-      // per-meter slope, the exponent is a small power, the fog color is a
-      // dim linear-space rgb and the transmittance scale a small factor.
-      const bool sane = rows[0] >= 0.0f && rows[0] < 0.1f && std::fabs(rows[1]) < 16.0f &&
-                        rows[2] > 0.0f && rows[2] <= 8.0f && rows[4] >= 0.0f &&
-                        rows[4] <= 4.0f && rows[5] >= 0.0f && rows[5] <= 4.0f &&
-                        rows[6] >= 0.0f && rows[6] <= 4.0f && std::fabs(rows[7]) <= 1.0f;
-      if (sane) {
-        std::memcpy(g_fog_rows, rows, sizeof(rows));
-        g_fog_have = true;
-        g_fog_frame_done = true;
+      const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+      if (!g_shadow_frame_done && ps_bank != 0 &&
+          REXCVAR_GET(skate3_native_render_scene_shadows)) {
+        float rows[36];
+        for (int i = 0; i < 36; ++i) {
+          rows[i] = LoadGuestF32(base, ps_bank + i * 4);
+        }
+        // Receiver-layout sanity:
+        // c0/c3 are the light-space X/Y rows with equal magnitude (the
+        // cascade-0 extent), c1/c2 the square cascade scale+offsets with
+        // scale2 < scale1 < 1, c4 the depth row (a pure height ramp: x/z
+        // components tiny), c8 a dim shadow color in [0,1]. Environment
+        // family only; other families fail these checks.
+        const float mx2 = rows[0] * rows[0] + rows[1] * rows[1] + rows[2] * rows[2];
+        const float my2 = rows[12] * rows[12] + rows[13] * rows[13] + rows[14] * rows[14];
+        const float s1 = rows[4], s2 = rows[8];
+        const bool sane =
+            mx2 > 0.01f && mx2 < 4.0f && std::fabs(mx2 - my2) < 0.05f * mx2 &&
+            s1 > 0.0f && s1 < 1.0f && std::fabs(rows[5] - s1) < 1e-4f &&
+            s2 > 0.0f && s2 < s1 && std::fabs(rows[9] - s2) < 1e-4f &&
+            std::fabs(rows[16]) < 0.02f && std::fabs(rows[18]) < 0.02f &&
+            std::fabs(rows[17]) > 0.005f && std::fabs(rows[17]) < 1.0f &&
+            rows[32] >= 0.0f && rows[32] <= 1.0f && rows[33] >= 0.0f &&
+            rows[33] <= 1.0f && rows[34] >= 0.0f && rows[34] <= 1.0f;
+        if (sane) {
+          std::memcpy(g_shadow_rows, rows, sizeof(rows));
+          g_shadow_have = true;
+          g_shadow_frame_done = true;
+        }
       }
     }
   }
@@ -2174,8 +2231,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.fog_ramp, g_fog_rows, 4 * sizeof(float));
     std::memcpy(scene.fog_color, g_fog_rows + 4, 4 * sizeof(float));
   }
+  if (g_shadow_have) {
+    std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
+    scene.shadow_valid = true;
+  }
   std::memcpy(g_fog_cam, scene.cam_pos, sizeof(g_fog_cam));
   g_fog_frame_done = false;
+  g_shadow_frame_done = false;
 
   if (g_recording.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(g_record_mutex);
@@ -2522,6 +2584,28 @@ struct RendererState {
   // no z-write): darken = straight alpha, default = additive glow.
   ID3D12PipelineState* pso_spline_darken = nullptr;
   ID3D12PipelineState* pso_spline_default = nullptr;
+  // Dynamic CSM shadows: casters render
+  // into a 3-tile (depth, coverage) atlas with MIN blend (depth clear 1,
+  // "uncoverage" clear 1 -> covered texels write 0), then the game's exact
+  // Gaussian-coverage + depth-dilation blur runs per tile (5-tap cascade 0,
+  // 3-tap cascade 1, format-convert-only cascade 2) into the atlas the
+  // scene pass samples at t5.
+  ID3D12PipelineState* pso_shadow_caster = nullptr;
+  ID3D12PipelineState* pso_shadow_blur = nullptr;
+  ID3D12Resource* shadow_raw = nullptr;    // caster pass target (RTV slot 2)
+  ID3D12Resource* shadow_mid = nullptr;    // hblur output (RTV slot 3)
+  ID3D12Resource* shadow_final = nullptr;  // vblur output, sampled (RTV slot 4)
+  uint32_t shadow_tile = 0;                // per-cascade tile size (atlas = 3*tile x tile)
+  uint32_t shadow_srv_raw = 0;
+  uint32_t shadow_srv_mid = 0;
+  uint32_t shadow_srv_final = 0;
+  // After a shadow pass all three textures sit in PIXEL_SHADER_RESOURCE;
+  // the next pass transitions them back to RENDER_TARGET first.
+  bool shadow_in_srv_state = false;
+  // Per-frame shadow constant buffer ring (root CBV b1).
+  static constexpr uint32_t kShadowCbRegions = 4;
+  ID3D12Resource* shadow_cb = nullptr;
+  uint8_t* shadow_cb_cpu = nullptr;
   static constexpr uint32_t kUiRegionSize = 1u << 20;
   static constexpr uint32_t kUiRegions = 4;
   ID3D12Resource* ui_ring = nullptr;
@@ -2569,10 +2653,22 @@ cbuffer C : register(b0) {
   // near enough for fog to be negligible).
   float4 misc;
 };
+// Per-frame dynamic-shadow (CSM) receiver constants, captured from the
+// game's world-material PIXEL banks.
+cbuffer S : register(b1) {
+  float4 sh_x;      // light-space X row (xyz) + translation (w)   [PS c0]
+  float4 sh_y;      // light-space Y row                           [PS c3]
+  float4 sh_z;      // depth row (height ramp)                     [PS c4]
+  float4 sh_c1;     // cascade 1 scale.xy + offset.zw              [PS c1]
+  float4 sh_c2;     // cascade 2 scale.xy + offset.zw              [PS c2]
+  float4 sh_color;  // shadow color rgb [PS c8] + its luma in w
+  float4 sh_misc;   // x = depth bias [PS c5.x], y = enable, z = lit level L
+};
 Texture2D<float4> diffuse : register(t0);
 Texture2D<float4> lightmap : register(t1);
 Texture2D<float4> macro : register(t3);
 Texture2D<float4> decal_art : register(t4);
+Texture2D<float2> shadow_atlas : register(t5);
 // Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
 // applied with explicit dots (StructuredBuffer<float4x4> default packing is
 // column-major and would silently transpose the matrices).
@@ -2677,6 +2773,38 @@ float4 ps_main(VSOut i) : SV_Target {
     float l = abs(dot(n, normalize(float3(0.4, 0.8, 0.3)))) * 0.35 + 0.75;
     lit = albedo.rgb * l;
   }
+  // Dynamic CSM shadow receive (world geometry + rigid props; characters
+  // need the game's separate PCF/bias variant; skipping them avoids
+  // self-shadow acne, and the ground shadow is 95% of the visible effect).
+  // Exact receiver math from the baseenvironment PS disassembly: finest
+  // cascade whose |ls| < 0.99 wins; shadow = saturate(infront + 1 -
+  // coverage). The game min-clamps the LINEAR lighting to (s + shadowColor)
+  // - our empirical shading is gamma, so the equivalent saturating curve
+  // f = saturate((s + luma) / L), col *= sqrt(f) is used (a plain lerp
+  // shows the whole Gaussian penumbra and looks conspicuously blurrier
+  // than the emulated edge; L ~ lit ground lighting level, ~0.45 linear).
+  if (sh_misc.y > 0.0 && tint.g == 0.0 && tint.b == 0.0 && misc.x == 0.0) {
+    float3 wp = i.rpos + cam_pos.xyz;
+    float2 lsv = float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
+    float rd = dot(sh_z.xyz, wp) + sh_z.w - sh_misc.x;
+    float2 luv = 0.0;
+    float casc = 0.0;
+    float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
+    if (max(abs(l2.x), abs(l2.y)) < 0.99) { luv = l2; casc = 3.0; }
+    float2 l1 = lsv * sh_c1.xy + sh_c1.zw;
+    if (max(abs(l1.x), abs(l1.y)) < 0.99) { luv = l1; casc = 2.0; }
+    if (max(abs(lsv.x), abs(lsv.y)) < 0.99) { luv = lsv; casc = 1.0; }
+    if (casc > 0.0) {
+      float2 uv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0, luv.y * -0.5 + 0.5);
+      float2 m = shadow_atlas.Sample(smp_clamp, uv);
+      float s = saturate((m.x >= rd ? 1.0 : 0.0) + (1.0 - m.y));
+      // Per-channel: the game clamps the linear lighting to s + c8.rgb, so
+      // full shadow takes on c8's cool blue cast ((0.05,0.09,0.13) in every
+      // capture so far); a scalar multiply left the shadow warm-brown.
+      float3 f = saturate((s + sh_color.rgb) / sh_misc.z);
+      lit *= sqrt(f);
+    }
+  }
   if (mat_tint.w > 0.0 && misc.x == 0.0) {
     lit *= mat_tint.rgb;
   }
@@ -2698,6 +2826,64 @@ float4 ps_main(VSOut i) : SV_Target {
     return float4(lit, albedo.a * albedo.a);
   }
   return float4(lit, 1.0);
+}
+// Shadow caster pass: vs_main runs with mvp = (world *) lightVP built from
+// the captured receiver rows, so SV_Position.z IS the light-space depth
+// (the height-ramp row; viewport z range 0..1, DepthClip off so casters
+// outside the 12 m depth window clamp like the game accepts). MIN blend on
+// both channels against a (1, 1) clear: R accumulates the min depth, G
+// drops to 0 where any caster drew ("uncoverage"; the blur pass converts
+// to the game's coverage convention).
+float2 ps_shadow_caster(VSOut i) : SV_Target {
+  return float2(i.pos.z, 0.0);
+}
+)";
+
+// Shadow blur: the game's shadow_h/vblur passes, exact semantics from the
+// disassembled Xenos ucode. One fullscreen-triangle draw
+// per tile per direction; taps stay inside the tile (clamped). Coverage is
+// Gaussian-blurred; depth keeps the exact center value where covered and
+// dilates (binary-coverage-weighted neighbour average) into the penumbra
+// otherwise, so depth compares stay valid across the blurred edge.
+// b0 floats: c0 = (dir.x, dir.y, ntaps, src_is_raw), c1 = (w0, w1, w2, 0),
+// c2 = (tile_x0, tile_x1, tile_y1, 0). ntaps 0 = format-convert only
+// (cascade 2 is never blurred).
+const char kShadowBlurSource[] = R"(
+cbuffer C : register(b0) {
+  float4 c0;
+  float4 c1;
+  float4 c2;
+};
+Texture2D<float2> src : register(t0);
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
+  float2 uv = float2((id << 1) & 2, id & 2);
+  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float2 ps_main(float4 pos : SV_Position) : SV_Target {
+  int2 p = int2(pos.xy);
+  int ntaps = int(c0.z);
+  float w[3] = {c1.x, c1.y, c1.z};
+  float2 center = src.Load(int3(p, 0));
+  float ccen = c0.w > 0.0 ? 1.0 - center.y : center.y;
+  float cov = 0.0;
+  float dsum = 0.0;
+  float dcnt = 0.0;
+  [unroll] for (int k = -2; k <= 2; ++k) {
+    if (abs(k) > ntaps) continue;
+    int2 q = p + int2(c0.xy) * k;
+    q.x = clamp(q.x, int(c2.x), int(c2.y));
+    q.y = clamp(q.y, 0, int(c2.z));
+    float2 t = src.Load(int3(q, 0));
+    float c = c0.w > 0.0 ? 1.0 - t.y : t.y;
+    cov += w[abs(k)] * c;
+    if (k != 0) {
+      float hard = c > 0.001 ? 1.0 : 0.0;
+      dcnt += hard;
+      dsum += hard * t.x;
+    }
+  }
+  float depth = ccen > 0.001 ? center.x : (dcnt > 0.0 ? dsum / dcnt : center.x);
+  return float2(depth, saturate(cov));
 }
 )";
 
@@ -3352,15 +3538,15 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   g_r.device = device;
 
   if (!g_r.root_signature) {
-    D3D12_ROOT_PARAMETER params[6] = {};
+    D3D12_ROOT_PARAMETER params[8] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    // NOTE the 64-DWORD root-signature budget: 52 constants + 4 descriptor
-    // tables (1 each) + 1 root SRV (2) = 58. Going to 60+ constants blew the
-    // limit and CreateRootSignature failed (renderer fell back to emulated).
+    // NOTE the 64-DWORD root-signature budget: 52 constants + 5 descriptor
+    // tables (1 each) + 1 root SRV (2) + 1 root CBV (2) = 61. Going past 64
+    // makes CreateRootSignature fail (renderer falls back to emulated).
     params[0].Constants.Num32BitValues = 52;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE srv_range[4] = {};
+    D3D12_DESCRIPTOR_RANGE srv_range[5] = {};
     srv_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srv_range[0].NumDescriptors = 1;
     srv_range[0].BaseShaderRegister = 0;
@@ -3370,6 +3556,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     srv_range[2].BaseShaderRegister = 3;  // macro overlay (t3)
     srv_range[3] = srv_range[0];
     srv_range[3].BaseShaderRegister = 4;  // environment.decal art (t4)
+    srv_range[4] = srv_range[0];
+    srv_range[4].BaseShaderRegister = 5;  // shadow atlas (t5)
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
     params[1].DescriptorTable.pDescriptorRanges = &srv_range[0];
@@ -3383,6 +3571,13 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     params[4].DescriptorTable.pDescriptorRanges = &srv_range[2];
     params[5] = params[1];
     params[5].DescriptorTable.pDescriptorRanges = &srv_range[3];
+    // Dynamic-shadow additions: per-frame receiver constants (b1) + the
+    // blurred shadow atlas (t5).
+    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[6].Descriptor.ShaderRegister = 1;
+    params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[7] = params[1];
+    params[7].DescriptorTable.pDescriptorRanges = &srv_range[4];
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
     samplers[0].Filter = D3D12_FILTER_ANISOTROPIC;
     samplers[0].MaxAnisotropy = 8;
@@ -3405,7 +3600,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 6;
+    desc.NumParameters = 8;
     desc.pParameters = params;
     desc.NumStaticSamplers = 2;
     desc.pStaticSamplers = samplers;
@@ -3687,6 +3882,85 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
         return false;
       }
     }
+    {
+      // Dynamic-shadow pipelines: casters (scene VS with a light-space
+      // "view-proj", MIN-blend depth/uncoverage accumulation, no depth
+      // buffer, depth clip OFF so casters outside the 12 m height window
+      // clamp like the game accepts) + the per-tile blur/convert pass.
+      ID3DBlob* cvs = nullptr;
+      ID3DBlob* cps = nullptr;
+      ID3DBlob* bvs = nullptr;
+      ID3DBlob* bps = nullptr;
+      ID3DBlob* werrors = nullptr;
+      if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
+                            nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &cvs, &werrors)) ||
+          FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
+                            nullptr, nullptr, "ps_shadow_caster", "ps_5_0", 0, 0, &cps,
+                            &werrors)) ||
+          FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
+                            "native_shadow_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0,
+                            0, &bvs, &werrors)) ||
+          FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
+                            "native_shadow_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0,
+                            0, &bps, &werrors))) {
+        REXLOG_ERROR("native-scene: shadow shader compile failed: {}",
+                     werrors ? static_cast<const char*>(werrors->GetBufferPointer())
+                             : "?");
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC cp{};
+      cp.pRootSignature = g_r.root_signature;
+      cp.VS = {cvs->GetBufferPointer(), cvs->GetBufferSize()};
+      cp.PS = {cps->GetBufferPointer(), cps->GetBufferSize()};
+      auto& crt = cp.BlendState.RenderTarget[0];
+      crt.BlendEnable = TRUE;
+      crt.SrcBlend = D3D12_BLEND_ONE;
+      crt.DestBlend = D3D12_BLEND_ONE;
+      crt.BlendOp = D3D12_BLEND_OP_MIN;
+      crt.SrcBlendAlpha = D3D12_BLEND_ONE;
+      crt.DestBlendAlpha = D3D12_BLEND_ONE;
+      crt.BlendOpAlpha = D3D12_BLEND_OP_MIN;
+      crt.RenderTargetWriteMask =
+          D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+      cp.SampleMask = UINT_MAX;
+      cp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      cp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      cp.RasterizerState.DepthClipEnable = FALSE;
+      cp.InputLayout = {input, 7};
+      cp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      cp.NumRenderTargets = 1;
+      cp.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+      cp.SampleDesc.Count = 1;
+      const HRESULT hr7 =
+          device->CreateGraphicsPipelineState(&cp, IID_PPV_ARGS(&g_r.pso_shadow_caster));
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
+      bp.pRootSignature = g_r.root_signature;
+      bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
+      bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
+      bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      bp.SampleMask = UINT_MAX;
+      bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      bp.RasterizerState.DepthClipEnable = TRUE;
+      bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      bp.NumRenderTargets = 1;
+      bp.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+      bp.SampleDesc.Count = 1;
+      const HRESULT hr8 =
+          device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_shadow_blur));
+      cvs->Release();
+      cps->Release();
+      bvs->Release();
+      bps->Release();
+      if (werrors) werrors->Release();
+      if (FAILED(hr7) || FAILED(hr8)) {
+        REXLOG_ERROR("native-scene: shadow PSO creation failed {:08X}/{:08X}",
+                     uint32_t(hr7), uint32_t(hr8));
+        g_r.failed = true;
+        return false;
+      }
+    }
     REXLOG_INFO("native-scene: pipelines created (MSAA x{})", g_r.msaa);
     g_r.rtv_format = context.d3d12.guest_output_format;
   }
@@ -3734,6 +4008,67 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     if (!g_r.ui_ring ||
         FAILED(g_r.ui_ring->Map(0, nullptr,
                                 reinterpret_cast<void**>(&g_r.ui_ring_cpu)))) {
+      g_r.failed = true;
+      return false;
+    }
+  }
+
+  if (!g_r.shadow_raw && REXCVAR_GET(skate3_native_render_scene_shadows)) {
+    // Dynamic-shadow atlas chain: raw casters -> hblur intermediate ->
+    // blurred final (the texture the scene pass samples). Three fixed-size
+    // R16G16_FLOAT targets, 3 tiles of tile x tile each; RTV heap slots
+    // 2/3/4.
+    g_r.shadow_tile = uint32_t(REXCVAR_GET(skate3_native_render_scene_shadow_tile));
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = g_r.shadow_tile * 3;
+    desc.Height = g_r.shadow_tile;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = desc.Format;
+    clear.Color[0] = 1.0f;  // depth: far
+    clear.Color[1] = 1.0f;  // "uncoverage": empty
+    ID3D12Resource** targets[3] = {&g_r.shadow_raw, &g_r.shadow_mid, &g_r.shadow_final};
+    uint32_t* srv_slots[3] = {&g_r.shadow_srv_raw, &g_r.shadow_srv_mid,
+                              &g_r.shadow_srv_final};
+    for (int t = 0; t < 3; ++t) {
+      if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+                                                 IID_PPV_ARGS(targets[t])))) {
+        REXLOG_ERROR("native-scene: shadow atlas creation failed");
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      rtv.ptr += size_t(2 + t) * g_r.rtv_size;
+      device->CreateRenderTargetView(*targets[t], nullptr, rtv);
+      *srv_slots[t] = g_r.srv_next++;
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = desc.Format;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Texture2D.MipLevels = 1;
+      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+      slot.ptr += size_t(*srv_slots[t]) * g_r.srv_size;
+      device->CreateShaderResourceView(*targets[t], &srv, slot);
+    }
+    g_r.shadow_in_srv_state = false;
+    REXLOG_INFO("native-scene: shadow atlas created ({}x{} tiles)", g_r.shadow_tile,
+                g_r.shadow_tile);
+  }
+  if (!g_r.shadow_cb) {
+    // Always created (even with shadows off): the scene PS declares b1 and
+    // a root CBV must be bound; a zeroed block disables the shadow branch.
+    g_r.shadow_cb = CreateUploadBuffer(device, 256u * RendererState::kShadowCbRegions);
+    if (!g_r.shadow_cb ||
+        FAILED(g_r.shadow_cb->Map(0, nullptr,
+                                  reinterpret_cast<void**>(&g_r.shadow_cb_cpu)))) {
       g_r.failed = true;
       return false;
     }
@@ -3939,6 +4274,194 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     });
   }
 
+  // Reset this frame's bone ring region (shared by the shadow casters and
+  // the main pass: the shadow pass allocates first, the main pass appends).
+  const uint64_t frame_number = g_frames_rendered.load(std::memory_order_relaxed);
+  const uint32_t bone_region =
+      uint32_t(frame_number % RendererState::kBoneRegions) *
+      RendererState::kBoneRegionSize;
+  g_r.bone_ring_offset = 0;
+
+  // ---- Dynamic-shadow atlas pass ----
+  // Renders the frame's dynamic casters (skinned characters + rigid
+  // non-identity-world props: exactly the game's caster list) into the
+  // three cascade tiles with the captured light rows, then applies the
+  // game's coverage blur + depth dilation. Runs before the main pass so the
+  // scene shader can sample the finished atlas.
+  bool shadow_ready = false;
+  uint32_t shadow_draws = 0;
+  const float* sh = scene.shadow_rows;
+  const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
+  if (REXCVAR_GET(skate3_native_render_scene_shadows) && scene.shadow_valid &&
+      g_r.shadow_raw != nullptr && g_r.pso_shadow_caster != nullptr &&
+      g_r.pso_shadow_blur != nullptr && debug_mode == 0) {
+    struct Caster {
+      const DrawItem* item;
+      uint32_t bone_offset;
+      bool bones;
+    };
+    std::vector<Caster> casters;
+    static const float kIdent[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    for (const DrawItem& item : scene.items) {
+      if (item.transparent || item.unlit || item.cloth_quads) {
+        continue;
+      }
+      const bool skinned = item.skinned && !item.bones.empty();
+      if (!skinned && std::memcmp(item.world, kIdent, sizeof(kIdent)) == 0) {
+        continue;  // static world geometry never casts (baked into lightmaps)
+      }
+      Caster c{&item, 0, false};
+      if (skinned) {
+        const uint32_t bytes = uint32_t(item.bones.size() * sizeof(float));
+        const uint32_t offset = (g_r.bone_ring_offset + 255u) & ~255u;
+        if (offset + bytes > RendererState::kBoneRegionSize) {
+          continue;
+        }
+        std::memcpy(g_r.bone_ring_cpu + bone_region + offset, item.bones.data(), bytes);
+        g_r.bone_ring_offset = offset + bytes;
+        c.bone_offset = offset;
+        c.bones = true;
+      }
+      casters.push_back(c);
+    }
+    if (!casters.empty()) {
+      if (g_r.shadow_in_srv_state) {
+        for (ID3D12Resource* res : {g_r.shadow_raw, g_r.shadow_mid, g_r.shadow_final}) {
+          context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                                res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+        g_r.shadow_in_srv_state = false;
+      }
+      const uint32_t tile = g_r.shadow_tile;
+      D3D12_CPU_DESCRIPTOR_HANDLE raw_rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      raw_rtv.ptr += size_t(2) * g_r.rtv_size;
+      const FLOAT shadow_clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+      list.D3DClearRenderTargetView(raw_rtv, shadow_clear, 0, nullptr);
+      list.D3DOMSetRenderTargets(1, &raw_rtv, FALSE, nullptr);
+      list.D3DSetGraphicsRootSignature(g_r.root_signature);
+      list.D3DSetPipelineState(g_r.pso_shadow_caster);
+      list.SetDescriptorHeaps(g_r.srv_heap, nullptr);
+      for (int ci = 0; ci < 3; ++ci) {
+        // Cascade scale/offset (cascade 0 = identity; PS c1/c2 for 1/2).
+        float sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
+        if (ci == 1) {
+          sx = sh[4]; sy = sh[5]; ox = sh[6]; oy = sh[7];
+        } else if (ci == 2) {
+          sx = sh[8]; sy = sh[9]; ox = sh[10]; oy = sh[11];
+        }
+        // Light view-proj, row-vector convention: clip.x = ls_i.x,
+        // clip.y = ls_i.y, clip.z = the height-ramp depth, clip.w = 1,
+        // columns built from the receiver rows c0/c3/c4.
+        float lightvp[16];
+        for (int r = 0; r < 3; ++r) {
+          lightvp[r * 4 + 0] = sh[0 + r] * sx;
+          lightvp[r * 4 + 1] = sh[12 + r] * sy;
+          lightvp[r * 4 + 2] = sh[16 + r];
+          lightvp[r * 4 + 3] = 0.0f;
+        }
+        lightvp[12] = sh[3] * sx + ox;
+        lightvp[13] = sh[15] * sy + oy;
+        lightvp[14] = sh[19];
+        lightvp[15] = 1.0f;
+        D3D12_VIEWPORT vp{float(tile) * ci, 0.0f, float(tile), float(tile), 0.0f, 1.0f};
+        list.RSSetViewport(vp);
+        D3D12_RECT rc{LONG(tile) * ci, 0, LONG(tile) * (ci + 1), LONG(tile)};
+        list.RSSetScissorRect(rc);
+        for (const Caster& c : casters) {
+          auto mit = g_r.meshes.find(c.item->mesh);
+          if (mit == g_r.meshes.end() || mit->second.fingerprint != c.item->fingerprint) {
+            continue;  // decoded by the main pass below; casts from next frame
+          }
+          float constants[52] = {};
+          std::memcpy(constants, c.item->world, sizeof(c.item->world));
+          float* mvp = constants + 16;
+          for (int r = 0; r < 4; ++r) {
+            for (int col = 0; col < 4; ++col) {
+              float sum = 0.0f;
+              for (int k = 0; k < 4; ++k) {
+                sum += c.item->world[r * 4 + k] * lightvp[k * 4 + col];
+              }
+              mvp[r * 4 + col] = sum;
+            }
+          }
+          constants[33] = c.bones ? 1.0f : 0.0f;  // tint.g = skinned branch
+          list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
+          list.D3DSetGraphicsRootShaderResourceView(
+              3, g_r.bone_ring->GetGPUVirtualAddress() + bone_region +
+                     (c.bones ? c.bone_offset : 0));
+          list.D3DIASetVertexBuffers(0, 1, &mit->second.vb_view);
+          list.D3DIASetIndexBuffer(&mit->second.ib_view);
+          for (const DrawEntry& draw : c.item->draws) {
+            if (draw.prim == 4) {
+              list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            } else if (draw.prim == 6) {
+              list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            } else {
+              continue;
+            }
+            list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index,
+                                         draw.base_vertex, 0);
+            ++shadow_draws;
+          }
+        }
+      }
+      // Blur/convert chain: raw -> (hblur) -> mid -> (vblur) -> final. The
+      // game's kernels: 5-tap Gaussian coverage cascade 0, 3-tap cascade 1,
+      // format-convert only for cascade 2 (weights (1,0,0), 0 taps), plus
+      // depth dilation into the penumbra. One fullscreen-triangle draw per
+      // tile per direction, taps clamped inside the tile.
+      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                            g_r.shadow_raw, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      list.D3DSetPipelineState(g_r.pso_shadow_blur);
+      list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      const float kernels[3][3] = {{0.292082f, 0.233881f, 0.120078f},
+                                   {0.667243f, 0.166379f, 0.0f},
+                                   {1.0f, 0.0f, 0.0f}};
+      const float ntaps[3] = {2.0f, 1.0f, 0.0f};
+      const auto blur_pass = [&](int ci, bool horizontal, uint32_t src_slot,
+                                 uint32_t dst_rtv_slot, bool src_raw) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += size_t(dst_rtv_slot) * g_r.rtv_size;
+        list.D3DOMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_VIEWPORT vp{float(tile) * ci, 0.0f, float(tile), float(tile), 0.0f, 1.0f};
+        list.RSSetViewport(vp);
+        D3D12_RECT rc{LONG(tile) * ci, 0, LONG(tile) * (ci + 1), LONG(tile)};
+        list.RSSetScissorRect(rc);
+        const float bc[12] = {horizontal ? 1.0f : 0.0f, horizontal ? 0.0f : 1.0f,
+                              ntaps[ci], src_raw ? 1.0f : 0.0f,
+                              kernels[ci][0], kernels[ci][1], kernels[ci][2], 0.0f,
+                              float(tile) * ci, float(tile) * (ci + 1) - 1.0f,
+                              float(tile) - 1.0f, 0.0f};
+        list.D3DSetGraphicsRoot32BitConstants(0, 12, bc, 0);
+        D3D12_GPU_DESCRIPTOR_HANDLE src = g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+        src.ptr += size_t(src_slot) * g_r.srv_size;
+        context.d3d12.set_graphics_root_descriptor_table(
+            context.d3d12.command_processor_user_data, 1, src);
+        list.D3DDrawInstanced(3, 1, 0, 0);
+      };
+      for (int ci = 0; ci < 3; ++ci) {
+        blur_pass(ci, true, g_r.shadow_srv_raw, 3, true);
+      }
+      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                            g_r.shadow_mid, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      for (int ci = 0; ci < 3; ++ci) {
+        blur_pass(ci, false, g_r.shadow_srv_mid, 4, false);
+      }
+      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                            g_r.shadow_final, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      g_r.shadow_in_srv_state = true;
+      shadow_ready = shadow_draws > 0;
+    }
+  }
+
   // The scene draws into the MSAA target when enabled (resolved into the
   // guest output at the end of the pass), or straight into the guest output.
   const bool msaa_on = g_r.msaa > 1 && g_r.msaa_color != nullptr && g_r.resolve_pso != nullptr;
@@ -3955,7 +4478,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
   }
 
-  const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
   const bool use_depth = debug_mode != 4;
   const D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_r.dsv_heap->GetCPUDescriptorHandleForHeapStart();
   const FLOAT clear_color[4] = {0.25f, 0.35f, 0.55f, 1.0f};
@@ -3984,12 +4506,38 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // heap binding is safe.
   list.SetDescriptorHeaps(g_r.srv_heap, nullptr);
 
-  // Reset this frame's bone ring region.
-  const uint64_t frame_number = g_frames_rendered.load(std::memory_order_relaxed);
-  const uint32_t bone_region =
-      uint32_t(frame_number % RendererState::kBoneRegions) *
-      RendererState::kBoneRegionSize;
-  g_r.bone_ring_offset = 0;
+  // Per-frame dynamic-shadow bindings: receiver constants at b1 (a small
+  // per-frame CBV ring: the 52-float root-constant block is full) and the
+  // blurred atlas at t5 (white when no atlas was rendered this frame; the
+  // shader is also gated by sh_misc.y).
+  if (g_r.shadow_cb != nullptr) {
+    const uint32_t cb_offset =
+        uint32_t(frame_number % RendererState::kShadowCbRegions) * 256u;
+    float* cb = reinterpret_cast<float*>(g_r.shadow_cb_cpu + cb_offset);
+    std::memset(cb, 0, 256);
+    if (shadow_ready) {
+      std::memcpy(cb + 0, sh + 0, 4 * sizeof(float));    // sh_x   = PS c0
+      std::memcpy(cb + 4, sh + 12, 4 * sizeof(float));   // sh_y   = PS c3
+      std::memcpy(cb + 8, sh + 16, 4 * sizeof(float));   // sh_z   = PS c4
+      std::memcpy(cb + 12, sh + 4, 4 * sizeof(float));   // sh_c1  = PS c1
+      std::memcpy(cb + 16, sh + 8, 4 * sizeof(float));   // sh_c2  = PS c2
+      cb[20] = sh[32];                                   // sh_color = PS c8
+      cb[21] = sh[33];
+      cb[22] = sh[34];
+      cb[23] = 0.299f * sh[32] + 0.587f * sh[33] + 0.114f * sh[34];
+      cb[24] = sh[20];  // depth bias (PS c5.x)
+      cb[25] = 1.0f;    // enable
+      cb[26] = 0.45f;   // lit ground lighting level L for the saturating curve
+    }
+    list.D3DSetGraphicsRootConstantBufferView(
+        6, g_r.shadow_cb->GetGPUVirtualAddress() + cb_offset);
+    D3D12_GPU_DESCRIPTOR_HANDLE atlas = g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+    atlas.ptr += size_t(shadow_ready ? g_r.shadow_srv_final : g_r.white.srv_slot) *
+                 g_r.srv_size;
+    context.d3d12.set_graphics_root_descriptor_table(
+        context.d3d12.command_processor_user_data, 7, atlas);
+  }
+
   uint32_t drawn = 0;
   uint32_t item_index = 0;
   // Per-frame decode budgets: panning/streaming can surface dozens of new
@@ -4462,7 +5010,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={}] skinned={} skinned_skipped={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
-        "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}]",
+        "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
+        "shadow[valid={} ready={} draws={}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
@@ -4474,7 +5023,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
         g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
         g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
-        g_rr_tex_deferred.load());
+        g_rr_tex_deferred.load(), scene.shadow_valid, shadow_ready, shadow_draws);
   }
   return true;
 }
