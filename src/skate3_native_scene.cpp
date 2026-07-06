@@ -43,10 +43,13 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene, false, "Skate 3",
                     "replacing the emulated GPU output (requires skate3_native_render). "
                     "Hot-toggles live between the native and emulated renderers (F5).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmaps, false, "Skate 3",
-                    "Sample guest lightmap textures in the native scene renderer. Off by "
-                    "default: Skate 3 lightpages are composed at runtime on the GPU, so "
-                    "their CPU-side payloads decode black.")
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmaps, true, "Skate 3",
+                    "Sample guest lightmap textures in the native scene renderer. The "
+                    "old 'lightpages decode black' finding is stale: in gameplay the "
+                    "composed atlas payloads are CPU-readable (offline-validated: "
+                    "lightmap x2 at the |uv2| unwrap reproduces the emulated baked "
+                    "sun/shadow/AO structure), and the texture payload revalidation "
+                    "re-decodes pages that were captured before composition.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_debug, 0, "Skate 3",
                      "Native scene debug: 0=normal, 1=clear only, 2=solid color per item, "
@@ -74,18 +77,18 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_quadlists, false, "Skate 3",
                     "sprites), which renders as floating white squares without the game's "
                     "sprite textures and blending.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_mesh_decode_budget, 8, "Skate 3",
-                     "Max new mesh decodes per rendered frame (0 = unlimited). Each decode "
-                     "converts vertices and creates GPU upload resources on the render "
-                     "thread; panning streams dozens of new meshes into view at once and "
-                     "unbounded decoding hitches the frame. Deferred meshes pop in a few "
-                     "frames later.")
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_mesh_decode_budget, 0, "Skate 3",
+                     "Max new mesh decodes per rendered frame (0 = unlimited, the "
+                     "default: budgeting made the world stream in visibly slowly for no "
+                     "measured perf win). Each decode converts vertices and creates GPU "
+                     "upload resources on the render thread.")
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_texture_decode_budget, 4, "Skate 3",
-                     "Max new texture decodes per rendered frame (0 = unlimited). CPU "
-                     "untile + mip upload is expensive; deferred textures render white "
-                     "for the few frames until their turn.")
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_texture_decode_budget, 0, "Skate 3",
+                     "Max new texture decodes per rendered frame (0 = unlimited, the "
+                     "default: budgeting made the world stream in visibly slowly for no "
+                     "measured perf win; deferred textures render white until their "
+                     "turn).")
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
@@ -142,6 +145,16 @@ std::atomic<uint32_t> g_vs_bank{0};
 // Pixel constant shadow bank (bank id 0x4400, device+6016): material colors
 // (e.g. the CAS hair tint) are staged here per draw.
 std::atomic<uint32_t> g_ps_bank{0};
+// Global per-frame fog rows (see FrameScene::fog_ramp): main-pass VS banks
+// keep the camera at c4 and the frame's fog params at c5 (ramp) / c6 (color)
+// - identical across every main-pass draw of a frame (verified from a
+// recorded draw stream). OnDrawDone grabs them from the first 3D draw whose
+// c4 matches the last built scene's camera; BuildFrameScene publishes them
+// and re-arms the capture. All on the guest render thread.
+float g_fog_cam[3] = {};
+float g_fog_rows[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+bool g_fog_have = false;
+bool g_fog_frame_done = false;
 // Dynamic entities (characters, movable props) live entirely in transient
 // per-frame arenas: the context, its record, mesh pointers, transforms and
 // bone palettes are all recycled before frame end. The complete DrawItem is
@@ -307,6 +320,13 @@ std::atomic<uint64_t> g_palette_snapshots{0};
 // Palettes captured at base+1 (the cloth/morph VS layout with an extra
 // parameter row before the palette, see RefinePaletteBase).
 std::atomic<uint64_t> g_palette_base_plus1{0};
+// character.cloth_ropa items captured in the sim-active RIGID mode (world
+// from c188/c191 instead of a bone palette, see CaptureSkinnedState).
+std::atomic<uint64_t> g_ropa_rigid{0};
+// ropa rigid captures REFUSED because the bank's c188/c191 was implausible
+// or projected the garment off-clip (stale bank from another mesh's draw);
+// the item stays pending for the post-draw fixup.
+std::atomic<uint64_t> g_ropa_stale{0};
 std::atomic<uint64_t> g_skinned_items{0};
 std::atomic<uint64_t> g_skinned_skipped{0};
 // Rigid items whose transform had to wait for the post-draw fixup (deferred
@@ -353,8 +373,15 @@ std::atomic<uint64_t> g_draw_seq{0};
 // Where does this bank keep its bone palette? Pre-pass layout: c4 (bone 0's
 // affine rows right after viewproj). Main-pass layout: camera position at
 // c4, two parameter rows, palette at c7. A camera-position row is easily
-// told from a bone rotation row by its norm (hundreds vs ~1). Returns the
-// base register, or 0 when neither location holds plausible bone rows.
+// told from a bone rotation row by its norm (hundreds vs ~1). The ropa-cloth
+// skinned VS variant (character.cloth_ropa, player tees) keeps one extra
+// parameter row (0,0,0,1) in front of the palette; its zero xyz norm fails
+// the bone check outright (unlike the NPC cloth/morph variant's (1,0,0,0),
+// which passes at c4 and is corrected by RefinePaletteBase), so the palette
+// really starts at c5 (pre-pass) / c8 (main-pass); reading c7 there lands
+// mid-palette and scrambles every bone by two rows (the mangled player-shirt
+// bug). Returns the base register, or 0 when no location holds plausible
+// bone rows.
 uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
   const auto bone_at = [&](uint32_t reg) -> bool {
     for (int r = 0; r < 3; ++r) {
@@ -369,8 +396,19 @@ uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
     }
     return true;
   };
+  // A parameter/sentinel row like (0,0,0,1): xyz norm ~0, never a bone row.
+  const auto param_row_at = [&](uint32_t reg) -> bool {
+    float f[3];
+    for (int i = 0; i < 3; ++i) {
+      f[i] = LoadGuestF32(base, bank + (reg * 4 + i) * 4);
+      if (!(f[i] > -1e7f && f[i] < 1e7f)) return false;
+    }
+    return f[0] * f[0] + f[1] * f[1] + f[2] * f[2] <= 0.0025f;
+  };
   if (bone_at(4)) return 4;
+  if (param_row_at(4) && bone_at(5)) return 5;
   if (bone_at(7)) return 7;
+  if (param_row_at(7) && bone_at(8)) return 8;
   return 0;
 }
 
@@ -708,7 +746,14 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   // registered texture objects.
   item.diffuse_tex = 0;
   item.lightmap_tex = 0;
+  item.macro_tex = 0;
+  item.macro_scale = 1.0f;
+  item.macro_opacity = 1.0f;
+  item.decal_art = 0;
   item.hair = false;
+  item.ropa = false;
+  item.decal = false;
+  item.transparent = false;
   item.unlit = false;
   item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
   const uint32_t material = REX_LOAD_U32(mesh + kMeshMaterial);
@@ -720,8 +765,8 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
         const uint32_t chan = channels + i * 0x20;
         const uint32_t name = REX_LOAD_U32(chan);
         if (!GuestReadableApprox(base, name)) continue;
-        char text[10] = {};
-        for (int k = 0; k < 9; ++k) {
+        char text[20] = {};
+        for (int k = 0; k < 19; ++k) {
           text[k] = char(REX_LOAD_U8(name + k));
           if (text[k] == '\0') break;
         }
@@ -730,20 +775,41 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           slot = &item.diffuse_tex;
         } else if (std::memcmp(text, "lightmap", 9) == 0) {
           slot = &item.lightmap_tex;
+        } else if (std::memcmp(text, "macrooverlay", 13) == 0) {
+          slot = &item.macro_tex;
+        } else if (std::memcmp(text, "decal", 6) == 0) {
+          slot = &item.decal_art;
+        } else if (std::memcmp(text, "macroOverlayUVScale", 20) == 0 ||
+                   std::memcmp(text, "macroOverlayOpacity", 20) == 0) {
+          // Shader-constant channel: the float lives in the first guid word.
+          const float f = std::bit_cast<float>(REX_LOAD_U32(chan + 0x10));
+          if (f > 0.0f && f < 1e6f) {
+            (text[12] == 'U' ? item.macro_scale : item.macro_opacity) = f;
+          }
+          continue;
         } else if (std::memcmp(text, "Attribul", 8) == 0) {
           // AttribulatorMaterialName: chan+0x18 is the material name string.
           // "character.hair" marks the grayscale hair that needs the
           // per-character tint from the pixel constant bank; "sky.*" draws
-          // fullbright.
+          // fullbright; "character.cloth_ropa" is the Ropa cloth-sim VS
+          // variant (flag-row-switched skinned/rigid, see CaptureSkinnedState).
           const uint32_t s = REX_LOAD_U32(chan + 0x18);
           if (GuestReadableApprox(base, s)) {
-            char mat_name[16] = {};
-            for (int k = 0; k < 15; ++k) {
+            char mat_name[24] = {};
+            for (int k = 0; k < 23; ++k) {
               mat_name[k] = char(REX_LOAD_U8(s + k));
               if (mat_name[k] == '\0') break;
             }
             item.hair = std::memcmp(mat_name, "character.hair", 15) == 0;
             item.unlit = std::memcmp(mat_name, "sky.", 4) == 0;
+            item.ropa = std::memcmp(mat_name, "character.cloth_ropa", 21) == 0;
+            // environment.decal / environment.decal_tileable: graffiti and
+            // painted-branding overlay meshes (see DrawItem::decal).
+            item.decal = std::memcmp(mat_name, "environment.decal", 17) == 0;
+            // environment.transparent: alpha-blended world geometry (mist
+            // sheets, glass, fences); see DrawItem::transparent.
+            item.transparent =
+                std::memcmp(mat_name, "environment.transparent", 23) == 0;
           }
           continue;
         }
@@ -771,9 +837,10 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             }
           }
         }
-        if (item.diffuse_tex != 0 && item.lightmap_tex != 0) {
-          break;
-        }
+        // No early-out: channel order varies per material and the float
+        // channels ride AFTER their texture (macroOverlayUVScale follows
+        // macrooverlay on the plaza asphalt, breaking once the textures
+        // resolved left the macro tiling at 1.0 instead of 0.3).
       }
     }
   }
@@ -1004,9 +1071,169 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
 // The base from BankPaletteBase is refined by +1 for the cloth/morph VS
 // layout (extra parameter row before the palette); the mesh's own sample
 // vertices projected with the bank's viewproj decide (RefinePaletteBase).
-void CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
+//
+// character.cloth_ropa items (Ropa cloth-simulated garments, the player's
+// tee) use a VS that BRANCHES on the row in front of the palette (c4
+// pre-pass / c7 main-pass; disassembled from a live
+// capture): flag.x > 0 skins with the palette one
+// register late (c5/c8); flag.x <= 0 means the CPU cloth sim already wrote
+// deformed root-local positions into the (dynamic, per-frame) VB and the VS
+// ignores palette and blend attributes entirely, applying ONE affine at
+// c188 (pre-pass) / c191 (main-pass): 3 column-vector [R | t] rows, same
+// packing as palette rows. Skinning the simulated vertices instead renders
+// the garment as a mangled ribbon off the body (the distorted-player-shirt
+// bug). Offline validation: the rigid rows put 31/31 sampled shirt verts in
+// clip at the player's position; the skinned interpretation scores 0/31.
+// Transform up to 6 sample vertices of the item by the affine at register m
+// (3 column-vector [R | t] rows) and project them with the bank's own
+// viewproj (c0..c3). Returns the count of samples inside the clip volume,
+// -1 when unscorable. A stale bank (the submit-exit capture can run after
+// ANOTHER mesh's draw when this mesh's own draws are deferred) holds some
+// other object's matrix at c188/c191; geometry projected with it lands
+// far off-clip, while the true matrix scores full (validated offline:
+// 31/31 vs 0/31 on an F10 capture).
+int ScoreRigidAffine(uint8_t* base, uint32_t bank, uint32_t m, const DrawItem& item) {
+  if (item.stride == 0) return -1;
+  const uint32_t count = item.vb_bytes / item.stride;
+  if (count < 2) return -1;
+  float vp[16];
+  float rows[12];
+  for (int i = 0; i < 16; ++i) {
+    vp[i] = LoadGuestF32(base, bank + i * 4);
+    if (!(vp[i] > -1e9f && vp[i] < 1e9f)) return -1;
+  }
+  for (int i = 0; i < 12; ++i) {
+    rows[i] = LoadGuestF32(base, bank + (m * 4 + i) * 4);
+  }
+  constexpr uint32_t kSamples = 6;
+  int ok = 0;
+  int n = 0;
+  for (uint32_t s = 0; s < kSamples; ++s) {
+    const uint32_t v = item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
+    const uint32_t pa = v + item.pos_offset;
+    float p[3];
+    switch (item.pos_fmt) {
+      case 57:
+        for (int a = 0; a < 3; ++a) p[a] = LoadGuestF32(base, pa + a * 4);
+        break;
+      case 32:
+        for (int a = 0; a < 3; ++a) {
+          p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
+        }
+        break;
+      case 26: {
+        constexpr float kScale = 2.0f / 32767.0f;
+        for (int a = 0; a < 3; ++a) {
+          p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale + (a == 1 ? 0.8f : 0.0f);
+        }
+        break;
+      }
+      default:
+        return -1;
+    }
+    float q[3];
+    for (int a = 0; a < 3; ++a) {
+      q[a] = rows[a * 4] * p[0] + rows[a * 4 + 1] * p[1] + rows[a * 4 + 2] * p[2] +
+             rows[a * 4 + 3];
+    }
+    float clip[4];
+    for (int r = 0; r < 4; ++r) {
+      clip[r] = vp[r * 4] * q[0] + vp[r * 4 + 1] * q[1] + vp[r * 4 + 2] * q[2] +
+                vp[r * 4 + 3];
+    }
+    const float aw = std::abs(clip[3]) < 1.0f ? 1.0f : std::abs(clip[3]);
+    ++n;
+    if (std::abs(clip[0]) <= 1.5f * aw && std::abs(clip[1]) <= 1.5f * aw) {
+      ++ok;
+    }
+  }
+  return n == 0 ? -1 : (ok * 16) / n;
+}
+
+// Returns false when the bank could not be consumed for this item (ropa
+// rigid matrix implausible or off-clip = stale bank); the caller must
+// leave/mark the item pending so a later matching draw re-captures it.
+bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
                          DrawItem& item) {
-  palette_base = RefinePaletteBase(base, bank, palette_base, item);
+  if (item.ropa && palette_base != 0) {
+    const bool main_pass = palette_base >= 7;
+    const uint32_t flag_reg = main_pass ? 7u : 4u;
+    const float flag_x = LoadGuestF32(base, bank + (flag_reg * 4) * 4);
+    // Diagnosis logging (rate-limited): the flag/matrix registers were
+    // verified against an emulated-mode F10 capture; this confirms what the
+    // live native-mode banks actually hold at OUR capture moments.
+    static std::atomic<uint32_t> ropa_log_count{0};
+    const uint32_t ln = ropa_log_count.fetch_add(1, std::memory_order_relaxed);
+    if (ln < 8 || (ln & 1023u) == 0) {
+      const uint32_t m = main_pass ? 191u : 188u;
+      REXLOG_INFO(
+          "native-scene: ropa mesh={:08X} vb={:08X} base={} score={} "
+          "flag=({:.3f},{:.3f},{:.3f},{:.3f}) "
+          "m[c{}]=({:.3f},{:.3f},{:.3f},{:.2f})({:.3f},{:.3f},{:.3f},{:.2f})({:.3f},{:.3f},{:.3f},{:.2f})",
+          item.mesh, item.vb_obj, palette_base, ScoreRigidAffine(base, bank, m, item),
+          LoadGuestF32(base, bank + (flag_reg * 4 + 0) * 4),
+          LoadGuestF32(base, bank + (flag_reg * 4 + 1) * 4),
+          LoadGuestF32(base, bank + (flag_reg * 4 + 2) * 4),
+          LoadGuestF32(base, bank + (flag_reg * 4 + 3) * 4), m,
+          LoadGuestF32(base, bank + ((m + 0) * 4 + 0) * 4),
+          LoadGuestF32(base, bank + ((m + 0) * 4 + 1) * 4),
+          LoadGuestF32(base, bank + ((m + 0) * 4 + 2) * 4),
+          LoadGuestF32(base, bank + ((m + 0) * 4 + 3) * 4),
+          LoadGuestF32(base, bank + ((m + 1) * 4 + 0) * 4),
+          LoadGuestF32(base, bank + ((m + 1) * 4 + 1) * 4),
+          LoadGuestF32(base, bank + ((m + 1) * 4 + 2) * 4),
+          LoadGuestF32(base, bank + ((m + 1) * 4 + 3) * 4),
+          LoadGuestF32(base, bank + ((m + 2) * 4 + 0) * 4),
+          LoadGuestF32(base, bank + ((m + 2) * 4 + 1) * 4),
+          LoadGuestF32(base, bank + ((m + 2) * 4 + 2) * 4),
+          LoadGuestF32(base, bank + ((m + 2) * 4 + 3) * 4));
+    }
+    if (flag_x > 0.0f) {
+      // Sim inactive: the layout is exact (no refine needed).
+      palette_base = main_pass ? 8u : 5u;
+    } else {
+      const uint32_t m = main_pass ? 191u : 188u;
+      float rows[12];
+      bool plausible = true;
+      for (int r = 0; r < 3 && plausible; ++r) {
+        float n = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+          const float f = LoadGuestF32(base, bank + ((m + r) * 4 + i) * 4);
+          if (!(f > -1e7f && f < 1e7f)) {
+            plausible = false;
+            break;
+          }
+          rows[r * 4 + i] = f;
+          if (i < 3) n += f * f;
+        }
+        plausible = plausible && n > 0.0025f && n < 400.0f &&
+                    rows[r * 4 + 3] > -20000.f && rows[r * 4 + 3] < 20000.f;
+      }
+      if (plausible && ScoreRigidAffine(base, bank, m, item) >= 8) {
+        // Column-vector [R | t] rows -> item.world (row-vector, t in row 3).
+        for (int i = 0; i < 3; ++i) {
+          for (int j = 0; j < 3; ++j) {
+            item.world[i * 4 + j] = rows[j * 4 + i];
+          }
+          item.world[i * 4 + 3] = 0.0f;
+          item.world[12 + i] = rows[i * 4 + 3];
+        }
+        item.world[15] = 1.0f;
+        item.skinned = false;
+        item.bones.clear();
+        g_ropa_rigid.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
+      // Implausible or off-clip matrix: the bank belongs to another mesh
+      // (the submit-exit capture runs after whatever draw happened to be
+      // inline). Refuse it; the caller keeps the item pending and the
+      // post-draw fixup re-captures from this mesh's own draw.
+      g_ropa_stale.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+  } else {
+    palette_base = RefinePaletteBase(base, bank, palette_base, item);
+  }
   constexpr uint32_t kPaletteFloats = 84 * 12;  // c4..c255 = up to 84 bones
   item.bones.resize(kPaletteFloats);
   for (uint32_t i = 0; i < kPaletteFloats; ++i) {
@@ -1016,6 +1243,7 @@ void CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
   if (item.hair) {
     CaptureHairTint(base, item);
   }
+  return true;
 }
 
 uint64_t DrawSequence() { return g_draw_seq.load(std::memory_order_relaxed); }
@@ -1110,8 +1338,11 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
     item.pending = world_path || !drew_inside || (passes > 1 && passes < 16) ||
                    palette_base == 0;
     if (!item.pending) {
-      CaptureSkinnedState(base, bank, palette_base, item);
-      g_palette_snapshots.fetch_add(1, std::memory_order_relaxed);
+      if (CaptureSkinnedState(base, bank, palette_base, item)) {
+        g_palette_snapshots.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        item.pending = true;
+      }
     }
     g_skinned_items.fetch_add(1, std::memory_order_relaxed);
   }
@@ -1291,6 +1522,33 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   const uint32_t bank = g_vs_bank.load(std::memory_order_relaxed);
   if (bank == 0) {
     return;
+  }
+  // Fog rows: grab c5/c6 from the first 3D draw whose bank c4 row matches
+  // the last built scene's camera (main-pass layout; tolerant of one frame
+  // of camera motion). See g_fog_rows.
+  if (!g_fog_frame_done && func == 0 && flags2d == 0 && SceneEnabled() &&
+      (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
+    const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
+    const float dy = LoadGuestF32(base, bank + 17 * 4) - g_fog_cam[1];
+    const float dz = LoadGuestF32(base, bank + 18 * 4) - g_fog_cam[2];
+    if (dx * dx + dy * dy + dz * dz < 25.0f) {
+      float rows[8];
+      for (int i = 0; i < 8; ++i) {
+        rows[i] = LoadGuestF32(base, bank + (20 + i) * 4);
+      }
+      // Sanity-gate before trusting the layout: ramp scale is a tiny
+      // per-meter slope, the exponent is a small power, the fog color is a
+      // dim linear-space rgb and the transmittance scale a small factor.
+      const bool sane = rows[0] >= 0.0f && rows[0] < 0.1f && std::fabs(rows[1]) < 16.0f &&
+                        rows[2] > 0.0f && rows[2] <= 8.0f && rows[4] >= 0.0f &&
+                        rows[4] <= 4.0f && rows[5] >= 0.0f && rows[5] <= 4.0f &&
+                        rows[6] >= 0.0f && rows[6] <= 4.0f && std::fabs(rows[7]) <= 1.0f;
+      if (sane) {
+        std::memcpy(g_fog_rows, rows, sizeof(rows));
+        g_fog_have = true;
+        g_fog_frame_done = true;
+      }
+    }
   }
   // Live 2D overlay capture: the HUD renders exclusively through the
   // BeginVertices inline path (func 2). Vertex payloads are read at frame
@@ -1528,7 +1786,9 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     if (palette_base == 0) {
       return;
     }
-    CaptureSkinnedState(base, bank, palette_base, d);
+    if (!CaptureSkinnedState(base, bank, palette_base, d)) {
+      return;  // stale bank refused: wait for a later draw with these buffers
+    }
   } else {
     // Deferred rigid prop: the world matrix is wherever this draw's layout
     // keeps it (pre-pass c4..c7, main-pass c8..c11). Not plausible -> wait
@@ -1908,6 +2168,15 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // correct D3D NDC orientation; use the view*proj matrix as captured.
   // (Negating column 0 here mirrors the image left-right.)
 
+  // Publish the frame's captured fog rows and re-arm the OnDrawDone capture
+  // (keyed to this frame's camera) for the next frame.
+  if (g_fog_have) {
+    std::memcpy(scene.fog_ramp, g_fog_rows, 4 * sizeof(float));
+    std::memcpy(scene.fog_color, g_fog_rows + 4, 4 * sizeof(float));
+  }
+  std::memcpy(g_fog_cam, scene.cam_pos, sizeof(g_fog_cam));
+  g_fog_frame_done = false;
+
   if (g_recording.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(g_record_mutex);
     if (++g_frames_seen % g_record_stride == 0) {
@@ -2008,13 +2277,16 @@ void WriteRecording(const char* dir, const char* stem) {
       out << "{\"mesh\":\"" << std::hex << d.mesh << "\",\"ib_obj\":\"" << d.ib_obj
           << "\",\"vb_obj\":\"" << d.vb_obj << "\",\"vb_addr\":\"" << d.vb_addr
           << "\",\"ib_addr\":\"" << d.ib_addr << "\",\"diffuse\":\"" << d.diffuse_tex
+          << "\",\"lightmap\":\"" << d.lightmap_tex << "\",\"macro\":\"" << d.macro_tex
+          << "\",\"decal_art\":\"" << d.decal_art
           << "\",\"fp\":\"" << d.fingerprint
           << "\"" << std::dec << ",\"vb_bytes\":" << d.vb_bytes << ",\"ib_count\":"
           << d.ib_count << ",\"stride\":" << int(d.stride) << ",\"pos_fmt\":"
           << int(d.pos_fmt) << ",\"pos_off\":" << d.pos_offset << ",\"bw_off\":"
           << d.bw_offset << ",\"bi_off\":" << d.bi_offset << ",\"skinned\":"
           << (d.skinned ? 1 : 0) << ",\"pending\":" << (d.pending ? 1 : 0)
-          << ",\"world\":[";
+          << ",\"decal\":" << (d.decal ? 1 : 0)
+          << ",\"transparent\":" << (d.transparent ? 1 : 0) << ",\"world\":[";
       for (int i = 0; i < 16; ++i) out << (i ? "," : "") << d.world[i];
       out << "],\"draws\":[";
       for (size_t i = 0; i < d.draws.size(); ++i) {
@@ -2084,8 +2356,35 @@ struct GuestTexture {
   // For failed decodes: frame number for periodic retry (payload may stream
   // in after the fetch constant is already valid).
   uint64_t retry_after_frame = 0;
+  // Payload-content revalidation: a texture first seen while its payload is
+  // still STREAMING IN decodes to garbage (blocky macro-tile checkers /
+  // blacked-out walls), and the fetch words never change when the content
+  // finishes filling in at the same address, so the garbage decode was
+  // cached forever. Sampled qwords across mip 0, rechecked periodically.
+  uint32_t payload_addr = 0;   // 0xA-mirror guest address of mip 0
+  uint32_t payload_size = 0;
+  uint64_t payload_fp = 0;
+  uint64_t recheck_frame = 0;
   bool valid = false;
 };
+
+// FNV-1a over 16 qwords sampled across a guest payload (SEH-guarded reads;
+// streaming can decommit the range). Returns 0 only on unreadable payloads.
+uint64_t SamplePayloadFingerprint(uint8_t* base, uint32_t addr, uint32_t size) {
+  if (addr == 0 || size < 8) {
+    return 0;
+  }
+  uint64_t h = 1469598103934665603ull;
+  for (uint32_t k = 0; k < 16; ++k) {
+    const uint32_t off = uint32_t(uint64_t(size - 8) * k / 15u) & ~7u;
+    uint64_t v = 0;
+    if (!GuestTryCopy(&v, base + addr + off, sizeof(v))) {
+      return 0;
+    }
+    h = (h ^ v) * 1099511628211ull;
+  }
+  return h;
+}
 
 // Host format mapping for the formats Skate 3 uses (mirrors the SDK's
 // D3D12 texture cache table). host_swizzle remaps guest data components
@@ -2179,6 +2478,9 @@ struct RendererState {
   ID3D12RootSignature* root_signature = nullptr;
   ID3D12PipelineState* pso = nullptr;
   ID3D12PipelineState* pso_nodepth = nullptr;
+  // environment.transparent sub-pass: straight alpha blend, depth test on,
+  // z-write OFF; items drawn back-to-front after all opaque items.
+  ID3D12PipelineState* pso_transparent = nullptr;
   DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
   ID3D12DescriptorHeap* rtv_heap = nullptr;  // slot 0 = output, slot 1 = MSAA
   ID3D12DescriptorHeap* dsv_heap = nullptr;
@@ -2246,24 +2548,52 @@ cbuffer C : register(b0) {
   // Per-material color multiplier (w > 0 enables): CAS hair is a grayscale
   // texture times the character's hair color.
   float4 mat_tint;
+  // x = macroOverlayUVScale, y = macroOverlayOpacity, z > 0 = macro overlay
+  // texture bound at t3, w > 0 = environment.decal item with its `decal`
+  // art bound at t4 (composited in-shader over the diffuse, exactly like
+  // the game's decalenvironment PS: lerp by the art's alpha; opaque).
+  // Macro and decal art are INDEPENDENT: decal ground/wall sections carry
+  // the same macrooverlay as their non-decal neighbors, sharing one slot
+  // dropped the macro grime there and rendered alternating plaza sections
+  // ~1.4x too bright (the large-scale ground checkerboard).
+  float4 overlay;
+  // x > 0 = environment.transparent item (alpha-blended sub-pass): shading
+  // follows the game's transparentenvironment.fx; the opaque pass's
+  // alpha-test turned the soft mist gradients into solid white cloud blobs.
+  // yzw = the global distance-fog RAMP (scale/bias/exponent from main-pass
+  // VS c5), and mat_tint doubles as the linear-space fog COLOR (rgb +
+  // transmittance scale in w, VS c6) for transparent items; the root
+  // signature is capped at 64 DWORDs, so fog rides in slots transparent
+  // items never use otherwise. Fog is currently applied to transparent
+  // items only (the km-distant mist sheets; everything else we render is
+  // near enough for fog to be negligible).
+  float4 misc;
 };
 Texture2D<float4> diffuse : register(t0);
 Texture2D<float4> lightmap : register(t1);
+Texture2D<float4> macro : register(t3);
+Texture2D<float4> decal_art : register(t4);
 // Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
 // applied with explicit dots (StructuredBuffer<float4x4> default packing is
 // column-major and would silently transpose the matrices).
 StructuredBuffer<float4> bones : register(t2);
 SamplerState smp : register(s0);
+// s1 = bilinear CLAMP (shared with the 2D pass). Decal art must clamp: the
+// art UV runs far outside [0,1] across big ground sheets and the art's
+// transparent border keeps everything outside the single placement clear;
+// wrap sampling tiled the graffiti across the whole plaza.
+SamplerState smp_clamp : register(s1);
 struct VSOut {
   float4 pos : SV_Position;
   float3 rpos : TEXCOORD0;
   float2 uv : TEXCOORD1;
   float2 uv2 : TEXCOORD2;
   float3 nrm : TEXCOORD3;
+  float2 uv3 : TEXCOORD4;
 };
 VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1,
               float4 bw : BLENDWEIGHT0, uint4 bi : BLENDINDICES0,
-              float3 nrm : NORMAL0) {
+              float3 nrm : NORMAL0, float2 uv3 : TEXCOORD2) {
   VSOut o;
   float4 mp = float4(p, 1.0);
   float3 n = nrm;
@@ -2292,6 +2622,7 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
   o.uv = uv;
   o.uv2 = uv2;
   o.nrm = n;
+  o.uv3 = uv3;
   return o;
 }
 float4 ps_main(VSOut i) : SV_Target {
@@ -2299,10 +2630,37 @@ float4 ps_main(VSOut i) : SV_Target {
     return tint;
   }
   float4 albedo = diffuse.Sample(smp, i.uv);
-  // Alpha-tested foliage/fences; opaque formats sample alpha = 1. Skinned
-  // characters pack gloss in alpha; never clip them.
-  if (tint.g == 0.0) {
-    clip(albedo.a - 0.35);
+  // Alpha-tested foliage/fences; opaque formats sample alpha = 1. Character
+  // diffuse packs GLOSS in alpha; never clip characters. tint.g > 0 marks
+  // them: set for bones-bound skinned items AND for ropa cloth garments
+  // rendered rigid (sim-active player tees, clipping their gloss alpha
+  // discarded every pixel: the invisible-shirt bug; their decode writes
+  // zero blend weights, so the VS skinning branch stays off).
+  if (tint.g == 0.0 && overlay.w == 0.0) {
+    // environment.transparent alpha-tests its SQUARED alpha at ref 16/255
+    // (transparentenvironment.xml: ALPHAREF 16, PS outputs a = diffuse.a^2).
+    clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - 0.35);
+  }
+  // Macro overlay: large-scale grime/cracks multiplied over the diffuse at
+  // uv * macroOverlayUVScale, faded by macroOverlayOpacity: the ground and
+  // wall weathering. WHITE is the neutral (materials without weathering
+  // bind a 16x16 "default_white"). The game multiplies it ONCE in its
+  // linear (squared) color space, so the gamma-space equivalent is
+  // sqrt(m); a direct multiply doubles the darkening (harsh black
+  // patchwork vs the emulated subtle weathering).
+  if (overlay.z > 0.0) {
+    float4 m = macro.Sample(smp, i.uv * overlay.x);
+    albedo.rgb *= lerp(float3(1.0, 1.0, 1.0), sqrt(m.rgb), overlay.y * m.a);
+  }
+  // environment.decal surfaces: the paint/graffiti art (t4) is composited
+  // over the base diffuse by ITS alpha, opaque output; these meshes ARE
+  // the wall/ground there. The art maps with uv3, the second half-pair of
+  // the packed half4 first texcoord (validated offline: sampling with the
+  // tiling uv0 repeats it: "Stereo Stereo Stereo"; the fmt-26 second
+  // element is the lightmap unwrap, not the decal's).
+  if (overlay.w > 0.0) {
+    float4 dk = decal_art.Sample(smp_clamp, i.uv3);
+    albedo.rgb = lerp(albedo.rgb, dk.rgb, dk.a);
   }
   // tint.r > 0 marks items with a lightmap bound (2x baked lighting);
   // otherwise fall back to derivative face shading.
@@ -2319,8 +2677,25 @@ float4 ps_main(VSOut i) : SV_Target {
     float l = abs(dot(n, normalize(float3(0.4, 0.8, 0.3)))) * 0.35 + 0.75;
     lit = albedo.rgb * l;
   }
-  if (mat_tint.w > 0.0) {
+  if (mat_tint.w > 0.0 && misc.x == 0.0) {
     lit *= mat_tint.rgb;
+  }
+  if (misc.x > 0.0) {
+    // transparentenvironment.fx (Skate 2 source; disassembled Skate 3 PS
+    // matches): outcolor.rgb = diffTerm * diffuse.rgb * diffuse.a; the rgb
+    // is premultiplied by alpha ONCE IN THE SHADER on top of the a^2 blend
+    // factor, so wisps thin out as ~a^3. That cubic falloff is most of the
+    // emulated "sparse clouds" look. Fog is applied in the game's linear
+    // (squared) color space: fade = saturate(dist * ramp.x + ramp.y)^ramp.z
+    // toward the fog color, transmittance = 1 + fade * fogcolor.w.
+    lit *= albedo.a;
+    float fade = saturate(length(i.rpos) * misc.y + misc.z);
+    if (misc.w != 1.0) {
+      fade = pow(max(fade, 1e-4), misc.w);
+    }
+    lit = sqrt(max(lit * lit * saturate(1.0 + fade * mat_tint.w) +
+                   fade * mat_tint.rgb, 0.0));
+    return float4(lit, albedo.a * albedo.a);
   }
   return float4(lit, 1.0);
 }
@@ -2478,7 +2853,10 @@ uint32_t SwapU32(uint32_t v) {
 }
 
 // Decode guest vertices into {float3 position, float2 uv, float2 uv2,
-// unorm4 blend weights, u8x4 blend indices, float3 normal} (48-byte stride).
+// unorm4 blend weights, u8x4 blend indices, float3 normal, float2 decal_uv}
+// (56-byte stride). decal_uv = the 3rd/4th halves of a half4 first texcoord
+// (the packed second UV pair environment.decal art is mapped with), equal to
+// the first pair when the element has only two halves.
 bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
                 MeshBuffers& out) {
   const uint32_t num_verts = item.vb_bytes / item.stride;
@@ -2499,7 +2877,7 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       return false;
     }
   }
-  ID3D12Resource* vb = CreateUploadBuffer(device, size_t(num_verts) * 48);
+  ID3D12Resource* vb = CreateUploadBuffer(device, size_t(num_verts) * 56);
   ID3D12Resource* ib = CreateUploadBuffer(device, size_t(item.ib_count) * 2);
   if (!vb || !ib) {
     if (vb) vb->Release();
@@ -2573,15 +2951,29 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
           w = sv / 32767.0f;
           break;
         }
+        case 26: {  // k_16_16_16_16 (snorm; use xy: unwrap UV sets)
+          const int16_t su = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q)));
+          const int16_t sv = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q + 2)));
+          u = su / 32767.0f;
+          w = sv / 32767.0f;
+          break;
+        }
         default:
           break;
       }
     };
-    dst[v * 12 + 0] = x;
-    dst[v * 12 + 1] = y;
-    dst[v * 12 + 2] = z;
-    decode_uv(item.uv_fmt, item.uv_offset, dst[v * 12 + 3], dst[v * 12 + 4]);
-    decode_uv(item.uv2_fmt, item.uv2_offset, dst[v * 12 + 5], dst[v * 12 + 6]);
+    dst[v * 14 + 0] = x;
+    dst[v * 14 + 1] = y;
+    dst[v * 14 + 2] = z;
+    decode_uv(item.uv_fmt, item.uv_offset, dst[v * 14 + 3], dst[v * 14 + 4]);
+    decode_uv(item.uv2_fmt, item.uv2_offset, dst[v * 14 + 5], dst[v * 14 + 6]);
+    // The second texcoord is the lightmap/decal UNWRAP, stored as an
+    // absolute value with tangent handedness in the sign bits, in BOTH the
+    // s16-snorm (fmt 26, decal meshes) and half-float (fmt 31, world tiles)
+    // encodings (decalenvironment VS: o0.zw = |uv|; baseenvironment VS:
+    // maxs r2.zw = |r4.xy|). Raw signed values sample mirrored atlas cells.
+    dst[v * 14 + 5] = std::fabs(dst[v * 14 + 5]);
+    dst[v * 14 + 6] = std::fabs(dst[v * 14 + 6]);
     // Blend weights (unorm bytes) and indices (raw bytes). Guest u8x4
     // attributes are stored big-endian per 32-bit word; swap so component k
     // in the shader matches guest component k.
@@ -2601,8 +2993,15 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
         }
       }
     }
-    std::memcpy(&dst[v * 12 + 7], &bw, 4);
-    std::memcpy(&dst[v * 12 + 8], &bi, 4);
+    std::memcpy(&dst[v * 14 + 7], &bw, 4);
+    std::memcpy(&dst[v * 14 + 8], &bi, 4);
+    // Decal-art UV: second half pair of a half4 first texcoord, else uv0.
+    if (item.uv_fmt == 32) {
+      decode_uv(31, item.uv_offset + 4, dst[v * 14 + 12], dst[v * 14 + 13]);
+    } else {
+      dst[v * 14 + 12] = dst[v * 14 + 3];
+      dst[v * 14 + 13] = dst[v * 14 + 4];
+    }
     // Vertex normal: k_10_11_11 packed (x 11 bits, y 11 bits, z 10 bits,
     // LSB to MSB, signed). Zero when absent -> derivative face-normal
     // fallback in the shader.
@@ -2617,9 +3016,9 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       ny = float(iy) / 1023.0f;
       nz = float(iz) / 511.0f;
     }
-    dst[v * 12 + 9] = nx;
-    dst[v * 12 + 10] = ny;
-    dst[v * 12 + 11] = nz;
+    dst[v * 14 + 9] = nx;
+    dst[v * 14 + 10] = ny;
+    dst[v * 14 + 11] = nz;
   }
   vb->Unmap(0, nullptr);
   // Blend indices outside the captured palette read garbage rows and mangle
@@ -2668,7 +3067,7 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
 
   out.vb = vb;
   out.ib = ib;
-  out.vb_view = {vb->GetGPUVirtualAddress(), num_verts * 48u, 48u};
+  out.vb_view = {vb->GetGPUVirtualAddress(), num_verts * 56u, 56u};
   out.ib_view = {ib->GetGPUVirtualAddress(), item.ib_count * 2u, DXGI_FORMAT_R16_UINT};
   return true;
 }
@@ -2749,8 +3148,14 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   uint32_t scratch_total = 0;
   for (uint32_t m = 0; m < mip_count; ++m) {
     uint32_t ox = 0, oy = 0;
-    const uint32_t mip_addr =
-        m == 0 ? info.memory.base_address : info.GetMipLocation(m, &ox, &oy, true);
+    // Mip 0 through GetMipLocation too: textures <= 16 texels on a side
+    // store their BASE level packed inside a 32x32 tile at a block offset.
+    // Reading at (0,0) decoded garbage; the 16x16 "default_white" macro
+    // overlay came out as pink/black blocks and multiplied giant soft black
+    // blobs over every wall whose material uses it (validated: with the
+    // packed offset it decodes pure white). Non-packed textures return the
+    // plain base address with zero offsets.
+    const uint32_t mip_addr = info.GetMipLocation(m, &ox, &oy, true);
     const auto ext = info.GetMipExtent(m, true);
     MipSrc& s = srcs[m];
     s.addr = mip_addr;
@@ -2916,6 +3321,11 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
   slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
   device->CreateShaderResourceView(out.texture, &srv, slot);
+  // Payload sample for content revalidation (see GuestTexture).
+  out.payload_addr = 0xA0000000u | info.memory.base_address;
+  out.payload_size = srcs[0].size;
+  out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
+  out.recheck_frame = 0;
   out.valid = true;
   return true;
 }
@@ -2942,17 +3352,24 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   g_r.device = device;
 
   if (!g_r.root_signature) {
-    D3D12_ROOT_PARAMETER params[4] = {};
+    D3D12_ROOT_PARAMETER params[6] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 44;
+    // NOTE the 64-DWORD root-signature budget: 52 constants + 4 descriptor
+    // tables (1 each) + 1 root SRV (2) = 58. Going to 60+ constants blew the
+    // limit and CreateRootSignature failed (renderer fell back to emulated).
+    params[0].Constants.Num32BitValues = 52;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE srv_range[2] = {};
+    D3D12_DESCRIPTOR_RANGE srv_range[4] = {};
     srv_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srv_range[0].NumDescriptors = 1;
     srv_range[0].BaseShaderRegister = 0;
     srv_range[1] = srv_range[0];
     srv_range[1].BaseShaderRegister = 1;
+    srv_range[2] = srv_range[0];
+    srv_range[2].BaseShaderRegister = 3;  // macro overlay (t3)
+    srv_range[3] = srv_range[0];
+    srv_range[3].BaseShaderRegister = 4;  // environment.decal art (t4)
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
     params[1].DescriptorTable.pDescriptorRanges = &srv_range[0];
@@ -2962,6 +3379,10 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[3].Descriptor.ShaderRegister = 2;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    params[4] = params[1];
+    params[4].DescriptorTable.pDescriptorRanges = &srv_range[2];
+    params[5] = params[1];
+    params[5].DescriptorTable.pDescriptorRanges = &srv_range[3];
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
     samplers[0].Filter = D3D12_FILTER_ANISOTROPIC;
     samplers[0].MaxAnisotropy = 8;
@@ -2984,7 +3405,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 4;
+    desc.NumParameters = 6;
     desc.pParameters = params;
     desc.NumStaticSamplers = 2;
     desc.pStaticSamplers = samplers;
@@ -3026,7 +3447,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
-    D3D12_INPUT_ELEMENT_DESC input[6] = {
+    D3D12_INPUT_ELEMENT_DESC input[7] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12,
@@ -3038,6 +3459,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
         {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 32,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 36,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 48,
          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
     pso.pRootSignature = g_r.root_signature;
@@ -3051,13 +3474,26 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     pso.DepthStencilState.DepthEnable = TRUE;
     pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    pso.InputLayout = {input, 6};
+    pso.InputLayout = {input, 7};
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pso.NumRenderTargets = 1;
     pso.RTVFormats[0] = context.d3d12.guest_output_format;
     pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pso.SampleDesc.Count = g_r.msaa;
     const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso));
+    // Transparent variant: straight alpha blend, depth-tested, no z-write.
+    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pso.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    pso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    pso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    pso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    pso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    pso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    const HRESULT hr_t =
+        device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_transparent));
+    pso.BlendState.RenderTarget[0].BlendEnable = FALSE;
+    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     pso.DepthStencilState.DepthEnable = FALSE;
     pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
     const HRESULT hr2 =
@@ -3065,9 +3501,9 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     vs->Release();
     ps->Release();
     if (errors) errors->Release();
-    if (FAILED(hr) || FAILED(hr2)) {
-      REXLOG_ERROR("native-scene: PSO creation failed {:08X}/{:08X}", uint32_t(hr),
-                   uint32_t(hr2));
+    if (FAILED(hr) || FAILED(hr2) || FAILED(hr_t)) {
+      REXLOG_ERROR("native-scene: PSO creation failed {:08X}/{:08X}/{:08X}", uint32_t(hr),
+                   uint32_t(hr2), uint32_t(hr_t));
       g_r.failed = true;
       return false;
     }
@@ -3565,14 +4001,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   const int32_t tex_budget = REXCVAR_GET(skate3_native_render_scene_texture_decode_budget);
   uint32_t mesh_decodes = 0;
   uint32_t tex_decodes = 0;
-  for (const DrawItem& item : scene.items) {
-    const uint32_t index = item_index++;
-    if (debug_mode == 1) {
-      break;
-    }
-    if (debug_mode == 3 && index >= 20) {
-      break;
-    }
+  // Item drawing body. environment.decal items draw in the same opaque pass:
+  // they ARE the wall/ground sections they cover, with the art composited
+  // in-shader (alpha-blending them as separate overlay geometry punched
+  // holes in the world).
+  const auto draw_item = [&](const DrawItem& item) {
     auto it = g_r.meshes.find(item.mesh);
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint) {
       const uint64_t submission = command_processor->GetCurrentSubmission();
@@ -3584,7 +4017,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (it == g_r.meshes.end()) {
       if (mesh_budget > 0 && mesh_decodes >= uint32_t(mesh_budget)) {
         g_rr_mesh_deferred.fetch_add(1, std::memory_order_relaxed);
-        continue;  // decodes on a later frame
+        return;  // decodes on a later frame
       }
       ++mesh_decodes;
       MeshBuffers buffers;
@@ -3595,7 +4028,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           REXLOG_WARN("native-scene: DecodeMesh FAILED mesh={:08X} vb={:08X} fmt={} stride={}",
                       item.mesh, item.vb_addr, item.pos_fmt, item.stride);
         }
-        continue;
+        return;
       }
       buffers.fingerprint = item.fingerprint;
       it = g_r.meshes.emplace(item.mesh, buffers).first;
@@ -3620,7 +4053,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
         const bool retry_failed =
             !tit->second.valid && frame_number >= tit->second.retry_after_frame;
-        if (retry_failed ||
+        // Content revalidation: a decode taken while the payload was still
+        // streaming in is garbage (checkered/blacked-out surfaces) and the
+        // fetch words never change when the content lands afterwards.
+        // Re-decode when the sampled payload changed; keep the old decode
+        // when the payload became unreadable (mip streamed out at range).
+        bool payload_changed = false;
+        if (tit->second.valid && frame_number >= tit->second.recheck_frame) {
+          tit->second.recheck_frame = frame_number + 16;
+          const uint64_t fp = SamplePayloadFingerprint(
+              base, tit->second.payload_addr, tit->second.payload_size);
+          payload_changed = fp != 0 && fp != tit->second.payload_fp;
+        }
+        if (retry_failed || payload_changed ||
             std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0) {
           const uint64_t submission = command_processor->GetCurrentSubmission();
           if (tit->second.texture) g_r.retired.emplace_back(tit->second.texture, submission);
@@ -3674,9 +4119,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
 
     // constants = world + mvp (world * view_proj, row-vector) + tint + cam
-    // + material tint. tint.a > 0 selects debug solid colors; tint.r > 0
-    // marks a bound lightmap in the normal path.
-    float constants[44];
+    // + material tint + overlay params + misc. tint.a > 0 selects debug
+    // solid colors; tint.r > 0 marks a bound lightmap. For transparent
+    // items misc.yzw carries the fog ramp and mat_tint the fog color.
+    float constants[52] = {};
     std::memcpy(constants, item.world, sizeof(item.world));
     float* mvp = constants + 16;
     for (int r = 0; r < 4; ++r) {
@@ -3720,7 +4166,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[35] = 1.0f;
     } else {
       constants[32] = lightmap != nullptr ? 1.0f : 0.0f;
-      constants[33] = bones_bound ? 1.0f : 0.0f;
+      // tint.g doubles as the "character: alpha = gloss, no alpha-test"
+      // marker; ropa garments rendered rigid have no bones but must not be
+      // alpha-clipped (their VS skinning branch is inert: zero weights).
+      constants[33] = (bones_bound || item.ropa) ? 1.0f : 0.0f;
       constants[34] = item.unlit ? 1.0f : 0.0f;
       constants[35] = 0.0f;
     }
@@ -3729,7 +4178,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     constants[38] = scene.cam_pos[2];
     constants[39] = 0.0f;
     std::memcpy(constants + 40, item.tint, 4 * sizeof(float));
-    list.D3DSetGraphicsRoot32BitConstants(0, 44, constants, 0);
+    // t3 = macro grime/crack overlay, t4 = decal art for environment.decal
+    // surfaces (in-shader composite). Independent slots: decal ground/wall
+    // sections carry the same macrooverlay as their non-decal neighbors, and
+    // binding only the art dropped the macro multiply there; alternating
+    // plaza sections rendered ~1.4x too bright (the ground checkerboard).
+    const GuestTexture* macro_tex =
+        item.macro_tex != 0 ? resolve_texture(item.macro_tex) : &g_r.white;
+    const GuestTexture* decal_tex = item.decal && item.decal_art != 0
+                                        ? resolve_texture(item.decal_art)
+                                        : &g_r.white;
+    const bool is_decal = decal_tex != &g_r.white;
+    constants[44] = item.macro_scale;
+    constants[45] = item.macro_opacity;
+    constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
+    constants[47] = is_decal ? 1.0f : 0.0f;
+    // misc.x: alpha-blended sub-pass item (transparentenvironment shading);
+    // fog rides in misc.yzw (ramp) and the mat_tint row (color), unused by
+    // transparent items otherwise (root-signature DWORD budget).
+    constants[48] = item.transparent ? 1.0f : 0.0f;
+    if (item.transparent) {
+      constants[49] = scene.fog_ramp[0];
+      constants[50] = scene.fog_ramp[1];
+      constants[51] = scene.fog_ramp[2];
+      std::memcpy(constants + 40, scene.fog_color, 4 * sizeof(float));
+    }
+    list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
 
     const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
         g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
@@ -3742,6 +4216,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         size_t((lightmap != nullptr ? lightmap : &g_r.white)->srv_slot) * g_r.srv_size;
     context.d3d12.set_graphics_root_descriptor_table(
         context.d3d12.command_processor_user_data, 2, lm_gpu);
+    D3D12_GPU_DESCRIPTOR_HANDLE macro_gpu = heap_start;
+    macro_gpu.ptr += size_t(macro_tex->srv_slot) * g_r.srv_size;
+    context.d3d12.set_graphics_root_descriptor_table(
+        context.d3d12.command_processor_user_data, 4, macro_gpu);
+    D3D12_GPU_DESCRIPTOR_HANDLE decal_gpu = heap_start;
+    decal_gpu.ptr += size_t(decal_tex->srv_slot) * g_r.srv_size;
+    context.d3d12.set_graphics_root_descriptor_table(
+        context.d3d12.command_processor_user_data, 5, decal_gpu);
     list.D3DIASetVertexBuffers(0, 1, &buffers.vb_view);
     list.D3DIASetIndexBuffer(&buffers.ib_view);
     for (const DrawEntry& draw : item.draws) {
@@ -3755,6 +4237,52 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index, draw.base_vertex,
                                    0);
       ++drawn;
+    }
+  };
+
+  // Opaque items first; environment.transparent items are deferred to an
+  // alpha-blended sub-pass (depth test on, z-write off) drawn back-to-front;
+  // interleaved opaque rendering alpha-tested the mist sheets into solid
+  // white cloud blobs.
+  std::vector<const DrawItem*> transparent_items;
+  for (const DrawItem& item : scene.items) {
+    const uint32_t index = item_index++;
+    if (debug_mode == 1) {
+      break;
+    }
+    if (debug_mode == 3 && index >= 20) {
+      break;
+    }
+    if (item.transparent && debug_mode == 0) {
+      transparent_items.push_back(&item);
+      continue;
+    }
+    draw_item(item);
+  }
+  if (!transparent_items.empty() && g_r.pso_transparent != nullptr) {
+    const auto view_dist2 = [&](const DrawItem& item) {
+      float c[3], w[3];
+      for (int a = 0; a < 3; ++a) {
+        c[a] = (item.bbox_min[a] + item.bbox_max[a]) * 0.5f;
+      }
+      for (int a = 0; a < 3; ++a) {
+        w[a] = c[0] * item.world[0 * 4 + a] + c[1] * item.world[1 * 4 + a] +
+               c[2] * item.world[2 * 4 + a] + item.world[3 * 4 + a];
+      }
+      float d2 = 0.0f;
+      for (int a = 0; a < 3; ++a) {
+        const float d = w[a] - scene.cam_pos[a];
+        d2 += d * d;
+      }
+      return d2;
+    };
+    std::stable_sort(transparent_items.begin(), transparent_items.end(),
+                     [&](const DrawItem* a, const DrawItem* b) {
+                       return view_dist2(*a) > view_dist2(*b);
+                     });
+    list.D3DSetPipelineState(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
+    for (const DrawItem* item : transparent_items) {
+      draw_item(*item);
     }
   }
 
@@ -3931,7 +4459,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} skinned={} skinned_skipped={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={}] skinned={} skinned_skipped={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}]",
@@ -3940,7 +4468,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
         g_r.meshes.size(), g_r.textures.size(),
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
-        g_skinned_items.load(),
+        g_ropa_rigid.load(), g_ropa_stale.load(), g_skinned_items.load(),
         g_skinned_skipped.load(), g_rigid_pending.load(), g_rigid_dropped.load(),
         g_world_props.load(),
         g_rej_no_dynstate.load(), g_rej_dyn_range.load(),

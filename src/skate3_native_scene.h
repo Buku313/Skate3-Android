@@ -29,6 +29,13 @@ struct DrawItem {
   uint32_t ib_count;
   uint32_t diffuse_tex;   // guest renderengine::Texture address (0 = none)
   uint32_t lightmap_tex;  // guest renderengine::Texture address (0 = none)
+  // "macrooverlay" material channel (environment shaders): a large-scale
+  // grime/crack overlay multiplied over the diffuse at uv *
+  // macroOverlayUVScale with macroOverlayOpacity: the ground/wall
+  // weathering that reads as "extra grit".
+  uint32_t macro_tex;     // guest renderengine::Texture address (0 = none)
+  float macro_scale;      // macroOverlayUVScale channel constant
+  float macro_opacity;    // macroOverlayOpacity channel constant
   uint16_t pos_offset;
   uint16_t uv_offset;
   uint16_t uv2_offset;
@@ -48,6 +55,28 @@ struct DrawItem {
   // by a per-character color staged in the PIXEL constant bank. Detected via
   // the AttribulatorMaterialName channel; tint captured with the palette.
   bool hair;
+  // AttribulatorMaterialName starts "environment.decal": wall/ground
+  // sections whose pixel shader composites a `decal` art texture (graffiti,
+  // painted branding, grime) over the base diffuse INSIDE the shader,
+  // lerp(base, decal.rgb, decal.a), and draws OPAQUE (disassembled from
+  // decalenvironment_defaultPS; these meshes ARE the surface there, so
+  // rendering them alpha-blended punches holes in walls). Without the
+  // composite the paint is missing (the no-graffiti bug).
+  bool decal;
+  uint32_t decal_art;  // `decal` channel texture (0 = none)
+  // AttribulatorMaterialName starts "environment.transparent": mist/cloud
+  // sheets, glass, fences, vines. Alpha-BLENDED in a sub-pass after all
+  // opaque items (back-to-front, depth test on, z-write off); the opaque
+  // pass's alpha-test turned the soft mist gradients into solid hard-edged
+  // white cloud blobs.
+  bool transparent;
+  // character.cloth_ropa (Ropa cloth-simulated garments, e.g. player tees):
+  // the VS variant branches on a flag row kept in front of the bone palette
+  // - sim active means the dynamic VB already holds deformed root-local
+  // positions and the draw is RIGID (one affine at c188/c191), not skinned.
+  // Detected via the AttribulatorMaterialName channel; consumed by
+  // CaptureSkinnedState.
+  bool ropa;
   float tint[4];  // rgb + enable flag in w
   // The item's per-draw state (bone palette for skinned, world matrix for
   // rigid model-space props) was not available at capture time; deferred
@@ -77,6 +106,13 @@ struct FrameScene {
   uint64_t generation = 0;
   float view_proj[16] = {};
   float cam_pos[3] = {};
+  // Global distance-fog parameter rows, captured once per frame from the
+  // first main-pass draw's VS constant bank (main-pass layout: c4 = camera,
+  // the validation key; c5 = fog ramp scale/bias/exponent, c6 = linear-space
+  // fog color rgb + transmittance scale in w; identical across every
+  // main-pass draw of a frame). Consumed by environment.transparent items.
+  float fog_ramp[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+  float fog_color[4] = {};
   std::vector<DrawItem> items;
 };
 

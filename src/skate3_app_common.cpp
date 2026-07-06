@@ -699,6 +699,11 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   rex::ui::RegisterBind("bind_skate3_menu_alt", "F1", "Skate 3 settings alternate", [this] {
     ToggleSimpleSettings();
   });
+  // Remembered handle: the F11 paired A/B parity capture (native + emulated
+  // screenshots + gsnap, sequenced from the guest frame loop in
+  // skate3_native_render.cpp) needs the window without an app pointer.
+  skate3::screenshot::RememberWindow(window() ? window()->GetNativeWindowHandle()
+                                              : nullptr);
   rex::ui::RegisterBind("bind_skate3_screenshot", "F6",
                         "Save screenshot to screenshots/", [this] {
                           skate3::screenshot::CaptureWindow(

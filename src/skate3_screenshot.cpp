@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -59,15 +60,21 @@ bool PngEncoderClsid(CLSID* clsid) {
   return false;
 }
 
-std::filesystem::path ScreenshotPath() {
+std::filesystem::path ScreenshotPath(const char* tag) {
   const auto now = std::chrono::system_clock::now();
   const std::time_t t = std::chrono::system_clock::to_time_t(now);
   std::tm tm{};
   localtime_s(&tm, &t);
-  char name[64];
-  std::snprintf(name, sizeof(name), "shot_%04d%02d%02d_%02d%02d%02d.png",
-                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
-                tm.tm_sec);
+  char name[96];
+  if (tag != nullptr && tag[0] != '\0') {
+    std::snprintf(name, sizeof(name), "shot_%04d%02d%02d_%02d%02d%02d_%s.png",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+                  tm.tm_sec, tag);
+  } else {
+    std::snprintf(name, sizeof(name), "shot_%04d%02d%02d_%02d%02d%02d.png",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+                  tm.tm_sec);
+  }
   return std::filesystem::absolute(std::filesystem::path("screenshots") / name);
 }
 
@@ -101,9 +108,17 @@ void EncodeAndSave(HBITMAP bitmap, int crop_x, int crop_y, int crop_w, int crop_
   REXLOG_INFO("screenshot: saved {} ({}x{})", path.string(), crop_w, crop_h);
 }
 
+std::atomic<void*> g_remembered_window{nullptr};
+
 }  // namespace
 
-void CaptureWindow(void* window_handle) {
+void RememberWindow(void* hwnd) {
+  g_remembered_window.store(hwnd, std::memory_order_relaxed);
+}
+
+void* RememberedWindow() { return g_remembered_window.load(std::memory_order_relaxed); }
+
+void CaptureWindow(void* window_handle, const char* tag) {
   HWND hwnd = static_cast<HWND>(window_handle);
   if (hwnd == nullptr) {
     REXLOG_WARN("screenshot: no window handle");
@@ -141,7 +156,7 @@ void CaptureWindow(void* window_handle) {
   }
 
   std::thread(EncodeAndSave, bitmap, int(client_origin.x - wr.left),
-              int(client_origin.y - wr.top), crop_w, crop_h, ScreenshotPath())
+              int(client_origin.y - wr.top), crop_w, crop_h, ScreenshotPath(tag))
       .detach();
 }
 
@@ -150,9 +165,11 @@ void CaptureWindow(void* window_handle) {
 #else  // !_WIN32
 
 namespace skate3::screenshot {
-void CaptureWindow(void* /*window_handle*/) {
+void CaptureWindow(void* /*window_handle*/, const char* /*tag*/) {
   REXLOG_WARN("screenshot: only implemented on Windows");
 }
+void RememberWindow(void* /*hwnd*/) {}
+void* RememberedWindow() { return nullptr; }
 }  // namespace skate3::screenshot
 
 #endif  // _WIN32

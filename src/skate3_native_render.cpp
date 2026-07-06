@@ -1,6 +1,7 @@
 #include "skate3_native_render.h"
 
 #include "skate3_native_scene.h"
+#include "skate3_screenshot.h"
 
 #include "generated/skate3_init.h"
 
@@ -9,6 +10,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -315,6 +317,74 @@ void OnFrameEnd(uint8_t* base) {
                   g_frame_index);
     }
     f10_was_down = f10_down;
+  }
+  // F11: paired A/B parity capture; one keypress produces
+  // shot_<ts>_native.png + shot_<ts>_emulated.png (same viewpoint, ~half a
+  // second apart while the renderer toggles) + an immediate F10-style
+  // capture taken back in native mode. Sequenced across guest frames so
+  // each renderer has settled before its screenshot (the emulated pipeline
+  // needs to recompose after suppression lifts).
+  {
+    enum class AbState { kIdle, kNativeSettle, kEmulatedSettle, kBackToNative };
+    static AbState ab_state = AbState::kIdle;
+    static uint64_t ab_resume_frame = 0;
+    static char ab_tag[24] = {};
+    static bool f11_was_down = false;
+    const bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    constexpr uint64_t kSettleFrames = 60;
+    switch (ab_state) {
+      case AbState::kIdle:
+        if (f11_down && !f11_was_down && !g_collecting) {
+          const std::time_t t = std::time(nullptr);
+          std::tm tm{};
+          localtime_s(&tm, &t);
+          std::snprintf(ab_tag, sizeof(ab_tag), "%02d%02d%02d", tm.tm_hour, tm.tm_min,
+                        tm.tm_sec);
+          // Ensure the sequence starts in NATIVE mode (the gsnap capture at
+          // the end must record native-path scene data).
+          if (!skate3::native_scene::Enabled()) {
+            skate3::native_scene::ToggleSceneEnabled();
+          }
+          ab_state = AbState::kNativeSettle;
+          ab_resume_frame = g_frame_index + kSettleFrames;
+          REXLOG_INFO("native-render A/B capture: F11, tag {}", ab_tag);
+        }
+        break;
+      case AbState::kNativeSettle:
+        if (g_frame_index >= ab_resume_frame) {
+          char tag[40];
+          std::snprintf(tag, sizeof(tag), "%s_native", ab_tag);
+          skate3::screenshot::CaptureWindow(skate3::screenshot::RememberedWindow(), tag);
+          skate3::native_scene::ToggleSceneEnabled();  // -> emulated
+          ab_state = AbState::kEmulatedSettle;
+          ab_resume_frame = g_frame_index + kSettleFrames;
+        }
+        break;
+      case AbState::kEmulatedSettle:
+        if (g_frame_index >= ab_resume_frame) {
+          char tag[40];
+          std::snprintf(tag, sizeof(tag), "%s_emulated", ab_tag);
+          skate3::screenshot::CaptureWindow(skate3::screenshot::RememberedWindow(), tag);
+          skate3::native_scene::ToggleSceneEnabled();  // -> native
+          ab_state = AbState::kBackToNative;
+          ab_resume_frame = g_frame_index + kSettleFrames;
+        }
+        break;
+      case AbState::kBackToNative:
+        if (g_frame_index >= ab_resume_frame && !g_collecting) {
+          g_collecting = true;
+          g_immediate = true;
+          g_collect_counter = 0;
+          skate3::native_scene::StartRecording(1);
+          REXLOG_INFO(
+              "native-render A/B capture: screenshots tagged {} done, immediate "
+              "capture armed",
+              ab_tag);
+          ab_state = AbState::kIdle;
+        }
+        break;
+    }
+    f11_was_down = f11_down;
   }
 #endif
   if (!g_collecting && g_frame_index % 32 == 0) {
