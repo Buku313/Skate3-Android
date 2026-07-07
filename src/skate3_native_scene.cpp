@@ -107,6 +107,38 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 1024, "Skate 3",
                      "matches the edge crispness players currently see.")
     .range(256, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Fine-grained feature gates for the F12 native-render debug dialog: each
+// isolates one subsystem so regressions (flicker, wrong shading) can be
+// bisected live without rebuilds. All hot-reload, default on.
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_macro, true, "Skate 3",
+                    "Apply the macrooverlay grime/crack multiply on world materials")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_decals, true, "Skate 3",
+                    "Composite environment.decal art (graffiti/paint) over base diffuse")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_transparents, true, "Skate 3",
+                    "Draw environment.transparent items (mist/glass/fences) in the "
+                    "alpha-blended sub-pass")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
+                    "Publish world sort-list items (static geometry)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynamic_items, true, "Skate 3",
+                    "Publish dynamic entities (characters, props, cloth)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_revalidate, true, "Skate 3",
+                    "Re-fingerprint cached texture payloads every 16 frames and "
+                    "re-decode on change (heals late-composed lightmap pages)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_mesh_revalidate, true, "Skate 3",
+                    "Re-decode cached meshes when their payload fingerprint changes "
+                    "(streaming arena reuse; also picks up CPU-animated buffers)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_mips, true, "Skate 3",
+                    "Upload guest texture MIP CHAINS (off = mip 0 only; distant "
+                    "surfaces alias but mip-related artifacts disappear). Flush the "
+                    "texture cache after toggling.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Hook layer master switch, defined in skate3_native_render.cpp. The runtime
 // toggle refuses to flip the scene on without it: the hooks that feed the
@@ -134,6 +166,11 @@ constexpr uint32_t kViewCamViewProj = 0xA0;
 std::mutex g_scene_mutex;
 FrameScene g_scene;
 uint64_t g_generation = 0;
+// Debug-dialog cache flushes: consumed at the top of RenderScene so texture/
+// mesh-affecting toggles (mip chains, 565 fixes, ...) take effect immediately
+// instead of only for newly streamed content.
+std::atomic<bool> g_flush_textures{false};
+std::atomic<bool> g_flush_meshes{false};
 std::atomic<uint8_t*> g_guest_base{nullptr};
 std::atomic<uint64_t> g_frames_rendered{0};
 
@@ -773,6 +810,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.hair = false;
   item.ropa = false;
   item.decal = false;
+  item.decal_tileable = false;
   item.transparent = false;
   item.unlit = false;
   item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
@@ -815,8 +853,8 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // variant (flag-row-switched skinned/rigid, see CaptureSkinnedState).
           const uint32_t s = REX_LOAD_U32(chan + 0x18);
           if (GuestReadableApprox(base, s)) {
-            char mat_name[24] = {};
-            for (int k = 0; k < 23; ++k) {
+            char mat_name[28] = {};
+            for (int k = 0; k < 27; ++k) {
               mat_name[k] = char(REX_LOAD_U8(s + k));
               if (mat_name[k] == '\0') break;
             }
@@ -825,7 +863,13 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             item.ropa = std::memcmp(mat_name, "character.cloth_ropa", 21) == 0;
             // environment.decal / environment.decal_tileable: graffiti and
             // painted-branding overlay meshes (see DrawItem::decal).
+            // Tileable art WRAPS (rock/cliff faces tile the art across the
+            // whole surface, uv spans many periods; clamping stretches the
+            // border texels into giant streaks); single-placement decal art
+            // CLAMPS (wrap tiled the graffiti across the plaza).
             item.decal = std::memcmp(mat_name, "environment.decal", 17) == 0;
+            item.decal_tileable =
+                std::memcmp(mat_name, "environment.decal_tileable", 26) == 0;
             // environment.transparent: alpha-blended world geometry (mist
             // sheets, glass, fences); see DrawItem::transparent.
             item.transparent =
@@ -934,6 +978,9 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
 }  // namespace
 
 bool Enabled() { return SceneEnabled(); }
+
+void FlushTextureCache() { g_flush_textures.store(true, std::memory_order_relaxed); }
+void FlushMeshCache() { g_flush_meshes.store(true, std::memory_order_relaxed); }
 
 bool ToggleSceneEnabled() {
   if (!REXCVAR_GET(skate3_native_render)) {
@@ -2173,6 +2220,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             .fetch_add(1, std::memory_order_relaxed);
         continue;
       }
+      if (!REXCVAR_GET(skate3_native_render_scene_dynamic_items)) {
+        continue;
+      }
       auto [slot, inserted] = dyn_slot.try_emplace(r.a, scene.items.size());
       if (inserted) {
         scene.items.push_back(cand);
@@ -2182,6 +2232,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       continue;
     }
     if (!seen.insert(r.a).second) {
+      continue;
+    }
+    if (!REXCVAR_GET(skate3_native_render_scene_world_items)) {
       continue;
     }
     DrawItem item;
@@ -2755,7 +2808,12 @@ float4 ps_main(VSOut i) : SV_Target {
   // tiling uv0 repeats it: "Stereo Stereo Stereo"; the fmt-26 second
   // element is the lightmap unwrap, not the decal's).
   if (overlay.w > 0.0) {
-    float4 dk = decal_art.Sample(smp_clamp, i.uv3);
+    // overlay.w == 2 marks environment.decal_tileable: the art tiles across
+    // the surface (rock/cliff faces) and must WRAP; clamp stretched the
+    // border texels into giant streaks. Single placements clamp (their
+    // transparent border keeps everything outside the placement clear).
+    float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
+                                : decal_art.Sample(smp_clamp, i.uv3);
     albedo.rgb = lerp(albedo.rgb, dk.rgb, dk.a);
   }
   // tint.r > 0 marks items with a lightmap bound (2x baked lighting);
@@ -3311,7 +3369,8 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   // alignment holds on every level.
   const bool pow2 = (width & (width - 1)) == 0 && (height & (height - 1)) == 0;
   uint32_t mip_count = 1;
-  if (pow2 && info.memory.mip_address != 0) {
+  if (pow2 && info.memory.mip_address != 0 &&
+      REXCVAR_GET(skate3_native_render_scene_tex_mips)) {
     const uint32_t avail = std::min(info.mip_levels(), info.GetMaxMipLevels());
     while (mip_count < avail && (width >> mip_count) >= 4 && (height >> mip_count) >= 4) {
       uint32_t ox = 0, oy = 0;
@@ -4274,6 +4333,33 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     });
   }
 
+  // Debug-dialog cache flushes: retire every cached decode (freed once the
+  // GPU is done with the current submission) so hot-toggled decode settings
+  // rebuild the world with the new rules this frame.
+  if (g_flush_textures.exchange(false, std::memory_order_relaxed)) {
+    const uint64_t submission = command_processor->GetCurrentSubmission();
+    for (auto& [key, t] : g_r.textures) {
+      if (t.texture) g_r.retired.emplace_back(t.texture, submission);
+      if (t.upload) g_r.retired.emplace_back(t.upload, submission);
+    }
+    g_r.textures.clear();
+    for (auto& [key, t] : g_r.textures_2d) {
+      if (t.texture) g_r.retired.emplace_back(t.texture, submission);
+      if (t.upload) g_r.retired.emplace_back(t.upload, submission);
+    }
+    g_r.textures_2d.clear();
+    REXLOG_INFO("native-scene: texture cache flushed (debug dialog)");
+  }
+  if (g_flush_meshes.exchange(false, std::memory_order_relaxed)) {
+    const uint64_t submission = command_processor->GetCurrentSubmission();
+    for (auto& [key, m] : g_r.meshes) {
+      if (m.vb) g_r.retired.emplace_back(m.vb, submission);
+      if (m.ib) g_r.retired.emplace_back(m.ib, submission);
+    }
+    g_r.meshes.clear();
+    REXLOG_INFO("native-scene: mesh cache flushed (debug dialog)");
+  }
+
   // Reset this frame's bone ring region (shared by the shadow casters and
   // the main pass: the shadow pass allocates first, the main pass appends).
   const uint64_t frame_number = g_frames_rendered.load(std::memory_order_relaxed);
@@ -4555,7 +4641,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // holes in the world).
   const auto draw_item = [&](const DrawItem& item) {
     auto it = g_r.meshes.find(item.mesh);
-    if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint) {
+    if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
+        REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
       const uint64_t submission = command_processor->GetCurrentSubmission();
       g_r.retired.emplace_back(it->second.vb, submission);
       g_r.retired.emplace_back(it->second.ib, submission);
@@ -4607,14 +4694,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // Re-decode when the sampled payload changed; keep the old decode
         // when the payload became unreadable (mip streamed out at range).
         bool payload_changed = false;
-        if (tit->second.valid && frame_number >= tit->second.recheck_frame) {
+        if (tit->second.valid && frame_number >= tit->second.recheck_frame &&
+            REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
           tit->second.recheck_frame = frame_number + 16;
           const uint64_t fp = SamplePayloadFingerprint(
               base, tit->second.payload_addr, tit->second.payload_size);
           payload_changed = fp != 0 && fp != tit->second.payload_fp;
         }
-        if (retry_failed || payload_changed ||
-            std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0) {
+        const bool words_changed =
+            std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0;
+        if (retry_failed || payload_changed || words_changed) {
+          // Re-decode churn diagnostic: repeated fetch-word or payload
+          // changes on one object = streaming oscillation, visible as
+          // texture flicker on the affected meshes.
+          static std::atomic<uint32_t> s_redecode_logs{0};
+          if (s_redecode_logs.fetch_add(1) < 256) {
+            REXLOG_INFO(
+                "native-scene: texture re-decode obj={:08X} reason={}{}{} "
+                "old=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] new=[{:08X} {:08X} "
+                "{:08X} {:08X} {:08X} {:08X}]",
+                tex_ptr, words_changed ? "words" : "", payload_changed ? "payload" : "",
+                retry_failed ? "retry" : "", tit->second.fetch_words[0],
+                tit->second.fetch_words[1], tit->second.fetch_words[2],
+                tit->second.fetch_words[3], tit->second.fetch_words[4],
+                tit->second.fetch_words[5], live[0], live[1], live[2], live[3], live[4],
+                live[5]);
+          }
           const uint64_t submission = command_processor->GetCurrentSubmission();
           if (tit->second.texture) g_r.retired.emplace_back(tit->second.texture, submission);
           if (tit->second.upload) g_r.retired.emplace_back(tit->second.upload, submission);
@@ -4732,15 +4837,21 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // binding only the art dropped the macro multiply there; alternating
     // plaza sections rendered ~1.4x too bright (the ground checkerboard).
     const GuestTexture* macro_tex =
-        item.macro_tex != 0 ? resolve_texture(item.macro_tex) : &g_r.white;
-    const GuestTexture* decal_tex = item.decal && item.decal_art != 0
+        item.macro_tex != 0 && REXCVAR_GET(skate3_native_render_scene_macro)
+            ? resolve_texture(item.macro_tex)
+            : &g_r.white;
+    const GuestTexture* decal_tex = item.decal && item.decal_art != 0 &&
+                                            REXCVAR_GET(skate3_native_render_scene_decals)
                                         ? resolve_texture(item.decal_art)
                                         : &g_r.white;
     const bool is_decal = decal_tex != &g_r.white;
     constants[44] = item.macro_scale;
     constants[45] = item.macro_opacity;
     constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
-    constants[47] = is_decal ? 1.0f : 0.0f;
+    // overlay.w: 1 = single-placement decal (art clamps), 2 = tileable
+    // decal (art wraps; clamping a many-period uv range stretched the
+    // border texels into the giant cliff-face streaks).
+    constants[47] = is_decal ? (item.decal_tileable ? 2.0f : 1.0f) : 0.0f;
     // misc.x: alpha-blended sub-pass item (transparentenvironment shading);
     // fog rides in misc.yzw (ramp) and the mat_tint row (color), unused by
     // transparent items otherwise (root-signature DWORD budget).
@@ -4802,7 +4913,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       break;
     }
     if (item.transparent && debug_mode == 0) {
-      transparent_items.push_back(&item);
+      if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
+        transparent_items.push_back(&item);
+      }
       continue;
     }
     draw_item(item);
@@ -5045,6 +5158,8 @@ void Install() {
 
 namespace skate3::native_scene {
 void Install() {}
+void FlushTextureCache() {}
+void FlushMeshCache() {}
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12

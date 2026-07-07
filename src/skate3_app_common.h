@@ -14,6 +14,8 @@
 #include <rex/ui/overlay/simple_settings_overlay.h>
 #include <rex/ui/overlay/ultrawide_targets_overlay.h>
 
+#include "skate3_native_debug_dialog.h"
+
 namespace rex::ui {
 class ImGuiDrawer;
 }
@@ -39,6 +41,7 @@ class Skate3BaseApp : public rex::ReXApp {
   void InstallDlcPackages();
   void ToggleSimpleSettings();
   void ToggleUltrawideTargets();
+  void ToggleNativeDebug();
   void ApplySettingsCursorMode();
   void ApplyGameplayCursorMode();
   void RestartGame();
@@ -58,6 +61,7 @@ class Skate3BaseApp : public rex::ReXApp {
   std::filesystem::path profiles_path_;
   std::unique_ptr<rex::ui::SimpleSettingsDialog> simple_settings_dialog_;
   std::unique_ptr<rex::ui::UltrawideTargetsDialog> ultrawide_targets_dialog_;
+  std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   bool recipe_overlay_installed_ = false;
   bool big_device_aliases_installed_ = false;
   std::atomic<uint32_t> debug_marker_count_{0};

@@ -63,6 +63,11 @@ struct DrawItem {
   // rendering them alpha-blended punches holes in walls). Without the
   // composite the paint is missing (the no-graffiti bug).
   bool decal;
+  // environment.decal_tileable: the decal art TILES across the surface
+  // (rock/cliff faces) and must sample with WRAP; single-placement decal
+  // art samples with CLAMP (its transparent border keeps the area outside
+  // the placement clear).
+  bool decal_tileable;
   uint32_t decal_art;  // `decal` channel texture (0 = none)
   // AttribulatorMaterialName starts "environment.transparent": mist/cloud
   // sheets, glass, fences, vines. Alpha-BLENDED in a sub-pass after all
@@ -233,5 +238,11 @@ void Install();
 // new state; refuses (returns false) when the skate3_native_render hook
 // layer was not enabled at boot.
 bool ToggleSceneEnabled();
+
+// Debug-dialog cache flushes (F12 native-render debug menu): retire every
+// cached GPU texture / mesh decode so hot-toggled decode settings (mip
+// chains, revalidation, ...) rebuild immediately.
+void FlushTextureCache();
+void FlushMeshCache();
 
 }  // namespace skate3::native_scene

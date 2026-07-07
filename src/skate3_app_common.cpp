@@ -729,6 +729,10 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         "Write marker to log", [this] {
                           LogUserMarker();
                         });
+  rex::ui::RegisterBind("bind_skate3_native_debug", "F12",
+                        "Native render debug menu", [this] {
+                          ToggleNativeDebug();
+                        });
 }
 
 void Skate3BaseApp::OnPostSetup() {
@@ -783,9 +787,11 @@ void Skate3BaseApp::OnShutdown() {
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
   rex::ui::UnregisterBind("bind_skate3_log_debug_marker");
   rex::ui::UnregisterBind("bind_skate3_log_user_marker");
+  rex::ui::UnregisterBind("bind_skate3_native_debug");
   ApplyGameplayCursorMode();
   simple_settings_dialog_.reset();
   ultrawide_targets_dialog_.reset();
+  native_debug_dialog_.reset();
 }
 
 void Skate3BaseApp::ToggleSimpleSettings() {
@@ -880,6 +886,19 @@ void Skate3BaseApp::ToggleUltrawideTargets() {
       imgui_drawer(), export_path, [this]() { ApplyGameplayCursorMode(); });
   ApplySettingsCursorMode();
   ultrawide_targets_dialog_->Show();
+}
+
+void Skate3BaseApp::ToggleNativeDebug() {
+  if (!native_debug_dialog_) {
+    native_debug_dialog_ = std::make_unique<skate3::NativeDebugDialog>(imgui_drawer());
+  }
+  if (native_debug_dialog_->visible()) {
+    native_debug_dialog_->Hide();
+    ApplyGameplayCursorMode();
+  } else {
+    ApplySettingsCursorMode();
+    native_debug_dialog_->Show();
+  }
 }
 
 void Skate3BaseApp::ApplySettingsCursorMode() {
