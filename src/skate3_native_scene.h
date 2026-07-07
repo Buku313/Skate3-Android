@@ -101,6 +101,12 @@ struct DrawItem {
   // float3 verts): the renderer synthesizes quad->triangle indices instead
   // of reading a guest index buffer.
   bool cloth_quads;
+  // Park-editor / object-mover selection: the game re-draws the selected
+  // object after the sky (twice, stencil-marking it) and a postfx stencil
+  // edge-detect adds the blue outline. Items matched to those re-draws by
+  // (ib_obj, vb_obj, world translation) render into the native outline mask
+  // (see kOutlineShaderSource).
+  bool selected = false;
   // Bone palette snapshot taken on the game thread: raw staged rows, 3
   // float4s per bone (column-vector affine [R | t], model -> world). The
   // guest staging bank is reused draw to draw, hence the copy.
@@ -144,6 +150,10 @@ struct FrameScene {
   // capture), detected per frame from the blur_hBlurPS draw. The native
   // replica runs after the MSAA resolve, before the 2D overlay draws.
   float ui_blur = 0.0f;
+  // Selection-outline color (postfx_edgedetectstencilPS c0; the park-editor
+  // blue in every capture), refreshed from the guest edge-detect draw when
+  // it runs. Consumed by the outline composite when any item is selected.
+  float outline_color[4] = {0.21569f, 0.64706f, 1.0f, 1.0f};
   std::vector<DrawItem> items;
 };
 

@@ -71,6 +71,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_splines, true, "Skate 3",
                     "marker beams; spline_darken/spline_default shaders) inside the "
                     "native scene pass")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_selection_outline, true, "Skate 3",
+                    "Replay the park-editor / object-mover selected-object outline: the "
+                    "game stencil-marks the selected object after the sky and a postfx "
+                    "edge-detect adds the blue contour (postfx_edgedetectstencil port)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_quadlists, false, "Skate 3",
                     "Render captured non-indexed quad-list draws. Off by default: every "
                     "quad-list capture seen so far is a PARTICLE system (disjoint 2-4cm "
@@ -228,7 +233,27 @@ bool g_ui_blur_seen = false;
 // shimmer. Two publishes of hysteresis bridges the gaps; on popup close the
 // blur lingers ~2 guest frames, imperceptible.
 int g_ui_blur_hold = 0;
-// Dynamic-shadow receiver rows (see FrameScene::shadow_rows): world-material
+// Selected-object outline capture (see DrawItem::selected): in the park
+// editor / object mover the game EXCLUDES the selected object from the main
+// color pass and re-draws it right after the sky, twice, back to back, the
+// stencil-marking passes the postfx edge-detect turns into the blue contour
+// (verified in capture: consecutive environmentpark decal +
+// diffuse parts, identical VS banks, vs the same mesh at OTHER placements in
+// the main pass). Hook side records each post-sky environmentpark/
+// dynamicobject draw's (ib, vb, world translation); entries seen >= 2 times
+// mark the matching published items. Guest render thread only, like the fog
+// capture state.
+struct SelectedDrawKey {
+  uint32_t ib;
+  uint32_t vb;
+  float t[3];
+  uint32_t count;
+};
+bool g_sky_seen_this_frame = false;
+std::vector<SelectedDrawKey> g_frame_selected;
+// Outline color, refreshed from the guest postfx_edgedetectstencil draw's
+// PS c0 (the park-editor blue in every capture) whenever that pass runs.
+float g_outline_color[4] = {0.21569f, 0.64706f, 1.0f, 1.0f};
 // PIXEL banks keep the CSM constants at c0..c8, pass-global (identical on
 // every environment-family draw of the pass; character/hair/tree PSes
 // allocate differently and are rejected by the sanity gate). Captured on the
@@ -1744,6 +1769,101 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       g_ui_blur_seen = true;
     }
   }
+  // Selected-object outline capture (see g_frame_selected): the sky draw
+  // opens the post-sky window; environmentpark/dynamicobject draws inside it
+  // are the selection re-draws (the game excludes the selected object from
+  // the main pass and stencil-marks it here). The postfx_edgedetectstencil
+  // draw refreshes the outline color.
+  if (flags2d == 0 && SceneEnabled() &&
+      REXCVAR_GET(skate3_native_render_scene_selection_outline)) {
+    // Debug-path family, cached per shader object (guest render thread only,
+    // like the blur classifier). 1 = sky, 2 = park piece / dynamic object,
+    // 3 = postfx_edgedetectstencil.
+    const auto family_of = [&](uint32_t obj) -> int {
+      if (obj == 0 || !GuestReadableApprox(base, obj)) {
+        return 0;
+      }
+      static std::unordered_map<uint32_t, int> cache;
+      auto it = cache.find(obj);
+      if (it != cache.end()) {
+        return it->second;
+      }
+      char text[120] = {};
+      for (int k = 0; k < 119; ++k) {
+        text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+        if (text[k] == '\0') break;
+      }
+      int fam = 0;
+      if (std::strstr(text, "\\sky_") != nullptr) {
+        fam = 1;
+      } else if (std::strstr(text, "\\environmentpark") != nullptr ||
+                 std::strstr(text, "\\dynamicobject") != nullptr) {
+        fam = 2;
+      } else if (std::strstr(text, "postfx_edgedetectstencil") != nullptr) {
+        fam = 3;
+      }
+      if (cache.size() < 4096) {
+        cache.emplace(obj, fam);
+      }
+      return fam;
+    };
+    // Shader labels can be swapped in the hook; accept either slot.
+    int fam = family_of(g_cur_ps_obj.load(std::memory_order_relaxed));
+    if (fam == 0) {
+      fam = family_of(g_cur_vs_obj.load(std::memory_order_relaxed));
+    }
+    if (func == 0 && fam == 1) {
+      g_sky_seen_this_frame = true;
+    } else if (func == 0 && fam == 2 && g_sky_seen_this_frame) {
+      // World matrix in the VS bank: 3 rotation rows (w == 0) followed by
+      // the translation row (w == 1): c11..c14 on the decal variant,
+      // c9..c12 on the diffuse variant. Scan for the first such group.
+      for (int r = 8; r <= 16; ++r) {
+        if (LoadGuestF32(base, bank + (r * 4 + 3) * 4) != 1.0f) continue;
+        bool rot = true;
+        for (int p = 1; p <= 3 && rot; ++p) {
+          rot = LoadGuestF32(base, bank + ((r - p) * 4 + 3) * 4) == 0.0f;
+        }
+        if (!rot) continue;
+        float t[3];
+        for (int a = 0; a < 3; ++a) {
+          t[a] = LoadGuestF32(base, bank + (r * 4 + a) * 4);
+        }
+        if (std::fabs(t[0]) < 100000.0f && std::fabs(t[1]) < 100000.0f &&
+            std::fabs(t[2]) < 100000.0f) {
+          const uint32_t ib = g_cur_ib.load(std::memory_order_relaxed);
+          const uint32_t vb = g_cur_vb.load(std::memory_order_relaxed);
+          bool merged = false;
+          for (SelectedDrawKey& k : g_frame_selected) {
+            if (k.ib == ib && k.vb == vb && std::fabs(k.t[0] - t[0]) < 0.05f &&
+                std::fabs(k.t[1] - t[1]) < 0.05f && std::fabs(k.t[2] - t[2]) < 0.05f) {
+              ++k.count;
+              merged = true;
+              break;
+            }
+          }
+          if (!merged && g_frame_selected.size() < 64) {
+            g_frame_selected.push_back({ib, vb, {t[0], t[1], t[2]}, 1});
+          }
+        }
+        break;
+      }
+    } else if (fam == 3) {
+      // postfx edge-detect: PS c0 = the outline color as staged (the
+      // park-editor blue (0.216, 0.647, 1.0) in every capture).
+      const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+      if (ps_bank != 0) {
+        float c[4];
+        for (int a = 0; a < 4; ++a) {
+          c[a] = LoadGuestF32(base, ps_bank + a * 4);
+        }
+        if (c[0] >= 0.0f && c[0] <= 8.0f && c[1] >= 0.0f && c[1] <= 8.0f &&
+            c[2] >= 0.0f && c[2] <= 8.0f) {
+          std::memcpy(g_outline_color, c, sizeof(g_outline_color));
+        }
+      }
+    }
+  }
   // Live 2D overlay capture: the HUD renders exclusively through the
   // BeginVertices inline path (func 2). Vertex payloads are read at frame
   // end; everything else (transform constants, texture fetch) is staged now.
@@ -2248,6 +2368,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     dynitems.swap(g_frame_dynitems);
     g_frame_pending_by_buffers.clear();
   }
+  // Take this frame's selection re-draw captures and re-arm the post-sky
+  // window (must happen on every exit path, like the dynitems swap).
+  std::vector<SelectedDrawKey> frame_selected;
+  frame_selected.swap(g_frame_selected);
+  g_sky_seen_this_frame = false;
   if (count == 0) {
     return;
   }
@@ -2362,6 +2487,33 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
   if (scene.items.empty()) {
     return;
+  }
+  // Selected-object outline: flag items matching this frame's post-sky
+  // re-draw captures. >= 2 identical draws = the stencil-marking pair; a
+  // single occurrence is a legitimately late-drawn object, not a selection.
+  {
+    uint32_t outline_items = 0;
+    for (const SelectedDrawKey& k : frame_selected) {
+      if (k.count < 2) {
+        continue;
+      }
+      for (DrawItem& item : scene.items) {
+        if (item.ib_obj == k.ib && item.vb_obj == k.vb &&
+            std::fabs(item.world[12] - k.t[0]) < 0.05f &&
+            std::fabs(item.world[13] - k.t[1]) < 0.05f &&
+            std::fabs(item.world[14] - k.t[2]) < 0.05f && !item.selected) {
+          item.selected = true;
+          ++outline_items;
+        }
+      }
+    }
+    std::memcpy(scene.outline_color, g_outline_color, sizeof(scene.outline_color));
+    static uint32_t s_outline_items = 0;
+    if (outline_items != s_outline_items) {
+      REXLOG_INFO("native-scene: selection outline {} item(s) (captures={})",
+                  outline_items, frame_selected.size());
+      s_outline_items = outline_items;
+    }
   }
   for (int i = 0; i < 16; ++i) {
     scene.view_proj[i] = LoadGuestF32(base, viewcam + kViewCamViewProj + i * 4);
@@ -2525,7 +2677,8 @@ void WriteRecording(const char* dir, const char* stem) {
           << d.bw_offset << ",\"bi_off\":" << d.bi_offset << ",\"skinned\":"
           << (d.skinned ? 1 : 0) << ",\"pending\":" << (d.pending ? 1 : 0)
           << ",\"decal\":" << (d.decal ? 1 : 0)
-          << ",\"transparent\":" << (d.transparent ? 1 : 0) << ",\"world\":[";
+          << ",\"transparent\":" << (d.transparent ? 1 : 0)
+          << ",\"selected\":" << (d.selected ? 1 : 0) << ",\"world\":[";
       for (int i = 0; i < 16; ++i) out << (i ? "," : "") << d.world[i];
       out << "],\"draws\":[";
       for (size_t i = 0; i < d.draws.size(); ++i) {
@@ -2757,6 +2910,19 @@ struct RendererState {
   ID3D12PipelineState* pso_blur = nullptr;
   ID3D12PipelineState* pso_blur_blit = nullptr;
   ID3D12PipelineState* pso_blur_down = nullptr;
+  // Selection outline (see DrawItem::selected): selected items re-render
+  // into a single-sample R8 mask at OUTPUT resolution (RTV slot 7: a
+  // low-res mask stairstepped the contour centerline at 4K) and a
+  // fullscreen edge-detect pass with fixed UV-fraction tap pitch adds the
+  // blue outline onto the resolved output (postfx_edgedetectstencil
+  // equivalent). Mask steady state is RENDER_TARGET.
+  ID3D12Resource* outline_mask = nullptr;
+  uint32_t outline_mask_width = 0;
+  uint32_t outline_mask_height = 0;
+  uint32_t outline_mask_srv = 0;
+  bool outline_mask_srv_allocated = false;
+  ID3D12PipelineState* pso_outline_mask = nullptr;
+  ID3D12PipelineState* pso_outline_edge = nullptr;
   uint32_t rtv_size = 0;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // Buffers replaced by re-decode, kept alive until the GPU has finished the
@@ -3238,6 +3404,55 @@ float4 ps_down(VSOut i) : SV_Target {
 // postfx_basictex: oC0 = tex (verified: `max oC0, r0, r0`).
 float4 ps_blit(VSOut i) : SV_Target {
   return float4(src.SampleLevel(smp_clamp, i.uv, 0).rgb, 1.0);
+}
+)";
+
+// Selected-object outline composite (park editor / object mover): port of
+// postfx_edgedetectstencilPS. The game stencil-marks the selected object,
+// resolves stencil to a 576x320 texture and adds |threshold crossings| x
+// the outline color (PS c0, the editor blue) onto the frame; our mask pass
+// renders the selected items into a small R8 target instead (see
+// pso_outline_mask) and this pass composites additively over the resolved
+// output. Tap offsets are 1/576 x 1/320 UV fractions like the original, so
+// the contour thickness matches at any output resolution.
+const char kOutlineShaderSource[] = R"(
+cbuffer C : register(b0) {
+  float4 color;  // rgb = outline color (guest edge-detect PS c0)
+};
+Texture2D<float4> src : register(t0);
+SamplerState smp_clamp : register(s1);
+struct VSOut {
+  float4 pos : SV_Position;
+  float2 uv : TEXCOORD0;
+};
+VSOut vs_main(uint id : SV_VertexID) {
+  VSOut o;
+  float2 uv = float2((id << 1) & 2, id & 2);
+  o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+  o.uv = uv;
+  return o;
+}
+float4 ps_main(VSOut i) : SV_Target {
+  // Averaged 5x5 neighborhood of the (binary, full-resolution) mask with a
+  // fixed UV-fraction pitch -> a smooth 0..1 ramp across the silhouette
+  // boundary; the peaked profile 4m(1-m) turns the ramp into an
+  // antialiased line of constant screen-fraction width. The core is
+  // whitened (the emulated line goes through the game's uber grade +
+  // bloom, which lifts its center toward white). A literal port:
+  // binarized crossing counts on the 576x320 grid, stairstepped visibly
+  // at native output resolutions.
+  const float2 t = float2(0.8 / 1152.0, 0.8 / 640.0);
+  float m = 0.0;
+  [unroll] for (int y = -2; y <= 2; ++y) {
+    [unroll] for (int x = -2; x <= 2; ++x) {
+      m += src.SampleLevel(smp_clamp, i.uv + float2(x, y) * t, 0).r;
+    }
+  }
+  m /= 25.0;
+  float band = saturate(6.4 * m * (1.0 - m));
+  float core = band * band * band;
+  // Additive blend (ONE, ONE) onto the frame; alpha untouched (ZERO, ONE).
+  return float4(color.rgb * band + 0.5 * core, 0.0);
 }
 )";
 
@@ -4594,6 +4809,22 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
     const HRESULT hr2 =
         device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_nodepth));
+    // Selection-outline mask: the same scene VS/PS (the tint.a > 0 solid
+    // path renders flat 1.0) into the small single-sample R8 target. No
+    // depth: the mask is the full silhouette. The guest marking pass is
+    // depth-tested, so a partially occluded selection outlines slightly
+    // differently, acceptable for the editor UI.
+    pso.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+    pso.SampleDesc.Count = 1;
+    const HRESULT hr_om =
+        device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_outline_mask));
+    if (FAILED(hr_om)) {
+      REXLOG_WARN("native-scene: outline mask PSO creation failed {:08X}",
+                  uint32_t(hr_om));
+      g_r.pso_outline_mask = nullptr;  // outline pass disables itself
+    }
+    pso.RTVFormats[0] = context.d3d12.guest_output_format;
+    pso.SampleDesc.Count = g_r.msaa;
     vs->Release();
     ps->Release();
     if (errors) errors->Release();
@@ -4704,6 +4935,52 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
         g_r.pso_blur = nullptr;
         g_r.pso_blur_blit = nullptr;  // blur unavailable; everything else runs
         g_r.pso_blur_down = nullptr;
+      }
+    }
+    {
+      // Selection-outline edge composite (postfx_edgedetectstencil port):
+      // fullscreen triangle over the resolved output, additive blend.
+      ID3DBlob* ovs = nullptr;
+      ID3DBlob* ops = nullptr;
+      ID3DBlob* oerr = nullptr;
+      if (FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
+                            "native_outline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
+                            &ovs, &oerr)) ||
+          FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
+                            "native_outline", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
+                            &ops, &oerr))) {
+        REXLOG_ERROR("native-scene: outline shader compile failed: {}",
+                     oerr ? static_cast<const char*>(oerr->GetBufferPointer()) : "?");
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC op{};
+      op.pRootSignature = g_r.root_signature;
+      op.VS = {ovs->GetBufferPointer(), ovs->GetBufferSize()};
+      op.PS = {ops->GetBufferPointer(), ops->GetBufferSize()};
+      op.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      op.BlendState.RenderTarget[0].BlendEnable = TRUE;
+      op.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+      op.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+      op.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+      op.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
+      op.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+      op.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+      op.SampleMask = UINT_MAX;
+      op.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      op.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      op.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      op.NumRenderTargets = 1;
+      op.RTVFormats[0] = context.d3d12.guest_output_format;
+      op.SampleDesc.Count = 1;
+      if (g_r.pso_outline_edge) g_r.pso_outline_edge->Release();
+      const HRESULT ho = device->CreateGraphicsPipelineState(&op, IID_PPV_ARGS(&g_r.pso_outline_edge));
+      ovs->Release();
+      ops->Release();
+      if (oerr) oerr->Release();
+      if (FAILED(ho)) {
+        REXLOG_WARN("native-scene: outline edge PSO creation failed {:08X}", uint32_t(ho));
+        g_r.pso_outline_edge = nullptr;  // outline unavailable; everything else runs
       }
     }
     {
@@ -5082,6 +5359,58 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
         g_r.blur_tex[t] = nullptr;
       }
       g_r.pso_blur = nullptr;  // leaked PSO acceptable on this cold path
+    }
+  }
+
+  if ((g_r.outline_mask == nullptr ||
+       g_r.outline_mask_width != context.guest_output_width ||
+       g_r.outline_mask_height != context.guest_output_height) &&
+      g_r.pso_outline_mask != nullptr && g_r.pso_outline_edge != nullptr) {
+    // Selection-outline mask: single-sample R8 target at output resolution
+    // (a 1152x640 mask left the contour centerline visibly stairstepped;
+    // the mask's own rasterization aliasing survives any amount of
+    // downstream filtering). RTV slot 7.
+    if (g_r.outline_mask) {
+      g_r.retired.emplace_back(g_r.outline_mask,
+                               context.d3d12.command_processor->GetCurrentSubmission());
+      g_r.outline_mask = nullptr;
+    }
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = context.guest_output_width;
+    desc.Height = context.guest_output_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = desc.Format;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+                                               IID_PPV_ARGS(&g_r.outline_mask)))) {
+      REXLOG_ERROR("native-scene: outline mask creation failed; outline disabled");
+      g_r.pso_outline_edge = nullptr;
+    } else {
+      g_r.outline_mask_width = context.guest_output_width;
+      g_r.outline_mask_height = context.guest_output_height;
+      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      rtv.ptr += size_t(7) * g_r.rtv_size;
+      device->CreateRenderTargetView(g_r.outline_mask, nullptr, rtv);
+      if (!g_r.outline_mask_srv_allocated) {
+        g_r.outline_mask_srv = g_r.srv_next++;
+        g_r.outline_mask_srv_allocated = true;
+      }
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = desc.Format;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Texture2D.MipLevels = 1;
+      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+      slot.ptr += size_t(g_r.outline_mask_srv) * g_r.srv_size;
+      device->CreateShaderResourceView(g_r.outline_mask, &srv, slot);
     }
   }
 
@@ -6121,6 +6450,90 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
+  // Selection-outline mask (see kOutlineShaderSource): re-render the frame's
+  // selected items into the small R8 target while the scene pass state is
+  // still bound. The edge composite runs after the resolve, on the
+  // single-sample output.
+  bool outline_ready = false;
+  if (REXCVAR_GET(skate3_native_render_scene_selection_outline) &&
+      g_r.pso_outline_mask != nullptr && g_r.pso_outline_edge != nullptr &&
+      g_r.outline_mask != nullptr) {
+    std::vector<const DrawItem*> sel;
+    for (const DrawItem& item : scene.items) {
+      // Skinned items are excluded: the mask VS runs the rigid path (world
+      // matrix), which renders a skinned mesh at bind pose at the origin.
+      if (item.selected && !item.skinned) {
+        sel.push_back(&item);
+      }
+    }
+    if (!sel.empty()) {
+      D3D12_CPU_DESCRIPTOR_HANDLE mask_rtv =
+          g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      mask_rtv.ptr += size_t(7) * g_r.rtv_size;
+      const FLOAT mask_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      list.D3DClearRenderTargetView(mask_rtv, mask_clear, 0, nullptr);
+      list.D3DOMSetRenderTargets(1, &mask_rtv, FALSE, nullptr);
+      D3D12_VIEWPORT mask_vp{0.0f, 0.0f, float(g_r.outline_mask_width),
+                             float(g_r.outline_mask_height), 0.0f, 1.0f};
+      list.RSSetViewport(mask_vp);
+      D3D12_RECT mask_sc{0, 0, LONG(g_r.outline_mask_width),
+                         LONG(g_r.outline_mask_height)};
+      list.RSSetScissorRect(mask_sc);
+      list.D3DSetPipelineState(g_r.pso_outline_mask);
+      for (const DrawItem* item : sel) {
+        auto mit = g_r.meshes.find(item->mesh);
+        if (mit == g_r.meshes.end() || mit->second.fingerprint != item->fingerprint) {
+          continue;  // decoded by the main pass this frame; masks from the next
+        }
+        float constants[52] = {};
+        std::memcpy(constants, item->world, sizeof(item->world));
+        float* mvp = constants + 16;
+        for (int r = 0; r < 4; ++r) {
+          for (int c = 0; c < 4; ++c) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+              sum += constants[r * 4 + k] * scene.view_proj[k * 4 + c];
+            }
+            mvp[r * 4 + c] = sum;
+          }
+        }
+        // tint = (1, 0, 0, 1): the scene PS's solid-color early-out
+        // (tint.a > 0) writes 1.0 into the R8 mask; tint.g = 0 keeps the VS
+        // skinning branch off.
+        constants[32] = 1.0f;
+        constants[35] = 1.0f;
+        list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
+        list.D3DIASetVertexBuffers(0, 1, &mit->second.vb_view);
+        list.D3DIASetIndexBuffer(&mit->second.ib_view);
+        for (const DrawEntry& draw : item->draws) {
+          if (draw.prim == 4) {
+            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          } else if (draw.prim == 6) {
+            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+          } else {
+            continue;
+          }
+          list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index,
+                                       draw.base_vertex, 0);
+          outline_ready = true;
+        }
+      }
+      // Restore the pass state the resolve/2D paths rely on (fullscreen
+      // viewport; the non-MSAA path keeps rendering into the scene target).
+      list.RSSetViewport(viewport);
+      list.RSSetScissorRect(scissor);
+      if (!msaa_on) {
+        list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, use_depth ? &dsv : nullptr);
+      }
+      if (outline_ready) {
+        context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                              g_r.outline_mask,
+                                              D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      }
+    }
+  }
+
   if (msaa_on) {
     // Resolve: average the MSAA samples into the guest output with a
     // fullscreen pass, then restore steady-state resource states.
@@ -6143,6 +6556,29 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     list.D3DDrawInstanced(3, 1, 0, 0);
     context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
                                           g_r.msaa_color,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+  }
+
+  if (outline_ready) {
+    // Selection-outline composite: additive stencil-edge-detect over the
+    // resolved output (before the popup blur, like the game's postfx order).
+    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+    list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+    list.RSSetViewport(viewport);
+    list.RSSetScissorRect(scissor);
+    list.D3DSetPipelineState(g_r.pso_outline_edge);
+    list.D3DSetGraphicsRoot32BitConstants(0, 4, scene.outline_color, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE mask_srv =
+        g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+    mask_srv.ptr += size_t(g_r.outline_mask_srv) * g_r.srv_size;
+    context.d3d12.set_graphics_root_descriptor_table(
+        context.d3d12.command_processor_user_data, 1, mask_srv);
+    list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list.D3DDrawInstanced(3, 1, 0, 0);
+    // Back to the mask's steady state for the next frame.
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          g_r.outline_mask,
                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
   }
