@@ -75,6 +75,14 @@ struct DrawItem {
   // pass's alpha-test turned the soft mist gradients into solid hard-edged
   // white cloud blobs.
   bool transparent;
+  // AttribulatorMaterialName starts "water.": canal/ocean surfaces
+  // (flowingwater.fx family). Drawn in the transparent sub-pass with a
+  // dedicated shading branch (ripple normal taps + fresnel reflection);
+  // `water_normal` is the material's `normal` channel texture, bound in the
+  // macro slot (water never carries a macro overlay).
+  bool water;
+  uint32_t water_normal;
+  uint32_t water_env;  // `environment` channel cube map (reflection term)
   // character.cloth_ropa (Ropa cloth-simulated garments, e.g. player tees):
   // the VS variant branches on a flag row kept in front of the bone palette
   // - sim active means the dynamic VB already holds deformed root-local

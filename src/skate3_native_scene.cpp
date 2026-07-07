@@ -812,6 +812,9 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.decal = false;
   item.decal_tileable = false;
   item.transparent = false;
+  item.water = false;
+  item.water_normal = 0;
+  item.water_env = 0;
   item.unlit = false;
   item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
   const uint32_t material = REX_LOAD_U32(mesh + kMeshMaterial);
@@ -837,6 +840,13 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           slot = &item.macro_tex;
         } else if (std::memcmp(text, "decal", 6) == 0) {
           slot = &item.decal_art;
+        } else if (std::memcmp(text, "normal", 7) == 0) {
+          // Exact match only ("normal2" is the second flowing-water tap).
+          // Consumed by the water branch; other families ignore it.
+          slot = &item.water_normal;
+        } else if (std::memcmp(text, "environment", 12) == 0) {
+          // Environment CUBE map: the water reflection term.
+          slot = &item.water_env;
         } else if (std::memcmp(text, "macroOverlayUVScale", 20) == 0 ||
                    std::memcmp(text, "macroOverlayOpacity", 20) == 0) {
           // Shader-constant channel: the float lives in the first guid word.
@@ -874,6 +884,9 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             // sheets, glass, fences); see DrawItem::transparent.
             item.transparent =
                 std::memcmp(mat_name, "environment.transparent", 23) == 0;
+            // water.*: canal/ocean surfaces, transparent sub-pass with the
+            // dedicated water shading branch (see DrawItem::water).
+            item.water = std::memcmp(mat_name, "water.", 6) == 0;
           }
           continue;
         }
@@ -2632,6 +2645,10 @@ struct RendererState {
   uint32_t srv_next = 0;
   std::unordered_map<uint32_t, GuestTexture> textures;
   GuestTexture white;
+  // Water environment CUBE maps (t6): separate cache; same guest object
+  // addresses decode differently (6 faces, TextureCube SRV).
+  std::unordered_map<uint32_t, GuestTexture> cube_textures;
+  GuestTexture white_cube;
   // Bone palette ring: persistent-mapped upload buffer, one region per
   // in-flight frame.
   static constexpr uint32_t kBoneRegionSize = 1u << 20;
@@ -2731,6 +2748,7 @@ Texture2D<float4> lightmap : register(t1);
 Texture2D<float4> macro : register(t3);
 Texture2D<float4> decal_art : register(t4);
 Texture2D<float2> shadow_atlas : register(t5);
+TextureCube<float4> env_cube : register(t6);
 // Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
 // applied with explicit dots (StructuredBuffer<float4x4> default packing is
 // column-major and would silently transpose the matrices).
@@ -2806,7 +2824,7 @@ float4 ps_main(VSOut i) : SV_Target {
   // linear (squared) color space, so the gamma-space equivalent is
   // sqrt(m); a direct multiply doubles the darkening (harsh black
   // patchwork vs the emulated subtle weathering).
-  if (overlay.z > 0.0) {
+  if (overlay.z > 0.0 && misc.x < 1.5) {  // water reuses overlay.z (ripple map flag)
     float4 m = macro.Sample(smp, i.uv * overlay.x);
     albedo.rgb *= lerp(float3(1.0, 1.0, 1.0), sqrt(m.rgb), overlay.y * m.a);
   }
@@ -2874,6 +2892,68 @@ float4 ps_main(VSOut i) : SV_Target {
   }
   if (mat_tint.w > 0.0 && misc.x == 0.0) {
     lit *= mat_tint.rgb;
+  }
+  if (misc.x > 1.5) {
+    // water.* (flowingwater.fx approximation): the real shader is
+    // near-black diffuse + dual time-scrolled ripple-normal taps + an
+    // environment-cube reflection + sun specular. We have no cube map
+    // bound, so the reflection term is the frame fog color (the best
+    // single approximation of the surroundings' haze tone) scaled by a
+    // fresnel curve; the ripple normal perturbs both the fresnel and a sun
+    // sparkle along the captured CSM light axis. The lightmap (x2) keeps
+    // the baked bridge/wall shading on the surface. Calibrated against the
+    // canal capture (emulated mid-canal mean ~(24,28,32)/255).
+    float t = overlay.x;
+    float2 rip;
+    if (overlay.z > 0.0) {
+      // Dual scrolled taps of the material's ripple normal map (macro slot).
+      float2 wuv = i.uv * 6.0;
+      float3 n1 = macro.Sample(smp, wuv + t * float2(0.11, 0.06)).rgb;
+      float3 n2 = macro.Sample(smp, wuv * 1.71 - t * float2(0.07, 0.13)).rgb;
+      rip = (n1.xy + n2.xy) - 1.0;
+    } else {
+      // Normal map unresolved: procedural ripples from world position.
+      // Wavelengths ~0.4-1m (emulated ripples are decimeter-scale); low
+      // frequencies formed meter-wide chevron interference bands that read
+      // as giant arrows on the surface.
+      float3 wp = i.rpos + cam_pos.xyz;
+      rip = 0.35 * float2(sin(wp.x * 9.7 + wp.z * 6.1 + t * 2.3) +
+                              0.6 * sin(wp.x * 17.3 - wp.z * 11.9 + t * 3.4),
+                          cos(wp.x * 7.1 - wp.z * 13.7 + t * 2.7) +
+                              0.6 * cos(wp.x * 12.9 + wp.z * 18.3 + t * 3.1));
+    }
+    float3 wn = normalize(float3(rip.x * 0.4, 2.0, rip.y * 0.4));
+    float3 vd = -normalize(i.rpos);
+    float fres = pow(1.0 - saturate(dot(vd, wn)), 3.0);
+    // The flowing-water lightmap unwrap decodes unreliably (bands across
+    // atlas gutters), so the water term deliberately ignores it: near-black
+    // body + ripple-perturbed cube reflection + sun sparkle.
+    // Deep body: the water "diffuse" is a faint STRIPE MASK (max 24/255,
+    // WaterFallFoamAlpha, a lookup for the real shader, not a color). The
+    // game consumes it in linear space where 0.09^2 vanishes; squaring here
+    // likewise kills the visible blue/black banding.
+    float3 col = albedo.rgb * albedo.rgb * 0.6;
+    // Reflection tint: the environment cube when resolved (t6); otherwise a
+    // haze derived from the frame fog color, lifted toward neutral so dark
+    // dusk fog doesn't collapse the water to black (fit: emulated canal
+    // mean ~(24,28,32)/255 with fog color (0.02,0.07,0.13)).
+    float3 renv = overlay.y > 0.0
+                      ? env_cube.Sample(smp, reflect(-vd, wn)).rgb
+                      : mat_tint.rgb * 0.5 + 0.06;
+    col += renv * (0.55 + 0.45 * fres);
+    if (sh_misc.y > 0.0) {
+      float3 h = normalize(vd + normalize(-sh_z.xyz));
+      col += pow(saturate(dot(wn, h)), 90.0) * 0.35;            // sun sparkle
+    }
+    float fade = saturate(length(i.rpos) * misc.y + misc.z);
+    if (misc.w != 1.0) {
+      fade = pow(max(fade, 1e-4), misc.w);
+    }
+    col = sqrt(max(col * col * saturate(1.0 + fade * mat_tint.w) +
+                   fade * mat_tint.rgb, 0.0));
+    // Opaque: the game's murk hides the canal bed entirely (and our bed
+    // shading is untrustworthy under water: striped lightmap unwraps).
+    return float4(col, 1.0);
   }
   if (misc.x > 0.0) {
     // transparentenvironment.fx (Skate 2 source; disassembled Skate 3 PS
@@ -3985,21 +4065,180 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   return EnsureGuestTextureFromWords(context, base, words, out);
 }
 
+// Environment CUBE map for the water reflection term (t6). Mip 0 only, six
+// faces untiled independently (Xenos cubes are 2D-tiled per face slice).
+bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8_t* base,
+                            uint32_t tex_ptr, GuestTexture& out) {
+  uint32_t words[6] = {};
+  {
+    uint32_t raw[6];
+    if (!GuestTryCopy(raw, base + tex_ptr + 7 * 4, sizeof(raw))) {
+      return false;
+    }
+    for (uint32_t i = 0; i < 6; ++i) {
+      words[i] = SwapU32(raw[i]);
+    }
+  }
+  std::memcpy(out.fetch_words, words, sizeof(words));
+  xenos::xe_gpu_texture_fetch_t fetch = {};
+  fetch.dword_0 = words[0];
+  fetch.dword_1 = words[1];
+  fetch.dword_2 = words[2];
+  fetch.dword_3 = words[3];
+  fetch.dword_4 = words[4];
+  fetch.dword_5 = words[5];
+  if (fetch.type != xenos::FetchConstantType::kTexture || fetch.base_address == 0) {
+    return false;
+  }
+  rex::graphics::TextureInfo info;
+  if (!rex::graphics::TextureInfo::Prepare(fetch, &info)) {
+    return false;
+  }
+  if (info.dimension != xenos::DataDimension::kCube || info.memory.base_address == 0 ||
+      info.width >= 1024 || info.height >= 1024) {
+    return false;
+  }
+  HostTextureFormat host;
+  if (!GetHostTextureFormat(info.format, host)) {
+    return false;
+  }
+  const rex::graphics::FormatInfo* format_info = info.format_info();
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (bytes_per_block == 0 || (bytes_per_block & (bytes_per_block - 1)) != 0) {
+    return false;
+  }
+  const uint32_t bytes_per_block_log2 = uint32_t(std::countr_zero(bytes_per_block));
+  const uint32_t width = info.width + 1u;
+  const uint32_t height = info.height + 1u;
+  const uint32_t block_w = format_info->block_width;
+  const uint32_t block_h = format_info->block_height;
+  const uint32_t host_width = ((width + block_w - 1) / block_w) * block_w;
+  const uint32_t host_height = ((height + block_h - 1) / block_h) * block_h;
+  const uint32_t cols = (width + block_w - 1) / block_w;
+  const uint32_t rows = (height + block_h - 1) / block_h;
+  const uint32_t pitch_blocks = info.extent.block_pitch_h;
+  const uint32_t slice_blocks = info.extent.block_pitch_h * info.extent.block_pitch_v;
+  const uint32_t slice_bytes = slice_blocks * bytes_per_block;
+  const uint32_t total = slice_bytes * 6;
+  if (total == 0 || total > 16u * 1024u * 1024u) {
+    return false;
+  }
+  static thread_local std::vector<uint8_t> cube_scratch;
+  cube_scratch.resize(total);
+  if (!GuestTryCopy(cube_scratch.data(), base + (0xA0000000u | info.memory.base_address),
+                    total)) {
+    return false;
+  }
+
+  const uint32_t row_bytes = cols * bytes_per_block;
+  const uint32_t pitch = (row_bytes + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+                         ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+  const uint32_t face_upload = ((pitch * rows + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
+                                ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u));
+  ID3D12Device* device = context.d3d12.device;
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = host_width;
+  desc.Height = host_height;
+  desc.DepthOrArraySize = 6;
+  desc.MipLevels = 1;
+  desc.Format = host.resource_format;
+  desc.SampleDesc.Count = 1;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&out.texture)))) {
+    out.texture = nullptr;
+    return false;
+  }
+  out.upload = CreateUploadBuffer(device, face_upload * 6);
+  if (!out.upload) {
+    out.texture->Release();
+    out.texture = nullptr;
+    return false;
+  }
+  uint8_t* mapping = nullptr;
+  out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+  for (uint32_t face = 0; face < 6; ++face) {
+    const uint8_t* guest = cube_scratch.data() + size_t(face) * slice_bytes;
+    for (uint32_t by = 0; by < rows; ++by) {
+      uint8_t* out_row = mapping + size_t(face) * face_upload + size_t(by) * pitch;
+      for (uint32_t bx = 0; bx < cols; ++bx) {
+        uint32_t source_offset;
+        if (info.is_tiled) {
+          source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+              int32_t(bx), int32_t(by), pitch_blocks, bytes_per_block_log2));
+        } else {
+          source_offset = (by * pitch_blocks + bx) * bytes_per_block;
+        }
+        if (source_offset + bytes_per_block > slice_bytes) {
+          std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+          continue;
+        }
+        std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + source_offset,
+                    bytes_per_block);
+      }
+      SwapGuestEndian(out_row, row_bytes, info.endianness);
+    }
+  }
+  out.upload->Unmap(0, nullptr);
+
+  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+  for (uint32_t face = 0; face < 6; ++face) {
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = out.texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = face;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = out.upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = size_t(face) * face_upload;
+    src.PlacedFootprint.Footprint.Format = host.resource_format;
+    src.PlacedFootprint.Footprint.Width = host_width;
+    src.PlacedFootprint.Footprint.Height = host_height;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = pitch;
+    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
+  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                        out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  if (g_r.srv_next >= 8192) {
+    return false;
+  }
+  out.srv_slot = g_r.srv_next++;
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = host.srv_format;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+  srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
+  srv.TextureCube.MipLevels = 1;
+  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+  slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
+  device->CreateShaderResourceView(out.texture, &srv, slot);
+  out.payload_addr = 0xA0000000u | info.memory.base_address;
+  out.payload_size = total;
+  out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
+  out.recheck_frame = 0;
+  out.valid = true;
+  return true;
+}
+
 bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   if (g_r.failed) return false;
   ID3D12Device* device = context.d3d12.device;
   g_r.device = device;
 
   if (!g_r.root_signature) {
-    D3D12_ROOT_PARAMETER params[8] = {};
+    D3D12_ROOT_PARAMETER params[9] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    // NOTE the 64-DWORD root-signature budget: 52 constants + 5 descriptor
-    // tables (1 each) + 1 root SRV (2) + 1 root CBV (2) = 61. Going past 64
+    // NOTE the 64-DWORD root-signature budget: 52 constants + 6 descriptor
+    // tables (1 each) + 1 root SRV (2) + 1 root CBV (2) = 62. Going past 64
     // makes CreateRootSignature fail (renderer falls back to emulated).
     params[0].Constants.Num32BitValues = 52;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE srv_range[5] = {};
+    D3D12_DESCRIPTOR_RANGE srv_range[6] = {};
     srv_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srv_range[0].NumDescriptors = 1;
     srv_range[0].BaseShaderRegister = 0;
@@ -4011,6 +4250,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     srv_range[3].BaseShaderRegister = 4;  // environment.decal art (t4)
     srv_range[4] = srv_range[0];
     srv_range[4].BaseShaderRegister = 5;  // shadow atlas (t5)
+    srv_range[5] = srv_range[0];
+    srv_range[5].BaseShaderRegister = 6;  // water environment cube (t6)
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
     params[1].DescriptorTable.pDescriptorRanges = &srv_range[0];
@@ -4031,6 +4272,9 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[7] = params[1];
     params[7].DescriptorTable.pDescriptorRanges = &srv_range[4];
+    // Water environment cube (t6): the flowingwater/ocean reflection term.
+    params[8] = params[1];
+    params[8].DescriptorTable.pDescriptorRanges = &srv_range[5];
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
     samplers[0].Filter = D3D12_FILTER_ANISOTROPIC;
     samplers[0].MaxAnisotropy = 8;
@@ -4053,7 +4297,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 8;
+    desc.NumParameters = 9;
     desc.pParameters = params;
     desc.NumStaticSamplers = 2;
     desc.pStaticSamplers = samplers;
@@ -4598,6 +4842,68 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     device->CreateShaderResourceView(g_r.white.texture, &srv, slot);
     g_r.white.valid = true;
   }
+  if (!g_r.white_cube.valid) {
+    // 1x1x6 mid-gray fallback cube for the water reflection slot (t6): a
+    // TextureCube SRV must always be bound where the shader declares one.
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 1;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 6;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&g_r.white_cube.texture)))) {
+      g_r.failed = true;
+      return false;
+    }
+    g_r.white_cube.upload = CreateUploadBuffer(device, 512 * 6);
+    if (!g_r.white_cube.upload) {
+      g_r.failed = true;
+      return false;
+    }
+    uint8_t* mapping = nullptr;
+    g_r.white_cube.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+    for (uint32_t f = 0; f < 6; ++f) {
+      std::memset(mapping + f * 512, 0x80, 4);
+    }
+    g_r.white_cube.upload->Unmap(0, nullptr);
+    auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+    for (uint32_t f = 0; f < 6; ++f) {
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = g_r.white_cube.texture;
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = f;
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = g_r.white_cube.upload;
+      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint.Offset = f * 512;
+      src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      src.PlacedFootprint.Footprint.Width = 1;
+      src.PlacedFootprint.Footprint.Height = 1;
+      src.PlacedFootprint.Footprint.Depth = 1;
+      src.PlacedFootprint.Footprint.RowPitch = 256;
+      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          g_r.white_cube.texture,
+                                          D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    g_r.white_cube.srv_slot = g_r.srv_next++;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.TextureCube.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+    slot.ptr += size_t(g_r.white_cube.srv_slot) * g_r.srv_size;
+    device->CreateShaderResourceView(g_r.white_cube.texture, &srv, slot);
+    g_r.white_cube.valid = true;
+  }
 
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
@@ -5054,6 +5360,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // they ARE the wall/ground sections they cover, with the art composited
   // in-shader (alpha-blending them as separate overlay geometry punched
   // holes in the world).
+  // Ripple scroll clock for the water branch (seconds; wraps every hour to
+  // keep float precision on the scrolled UVs).
+  static const std::chrono::steady_clock::time_point water_t0 =
+      std::chrono::steady_clock::now();
+  const float water_time = float(
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - water_t0).count() -
+      std::floor(
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - water_t0).count() /
+          3600.0) *
+          3600.0);
+
   const auto draw_item = [&](const DrawItem& item) {
     auto it = g_r.meshes.find(item.mesh);
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
@@ -5089,7 +5406,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // front/back copies z-fight into lightmap flicker at range (banners/
     // flags). Opaque depth pass only; a mirrored instance (negative world
     // determinant) would flip winding, so those stay uncull(ed).
-    if (use_depth && !item.transparent && g_r.pso_cullback != nullptr) {
+    if (use_depth && !item.transparent && !item.water && g_r.pso_cullback != nullptr) {
       const float* w = item.world;
       const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
                          w[1] * (w[4] * w[10] - w[6] * w[8]) +
@@ -5272,6 +5589,33 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         item.macro_tex != 0 && REXCVAR_GET(skate3_native_render_scene_macro)
             ? resolve_texture(item.macro_tex)
             : &g_r.white;
+    if (item.water && item.water_normal != 0) {
+      // Water rides its ripple normal map in the macro slot (water never
+      // carries a macro overlay; overlay.z stays 0 below so the macro
+      // composite path never runs).
+      macro_tex = resolve_texture(item.water_normal);
+    }
+    // Water environment cube (t6, root param 8): decoded once per guest
+    // object into the cube cache; the gray fallback cube otherwise.
+    const GuestTexture* cube_tex = &g_r.white_cube;
+    if (item.water && item.water_env != 0) {
+      auto cit = g_r.cube_textures.find(item.water_env);
+      if (cit == g_r.cube_textures.end()) {
+        GuestTexture c{};
+        if (EnsureGuestCubeTexture(context, base, item.water_env, c)) {
+          cit = g_r.cube_textures.emplace(item.water_env, c).first;
+        } else {
+          if (c.upload) c.upload->Release();
+          if (c.texture) c.texture->Release();
+          c = GuestTexture{};
+          c.valid = false;
+          cit = g_r.cube_textures.emplace(item.water_env, c).first;  // negative-cache
+        }
+      }
+      if (cit->second.valid) {
+        cube_tex = &cit->second;
+      }
+    }
     const GuestTexture* decal_tex = item.decal && item.decal_art != 0 &&
                                             REXCVAR_GET(skate3_native_render_scene_decals)
                                         ? resolve_texture(item.decal_art)
@@ -5284,11 +5628,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // decal (art wraps; clamping a many-period uv range stretched the
     // border texels into the giant cliff-face streaks).
     constants[47] = is_decal ? (item.decal_tileable ? 2.0f : 1.0f) : 0.0f;
-    // misc.x: alpha-blended sub-pass item (transparentenvironment shading);
-    // fog rides in misc.yzw (ramp) and the mat_tint row (color), unused by
-    // transparent items otherwise (root-signature DWORD budget).
-    constants[48] = item.transparent ? 1.0f : 0.0f;
-    if (item.transparent) {
+    if (item.water) {
+      // overlay.x = ripple scroll time, overlay.y = real environment cube
+      // bound at t6, overlay.z = ripple normal map resolved (in the macro
+      // slot; the shader synthesizes procedural ripples otherwise).
+      // overlay.w stays 0: no macro composite, no decal.
+      constants[44] = water_time;
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
+      constants[47] = 0.0f;
+    }
+    // misc.x: alpha-blended sub-pass item (1 = transparentenvironment
+    // shading, 2 = water branch); fog rides in misc.yzw (ramp) and the
+    // mat_tint row (color), unused by these items otherwise
+    // (root-signature DWORD budget).
+    constants[48] = item.water ? 2.0f : (item.transparent ? 1.0f : 0.0f);
+    if (item.transparent || item.water) {
       constants[49] = scene.fog_ramp[0];
       constants[50] = scene.fog_ramp[1];
       constants[51] = scene.fog_ramp[2];
@@ -5315,6 +5670,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     decal_gpu.ptr += size_t(decal_tex->srv_slot) * g_r.srv_size;
     context.d3d12.set_graphics_root_descriptor_table(
         context.d3d12.command_processor_user_data, 5, decal_gpu);
+    D3D12_GPU_DESCRIPTOR_HANDLE cube_gpu = heap_start;
+    cube_gpu.ptr += size_t(cube_tex->srv_slot) * g_r.srv_size;
+    context.d3d12.set_graphics_root_descriptor_table(
+        context.d3d12.command_processor_user_data, 8, cube_gpu);
     list.D3DIASetVertexBuffers(0, 1, &buffers.vb_view);
     list.D3DIASetIndexBuffer(&buffers.ib_view);
     for (const DrawEntry& draw : item.draws) {
@@ -5344,7 +5703,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (debug_mode == 3 && index >= 20) {
       break;
     }
-    if (item.transparent && debug_mode == 0) {
+    if ((item.transparent || item.water) && debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
       }
