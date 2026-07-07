@@ -42,6 +42,15 @@ struct DrawItem {
   uint16_t bw_offset;  // blend weights (u8x4), valid when skinned
   uint16_t bi_offset;  // blend indices (u8x4), valid when skinned
   uint16_t normal_offset;  // usage-3 vertex normal (0 fmt = none)
+  // usage-6 tangent / usage-7 binormal (k_10_11_11): NPC character meshes
+  // (default_cloth / default_hair / livingworld peds / skateboard) carry NO
+  // usage-3 normal; the game's VS derives it as cross(tangent, binormal)
+  // (verified numerically against the emulated VS outputs, dot 0.9999).
+  // tb_fmt = 16 when both are present; DecodeMesh then synthesizes the
+  // normal, replacing the faceted ddx/ddy face-normal fallback.
+  uint16_t tangent_offset = 0;
+  uint16_t binormal_offset = 0;
+  uint8_t tb_fmt = 0;
   uint8_t stride;
   uint8_t pos_fmt;    // xenos vertex format (26 s16x4, 32 half4, 57 float3)
   uint8_t uv_fmt;     // xenos vertex format of the first texcoord (0 = none)
@@ -55,6 +64,23 @@ struct DrawItem {
   // by a per-character color staged in the PIXEL constant bank. Detected via
   // the AttribulatorMaterialName channel; tint captured with the palette.
   bool hair;
+  // Character-family exact shading (defaultcharacter.fx and friends).
+  // Classified from AttribulatorMaterialName: 1 = character.default_*
+  // (defaultcharacter PS layout), 2 = CAC player pieces (skin / face / cloth
+  // / leather / shift / cloth_ropa: cacstamp layout), 3 =
+  // character.livingworld_* pedestrians (stamp recolor), 4 = character.hair
+  // (CAC), 5 = character.default_hair (NPC hair). 0 = not a character.
+  // char_rows = the canonical per-draw lighting block captured from the
+  // PIXEL constant bank at palette-capture time (CaptureCharLighting):
+  // 15 float4 rows consumed by the scene PS character branch (cbuffer CH,
+  // b2). rows[14].y = family, > 0 only when the capture validated; items
+  // without it fall back to the legacy empirical character shading.
+  uint8_t char_family = 0;
+  float char_rows[60] = {};
+  // Hair strand coverage: the hair mesh's "alpha" channel texture, sampled
+  // at the SECOND texcoord (raw float2); hair renders alpha-blended in the
+  // sorted sub-pass (the opaque path is the blocky-helmet look).
+  uint32_t hair_alpha_tex = 0;
   // AttribulatorMaterialName starts "environment.decal": wall/ground
   // sections whose pixel shader composites a `decal` art texture (graffiti,
   // painted branding, grime) over the base diffuse INSIDE the shader,

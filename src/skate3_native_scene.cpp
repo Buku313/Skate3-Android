@@ -271,6 +271,12 @@ std::vector<DrawItem> g_frame_dynitems;
 // for the post-draw state fixup (deferred / world-path captures draw after
 // their capture; the fixup fills palette or world from the actual draw).
 std::unordered_multimap<uint64_t, size_t> g_frame_pending_by_buffers;
+// (ib_obj << 32 | vb_obj) -> dynitem indices whose character-lighting rows
+// should refresh on every later matching draw this frame. The one-shot
+// palette fixup usually pops on the shadow-CASTER draw, whose PS bank is
+// stale (shadowPS uploads no PS constants); re-capturing on the main-pass
+// draw (last writer) lands the real per-instance rows (stamp tints etc.).
+std::unordered_multimap<uint64_t, size_t> g_frame_char_refresh;
 std::atomic<uint32_t> g_cur_ib{0};
 std::atomic<uint32_t> g_cur_vb{0};
 std::atomic<uint32_t> g_cur_vb_offset{0};
@@ -426,6 +432,11 @@ std::atomic<uint64_t> g_palette_snapshots{0};
 // Palettes captured at base+1 (the cloth/morph VS layout with an extra
 // parameter row before the palette, see RefinePaletteBase).
 std::atomic<uint64_t> g_palette_base_plus1{0};
+// Character-lighting capture telemetry: attempts vs validated captures per
+// family (see CaptureCharLighting).
+std::atomic<uint64_t> g_char_attempts{0};
+std::atomic<uint64_t> g_char_valid{0};
+std::atomic<uint64_t> g_char_drawn{0};
 // character.cloth_ropa items captured in the sim-active RIGID mode (world
 // from c188/c191 instead of a bone palette, see CaptureSkinnedState).
 std::atomic<uint64_t> g_ropa_rigid{0};
@@ -780,6 +791,11 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.bi_offset = 0;
   item.normal_offset = 0;
   item.normal_fmt = 0;
+  item.tangent_offset = 0;
+  item.binormal_offset = 0;
+  item.tb_fmt = 0;
+  bool have_tan = false;
+  bool have_bin = false;
   item.skinned = false;
   for (uint32_t i = 0; i < num_elements; ++i) {
     const uint32_t e = vdesc + 0x10 + i * 16;
@@ -808,7 +824,18 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
     } else if (usage == 2 && !have_bi) {  // blend indices u8x4
       item.bi_offset = REX_LOAD_U16(e + 2);
       have_bi = (REX_LOAD_U32(e + 4) & 0x3F) == 6;
+    } else if (usage == 6 && !have_tan &&
+               (REX_LOAD_U32(e + 4) & 0x3F) == 16) {  // tangent k_10_11_11
+      item.tangent_offset = REX_LOAD_U16(e + 2);
+      have_tan = true;
+    } else if (usage == 7 && !have_bin &&
+               (REX_LOAD_U32(e + 4) & 0x3F) == 16) {  // binormal k_10_11_11
+      item.binormal_offset = REX_LOAD_U16(e + 2);
+      have_bin = true;
     }
+  }
+  if (have_tan && have_bin) {
+    item.tb_fmt = 16;
   }
   if (!have_pos) {
     g_rej_geom.fetch_add(1, std::memory_order_relaxed);
@@ -857,6 +884,8 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.macro_opacity = 1.0f;
   item.decal_art = 0;
   item.hair = false;
+  item.char_family = 0;
+  item.hair_alpha_tex = 0;
   item.ropa = false;
   item.decal = false;
   item.decal_tileable = false;
@@ -893,6 +922,10 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // Exact match only ("normal2" is the second flowing-water tap).
           // Consumed by the water branch; other families ignore it.
           slot = &item.water_normal;
+        } else if (std::memcmp(text, "alpha", 6) == 0) {
+          // Hair strand coverage (cac_hair/defaulthair tf5, sampled at the
+          // second texcoord), the hair alpha-blend term.
+          slot = &item.hair_alpha_tex;
         } else if (std::memcmp(text, "environment", 12) == 0) {
           // Environment CUBE map: the water reflection term.
           slot = &item.water_env;
@@ -920,6 +953,23 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             item.hair = std::memcmp(mat_name, "character.hair", 15) == 0;
             item.unlit = std::memcmp(mat_name, "sky.", 4) == 0;
             item.ropa = std::memcmp(mat_name, "character.cloth_ropa", 21) == 0;
+            // Character shading family (see DrawItem::char_family). Order
+            // matters: "default_hair" before the "default" prefix, exact
+            // "hair" after (memcmp includes the NUL for exact names).
+            if (std::memcmp(mat_name, "character.", 10) == 0) {
+              const char* sub = mat_name + 10;
+              if (std::memcmp(sub, "default_hair", 13) == 0) {
+                item.char_family = 5;
+              } else if (std::memcmp(sub, "default", 7) == 0) {
+                item.char_family = 1;
+              } else if (std::memcmp(sub, "hair", 5) == 0) {
+                item.char_family = 4;
+              } else if (std::memcmp(sub, "livingworld", 11) == 0) {
+                item.char_family = 3;
+              } else {
+                item.char_family = 2;  // skin/face/cloth/leather/shift/ropa
+              }
+            }
             // environment.decal / environment.decal_tileable: graffiti and
             // painted-branding overlay meshes (see DrawItem::decal).
             // Tileable art WRAPS (rock/cliff faces tile the art across the
@@ -1200,6 +1250,173 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
   item.tint[3] = 1.0f;
 }
 
+// Character-family lighting capture: reads the family-specific rows of the
+// PIXEL constant bank into the canonical block the scene PS character branch
+// consumes (cbuffer CH at b2). Row maps come from the disassembled Skate 3
+// pixel shaders (offline-validated by running the actual ucode per pixel):
+//   defaultcharacter (fam 1): light c0, key c6, ambMult c10.w, SH c14..c22
+//     scaled by c12.y, exposure c4.z, alpha c13.x.
+//   cacstamp/cac_* (fam 2): light c9, key c15, ambMult c19.w, SH c24..c32
+//     scaled by c21.y, exposure c13.z, alpha c22.x, diffuse tint c23.
+//   livingworld_stamp (fam 3): light c9, key c15, FLAT ambient = c19.w *
+//     (0.1, 0.175, 0.3) (shader literal), exposure c13.z, alpha c21.x, stamp
+//     recolor tints c22 (red mask) / c23 (blue mask).
+//   cac_hair (fam 4): light c4, key c16, ambient c14.w * 0.25, fresnel tint
+//     c17 with power c11.w, exposure c8.z, strand-alpha scale c15.x.
+//   defaulthair (fam 5): light c4, key c15, ambient c14.w * 0.25, fresnel
+//     tint c10 with power c9.z, exposure c8.z, strand-alpha scale c16.x.
+// The SH irradiance evaluation is sat(c_base + s*(N.x*r1 + N.y*r2 + N.z*r3)
+// + s^2*(NxNz*r4 + NzNy*r5 + NyNx*r6) + (3 s^2 Nz^2 - 1)*r7 + s^2*(Nx^2 -
+// Ny^2)*r8); the scale and the -1 are folded into the stored rows so the
+// shader evaluates a plain 9-row basis.
+//
+// Canonical block (15 float4 rows): [0] = light dir + hair fresnel power,
+// [1] = key color + exposure, [2] = flat ambient rgb + SH-ambient
+// multiplier (hair ambient scalar in w), [3..11] = SH rows, [12] = tintA
+// (w = apply), [13] = tintB + strand-alpha scale, [14].x = alpha out,
+// [14].y = family (0 = capture failed validation -> legacy shading).
+void CaptureCharLighting(uint8_t* base, DrawItem& item) {
+  if (item.char_family == 0) {
+    return;
+  }
+  const uint32_t ps = g_ps_bank.load(std::memory_order_relaxed);
+  if (ps == 0) {
+    return;
+  }
+  g_char_attempts.fetch_add(1, std::memory_order_relaxed);
+  const auto row = [&](uint32_t r, uint32_t c) {
+    return LoadGuestF32(base, ps + (r * 4 + c) * 4);
+  };
+  // Build locally and commit only on success: the capture can run again on a
+  // later draw with the same buffers (the caster-pass bank is stale; its
+  // shadowPS touches no PS constants), and a failed refresh must not wipe
+  // rows a previous successful capture staged.
+  float local[60];
+  float* d = local;
+  std::memset(local, 0, sizeof(local));
+  uint8_t fam = item.char_family;
+  const auto rows_valid = [&](uint8_t f, float* light, float* expo, float* key) {
+    uint32_t light_r = 9, key_r = 15, expo_r = 13, expo_c = 2;
+    switch (f) {
+      case 1: light_r = 0; key_r = 6; expo_r = 4; expo_c = 2; break;
+      case 2: case 3: break;  // defaults above
+      case 4: light_r = 4; key_r = 16; expo_r = 8; expo_c = 2; break;
+      case 5: light_r = 4; key_r = 15; expo_r = 8; expo_c = 2; break;
+    }
+    float norm2 = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+      light[i] = row(light_r, uint32_t(i));
+      if (!(light[i] > -4.0f && light[i] < 4.0f)) return false;
+      norm2 += light[i] * light[i];
+    }
+    // A real light-direction row carries w = 0; the world materials'
+    // shadow-transform rows are ALSO unit in xyz but keep the light-space
+    // translation (hundreds of meters) in w; reject those banks.
+    const float light_w = row(light_r, 3);
+    if (!(light_w > -1.0f && light_w < 1.0f)) return false;
+    *expo = row(expo_r, expo_c);
+    for (int i = 0; i < 3; ++i) {
+      key[i] = row(key_r, uint32_t(i));
+      if (!(key[i] >= 0.0f && key[i] < 64.0f)) return false;
+    }
+    // The bank can hold another pass's constants at our capture moment
+    // (characters render a shadow-caster pass first); the light-dir norm
+    // and exposure gates reject those; the item then keeps its previous /
+    // legacy shading.
+    return norm2 > 0.25f && norm2 < 2.25f && *expo > 0.25f && *expo < 16.0f;
+  };
+  float light[3];
+  float key[3];
+  float expo = 0.0f;
+  if (!rows_valid(fam, light, &expo, key)) {
+    // NPC skin (character_skin_defaultPS) shares the "character.skin"
+    // attribulator name with the CAC player skin (cacstamp_skin) but uses
+    // the DEFAULTCHARACTER register layout; the two banks are mutually
+    // exclusive on the light-row position (the other layout's slot holds
+    // non-unit data), so a failed fam-2 read retries as fam 1.
+    if (fam == 2 && rows_valid(1, light, &expo, key)) {
+      fam = 1;
+    } else {
+      static std::atomic<uint32_t> rej_log{0};
+      const uint32_t n = rej_log.fetch_add(1, std::memory_order_relaxed);
+      if (n < 16 || (n & 2047u) == 0) {
+        REXLOG_INFO(
+            "native-scene: char capture REJECTED fam={} light=({:.3f},{:.3f},{:.3f}) "
+            "expo={:.3f} key=({:.3f},{:.3f},{:.3f})",
+            fam, light[0], light[1], light[2], expo, key[0], key[1], key[2]);
+      }
+      return;
+    }
+  }
+  d[0] = light[0]; d[1] = light[1]; d[2] = light[2];
+  d[4] = key[0]; d[5] = key[1]; d[6] = key[2];
+  d[7] = expo;
+  if (fam == 1 || fam == 2) {
+    const uint32_t sh_base = fam == 1 ? 14u : 24u;
+    const float s = row(fam == 1 ? 12u : 21u, 1);
+    const float s2 = s * s;
+    const float amb_mult = row(fam == 1 ? 10u : 19u, 3);
+    if (!(s > -8.0f && s < 8.0f) || !(amb_mult >= 0.0f && amb_mult < 16.0f)) {
+      return;
+    }
+    d[2 * 4 + 3] = amb_mult;
+    for (int r = 0; r < 9; ++r) {
+      const float scale = r == 0 ? 1.0f : (r <= 3 ? s : (r == 7 ? 3.0f * s2 : s2));
+      for (int c = 0; c < 3; ++c) {
+        float v = row(sh_base + uint32_t(r), uint32_t(c)) * scale;
+        if (!(v > -64.0f && v < 64.0f)) v = 0.0f;
+        d[(3 + r) * 4 + c] = v;
+      }
+    }
+    for (int c = 0; c < 3; ++c) {
+      // Fold the (3 s^2 Nz^2 - 1) term's -1 into the base row.
+      d[3 * 4 + c] -= row(sh_base + 7u, uint32_t(c));
+    }
+    if (fam == 2) {
+      // CAC diffuse/skin tint (c23): multiplies the squared diffuse.
+      bool tint_ok = true;
+      float tint[3];
+      for (int c = 0; c < 3; ++c) {
+        tint[c] = row(23u, uint32_t(c));
+        tint_ok = tint_ok && tint[c] >= 0.0f && tint[c] < 16.0f;
+      }
+      if (tint_ok) {
+        d[12 * 4 + 0] = tint[0];
+        d[12 * 4 + 1] = tint[1];
+        d[12 * 4 + 2] = tint[2];
+        d[12 * 4 + 3] = 1.0f;
+      }
+    }
+    d[14 * 4 + 0] = row(fam == 1 ? 13u : 22u, 0);
+  } else if (fam == 3) {
+    const float amb = row(19u, 3);
+    if (!(amb >= 0.0f && amb < 16.0f)) return;
+    d[2 * 4 + 0] = amb * 0.1f;
+    d[2 * 4 + 1] = amb * 0.175f;
+    d[2 * 4 + 2] = amb * 0.3f;
+    for (int c = 0; c < 3; ++c) {
+      d[12 * 4 + c] = std::clamp(row(22u, uint32_t(c)), 0.0f, 4.0f);
+      d[13 * 4 + c] = std::clamp(row(23u, uint32_t(c)), 0.0f, 4.0f);
+    }
+    d[12 * 4 + 3] = 1.0f;
+    d[14 * 4 + 0] = row(21u, 0);
+  } else {
+    // Hair: flat ambient scalar + fresnel rim tint, strand-alpha scale.
+    const float amb = row(14u, 3) * 0.25f;
+    d[2 * 4 + 3] = std::clamp(amb, 0.0f, 4.0f);
+    d[3] = std::clamp(row(fam == 4 ? 11u : 9u, fam == 4 ? 3u : 2u), 1.0f, 64.0f);
+    const uint32_t fres_r = fam == 4 ? 17u : 10u;
+    for (int c = 0; c < 3; ++c) {
+      d[13 * 4 + c] = std::clamp(row(fres_r, uint32_t(c)), 0.0f, 8.0f);
+    }
+    d[13 * 4 + 3] = std::clamp(row(fam == 4 ? 15u : 16u, 0), 0.0f, 4.0f);
+    d[14 * 4 + 0] = 1.0f;
+  }
+  d[14 * 4 + 1] = float(fam);
+  std::memcpy(item.char_rows, local, sizeof(item.char_rows));
+  g_char_valid.fetch_add(1, std::memory_order_relaxed);
+}
+
 // Copy the staged bone palette (and, for hair, the tint) out of the shadow
 // banks into the item. The banks are reused draw to draw, hence the copy.
 // The base from BankPaletteBase is refined by +1 for the cloth/morph VS
@@ -1356,6 +1573,7 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
         item.skinned = false;
         item.bones.clear();
         g_ropa_rigid.fetch_add(1, std::memory_order_relaxed);
+        CaptureCharLighting(base, item);
         return true;
       }
       // Implausible or off-clip matrix: the bank belongs to another mesh
@@ -1377,6 +1595,7 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
   if (item.hair) {
     CaptureHairTint(base, item);
   }
+  CaptureCharLighting(base, item);
   return true;
 }
 
@@ -1505,6 +1724,13 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   if (g_frame_dynitems[index].pending) {
     const DrawItem& d = g_frame_dynitems[index];
     g_frame_pending_by_buffers.emplace((uint64_t(d.ib_obj) << 32) | d.vb_obj, index);
+  } else if (g_frame_dynitems[index].char_family != 0 &&
+             g_frame_char_refresh.size() < 256) {
+    // Character captured at submit-exit: the PS bank there can predate this
+    // character's main pass; refresh the lighting rows on its later draws
+    // (last successful capture wins).
+    const DrawItem& d = g_frame_dynitems[index];
+    g_frame_char_refresh.emplace((uint64_t(d.ib_obj) << 32) | d.vb_obj, index);
   }
   return uint32_t(index + 1);
 }
@@ -2077,6 +2303,48 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   }
   const uint64_t key = (uint64_t(cur_ib) << 32) | cur_vb;
   std::lock_guard<std::mutex> lock(g_palette_mutex);
+  // Character-lighting refresh: items already fixed up re-read their PS rows
+  // from later draws with the same buffers (commit-on-success, so the
+  // main-pass draw's rows win over the stale caster-pass bank). CLONES share
+  // (ib,vb) with per-instance constants (livingworld stamp tints, hair
+  // colors, SH rows); refreshing every registered item on every matching
+  // draw collapsed all clones onto the LAST instance's rows (the teal-vest
+  // twins). Pair draw to instance by the bone palette: the draw's VS bank
+  // holds the instance's palette, which matches exactly one item's captured
+  // bones.
+  auto refresh = g_frame_char_refresh.equal_range(key);
+  if (refresh.first != refresh.second) {
+    const uint32_t pb = BankPaletteBase(base, bank);
+    float row0[4] = {};
+    if (pb != 0) {
+      for (int i = 0; i < 4; ++i) {
+        row0[i] = LoadGuestF32(base, bank + (pb * 4 + uint32_t(i)) * 4);
+      }
+    }
+    for (auto it = refresh.first; it != refresh.second; ++it) {
+      if (it->second >= g_frame_dynitems.size()) continue;
+      DrawItem& d = g_frame_dynitems[it->second];
+      if (d.bones.size() >= 4 && pb != 0) {
+        bool match = true;
+        for (int i = 0; i < 4 && match; ++i) {
+          // The refined palette can sit one register past BankPaletteBase
+          // (cloth/morph layouts); compare against both candidate rows.
+          match = std::fabs(d.bones[size_t(i)] - row0[i]) < 1e-4f;
+        }
+        if (!match) {
+          bool match1 = true;
+          for (int i = 0; i < 4 && match1; ++i) {
+            match1 = std::fabs(d.bones[size_t(i)] -
+                               LoadGuestF32(base, bank + ((pb + 1) * 4 + uint32_t(i)) * 4)) <
+                     1e-4f;
+          }
+          match = match1;
+        }
+        if (!match) continue;
+      }
+      CaptureCharLighting(base, d);
+    }
+  }
   auto range = g_frame_pending_by_buffers.equal_range(key);
   if (range.first == range.second) {
     return;
@@ -2112,6 +2380,9 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     }
   }
   d.pending = false;
+  if (d.char_family != 0 && g_frame_char_refresh.size() < 256) {
+    g_frame_char_refresh.emplace(key, oldest->second);
+  }
   g_frame_pending_by_buffers.erase(oldest);
 }
 
@@ -2367,6 +2638,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::lock_guard<std::mutex> lock(g_palette_mutex);
     dynitems.swap(g_frame_dynitems);
     g_frame_pending_by_buffers.clear();
+    g_frame_char_refresh.clear();
   }
   // Take this frame's selection re-draw captures and re-arm the post-sky
   // window (must happen on every exit path, like the dynitems swap).
@@ -2882,6 +3154,10 @@ struct RendererState {
   // environment.transparent sub-pass: straight alpha blend, depth test on,
   // z-write OFF; items drawn back-to-front after all opaque items.
   ID3D12PipelineState* pso_transparent = nullptr;
+  // Hair sub-passes: transparent blend state with cull BACK / cull FRONT
+  // (the game's cac_hair/defaulthair two-pass draw order).
+  ID3D12PipelineState* pso_hair_a = nullptr;
+  ID3D12PipelineState* pso_hair_b = nullptr;
   DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
   ID3D12DescriptorHeap* rtv_heap = nullptr;  // slot 0 = output, slot 1 = MSAA
   ID3D12DescriptorHeap* dsv_heap = nullptr;
@@ -3033,6 +3309,21 @@ cbuffer S : register(b1) {
   float4 sh_color;  // shadow color rgb [PS c8] + its luma in w
   float4 sh_misc;   // x = depth bias [PS c5.x], y = enable, z = lit level L
 };
+// Character-family lighting (defaultcharacter.fx and friends): canonical
+// per-draw rows captured from the guest PIXEL constant bank at palette
+// capture (CaptureCharLighting has the per-family register maps; the math
+// below was validated offline by executing the game's own pixel shaders).
+// Enabled per draw via cam_pos.w = family (0 = not a character / capture
+// failed -> the legacy empirical shading below).
+cbuffer CH : register(b2) {
+  float4 ch_light;  // xyz = sun direction, w = hair fresnel power
+  float4 ch_key;    // rgb = key (sun) color, w = exposure
+  float4 ch_amb;    // rgb = flat ambient, w = SH ambient multiplier / hair ambient
+  float4 ch_sh[9];  // SH irradiance rows, pre-scaled (see capture)
+  float4 ch_tintA;  // CAC diffuse tint / livingworld red-mask tint (w = apply)
+  float4 ch_tintB;  // livingworld blue-mask tint / hair fresnel tint (w = strand-alpha scale)
+  float4 ch_misc;   // x = alpha out, y = family
+};
 Texture2D<float4> diffuse : register(t0);
 Texture2D<float4> lightmap : register(t1);
 Texture2D<float4> macro : register(t3);
@@ -3106,6 +3397,60 @@ float4 ps_main(VSOut i) : SV_Target {
     // environment.transparent alpha-tests its SQUARED alpha at ref 16/255
     // (transparentenvironment.xml: ALPHAREF 16, PS outputs a = diffuse.a^2).
     clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - 0.35);
+  }
+  // Character families: the game's own lighting in LINEAR space (diffuse is
+  // gamma -> square it), then the exact tone chain from the disassembly and
+  // the postfx uber's 1.41 scene multiplier (which the empirical world
+  // shading already folds into its constants; without it characters sit
+  // ~30% darker than their surroundings, measured on an F11 A/B pair).
+  if (cam_pos.w > 0.5) {
+    float fam = cam_pos.w;
+    float3 dlin = albedo.rgb * albedo.rgb;
+    float3 cn = dot(i.nrm, i.nrm) > 0.01
+                    ? normalize(i.nrm)
+                    : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+    float ndl = saturate(dot(cn, ch_light.xyz));
+    float3 vd = -normalize(i.rpos);
+    float3 lin;
+    float out_a = 1.0;
+    if (fam > 3.5) {
+      // Hair (cac_hair / defaulthair): key on a wrapped N.L ramp + flat
+      // ambient, fresnel rim tint on a steeper ramp; strand coverage from
+      // the mesh's "alpha" channel at the raw second texcoord (bound at t4)
+      // - alpha-blended in the sorted sub-pass (hair drawn opaque is the
+      // blocky-helmet look).
+      float fres = pow(1.0 - saturate(dot(cn, vd)), max(ch_light.w, 1.0));
+      float3 hl = ch_key.rgb * (saturate(ndl * 0.75 + 0.25) + ch_amb.w) +
+                  ch_tintB.rgb * fres * saturate(ndl * 1.75 + 0.25);
+      lin = dlin * hl;
+      out_a = saturate(decal_art.Sample(smp, i.uv2).r * ch_tintB.w);
+    } else if (fam > 2.5) {
+      // livingworld pedestrians: the diffuse is a stamp-mask atlas: red
+      // regions recolor with tintA, blue with tintB (judged in linear
+      // space; real-color regions have green above the threshold).
+      float3 sel = dlin.g > 0.001225
+                       ? dlin
+                       : ch_tintA.rgb * dlin.r + ch_tintB.rgb * dlin.b;
+      lin = sel * (ch_key.rgb * ndl + ch_amb.rgb);
+    } else {
+      // defaultcharacter / CAC pieces: key light + SH irradiance ambient.
+      if (ch_tintA.w > 0.0) {
+        dlin *= ch_tintA.rgb;
+      }
+      float3 irr = saturate(
+          ch_sh[0].rgb + cn.x * ch_sh[1].rgb + cn.y * ch_sh[2].rgb +
+          cn.z * ch_sh[3].rgb + (cn.x * cn.z) * ch_sh[4].rgb +
+          (cn.z * cn.y) * ch_sh[5].rgb + (cn.y * cn.x) * ch_sh[6].rgb +
+          (cn.z * cn.z) * ch_sh[7].rgb +
+          (cn.x * cn.x - cn.y * cn.y) * ch_sh[8].rgb);
+      lin = dlin * (ch_key.rgb * ndl + irr * ch_amb.w);
+    }
+    // Exact tone chain: sqrt(0.5 * (max(x*E/4 + 0.75, 1) - sat(1 - x*E)^2)).
+    float E = max(ch_key.w, 0.01);
+    float3 t1 = saturate(1.0 - lin * E);
+    float3 tm = max(lin * 0.25 * E + 0.75, 1.0) - t1 * t1;
+    float3 cc = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
+    return float4(cc, out_a);
   }
   // Macro overlay: large-scale grime/cracks multiplied over the diffuse at
   // uv * macroOverlayUVScale, faded by macroOverlayOpacity: the ground and
@@ -3691,7 +4036,8 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
           u = HalfToFloat(SwapU16(*reinterpret_cast<const uint16_t*>(q)));
           w = HalfToFloat(SwapU16(*reinterpret_cast<const uint16_t*>(q + 2)));
           break;
-        case 38:  // k_32_32_FLOAT
+        case 37:  // k_32_32_FLOAT (hair strand-alpha UV; xenos enum 37)
+        case 38:  // k_32_32_32_32_FLOAT (use xy)
           u = std::bit_cast<float>(SwapU32(*reinterpret_cast<const uint32_t*>(q)));
           w = std::bit_cast<float>(SwapU32(*reinterpret_cast<const uint32_t*>(q + 4)));
           break;
@@ -3728,8 +4074,12 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     // s16-snorm (fmt 26, decal meshes) and half-float (fmt 31, world tiles)
     // encodings (decalenvironment VS: o0.zw = |uv|; baseenvironment VS:
     // maxs r2.zw = |r4.xy|). Raw signed values sample mirrored atlas cells.
-    dst[v * 14 + 5] = std::fabs(dst[v * 14 + 5]);
-    dst[v * 14 + 6] = std::fabs(dst[v * 14 + 6]);
+    // Exception: hair meshes, their second texcoord is the strand-alpha
+    // UV, passed RAW by the hair VS (o0.zw = uv, float2).
+    if (item.char_family < 4) {
+      dst[v * 14 + 5] = std::fabs(dst[v * 14 + 5]);
+      dst[v * 14 + 6] = std::fabs(dst[v * 14 + 6]);
+    }
     // Blend weights (unorm bytes) and indices (raw bytes). Guest u8x4
     // attributes are stored big-endian per 32-bit word; swap so component k
     // in the shader matches guest component k.
@@ -3761,20 +4111,35 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     // Vertex normal: k_10_11_11 packed (x 11 bits, y 11 bits, z 10 bits,
     // LSB to MSB, signed). Zero when absent -> derivative face-normal
     // fallback in the shader.
-    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
-    if (item.normal_fmt == 16) {
+    const auto unpack_10_11_11 = [&](uint32_t offset, float out[3]) {
       const uint32_t word = SwapU32(*reinterpret_cast<const uint32_t*>(
-          src_vb + size_t(v) * item.stride + item.normal_offset));
+          src_vb + size_t(v) * item.stride + offset));
       const int32_t ix = int32_t(word << 21) >> 21;
       const int32_t iy = int32_t((word >> 11) << 21) >> 21;
       const int32_t iz = int32_t((word >> 22) << 22) >> 22;
-      nx = float(ix) / 1023.0f;
-      ny = float(iy) / 1023.0f;
-      nz = float(iz) / 511.0f;
+      out[0] = float(ix) / 1023.0f;
+      out[1] = float(iy) / 1023.0f;
+      out[2] = float(iz) / 511.0f;
+    };
+    float n3[3] = {0.0f, 0.0f, 0.0f};
+    if (item.normal_fmt == 16) {
+      unpack_10_11_11(item.normal_offset, n3);
+    } else if (item.tb_fmt == 16) {
+      // NPC character meshes carry no normal element; the game's VS
+      // derives it as cross(tangent, binormal) (usage 6 x usage 7; verified
+      // against the emulated VS outputs). Without this the strong
+      // character N.L shading exposes the face-normal fallback as visible
+      // low-poly facets on every pedestrian.
+      float t3[3], b3[3];
+      unpack_10_11_11(item.tangent_offset, t3);
+      unpack_10_11_11(item.binormal_offset, b3);
+      n3[0] = t3[1] * b3[2] - t3[2] * b3[1];
+      n3[1] = t3[2] * b3[0] - t3[0] * b3[2];
+      n3[2] = t3[0] * b3[1] - t3[1] * b3[0];
     }
-    dst[v * 14 + 9] = nx;
-    dst[v * 14 + 10] = ny;
-    dst[v * 14 + 11] = nz;
+    dst[v * 14 + 9] = n3[0];
+    dst[v * 14 + 10] = n3[1];
+    dst[v * 14 + 11] = n3[2];
   }
   vb->Unmap(0, nullptr);
   // Blend indices outside the captured palette read garbage rows and mangle
@@ -4633,12 +4998,13 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   g_r.device = device;
 
   if (!g_r.root_signature) {
-    D3D12_ROOT_PARAMETER params[9] = {};
+    D3D12_ROOT_PARAMETER params[10] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
     // NOTE the 64-DWORD root-signature budget: 52 constants + 6 descriptor
-    // tables (1 each) + 1 root SRV (2) + 1 root CBV (2) = 62. Going past 64
-    // makes CreateRootSignature fail (renderer falls back to emulated).
+    // tables (1 each) + 1 root SRV (2) + 2 root CBVs (2 each) = 64, FULL.
+    // Going past 64 makes CreateRootSignature fail (renderer falls back to
+    // emulated). Any further addition must pack into existing rows/tables.
     params[0].Constants.Num32BitValues = 52;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_DESCRIPTOR_RANGE srv_range[6] = {};
@@ -4678,6 +5044,12 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     // Water environment cube (t6): the flowingwater/ocean reflection term.
     params[8] = params[1];
     params[8].DescriptorTable.pDescriptorRanges = &srv_range[5];
+    // Character lighting block (b2): the canonical per-draw rows captured
+    // from the guest PS bank (CaptureCharLighting), sliced out of the bone
+    // upload ring per character draw.
+    params[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[9].Descriptor.ShaderRegister = 2;
+    params[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
     samplers[0].Filter = D3D12_FILTER_ANISOTROPIC;
     samplers[0].MaxAnisotropy = 8;
@@ -4700,7 +5072,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 9;
+    desc.NumParameters = 10;
     desc.pParameters = params;
     desc.NumStaticSamplers = 2;
     desc.pStaticSamplers = samplers;
@@ -4803,6 +5175,20 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     pso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
     const HRESULT hr_t =
         device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_transparent));
+    // Hair passes: the game draws hair twice with the SAME shader; cull
+    // BACK then cull FRONT (cac_hair.xml passes 0/1) so far-side strands
+    // never composite over near-side ones (one uncull(ed) blended pass
+    // interleaves them per triangle order = crunchy noise). Same blend /
+    // z-write-off state as the transparent variant.
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_a)))) {
+      g_r.pso_hair_a = nullptr;
+    }
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+    if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_b)))) {
+      g_r.pso_hair_b = nullptr;
+    }
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pso.BlendState.RenderTarget[0].BlendEnable = FALSE;
     pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     pso.DepthStencilState.DepthEnable = FALSE;
@@ -5772,6 +6158,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       list.D3DSetGraphicsRootSignature(g_r.root_signature);
       list.D3DSetPipelineState(g_r.pso_shadow_caster);
       list.SetDescriptorHeaps(g_r.srv_heap, nullptr);
+      // Unused by the caster shaders, but never leave root CBVs unset.
+      list.D3DSetGraphicsRootConstantBufferView(
+          9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region);
       for (int ci = 0; ci < 3; ++ci) {
         // Cascade scale/offset (cascade 0 = identity; PS c1/c2 for 1/2).
         float sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
@@ -5965,6 +6354,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     list.D3DSetGraphicsRootConstantBufferView(
         6, g_r.shadow_cb->GetGPUVirtualAddress() + cb_offset);
+    // b2 (character lighting) default: point at the ring base so the root
+    // CBV is never left unset; character draws re-point it per item.
+    list.D3DSetGraphicsRootConstantBufferView(
+        9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region);
     D3D12_GPU_DESCRIPTOR_HANDLE atlas = g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
     atlas.ptr += size_t(shadow_ready ? g_r.shadow_srv_final : g_r.white.srv_slot) *
                  g_r.srv_size;
@@ -6033,7 +6426,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // front/back copies z-fight into lightmap flicker at range (banners/
     // flags). Opaque depth pass only; a mirrored instance (negative world
     // determinant) would flip winding, so those stay uncull(ed).
-    if (use_depth && !item.transparent && !item.water && g_r.pso_cullback != nullptr) {
+    // (hair items with a validated lighting capture draw in the blended
+    // sub-pass under their own cull PSOs; never reset those here)
+    const bool hair_pass =
+        item.char_family >= 4 && item.char_rows[14 * 4 + 1] > 0.0f;
+    if (use_depth && !item.transparent && !item.water && !hair_pass &&
+        g_r.pso_cullback != nullptr) {
       const float* w = item.world;
       const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
                          w[1] * (w[4] * w[10] - w[6] * w[8]) +
@@ -6217,7 +6615,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     constants[36] = scene.cam_pos[0];
     constants[37] = scene.cam_pos[1];
     constants[38] = scene.cam_pos[2];
+    // cam_pos.w = character shading family: > 0 switches the PS to the
+    // captured character-lighting branch (rows uploaded to b2 below);
+    // char_rows[14*4+1] stays 0 when the capture failed validation, which
+    // keeps the item on the legacy empirical shading.
     constants[39] = 0.0f;
+    if (debug_mode == 0 && item.char_family != 0 &&
+        item.char_rows[14 * 4 + 1] > 0.0f) {
+      const uint32_t offset = (g_r.bone_ring_offset + 255u) & ~255u;
+      if (offset + 256u <= RendererState::kBoneRegionSize) {
+        std::memcpy(g_r.bone_ring_cpu + bone_region + offset, item.char_rows,
+                    sizeof(item.char_rows));
+        g_r.bone_ring_offset = offset + 256u;
+        list.D3DSetGraphicsRootConstantBufferView(
+            9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region + offset);
+        constants[39] = item.char_rows[14 * 4 + 1];
+        g_char_drawn.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
     std::memcpy(constants + 40, item.tint, 4 * sizeof(float));
     // t3 = macro grime/crack overlay, t4 = decal art for environment.decal
     // surfaces (in-shader composite). Independent slots: decal ground/wall
@@ -6259,7 +6674,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                             REXCVAR_GET(skate3_native_render_scene_decals)
                                         ? resolve_texture(item.decal_art)
                                         : &g_r.white;
-    const bool is_decal = decal_tex != &g_r.white;
+    if (item.char_family >= 4 && item.hair_alpha_tex != 0) {
+      // Hair strand coverage rides the (otherwise unused) decal slot; the
+      // PS hair branch samples it at the raw second texcoord. The white
+      // fallback keeps failed decodes opaque rather than invisible.
+      decal_tex = resolve_texture(item.hair_alpha_tex);
+    }
+    const bool is_decal =
+        item.char_family < 4 && item.decal && decal_tex != &g_r.white;
     constants[44] = item.macro_scale;
     constants[45] = item.macro_opacity;
     constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
@@ -6344,7 +6766,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (debug_mode == 3 && index >= 20) {
       break;
     }
-    if ((item.transparent || item.water) && debug_mode == 0) {
+    // Hair with a validated lighting capture joins the sorted alpha
+    // sub-pass (strand coverage blend, depth test on / z-write off, the
+    // game's own hair render state); without the capture it stays on the
+    // legacy opaque path.
+    const bool hair_blend =
+        item.char_family >= 4 && item.char_rows[14 * 4 + 1] > 0.0f;
+    if ((item.transparent || item.water || hair_blend) && debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
       }
@@ -6375,6 +6803,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                      });
     list.D3DSetPipelineState(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
     for (const DrawItem* item : transparent_items) {
+      const bool hair = item->char_family >= 4 && item->char_rows[14 * 4 + 1] > 0.0f;
+      if (hair && use_depth && g_r.pso_hair_a != nullptr && g_r.pso_hair_b != nullptr) {
+        // The game's two hair passes: cull BACK then cull FRONT with the
+        // same shader: keeps far-side strands from compositing over
+        // near-side ones (one uncull(ed) pass reads as crunchy noise).
+        list.D3DSetPipelineState(g_r.pso_hair_a);
+        draw_item(*item);
+        list.D3DSetPipelineState(g_r.pso_hair_b);
+        draw_item(*item);
+        list.D3DSetPipelineState(g_r.pso_transparent);
+        continue;
+      }
       draw_item(*item);
     }
   }
@@ -6759,7 +7199,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
-        "shadow[valid={} ready={} draws={}]",
+        "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
@@ -6771,7 +7211,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
         g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
         g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
-        g_rr_tex_deferred.load(), scene.shadow_valid, shadow_ready, shadow_draws);
+        g_rr_tex_deferred.load(), scene.shadow_valid, shadow_ready, shadow_draws,
+        g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load());
   }
   return true;
 }
