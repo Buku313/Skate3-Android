@@ -133,6 +133,17 @@ struct FrameScene {
   // captured for validation only).
   bool shadow_valid = false;
   float shadow_rows[36] = {};
+  // Sky-dome viewpos: sky.* meshes are camera-relative (sky.fx VS adds
+  // g_vViewPos), but the game pins the sky viewpos Y at a fixed level
+  // elevation (165.0 in every capture) so the skyline doesn't bob with the
+  // skater. Captured per frame from the sky draw's VS bank; the default
+  // covers frames before the first capture.
+  float sky_height = 165.0f;
+  // Fullscreen UI background blur: 0 = off; otherwise the kernel scale of
+  // the game's blur_hBlur/vBlur + basictex pass chain (PS c0.x, 8 in every
+  // capture), detected per frame from the blur_hBlurPS draw. The native
+  // replica runs after the MSAA resolve, before the 2D overlay draws.
+  float ui_blur = 0.0f;
   std::vector<DrawItem> items;
 };
 

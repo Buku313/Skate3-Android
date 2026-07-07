@@ -204,6 +204,30 @@ float g_fog_cam[3] = {};
 float g_fog_rows[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 bool g_fog_have = false;
 bool g_fog_frame_done = false;
+// Sky-dome viewpos height (see FrameScene::sky_height): sky.fx's VS adds
+// g_vViewPos to every dome vertex, but the game feeds the SKY draw a viewpos
+// whose Y is a fixed level elevation (165.0 in every Port Carverton capture)
+// instead of the camera's; the baked skyline must not bob with the skater.
+// Captured from the sky bank's unique signature: c4.xz matches the camera
+// while c4.y sits far above it (every other main-pass draw has c4 == camera;
+// water-reflection passes mirror y DOWNWARD and are excluded by dy > 0).
+float g_sky_height = 165.0f;  // every Port Carverton capture to date
+bool g_sky_have = false;
+bool g_sky_frame_done = false;
+// UI background blur (see FrameScene::ui_blur and kBlurShaderSource): while
+// a frontend popup is up the game appends blur_hBlur/vBlur + basictex passes
+// after the postfx uber. g_ui_blur holds the captured kernel scale (PS c0.x,
+// 8 in every capture); g_ui_blur_seen latches per frame on the blur_hBlurPS
+// draw and is cleared at publish; the pass chain only exists while the
+// popup is actually up, so this can never stick on.
+float g_ui_blur = 8.0f;
+bool g_ui_blur_seen = false;
+// Hold the blur across publishes that carry no blur draw: the game does not
+// issue the pass chain on every swap while the popup is up, and publishing
+// the raw per-swap flag alternated blur on/off: a visible brightness
+// shimmer. Two publishes of hysteresis bridges the gaps; on popup close the
+// blur lingers ~2 guest frames, imperceptible.
+int g_ui_blur_hold = 0;
 // Dynamic-shadow receiver rows (see FrameScene::shadow_rows): world-material
 // PIXEL banks keep the CSM constants at c0..c8, pass-global (identical on
 // every environment-family draw of the pass; character/hair/tree PSes
@@ -884,9 +908,14 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             // sheets, glass, fences); see DrawItem::transparent.
             item.transparent =
                 std::memcmp(mat_name, "environment.transparent", 23) == 0;
-            // water.*: canal/ocean surfaces, transparent sub-pass with the
-            // dedicated water shading branch (see DrawItem::water).
-            item.water = std::memcmp(mat_name, "water.", 6) == 0;
+            // water.* (canal) and ocean.* (the sea): transparent sub-pass
+            // with the dedicated water shading branch (see DrawItem::water).
+            // ocean.default has NO diffuse channel at all (ocean.fx computes
+            // color purely from the environment cube x lightmap x fresnel);
+            // without this branch it rendered as an 8 km white plane (white
+            // fallback diffuse x near-white ocean lightmap x2).
+            item.water = std::memcmp(mat_name, "water.", 6) == 0 ||
+                         std::memcmp(mat_name, "ocean.", 6) == 0;
           }
           continue;
         }
@@ -1610,12 +1639,20 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // pass-global on environment-family draws), captured here with an
   // independent done-flag: the first main-pass draw can be a character/tree
   // whose PS allocates differently (rejected by the sanity gate below).
-  if ((!g_fog_frame_done || !g_shadow_frame_done) && func == 0 && flags2d == 0 &&
-      SceneEnabled() &&
+  if ((!g_fog_frame_done || !g_shadow_frame_done || !g_sky_frame_done) && func == 0 &&
+      flags2d == 0 && SceneEnabled() &&
       (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
     const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
     const float dy = LoadGuestF32(base, bank + 17 * 4) - g_fog_cam[1];
     const float dz = LoadGuestF32(base, bank + 18 * 4) - g_fog_cam[2];
+    // The sky draw's bank: c4.xz == camera, c4.y = the fixed level sky
+    // elevation (dy ~ +160). dy > 50 excludes normal draws (dy == 0) and
+    // any reflection pass (y mirrored DOWN); the bound keeps out garbage.
+    if (!g_sky_frame_done && dx * dx + dz * dz < 25.0f && dy > 50.0f && dy < 2000.0f) {
+      g_sky_height = LoadGuestF32(base, bank + 17 * 4);
+      g_sky_have = true;
+      g_sky_frame_done = true;
+    }
     if (dx * dx + dy * dy + dz * dz < 25.0f) {
       if (!g_fog_frame_done) {
         float rows[8];
@@ -1665,6 +1702,46 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
           g_shadow_frame_done = true;
         }
       }
+    }
+  }
+  // UI background blur: while a frontend popup is up, the game appends a
+  // dedicated pass chain after the postfx uber: blur_hBlurPS + blur_vBlurPS
+  // (func-2 inline quads OUTSIDE the 2D phase) then a postfx_basictex
+  // fullscreen replace. The blur_hBlurPS draw itself is the trigger; its
+  // PS c0.x is the kernel scale (8 in every capture). See kBlurShaderSource.
+  if (func == 2 && flags2d == 0 && SceneEnabled()) {
+    const auto is_hblur = [&](uint32_t obj) -> bool {
+      if (obj == 0 || !GuestReadableApprox(base, obj)) {
+        return false;
+      }
+      // Guest-render-thread only (like the fog capture globals).
+      static std::unordered_map<uint32_t, bool> cache;
+      auto it = cache.find(obj);
+      if (it != cache.end()) {
+        return it->second;
+      }
+      // Debug path at +0x54, e.g. ".../blur_hBlurPS.updb".
+      char text[96] = {};
+      for (int k = 0; k < 95; ++k) {
+        text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+        if (text[k] == '\0') break;
+      }
+      const bool hit = std::strstr(text, "blur_hBlurPS") != nullptr;
+      if (cache.size() < 1024) {
+        cache.emplace(obj, hit);
+      }
+      return hit;
+    };
+    // Shader labels can be swapped in the hook; accept either slot.
+    if (is_hblur(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
+        is_hblur(g_cur_vs_obj.load(std::memory_order_relaxed))) {
+      // Kernel scale pinned to the ucode-verified steady-state constant: the
+      // recorded blur draw's PS c0.x is exactly 8 (tap pitch 0.0025). The
+      // live bank read at this hook point returned varying/stale values
+      // (e.g. 0.8 vs 8 across reads) and feeding it through per frame
+      // pulsed the blur radius; the popup backdrop shimmered.
+      g_ui_blur = 8.0f;
+      g_ui_blur_seen = true;
     }
   }
   // Live 2D overlay capture: the HUD renders exclusively through the
@@ -1977,6 +2054,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       //   20-byte {float3 pos, float2 uv}          - glyph text (bit 4)
       //   20-byte {float4 pos, u32 color}          - SimpleDraw untextured
       //   28-byte {float4 pos, u32 color, float2 uv} - SimpleDraw textured
+      //   16-byte {float4 pos}                     - SimpleDraw solid fill
+      //     (color rides in VS c8 = m[8]; the popup panel strips, Rewards
+      //     title bar / teal body / tan footer, are these)
       // (SimpleDraw = bit 5; its DrawParameters ctor orders colours before
       // texcoords.)
       {
@@ -1991,7 +2071,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         for (uint32_t v = 0; v < d.count && ok; ++v) {
           uint8_t* dst = norm_2d.data() + size_t(v) * 28;
           const uint8_t* src = scratch_2d.data() + size_t(v) * d.stride;
-          if (d.stride == 24) {  // APT: pos4 + uv (with or without the
+          if (d.stride == 16 && simple) {  // SimpleDraw: pos4, untextured
+            std::memcpy(dst, src, 16);
+            std::memcpy(dst + 16, &zero, 4);
+            std::memcpy(dst + 20, &zero, 4);
+            std::memcpy(dst + 24, &white, 4);
+          } else if (d.stride == 24) {  // APT: pos4 + uv (with or without the
             // SimpleDraw bracket; the compass needle/icons are 24-byte
             // quads issued through SimpleDraw::Draw inside the HUD pass,
             // same simpledraw_SimpleDrawUVSC shader as plain APT elements;
@@ -2028,6 +2113,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         if (!ok) {
           g_draws_2d_other.fetch_add(1, std::memory_order_relaxed);
           continue;
+        }
+        if (d.stride == 16) {
+          // Untextured fill: the captured fetch words are leftover state from
+          // the previous textured draw; zero them so the replay binds the
+          // white texture instead of tinting the fill with a stale texel.
+          std::memset(d.fetch, 0, sizeof(d.fetch));
         }
         scratch_2d = norm_2d;
         d.stride = 28;
@@ -2301,9 +2392,29 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
   }
+  if (g_sky_have) {
+    scene.sky_height = g_sky_height;
+  }
+  const bool blur_active = g_ui_blur_seen || g_ui_blur_hold > 0;
+  scene.ui_blur = blur_active ? g_ui_blur : 0.0f;
+  if (g_ui_blur_seen) {
+    g_ui_blur_hold = 2;
+  } else if (g_ui_blur_hold > 0) {
+    --g_ui_blur_hold;
+  }
+  {
+    static bool s_blur_was_active = false;
+    if (blur_active != s_blur_was_active) {
+      REXLOG_INFO("native-scene: popup background blur {} (kernel scale {:.1f})",
+                  blur_active ? "ON" : "off", g_ui_blur);
+      s_blur_was_active = blur_active;
+    }
+  }
+  g_ui_blur_seen = false;
   std::memcpy(g_fog_cam, scene.cam_pos, sizeof(g_fog_cam));
   g_fog_frame_done = false;
   g_shadow_frame_done = false;
+  g_sky_frame_done = false;
 
   if (g_recording.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(g_record_mutex);
@@ -2633,6 +2744,19 @@ struct RendererState {
   ID3D12PipelineState* resolve_pso = nullptr;
   uint32_t msaa_srv_slot = 0;
   bool msaa_srv_allocated = false;
+  // Popup background blur (see kBlurShaderSource): two intermediates at the
+  // game's fixed 1152x640 internal resolution (RTV heap slots 5/6) + an SRV
+  // slot re-pointed at the guest output each blur frame. Steady state for
+  // blur_tex is RENDER_TARGET.
+  static constexpr uint32_t kBlurWidth = 1152;
+  static constexpr uint32_t kBlurHeight = 640;
+  ID3D12Resource* blur_tex[2] = {nullptr, nullptr};
+  uint32_t blur_srv[2] = {0, 0};
+  uint32_t output_srv_slot = 0;
+  bool output_srv_allocated = false;
+  ID3D12PipelineState* pso_blur = nullptr;
+  ID3D12PipelineState* pso_blur_blit = nullptr;
+  ID3D12PipelineState* pso_blur_down = nullptr;
   uint32_t rtv_size = 0;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // Buffers replaced by re-decode, kept alive until the GPU has finished the
@@ -2931,8 +3055,10 @@ float4 ps_main(VSOut i) : SV_Target {
     // Deep body: the water "diffuse" is a faint STRIPE MASK (max 24/255,
     // WaterFallFoamAlpha, a lookup for the real shader, not a color). The
     // game consumes it in linear space where 0.09^2 vanishes; squaring here
-    // likewise kills the visible blue/black banding.
-    float3 col = albedo.rgb * albedo.rgb * 0.6;
+    // likewise kills the visible blue/black banding. overlay.w > 0 = no
+    // diffuse channel at all (ocean.default); body is zero there, NOT the
+    // white fallback (ocean.fx: diffTerm = (0,0,0), color is all reflection).
+    float3 col = overlay.w > 0.5 ? 0.0 : albedo.rgb * albedo.rgb * 0.6;
     // Reflection tint: the environment cube when resolved (t6); otherwise a
     // haze derived from the frame fog color, lifted toward neutral so dark
     // dusk fog doesn't collapse the water to black (fit: emulated canal
@@ -3050,6 +3176,68 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
     c += src.Load(p, k);
   }
   return c / SAMPLES;
+}
+)";
+
+// Popup background blur: EXACT port of the game's dedicated pass chain
+// (captured from a live frame with the Rewards popup up):
+//   blur_hBlurPS:  11 gaussian taps along +X over the finished frame,
+//                  offsets k * 0.0003125 * PS c0.x (c0.x = 8 -> 0.0025/tap,
+//                  +/-1.25% of the buffer), literal weights below (sum 1);
+//   blur_vBlurPS:  the same kernel along +Y;
+//   postfx_basictex: plain fullscreen REPLACE of the frame with the result.
+// The game runs it at its fixed 1152x640 internal resolution and the
+// console's bilinear upscale of that buffer is what reads as the "frosted
+// glass" lattice, so the passes here render into 1152x640 intermediates and
+// stretch back, reproducing both the kernel and the lattice.
+const char kBlurShaderSource[] = R"(
+cbuffer C : register(b0) {
+  float4 dir;  // xy = blur axis, z = kernel scale (the game's PS c0.x, 8)
+};
+Texture2D<float4> src : register(t0);
+SamplerState smp_clamp : register(s1);
+struct VSOut {
+  float4 pos : SV_Position;
+  float2 uv : TEXCOORD0;
+};
+VSOut vs_main(uint id : SV_VertexID) {
+  VSOut o;
+  float2 uv = float2((id << 1) & 2, id & 2);
+  o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+  o.uv = uv;
+  return o;
+}
+float4 ps_main(VSOut i) : SV_Target {
+  // Literal kernel from the blur_hBlurPS ucode (c251..c255).
+  const float w[6] = {0.2005654, 0.1769984, 0.1216491, 0.0651141,
+                      0.0271436, 0.0088122};
+  float2 step = dir.xy * (0.0003125 * dir.z);
+  float3 c = src.SampleLevel(smp_clamp, i.uv, 0).rgb * w[0];
+  [unroll] for (int k = 1; k < 6; ++k) {
+    c += src.SampleLevel(smp_clamp, i.uv + step * k, 0).rgb * w[k];
+    c += src.SampleLevel(smp_clamp, i.uv - step * k, 0).rgb * w[k];
+  }
+  return float4(c, 1.0);
+}
+// Prefiltered downsample of the (higher-res) native output into the game's
+// 1152x640 blur space (dir.xy = source texel size). A 4x4 grid of bilinear
+// taps covers reduction ratios up to ~4x (4K -> 1152 is 3.33x); narrower
+// footprints undersampled the scale and the aliased detail crawled as the
+// scene animated: the whole blurred backdrop shimmered, worst around
+// high-contrast edges.
+float4 ps_down(VSOut i) : SV_Target {
+  float3 c = 0.0;
+  [unroll] for (int y = 0; y < 4; ++y) {
+    [unroll] for (int x = 0; x < 4; ++x) {
+      float2 off = float2(float(x) - 1.5, float(y) - 1.5) * dir.xy;
+      c += src.SampleLevel(smp_clamp, i.uv + off, 0).rgb;
+    }
+  }
+  return float4(c / 16.0, 1.0);
+}
+// postfx_basictex: oC0 = tex (verified: `max oC0, r0, r0`).
+float4 ps_blit(VSOut i) : SV_Target {
+  return float4(src.SampleLevel(smp_clamp, i.uv, 0).rgb, 1.0);
 }
 )";
 
@@ -4459,6 +4647,66 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       }
     }
     {
+      // Popup background blur pipelines (blur_hBlur/vBlur port + basictex
+      // replace): fullscreen-triangle passes, no vertex buffer.
+      ID3DBlob* bvs = nullptr;
+      ID3DBlob* bps = nullptr;
+      ID3DBlob* bblit = nullptr;
+      ID3DBlob* bdown = nullptr;
+      ID3DBlob* berr = nullptr;
+      if (FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                            "native_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
+                            &bvs, &berr)) ||
+          FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                            "native_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
+                            &bps, &berr)) ||
+          FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                            "native_blur", nullptr, nullptr, "ps_blit", "ps_5_0", 0, 0,
+                            &bblit, &berr)) ||
+          FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                            "native_blur", nullptr, nullptr, "ps_down", "ps_5_0", 0, 0,
+                            &bdown, &berr))) {
+        REXLOG_ERROR("native-scene: blur shader compile failed: {}",
+                     berr ? static_cast<const char*>(berr->GetBufferPointer()) : "?");
+        g_r.failed = true;
+        return false;
+      }
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
+      bp.pRootSignature = g_r.root_signature;
+      bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
+      bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
+      bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      bp.SampleMask = UINT_MAX;
+      bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      bp.NumRenderTargets = 1;
+      bp.RTVFormats[0] = context.d3d12.guest_output_format;
+      bp.SampleDesc.Count = 1;
+      if (g_r.pso_blur) g_r.pso_blur->Release();
+      if (g_r.pso_blur_blit) g_r.pso_blur_blit->Release();
+      if (g_r.pso_blur_down) g_r.pso_blur_down->Release();
+      const HRESULT hb1 = device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur));
+      bp.PS = {bblit->GetBufferPointer(), bblit->GetBufferSize()};
+      const HRESULT hb2 =
+          device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_blit));
+      bp.PS = {bdown->GetBufferPointer(), bdown->GetBufferSize()};
+      const HRESULT hb3 =
+          device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_down));
+      bvs->Release();
+      bps->Release();
+      bblit->Release();
+      bdown->Release();
+      if (berr) berr->Release();
+      if (FAILED(hb1) || FAILED(hb2) || FAILED(hb3)) {
+        REXLOG_ERROR("native-scene: blur PSO creation failed {:08X}/{:08X}/{:08X}",
+                     uint32_t(hb1), uint32_t(hb2), uint32_t(hb3));
+        g_r.pso_blur = nullptr;
+        g_r.pso_blur_blit = nullptr;  // blur unavailable; everything else runs
+        g_r.pso_blur_down = nullptr;
+      }
+    }
+    {
       // 2D overlay pipeline: standard alpha blend, no depth, drawn into the
       // resolved guest output (sample count 1).
       ID3DBlob* uvs = nullptr;
@@ -4784,6 +5032,56 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
                                   reinterpret_cast<void**>(&g_r.shadow_cb_cpu)))) {
       g_r.failed = true;
       return false;
+    }
+  }
+
+  if (g_r.blur_tex[0] == nullptr && g_r.pso_blur != nullptr) {
+    // Popup background blur intermediates at the game's fixed 1152x640
+    // internal resolution (the bilinear stretch back to the output is what
+    // produces the authentic frosted-glass lattice). RTV heap slots 5/6.
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = RendererState::kBlurWidth;
+    desc.Height = RendererState::kBlurHeight;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = context.d3d12.guest_output_format;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    bool ok = true;
+    for (int t = 0; t < 2 && ok; ++t) {
+      if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 nullptr, IID_PPV_ARGS(&g_r.blur_tex[t])))) {
+        ok = false;
+        break;
+      }
+      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      rtv.ptr += size_t(5 + t) * g_r.rtv_size;
+      device->CreateRenderTargetView(g_r.blur_tex[t], nullptr, rtv);
+      g_r.blur_srv[t] = g_r.srv_next++;
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = desc.Format;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Texture2D.MipLevels = 1;
+      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+      slot.ptr += size_t(g_r.blur_srv[t]) * g_r.srv_size;
+      device->CreateShaderResourceView(g_r.blur_tex[t], &srv, slot);
+    }
+    if (ok && !g_r.output_srv_allocated) {
+      g_r.output_srv_slot = g_r.srv_next++;
+      g_r.output_srv_allocated = true;
+    }
+    if (!ok) {
+      REXLOG_ERROR("native-scene: blur intermediate creation failed; blur disabled");
+      for (int t = 0; t < 2; ++t) {
+        if (g_r.blur_tex[t]) g_r.blur_tex[t]->Release();
+        g_r.blur_tex[t] = nullptr;
+      }
+      g_r.pso_blur = nullptr;  // leaked PSO acceptable on this cold path
     }
   }
 
@@ -5526,12 +5824,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // items misc.yzw carries the fog ramp and mat_tint the fog color.
     float constants[52] = {};
     std::memcpy(constants, item.world, sizeof(item.world));
+    if (item.unlit) {
+      // sky.*: the dome mesh is CAMERA-RELATIVE (sky.fx defaultVS adds
+      // g_vViewPos to every vertex). Anchoring it at the world origin put
+      // the baked skyline panorama ~700 m off, visibly rotated/parallaxed
+      // against the emulated frame. The game's sky viewpos tracks the camera
+      // in x/z but pins Y at the level's fixed sky elevation (captured per
+      // frame from the sky draw's VS bank; 165.0 in every capture); using
+      // cam.y rendered the skyline ~160 m too LOW.
+      constants[12] += scene.cam_pos[0];
+      constants[13] += scene.sky_height;
+      constants[14] += scene.cam_pos[2];
+    }
     float* mvp = constants + 16;
     for (int r = 0; r < 4; ++r) {
       for (int c = 0; c < 4; ++c) {
         float sum = 0.0f;
         for (int k = 0; k < 4; ++k) {
-          sum += item.world[r * 4 + k] * scene.view_proj[k * 4 + c];
+          sum += constants[r * 4 + k] * scene.view_proj[k * 4 + c];
         }
         mvp[r * 4 + c] = sum;
       }
@@ -5632,11 +5942,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // overlay.x = ripple scroll time, overlay.y = real environment cube
       // bound at t6, overlay.z = ripple normal map resolved (in the macro
       // slot; the shader synthesizes procedural ripples otherwise).
-      // overlay.w stays 0: no macro composite, no decal.
+      // overlay.w = 1 marks water with NO diffuse channel (ocean.default):
+      // the body term must be zero (ocean.fx diffTerm = 0); the white
+      // fallback diffuse otherwise renders the whole sea as a bright plain.
       constants[44] = water_time;
       constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
       constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
-      constants[47] = 0.0f;
+      constants[47] = item.diffuse_tex == 0 ? 1.0f : 0.0f;
     }
     // misc.x: alpha-blended sub-pass item (1 = transparentenvironment
     // shading, 2 = water branch); fog rides in misc.yzw (ramp) and the
@@ -5833,6 +6145,102 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                           g_r.msaa_color,
                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
+  }
+
+  // Popup background blur: exact port of the game's blur_hBlur/vBlur +
+  // postfx_basictex chain (see kBlurShaderSource): H blur of the finished
+  // frame into a 1152x640 intermediate, V blur, then a fullscreen bilinear
+  // stretch back over the output. Runs only on frames where the game issued
+  // the blur draws (scene.ui_blur = captured kernel scale). The popup's own
+  // 2D draws follow after and stay sharp.
+  if (scene.ui_blur > 0.0f && g_r.pso_blur != nullptr && g_r.pso_blur_blit != nullptr &&
+      g_r.pso_blur_down != nullptr && g_r.blur_tex[0] != nullptr) {
+    // The guest output resource can change between frames; re-point the
+    // dedicated SRV slot at it each blur frame.
+    {
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = context.d3d12.guest_output_format;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Texture2D.MipLevels = 1;
+      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+      slot.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
+      g_r.device->CreateShaderResourceView(context.d3d12.guest_output_resource, &srv, slot);
+    }
+    const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
+        g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+    const auto srv_table = [&](uint32_t slot) {
+      D3D12_GPU_DESCRIPTOR_HANDLE h = heap_start;
+      h.ptr += size_t(slot) * g_r.srv_size;
+      context.d3d12.set_graphics_root_descriptor_table(
+          context.d3d12.command_processor_user_data, 1, h);
+    };
+    D3D12_VIEWPORT blur_vp{0.0f, 0.0f, float(RendererState::kBlurWidth),
+                           float(RendererState::kBlurHeight), 0.0f, 1.0f};
+    D3D12_RECT blur_sc{0, 0, LONG(RendererState::kBlurWidth),
+                       LONG(RendererState::kBlurHeight)};
+    D3D12_CPU_DESCRIPTOR_HANDLE blur_rtv0 = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    blur_rtv0.ptr += size_t(5) * g_r.rtv_size;
+    D3D12_CPU_DESCRIPTOR_HANDLE blur_rtv1 = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    blur_rtv1.ptr += size_t(6) * g_r.rtv_size;
+    const auto to_srv = [&](ID3D12Resource* r) {
+      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    };
+    const auto to_rt = [&](ID3D12Resource* r) {
+      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+    };
+    const auto flush = [&] {
+      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+    };
+    list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // Downsample (prefiltered): output -> blur_tex[0], the game's 1152x640
+    // blur space. The H/V passes then run 1:1 like the original chain.
+    to_srv(context.d3d12.guest_output_resource);
+    flush();
+    list.D3DOMSetRenderTargets(1, &blur_rtv0, FALSE, nullptr);
+    list.RSSetViewport(blur_vp);
+    list.RSSetScissorRect(blur_sc);
+    list.D3DSetPipelineState(g_r.pso_blur_down);
+    const float d_consts[4] = {1.0f / float(context.guest_output_width),
+                               1.0f / float(context.guest_output_height), 0.0f, 0.0f};
+    list.D3DSetGraphicsRoot32BitConstants(0, 4, d_consts, 0);
+    srv_table(g_r.output_srv_slot);
+    list.D3DDrawInstanced(3, 1, 0, 0);
+    // H: blur_tex[0] -> blur_tex[1].
+    to_srv(g_r.blur_tex[0]);
+    flush();
+    list.D3DOMSetRenderTargets(1, &blur_rtv1, FALSE, nullptr);
+    list.D3DSetPipelineState(g_r.pso_blur);
+    const float h_consts[4] = {1.0f, 0.0f, scene.ui_blur, 0.0f};
+    list.D3DSetGraphicsRoot32BitConstants(0, 4, h_consts, 0);
+    srv_table(g_r.blur_srv[0]);
+    list.D3DDrawInstanced(3, 1, 0, 0);
+    // V: blur_tex[1] -> blur_tex[0].
+    to_srv(g_r.blur_tex[1]);
+    to_rt(g_r.blur_tex[0]);
+    flush();
+    list.D3DOMSetRenderTargets(1, &blur_rtv0, FALSE, nullptr);
+    const float v_consts[4] = {0.0f, 1.0f, scene.ui_blur, 0.0f};
+    list.D3DSetGraphicsRoot32BitConstants(0, 4, v_consts, 0);
+    srv_table(g_r.blur_srv[1]);
+    list.D3DDrawInstanced(3, 1, 0, 0);
+    // Replace: blur_tex[0] stretched over the full output (basictex).
+    to_srv(g_r.blur_tex[0]);
+    to_rt(context.d3d12.guest_output_resource);
+    flush();
+    list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+    list.RSSetViewport(viewport);
+    list.RSSetScissorRect(scissor);
+    list.D3DSetPipelineState(g_r.pso_blur_blit);
+    srv_table(g_r.blur_srv[0]);
+    list.D3DDrawInstanced(3, 1, 0, 0);
+    // Restore the intermediates' steady state for the next blur frame.
+    to_rt(g_r.blur_tex[0]);
+    to_rt(g_r.blur_tex[1]);
   }
 
   // 2D overlay (HUD/APT): replay the frame's captured 2D draws over the
