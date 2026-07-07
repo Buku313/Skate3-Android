@@ -2461,6 +2461,14 @@ struct MeshBuffers {
   D3D12_VERTEX_BUFFER_VIEW vb_view{};
   D3D12_INDEX_BUFFER_VIEW ib_view{};
   uint64_t fingerprint = 0;
+  // Double-sided sheet prop (banners/flags): most triangles have an
+  // opposite-winding twin ~1cm behind, and the two faces map to DIFFERENT
+  // lightmap atlas cells (lit vs shaded side). Drawn without culling both
+  // faces z-fight once their depth gap drops below buffer precision;
+  // distant triangles alternate between the two cells per frame (the "flag
+  // flicker", stops up close where 1cm still resolves). These meshes draw
+  // with the backface-culling PSO instead.
+  bool two_sided_sheet = false;
 };
 
 struct GuestTexture {
@@ -2592,6 +2600,7 @@ struct RendererState {
   ID3D12Device* device = nullptr;
   ID3D12RootSignature* root_signature = nullptr;
   ID3D12PipelineState* pso = nullptr;
+  ID3D12PipelineState* pso_cullback = nullptr;  // two_sided_sheet meshes (see MeshBuffers)
   ID3D12PipelineState* pso_nodepth = nullptr;
   // environment.transparent sub-pass: straight alpha blend, depth test on,
   // z-write OFF; items drawn back-to-front after all opaque items.
@@ -3129,6 +3138,21 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     return false;
   }
 
+  // two_sided_sheet detection eligibility (see MeshBuffers): small static
+  // triangle-list meshes only. Strips alternate winding per triangle and
+  // skinned/cloth meshes deform, so both stay on the uncull(ed) PSO.
+  bool detect_sheet =
+      !item.skinned && !item.cloth_quads && item.ib_count >= 6 && item.ib_count <= 8192;
+  for (const DrawEntry& de : item.draws) {
+    if (de.prim != 4) {
+      detect_sheet = false;
+    }
+  }
+  std::vector<float> sheet_pos;
+  if (detect_sheet) {
+    sheet_pos.reserve(size_t(num_verts) * 3);
+  }
+
   const uint8_t* src_vb = vb_scratch.data();
   float* dst = nullptr;
   uint32_t garbage = 0;
@@ -3209,6 +3233,11 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     dst[v * 14 + 0] = x;
     dst[v * 14 + 1] = y;
     dst[v * 14 + 2] = z;
+    if (detect_sheet) {
+      sheet_pos.push_back(x);
+      sheet_pos.push_back(y);
+      sheet_pos.push_back(z);
+    }
     decode_uv(item.uv_fmt, item.uv_offset, dst[v * 14 + 3], dst[v * 14 + 4]);
     decode_uv(item.uv2_fmt, item.uv2_offset, dst[v * 14 + 5], dst[v * 14 + 6]);
     // The second texcoord is the lightmap/decal UNWRAP, stored as an
@@ -3307,12 +3336,109 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       dst_ib[i] = SwapU16(src_ib[i]);
     }
   }
+  // Front/back sheet pattern: opposite-winding twin triangles a few mm-cm
+  // apart ALONG THE NORMAL. The two sides are often triangulated along
+  // OPPOSITE quad diagonals (downtown lamppost posters: sheets 4mm apart,
+  // twin centroids 0.26m apart in-plane), so twins are matched by
+  // plane-to-plane distance with an in-plane tolerance scaled to triangle
+  // size; raw centroid distance misses them. >=60% twinned marks the mesh
+  // double-sided (banners are 100%); O(T^2) but only for <=8192-index
+  // static tri-list meshes and only once per decode.
+  bool two_sided = false;
+  if (detect_sheet) {
+    struct SheetTri {
+      float c[3];
+      float n[3];
+      float edge;  // longest edge length (in-plane tolerance scale)
+    };
+    std::vector<SheetTri> tris;
+    tris.reserve(item.ib_count / 3);
+    for (const DrawEntry& de : item.draws) {
+      if (uint64_t(de.start_index) + de.index_count > item.ib_count) {
+        continue;
+      }
+      for (uint32_t i = 0; i + 2 < de.index_count; i += 3) {
+        const uint32_t a = uint32_t(dst_ib[de.start_index + i]) + de.base_vertex;
+        const uint32_t b = uint32_t(dst_ib[de.start_index + i + 1]) + de.base_vertex;
+        const uint32_t c = uint32_t(dst_ib[de.start_index + i + 2]) + de.base_vertex;
+        if (a >= num_verts || b >= num_verts || c >= num_verts) {
+          continue;
+        }
+        const float* pa = &sheet_pos[size_t(a) * 3];
+        const float* pb = &sheet_pos[size_t(b) * 3];
+        const float* pc = &sheet_pos[size_t(c) * 3];
+        const float e1[3] = {pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]};
+        const float e2[3] = {pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]};
+        const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                            e1[0] * e2[1] - e1[1] * e2[0]};
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len < 1e-8f) {
+          continue;
+        }
+        SheetTri t;
+        for (int k = 0; k < 3; ++k) {
+          t.c[k] = (pa[k] + pb[k] + pc[k]) / 3.0f;
+          t.n[k] = n[k] / len;
+        }
+        const float e3[3] = {pc[0] - pb[0], pc[1] - pb[1], pc[2] - pb[2]};
+        const float l1 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+        const float l2 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+        const float l3 = e3[0] * e3[0] + e3[1] * e3[1] + e3[2] * e3[2];
+        t.edge = std::sqrt(std::max(l1, std::max(l2, l3)));
+        tris.push_back(t);
+      }
+    }
+    if (tris.size() >= 2) {
+      std::vector<char> used(tris.size(), 0);
+      size_t twins = 0;
+      for (size_t i = 0; i < tris.size(); ++i) {
+        if (used[i]) {
+          continue;
+        }
+        for (size_t j = i + 1; j < tris.size(); ++j) {
+          if (used[j]) {
+            continue;
+          }
+          const float dx = tris[i].c[0] - tris[j].c[0];
+          const float dy = tris[i].c[1] - tris[j].c[1];
+          const float dz = tris[i].c[2] - tris[j].c[2];
+          const float d2 = dx * dx + dy * dy + dz * dz;
+          // Plane separation along i's normal must be small (back-to-back
+          // sheets); in-plane offset up to the triangle scale (opposite
+          // diagonal splits put twin centroids half a quad apart).
+          const float along = std::fabs(dx * tris[i].n[0] + dy * tris[i].n[1] +
+                                        dz * tris[i].n[2]);
+          const float lat_limit = 0.5f * (tris[i].edge + tris[j].edge);
+          if (along > 0.05f || d2 - along * along > lat_limit * lat_limit) {
+            continue;
+          }
+          const float dot = tris[i].n[0] * tris[j].n[0] + tris[i].n[1] * tris[j].n[1] +
+                            tris[i].n[2] * tris[j].n[2];
+          if (dot < -0.9f) {
+            used[i] = 1;
+            used[j] = 1;
+            twins += 2;
+            break;
+          }
+        }
+      }
+      two_sided = twins * 10 >= tris.size() * 6;
+      if (two_sided) {
+        static std::atomic<uint32_t> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+          REXLOG_INFO("native-scene: two-sided sheet mesh {:08X} ({} indices, {}/{} twins) -> cull-back",
+                      item.mesh, item.ib_count, twins, tris.size());
+        }
+      }
+    }
+  }
   ib->Unmap(0, nullptr);
 
   out.vb = vb;
   out.ib = ib;
   out.vb_view = {vb->GetGPUVirtualAddress(), num_verts * 56u, 56u};
   out.ib_view = {ib->GetGPUVirtualAddress(), item.ib_count * 2u, DXGI_FORMAT_R16_UINT};
+  out.two_sided_sheet = two_sided;
   return true;
 }
 
@@ -3321,6 +3447,259 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
 // physical mirror, endian swap, and create its SRV in the staging heap.
 // The 3D path reads the words from renderengine::Texture objects; the 2D
 // path passes the device fetch-shadow words directly.
+// BC1/DXT1 block decode (both color modes) into 16 RGBA8 texels.
+void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4]) {
+  const uint16_t c0 = uint16_t(b[0] | (b[1] << 8));
+  const uint16_t c1 = uint16_t(b[2] | (b[3] << 8));
+  uint8_t col[4][4];
+  const auto expand = [](uint16_t c, uint8_t* o) {
+    o[0] = uint8_t(((c >> 11) & 31) * 255 / 31);
+    o[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+    o[2] = uint8_t((c & 31) * 255 / 31);
+    o[3] = 255;
+  };
+  expand(c0, col[0]);
+  expand(c1, col[1]);
+  if (c0 > c1) {
+    for (int k = 0; k < 3; ++k) {
+      col[2][k] = uint8_t((2 * col[0][k] + col[1][k]) / 3);
+      col[3][k] = uint8_t((col[0][k] + 2 * col[1][k]) / 3);
+    }
+    col[2][3] = 255;
+    col[3][3] = 255;
+  } else {
+    for (int k = 0; k < 3; ++k) {
+      col[2][k] = uint8_t((col[0][k] + col[1][k]) / 2);
+      col[3][k] = 0;
+    }
+    col[2][3] = 255;
+    col[3][3] = 0;
+  }
+  uint32_t bits =
+      uint32_t(b[4]) | (uint32_t(b[5]) << 8) | (uint32_t(b[6]) << 16) | (uint32_t(b[7]) << 24);
+  for (int i = 0; i < 16; ++i) {
+    std::memcpy(px[i], col[bits & 3u], 4);
+    bits >>= 2;
+  }
+}
+
+// Runtime-composed textures (lightmap atlas pages above all) ship with NO
+// mip chain; sampling their razor-contrast mip 0 under minification
+// shimmers, grazing-angle banner posters, distant thin geometry, because
+// the pixel footprint spans many texels the aniso sampler cannot average at
+// mip 0 alone. The game masked this with its 720p softness and the 4-tap
+// lightmap filter; at native 4K we need real prefiltering. Small no-mip
+// DXT1/8888 textures are decoded to RGBA8 and uploaded with a CPU
+// box-filtered mip chain instead. Returns false to fall back to the plain
+// single-mip path.
+bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t* base,
+                         const rex::graphics::TextureInfo& info, uint32_t fetch_swizzle,
+                         GuestTexture& out) {
+  const rex::graphics::FormatInfo* format_info = info.format_info();
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  const uint32_t bytes_per_block_log2 = uint32_t(std::countr_zero(bytes_per_block));
+  const uint32_t width = info.width + 1u;
+  const uint32_t height = info.height + 1u;
+  const uint32_t block_w = format_info->block_width;
+  const uint32_t block_h = format_info->block_height;
+  const bool bc1 =
+      rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_DXT1;
+
+  // Guest mip 0 copy: same packed-base + tiled macro-row padding rules as
+  // the plain path.
+  uint32_t ox = 0, oy = 0;
+  const uint32_t addr = info.GetMipLocation(0, &ox, &oy, true);
+  if (addr == 0) {
+    return false;
+  }
+  const uint32_t pitch_blocks = info.extent.block_pitch_h;
+  const uint32_t min_size = info.memory.base_size;
+  uint32_t size = min_size;
+  const uint32_t cols = (width + block_w - 1) / block_w;
+  const uint32_t rows = (height + block_h - 1) / block_h;
+  if (info.is_tiled) {
+    const uint32_t padded_rows = ((rows + oy) + 31u) & ~31u;
+    size = std::max(size, padded_rows * pitch_blocks * bytes_per_block);
+  }
+  static thread_local std::vector<uint8_t> gen_scratch;
+  gen_scratch.resize(size);
+  if (!GuestTryCopy(gen_scratch.data(), base + (0xA0000000u | addr), size)) {
+    if (min_size >= size ||
+        !GuestTryCopy(gen_scratch.data(), base + (0xA0000000u | addr), min_size)) {
+      return false;
+    }
+    size = min_size;
+  }
+
+  // Untile into linear block rows, endian-swap per row.
+  std::vector<uint8_t> linear(size_t(cols) * rows * bytes_per_block);
+  for (uint32_t by = 0; by < rows; ++by) {
+    uint8_t* out_row = linear.data() + size_t(by) * cols * bytes_per_block;
+    for (uint32_t bx = 0; bx < cols; ++bx) {
+      uint32_t source_offset;
+      if (info.is_tiled) {
+        source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+            int32_t(bx + ox), int32_t(by + oy), pitch_blocks, bytes_per_block_log2));
+      } else {
+        source_offset = ((by + oy) * pitch_blocks + bx + ox) * bytes_per_block;
+      }
+      if (source_offset + bytes_per_block > size) {
+        std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+        continue;
+      }
+      std::memcpy(out_row + size_t(bx) * bytes_per_block, gen_scratch.data() + source_offset,
+                  bytes_per_block);
+    }
+    SwapGuestEndian(out_row, cols * bytes_per_block, info.endianness);
+  }
+
+  // Decode to RGBA8 mip 0.
+  std::vector<uint8_t> rgba(size_t(width) * height * 4);
+  if (bc1) {
+    for (uint32_t by = 0; by < rows; ++by) {
+      for (uint32_t bx = 0; bx < cols; ++bx) {
+        uint8_t px[16][4];
+        DecodeBc1Block(linear.data() + (size_t(by) * cols + bx) * bytes_per_block, px);
+        for (uint32_t t = 0; t < 16; ++t) {
+          const uint32_t x = bx * 4 + (t & 3u);
+          const uint32_t y = by * 4 + (t >> 2);
+          if (x < width && y < height) {
+            std::memcpy(&rgba[(size_t(y) * width + x) * 4], px[t], 4);
+          }
+        }
+      }
+    }
+  } else {  // k_8_8_8_8: rows are already RGBA8 after the endian swap
+    for (uint32_t y = 0; y < height; ++y) {
+      std::memcpy(&rgba[size_t(y) * width * 4], linear.data() + size_t(y) * cols * 4,
+                  size_t(width) * 4);
+    }
+  }
+
+  // Box-filtered chain down to 1x1.
+  std::vector<std::vector<uint8_t>> mips;
+  mips.emplace_back(std::move(rgba));
+  uint32_t mw = width, mh = height;
+  while (mw > 1 || mh > 1) {
+    const uint32_t nw = std::max(mw >> 1, 1u);
+    const uint32_t nh = std::max(mh >> 1, 1u);
+    const std::vector<uint8_t>& srcm = mips.back();
+    std::vector<uint8_t> dstm(size_t(nw) * nh * 4);
+    for (uint32_t y = 0; y < nh; ++y) {
+      const uint32_t y0 = std::min(y * 2, mh - 1);
+      const uint32_t y1 = std::min(y * 2 + 1, mh - 1);
+      for (uint32_t x = 0; x < nw; ++x) {
+        const uint32_t x0 = std::min(x * 2, mw - 1);
+        const uint32_t x1 = std::min(x * 2 + 1, mw - 1);
+        for (int k = 0; k < 4; ++k) {
+          const uint32_t sum = srcm[(size_t(y0) * mw + x0) * 4 + k] +
+                               srcm[(size_t(y0) * mw + x1) * 4 + k] +
+                               srcm[(size_t(y1) * mw + x0) * 4 + k] +
+                               srcm[(size_t(y1) * mw + x1) * 4 + k];
+          dstm[(size_t(y) * nw + x) * 4 + k] = uint8_t((sum + 2) / 4);
+        }
+      }
+    }
+    mips.emplace_back(std::move(dstm));
+    mw = nw;
+    mh = nh;
+  }
+  const uint32_t mip_count = uint32_t(mips.size());
+
+  // Upload plan + resource (RGBA8).
+  struct Plan {
+    uint32_t offset, pitch, w, h;
+  };
+  std::vector<Plan> plans(mip_count);
+  uint32_t upload_size = 0;
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    Plan& p = plans[m];
+    p.w = std::max(width >> m, 1u);
+    p.h = std::max(height >> m, 1u);
+    p.pitch = (p.w * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+              ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    p.offset = (upload_size + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
+               ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+    upload_size = p.offset + p.pitch * p.h;
+  }
+  ID3D12Device* device = context.d3d12.device;
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = UINT16(mip_count);
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&out.texture)))) {
+    out.texture = nullptr;
+    return false;
+  }
+  out.upload = CreateUploadBuffer(device, upload_size);
+  if (!out.upload) {
+    out.texture->Release();
+    out.texture = nullptr;
+    return false;
+  }
+  uint8_t* mapping = nullptr;
+  out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    const Plan& p = plans[m];
+    for (uint32_t y = 0; y < p.h; ++y) {
+      std::memcpy(mapping + p.offset + size_t(y) * p.pitch, &mips[m][size_t(y) * p.w * 4],
+                  size_t(p.w) * 4);
+    }
+  }
+  out.upload->Unmap(0, nullptr);
+
+  auto* command_processor = context.d3d12.command_processor;
+  auto& list = command_processor->GetDeferredCommandList();
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    const Plan& p = plans[m];
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = out.texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = m;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = out.upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = p.offset;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    src.PlacedFootprint.Footprint.Width = p.w;
+    src.PlacedFootprint.Footprint.Height = p.h;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = p.pitch;
+    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
+  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                        out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+  if (g_r.srv_next >= 8192) {
+    return false;
+  }
+  out.srv_slot = g_r.srv_next++;
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping =
+      ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+  srv.Texture2D.MipLevels = mip_count;
+  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+  slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
+  device->CreateShaderResourceView(out.texture, &srv, slot);
+  out.payload_addr = 0xA0000000u | info.memory.base_address;
+  out.payload_size = size;
+  out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
+  out.recheck_frame = 0;
+  out.valid = true;
+  return true;
+}
+
 bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
                                  uint8_t* base, const uint32_t words[6],
                                  GuestTexture& out) {
@@ -3378,6 +3757,21 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
         break;
       }
       ++mip_count;
+    }
+  }
+  // No guest chain at all (runtime-composed lightmap pages): generate one,
+  // see UploadGeneratedMips. Small DXT1/8888 textures only; falls back to
+  // the plain single-mip path on any failure.
+  if (mip_count == 1 && pow2 && REXCVAR_GET(skate3_native_render_scene_tex_mips) &&
+      width >= 8 && height >= 8 && width <= 512 && height <= 512) {
+    const auto base_fmt = rex::graphics::GetBaseFormat(info.format);
+    if (base_fmt == xenos::TextureFormat::k_DXT1 ||
+        base_fmt == xenos::TextureFormat::k_8_8_8_8) {
+      GuestTexture gen = out;  // keeps fetch_words already copied
+      if (UploadGeneratedMips(context, base, info, fetch.swizzle, gen)) {
+        out = gen;
+        return true;
+      }
     }
   }
 
@@ -3735,6 +4129,22 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pso.SampleDesc.Count = g_r.msaa;
     const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso));
+    // Culling variant for double-sided sheet props (banners/flags,
+    // MeshBuffers::two_sided_sheet). The sheet whose winding-derived world
+    // normal faces the camera is the one the game keeps (its lightmap cell
+    // reproduces the emulated banner exactly: albedo x lm x 2 lands within
+    // 3-8% of the F11 emulated reference on capture 1783387480); under our
+    // pipeline those triangles are D3D12 BACK faces, so cull FRONT.
+    // (CULL_BACK was tried first and kept the wrong sheet; banners rendered
+    // the sun-side lightmap cell ~2.4x brighter than emulated.)
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+    const HRESULT hr_cb =
+        device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_cullback));
+    if (FAILED(hr_cb)) {
+      REXLOG_WARN("native-scene: cull-back PSO creation failed {:08X}", uint32_t(hr_cb));
+      g_r.pso_cullback = nullptr;  // sheets fall back to the uncull(ed) PSO
+    }
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     // Transparent variant: straight alpha blend, depth-tested, no z-write.
     pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     pso.BlendState.RenderTarget[0].BlendEnable = TRUE;
@@ -4587,6 +4997,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   list.RSSetScissorRect(scissor);
   list.D3DSetGraphicsRootSignature(g_r.root_signature);
   list.D3DSetPipelineState(use_depth ? g_r.pso : g_r.pso_nodepth);
+  // Per-item PSO tracking for the opaque pass: two_sided_sheet meshes swap
+  // to the backface-culling variant (see MeshBuffers), everything else uses
+  // the pass PSO. Only meaningful while use_depth; the transparent sub-pass
+  // sets its own PSO and is not switched per item.
+  ID3D12PipelineState* scene_pso_bound = use_depth ? g_r.pso : g_r.pso_nodepth;
   // Our own persistent shader-visible SRV heap for the whole pass. These are
   // the last commands of the submission, so displacing the emulated GPU's
   // heap binding is safe.
@@ -4669,6 +5084,23 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       it = g_r.meshes.emplace(item.mesh, buffers).first;
     }
     const MeshBuffers& buffers = it->second;
+
+    // Double-sided sheet props draw with backface culling; without it the
+    // front/back copies z-fight into lightmap flicker at range (banners/
+    // flags). Opaque depth pass only; a mirrored instance (negative world
+    // determinant) would flip winding, so those stay uncull(ed).
+    if (use_depth && !item.transparent && g_r.pso_cullback != nullptr) {
+      const float* w = item.world;
+      const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
+                         w[1] * (w[4] * w[10] - w[6] * w[8]) +
+                         w[2] * (w[4] * w[9] - w[5] * w[8]);
+      ID3D12PipelineState* want =
+          (buffers.two_sided_sheet && det3 >= 0.0f) ? g_r.pso_cullback : g_r.pso;
+      if (want != scene_pso_bound) {
+        list.D3DSetPipelineState(want);
+        scene_pso_bound = want;
+      }
+    }
 
     // Resolve guest textures (white fallback). Cached decodes revalidate
     // against the live fetch words; streaming reuses texture objects. The
