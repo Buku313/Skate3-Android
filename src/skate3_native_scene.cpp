@@ -267,6 +267,12 @@ bool g_shadow_frame_done = false;
 float g_family_rows[4] = {0.3435f, 0.02f, 1.0f, 0.45f};
 bool g_tree_frame_done = false;
 bool g_proxy_frame_done = false;
+// dynamicobject.fx frame-global lighting rows (see FrameScene::dynobj_rows),
+// captured from a dynamicobject/alphatestdynamicobject PS bank (debug-path
+// classified). Guest render thread only.
+float g_dynobj_rows[10] = {};
+bool g_dynobj_have = false;
+bool g_dynobj_frame_done = false;
 // Dynamic entities (characters, movable props) live entirely in transient
 // per-frame arenas: the context, its record, mesh pointers, transforms and
 // bone palettes are all recycled before frame end. The complete DrawItem is
@@ -476,6 +482,7 @@ std::atomic<uint64_t> g_palette_base_plus1{0};
 std::atomic<uint64_t> g_char_attempts{0};
 std::atomic<uint64_t> g_char_valid{0};
 std::atomic<uint64_t> g_char_drawn{0};
+std::atomic<uint64_t> g_dynobj_drawn{0};
 // character.cloth_ropa items captured in the sim-active RIGID mode (world
 // from c188/c191 instead of a bone palette, see CaptureSkinnedState).
 std::atomic<uint64_t> g_ropa_rigid{0};
@@ -1040,6 +1047,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.water_env = 0;
   item.unlit = false;
   item.env_family = 0;
+  item.dynobj = 0;
   item.spec_tex = 0;
   item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
   const uint32_t material = REX_LOAD_U32(mesh + kMeshMaterial);
@@ -1183,6 +1191,16 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
               item.env_family = 11;
             } else if (is("incandescent.default", 21)) {
               item.env_family = 12;
+            }
+            // dynamicobject.fx props (dispensers, dumpsters, benches, cans):
+            // rigid movable objects with their own dual-shadow lit PS
+            // (model verified exact against the game's own pixel shader).
+            // Separate from the world env families; the lighting rows come
+            // from the draw's PS bank, not the frame-global world rows.
+            if (is("dynamicobject.alphatest", 24)) {
+              item.dynobj = 2;
+            } else if (is("dynamicobject", 13)) {
+              item.dynobj = 1;
             }
           }
           continue;
@@ -2194,7 +2212,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // independent done-flag: the first main-pass draw can be a character/tree
   // whose PS allocates differently (rejected by the sanity gate below).
   if ((!g_fog_frame_done || !g_shadow_frame_done || !g_sky_frame_done ||
-       !g_tree_frame_done || !g_proxy_frame_done) &&
+       !g_tree_frame_done || !g_proxy_frame_done || !g_dynobj_frame_done) &&
       func == 0 && flags2d == 0 && SceneEnabled() &&
       (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
     const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
@@ -2298,7 +2316,8 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       // than the environment layout. Identified by the shader debug path
       // (cached, like the blur trigger); the camera-keyed VS c4 gate above
       // already filtered to main-pass draws.
-      if ((!g_tree_frame_done || !g_proxy_frame_done) && ps_bank != 0) {
+      if ((!g_tree_frame_done || !g_proxy_frame_done || !g_dynobj_frame_done) &&
+          ps_bank != 0) {
         const auto world_family = [&](uint32_t obj) -> int {
           if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
             return 0;
@@ -2319,6 +2338,10 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
             fam = 1;
           } else if (std::strstr(text, "\\proxyworld_defaultPS") != nullptr) {
             fam = 2;
+          } else if (std::strstr(text, "\\dynamicobject_defaultPS") != nullptr ||
+                     std::strstr(text, "\\alphatestdynamicobject_defaultPS") !=
+                         nullptr) {
+            fam = 3;
           }
           if (cache.size() < 4096) {
             cache.emplace(obj, fam);
@@ -2329,7 +2352,43 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         if (fam == 0) {
           fam = world_family(g_cur_vs_obj.load(std::memory_order_relaxed));
         }
-        if (fam == 1 && !g_tree_frame_done) {
+        if (fam == 3 && !g_dynobj_frame_done) {
+          // Sun dir c9, exposure c13.x, ambient c15.xyz + bounce c15.w,
+          // material multiplier c14.y, static world-shadow floor c8.w.
+          float sun[3];
+          float n2 = 0.0f;
+          for (int k = 0; k < 3; ++k) {
+            sun[k] = LoadGuestF32(base, ps_bank + (9 * 4 + k) * 4);
+            n2 += sun[k] * sun[k];
+          }
+          const float expo = LoadGuestF32(base, ps_bank + (13 * 4 + 0) * 4);
+          const float mult = LoadGuestF32(base, ps_bank + (14 * 4 + 1) * 4);
+          if (n2 > 0.9f && n2 < 1.1f && expo > 0.1f && expo < 16.0f &&
+              mult > 0.0f && mult < 16.0f) {
+            g_dynobj_rows[0] = sun[0];
+            g_dynobj_rows[1] = sun[1];
+            g_dynobj_rows[2] = sun[2];
+            g_dynobj_rows[3] = expo;
+            for (int k = 0; k < 3; ++k) {
+              g_dynobj_rows[4 + k] = LoadGuestF32(base, ps_bank + (15 * 4 + k) * 4);
+            }
+            g_dynobj_rows[7] = LoadGuestF32(base, ps_bank + (15 * 4 + 3) * 4);
+            g_dynobj_rows[8] = mult;
+            g_dynobj_rows[9] = LoadGuestF32(base, ps_bank + (8 * 4 + 3) * 4);
+            if (!g_dynobj_have) {
+              REXLOG_INFO(
+                  "native-scene: dynamicobject rows captured sun=({:.3f},{:.3f},"
+                  "{:.3f}) expo={:.2f} amb=({:.3f},{:.3f},{:.3f}) bounce={:.3f} "
+                  "mult={:.2f} floor={:.3f}",
+                  g_dynobj_rows[0], g_dynobj_rows[1], g_dynobj_rows[2],
+                  g_dynobj_rows[3], g_dynobj_rows[4], g_dynobj_rows[5],
+                  g_dynobj_rows[6], g_dynobj_rows[7], g_dynobj_rows[8],
+                  g_dynobj_rows[9]);
+            }
+            g_dynobj_have = true;
+            g_dynobj_frame_done = true;
+          }
+        } else if (fam == 1 && !g_tree_frame_done) {
           const float c0x = LoadGuestF32(base, ps_bank + 0 * 4);
           const float c0y = LoadGuestF32(base, ps_bank + 1 * 4);
           const float c4y = LoadGuestF32(base, ps_bank + 17 * 4);
@@ -3291,6 +3350,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     scene.shadow_valid = true;
   }
   std::memcpy(scene.family_rows, g_family_rows, sizeof(g_family_rows));
+  if (g_dynobj_have) {
+    std::memcpy(scene.dynobj_rows, g_dynobj_rows, sizeof(g_dynobj_rows));
+    scene.dynobj_valid = true;
+  }
   if (g_sky_have) {
     scene.sky_height = g_sky_height;
   }
@@ -3316,6 +3379,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_sky_frame_done = false;
   g_tree_frame_done = false;
   g_proxy_frame_done = false;
+  g_dynobj_frame_done = false;
 
   if (g_recording.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(g_record_mutex);
@@ -3803,6 +3867,11 @@ cbuffer S : register(b1) {
   float4 sh_fogp;   // xyz = global fog ramp scale/bias/exp [VS c5],
                     // w = proxyworld scale [proxy PS c3.y]
   float4 sh_fogc;   // fog color rgb + transmittance scale in w [VS c6]
+  // dynamicobject.fx frame-global lighting rows (see FrameScene::dynobj_rows).
+  float4 dyn_sun;   // xyz = sun direction (PS c9), w = scene exposure (c13.x)
+  float4 dyn_amb;   // xyz = flat ambient (c15.rgb), w = bounce scale (c15.w)
+  float4 dyn_misc;  // x = material multiplier (c14.y),
+                    // y = static world-shadow floor (c8.w)
 };
 // Character-family lighting (defaultcharacter.fx and friends): canonical
 // per-draw rows captured from the guest PIXEL constant bank at palette
@@ -3878,6 +3947,31 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
   o.uv3 = uv3;
   return o;
 }
+// Native CSM atlas sample at a world position: finest covering cascade,
+// s = saturate(infront + 1 - coverage). Returns 1 (lit) when uncovered or
+// shadows are off. extra_bias suppresses receiver self-shadow acne on
+// surfaces that are themselves casters (characters, held board).
+float SampleCsmShadow(float3 wp, float extra_bias) {
+  if (sh_misc.y <= 0.0) {
+    return 1.0;
+  }
+  float2 lsv = float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
+  float rd = dot(sh_z.xyz, wp) + sh_z.w - sh_misc.x - extra_bias;
+  float2 luv = 0.0;
+  float casc = 0.0;
+  float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
+  if (max(abs(l2.x), abs(l2.y)) < 0.99) { luv = l2; casc = 3.0; }
+  float2 l1 = lsv * sh_c1.xy + sh_c1.zw;
+  if (max(abs(l1.x), abs(l1.y)) < 0.99) { luv = l1; casc = 2.0; }
+  if (max(abs(lsv.x), abs(lsv.y)) < 0.99) { luv = lsv; casc = 1.0; }
+  if (casc <= 0.0) {
+    return 1.0;
+  }
+  float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
+                      luv.y * -0.5 + 0.5);
+  float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
+  return saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
+}
 float4 ps_main(VSOut i) : SV_Target {
   if (tint.a > 0.0) {
     return tint;
@@ -3889,12 +3983,55 @@ float4 ps_main(VSOut i) : SV_Target {
   // rendered rigid (sim-active player tees, clipping their gloss alpha
   // discarded every pixel: the invisible-shirt bug; their decode writes
   // zero blend weights, so the VS skinning branch stays off).
-  if (tint.g == 0.0 && overlay.w < 0.5) {
+  if (tint.g == 0.0 && overlay.w < 0.5 && cam_pos.w > -20.5) {
     // environment.transparent alpha-tests its SQUARED alpha at ref 16/255
     // (transparentenvironment.xml: ALPHAREF 16, PS outputs a = diffuse.a^2).
     // Exact env families (cam_pos.w < 0) use the game's world ALPHAREF 30.
+    // dynamicobject items (cam_pos.w <= -21) are excluded here and clip in
+    // their own branch (only the .alphatest variant tests, at ALPHAREF 30).
     float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
     clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
+  }
+  // dynamicobject.fx props (cam_pos.w = -(20 + variant): -21 default,
+  // -22 alphatest). Rigid movable objects (dispensers, dumpsters, benches,
+  // cans). Lit with the game's own dynamicobject model (verified exact):
+  // key sun light + bounce + flat ambient, gated by
+  // the CSM shadow (the static world-shadow map is approximated as fully lit
+  // - its floor c8.w bounds it), then fog -> exposure -> tonemap -> sqrt and
+  // the postfx uber 1.41. v1 uses the geometric normal (cross of the mesh
+  // tangent/binormal) with the flat normal-map kd 0.93429; the base/detail/
+  // spec normal maps are v2.
+  if (cam_pos.w < -20.5) {
+    if (cam_pos.w < -21.5) {
+      clip(albedo.a - 0.1176);  // dynamicobject.alphatest: ALPHAREF 30
+    }
+    float3 dlin = albedo.rgb * albedo.rgb;
+    float3 n = dot(i.nrm, i.nrm) > 0.01
+                   ? normalize(i.nrm)
+                   : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+    float ndl = dot(n, dyn_sun.xyz);
+    float key = saturate(ndl);  // key light gated on N.L >= 0
+    float bounce = saturate(dot(n, float3(-dyn_sun.x, dyn_sun.y, -dyn_sun.z)));
+    // CSM shadow (shared receiver rows at t5); the static world-shadow map is
+    // not rendered natively, so its term is 1 and the min collapses to the
+    // CSM (bounded below by the c8.w floor, dyn_misc.y).
+    float s = SampleCsmShadow(i.rpos + cam_pos.xyz, 0.0);
+    float shadow = min(s * (ndl >= 0.0 ? 1.0 : 0.0), max(1.0, dyn_misc.y));
+    float3 lighting = key * shadow + bounce * dyn_amb.w + dyn_amb.rgb;
+    // GetTangentLight with the neutral (flat) normal map: 0.39 * 2.39562.
+    float3 lin = lighting * 0.93429 * dlin;
+    // Fog -> exposure -> tonemap -> sqrt, then the 1.41 uber scene multiplier.
+    float fdist = length(i.rpos);
+    float f1 = saturate(fdist * sh_fogp.x + sh_fogp.y);
+    if (sh_fogp.z != 1.0) {
+      f1 = pow(max(f1, 1e-6), sh_fogp.z);
+    }
+    float3 fog_rgb = sh_fogc.rgb * f1;
+    float fog_a = (1.0 + sh_fogc.a * f1) * dyn_misc.x;  // x material multiplier
+    float3 xe = (lin * fog_a + fog_rgb) * dyn_sun.w;
+    float3 t1 = saturate(1.0 - xe);
+    float3 tm = max(xe * 0.25 + 0.75, 1.0) - t1 * t1;
+    return float4(saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41), 1.0);
   }
   // Character families: the game's own lighting in LINEAR space (diffuse is
   // gamma -> square it), then the exact tone chain from the disassembly and
@@ -7108,6 +7245,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[39] = scene.family_rows[3];  // proxyworld scale (proxy PS c3.y)
       std::memcpy(cb + 40, scene.fog_color, 4 * sizeof(float));
     }
+    // dynamicobject.fx frame rows (dyn_sun/dyn_amb/dyn_misc at cb[44..55]).
+    if (scene.dynobj_valid) {
+      cb[44] = scene.dynobj_rows[0];  // sun dir (PS c9)
+      cb[45] = scene.dynobj_rows[1];
+      cb[46] = scene.dynobj_rows[2];
+      cb[47] = scene.dynobj_rows[3];  // scene exposure (c13.x)
+      cb[48] = scene.dynobj_rows[4];  // flat ambient rgb (c15.xyz)
+      cb[49] = scene.dynobj_rows[5];
+      cb[50] = scene.dynobj_rows[6];
+      cb[51] = scene.dynobj_rows[7];  // bounce scale (c15.w)
+      cb[52] = scene.dynobj_rows[8];  // material multiplier (c14.y)
+      cb[53] = scene.dynobj_rows[9];  // static world-shadow floor (c8.w)
+    }
     list.D3DSetGraphicsRootConstantBufferView(
         6, g_r.shadow_cb->GetGPUVirtualAddress() + cb_offset);
     // b2 (character lighting) default: point at the ring base so the root
@@ -7447,6 +7597,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (debug_mode == 0 && item.env_family != 0 && scene.shadow_valid &&
         !item.water && !item.transparent) {
       constants[39] = -float(item.env_family);
+    }
+    // cam_pos.w = -(20 + variant) selects the exact dynamicobject branch
+    // (rigid props). Gated on the frame's dynamicobject lighting rows having
+    // been captured (dyn_* at b1); without them the tone chain multiplies by
+    // zero and renders black; fall back to the legacy shading otherwise.
+    if (debug_mode == 0 && item.dynobj != 0 && scene.dynobj_valid) {
+      constants[39] = -float(20 + item.dynobj);
+      g_dynobj_drawn.fetch_add(1, std::memory_order_relaxed);
     }
     std::memcpy(constants + 40, item.tint, 4 * sizeof(float));
     // t3 = macro grime/crack overlay, t4 = decal art for environment.decal
@@ -8061,7 +8219,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
-        "bones_rescued={}]",
+        "bones_rescued={}] dynobj[valid={} drawn={}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
@@ -8075,7 +8233,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
         g_rr_tex_deferred.load(), scene.shadow_valid, shadow_ready, shadow_draws,
         g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
-        g_char_rows_reused.load(), g_bones_rescued.load());
+        g_char_rows_reused.load(), g_bones_rescued.load(), scene.dynobj_valid,
+        g_dynobj_drawn.load());
   }
   return true;
 }

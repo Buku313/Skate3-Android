@@ -145,6 +145,14 @@ struct DrawItem {
   // 9 = tree.default, 10 = animated.tree, 11 = proxyworld.default,
   // 12 = incandescent.default.
   uint8_t env_family = 0;
+  // dynamicobject.fx family (movable props: dispensers, dumpsters, benches,
+  // cans, ...). 0 = not a dynamic object, 1 = dynamicobject.default,
+  // 2 = dynamicobject.alphatest. These are rigid model-space props with per-
+  // frame lighting rows (sun / ambient / exposure) captured from their PS
+  // bank, NOT the frame-global world-material rows; hence a separate family
+  // and its own scene PS branch (model verified exact against the game's
+  // own pixel shader).
+  uint8_t dynobj = 0;
   // "specular" channel texture (spec mask / eccentricity / reflection mask)
   // for env families; the "noise" tint texture for animated.tree. Bound in
   // the decal slot (t4) on families that carry no decal art.
@@ -206,6 +214,14 @@ struct FrameScene {
   // [2] = tree PS c4.y (tint multiplier), [3] = proxyworld PS c3.y (0.45).
   // Defaults from the day capture cover frames before the first hit.
   float family_rows[4] = {0.3435f, 0.02f, 1.0f, 0.45f};
+  // dynamicobject.fx frame-global lighting rows, captured from a
+  // dynamicobject/alphatestdynamicobject PS bank (debug-path classified):
+  // [0..2] sun direction (PS c9), [3] scene exposure (c13.x),
+  // [4..6] flat ambient rgb (c15.xyz), [7] bounce scale (c15.w),
+  // [8] material multiplier (c14.y), [9] static world-shadow floor (c8.w).
+  // Consumed by the exact dynamicobject scene PS branch.
+  bool dynobj_valid = false;
+  float dynobj_rows[10] = {};
   // Sky-dome viewpos: sky.* meshes are camera-relative (sky.fx VS adds
   // g_vViewPos), but the game pins the sky viewpos Y at a fixed level
   // elevation (165.0 in every capture) so the skyline doesn't bob with the
