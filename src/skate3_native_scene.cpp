@@ -251,6 +251,13 @@ struct SelectedDrawKey {
 };
 bool g_sky_seen_this_frame = false;
 std::vector<SelectedDrawKey> g_frame_selected;
+// The guest issued its postfx_edgedetectstencil draw this frame: the game's
+// own "an outline is being drawn" signal (park editor / object mover with an
+// active selection). Post-sky double-draws alone are NOT sufficient evidence
+// of a selection: normal gameplay draws some small props twice after the sky
+// (far LOD/imposter passes), which used to sprout phantom outlines on distant
+// objects. Guest render thread only; reset per frame in BuildFrameScene.
+bool g_outline_edge_seen = false;
 // Outline color, refreshed from the guest postfx_edgedetectstencil draw's
 // PS c0 (the park-editor blue in every capture) whenever that pass runs.
 float g_outline_color[4] = {0.21569f, 0.64706f, 1.0f, 1.0f};
@@ -2529,8 +2536,11 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         break;
       }
     } else if (fam == 3) {
-      // postfx edge-detect: PS c0 = the outline color as staged (the
-      // park-editor blue (0.216, 0.647, 1.0) in every capture).
+      // postfx edge-detect: the presence of this draw is what authorizes the
+      // native outline this frame (see g_outline_edge_seen); its PS c0 = the
+      // outline color as staged (the park-editor blue (0.216, 0.647, 1.0) in
+      // every capture).
+      g_outline_edge_seen = true;
       const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
       if (ps_bank != 0) {
         float c[4];
@@ -3112,6 +3122,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   std::vector<SelectedDrawKey> frame_selected;
   frame_selected.swap(g_frame_selected);
   g_sky_seen_this_frame = false;
+  const bool outline_edge_seen = g_outline_edge_seen;
+  g_outline_edge_seen = false;
   if (count == 0) {
     return;
   }
@@ -3296,10 +3308,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // Selected-object outline: flag items matching this frame's post-sky
   // re-draw captures. >= 2 identical draws = the stencil-marking pair; a
   // single occurrence is a legitimately late-drawn object, not a selection.
+  // BOTH signals are required: the guest's own postfx_edgedetectstencil draw
+  // must have run this frame too (park editor with an active selection);
+  // gameplay draws some small props twice after the sky as well, which used
+  // to outline distant objects during normal play.
   {
     uint32_t outline_items = 0;
     for (const SelectedDrawKey& k : frame_selected) {
-      if (k.count < 2) {
+      if (!outline_edge_seen || k.count < 2) {
         continue;
       }
       for (DrawItem& item : scene.items) {
