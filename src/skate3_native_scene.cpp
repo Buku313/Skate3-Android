@@ -291,6 +291,31 @@ std::unordered_multimap<uint64_t, size_t> g_frame_char_refresh;
 // the engine binds the streamed art via the fetch constants at draw time.
 // Guarded by g_palette_mutex; cleared at the end of BuildFrameScene.
 std::unordered_map<uint64_t, std::array<uint32_t, 12>> g_frame_draw_fetch;
+// mesh -> last VALIDATED character-lighting rows (see CaptureCharLighting).
+// The per-frame capture depends on a fragile draw-order chain (capture at
+// submit-exit -> pending fixup -> per-draw refresh, commit-on-success); on
+// frames where no draw in the chain carried this character's main-pass PS
+// bank the item ends with INVALID rows and the renderer falls back to the
+// legacy empirical shading; the player visibly flickered between the two
+// looks while moving, and the hair left the blended sub-pass (opaque "hair
+// helmet" covering the cap crown). The rows are frame-coherent (sun/ambient
+// move slowly), so reusing the previous valid capture is visually seamless.
+// TRAP: NPC clones share a mesh with PER-INSTANCE rows (stamp tints, the
+// teal-vest twins), so the fallback applies only to meshes with a single
+// instance in the frame. Guest-render-thread only (capture hooks +
+// BuildFrameScene), no lock needed.
+std::unordered_map<uint32_t, std::array<float, 60>> g_char_rows_cache;
+std::atomic<uint64_t> g_char_rows_reused{0};
+// mesh -> last published bone palette (skinned single-instance meshes).
+// Rescue for frames whose palette capture was REFUSED by the acceptance
+// gates (RefinePaletteBase returning 0 on a stale/ambiguous bank): garments
+// that draw only once per frame (the trucker cap) have no later draw for
+// the fixup to pop on, so a refused capture used to mean a one-frame
+// disappearance (the "momentary blip" while rotating the camera). One frame
+// of pose lag is invisible; a missing hat is not. Single-instance only;
+// clones share meshes with per-instance poses. Guest-render-thread only.
+std::unordered_map<uint32_t, std::vector<float>> g_bones_cache;
+std::atomic<uint64_t> g_bones_rescued{0};
 std::atomic<uint32_t> g_cur_ib{0};
 std::atomic<uint32_t> g_cur_vb{0};
 std::atomic<uint32_t> g_cur_vb_offset{0};
@@ -536,6 +561,25 @@ uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
     }
     return f[0] * f[0] + f[1] * f[1] + f[2] * f[2] <= 0.0025f;
   };
+  // DETERMINISTIC main-pass detection first: that layout keeps the CAMERA
+  // POSITION at c4 (palette at c7, or c8 behind a parameter row). Matching
+  // c4 against the frame camera pins the layout without any scoring; the
+  // norm checks alone accepted banks whose c4 was the camera followed by
+  // leftover bone rows (the trucker cap's single main-pass capture), and
+  // score-based c7-vs-c8 arbitration flipped to the row-shifted palette
+  // whenever camera rotation clipped a sample of the real one (the cap
+  // teleporting to axis-permuted coordinates while rotating).
+  {
+    const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
+    const float dy = LoadGuestF32(base, bank + 17 * 4) - g_fog_cam[1];
+    const float dz = LoadGuestF32(base, bank + 18 * 4) - g_fog_cam[2];
+    if (dx * dx + dy * dy + dz * dz < 25.0f &&
+        (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
+      if (param_row_at(7) && bone_at(8)) return 8;
+      if (bone_at(7)) return 7;
+      return 0;
+    }
+  }
   if (bone_at(4)) return 4;
   if (param_row_at(4) && bone_at(5)) return 5;
   if (bone_at(7)) return 7;
@@ -592,9 +636,14 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     if (!(vp[i] > -1e9f && vp[i] < 1e9f)) return palette_base;
   }
   constexpr uint32_t kSamples = 6;
-  const auto score = [&](uint32_t pb) -> int {
+  // score: fraction (0..16) of samples that skin in front of and inside the
+  // bank's own clip volume; *out_spread = the skinned samples' bbox diagonal
+  // (world units) for the bind-size sanity test below.
+  const auto score = [&](uint32_t pb, float* out_spread) -> int {
     int ok = 0;
     int n = 0;
+    float qmin[3] = {1e9f, 1e9f, 1e9f};
+    float qmax[3] = {-1e9f, -1e9f, -1e9f};
     for (uint32_t s = 0; s < kSamples; ++s) {
       const uint32_t v = item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
       float p[3];
@@ -648,19 +697,93 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
       }
       const float aw = std::abs(clip[3]) < 1.0f ? 1.0f : std::abs(clip[3]);
       ++n;
-      if (std::abs(clip[0]) <= 1.5f * aw && std::abs(clip[1]) <= 1.5f * aw) {
+      for (int a = 0; a < 3; ++a) {
+        qmin[a] = std::min(qmin[a], q[a]);
+        qmax[a] = std::max(qmax[a], q[a]);
+      }
+      // In FRONT of the projection (w > 0) and inside a generous guard band.
+      // Without the w check a foreign palette that skins the mesh BEHIND the
+      // camera can still land |x|,|y| within the band and score well.
+      if (clip[3] > 0.0f && std::abs(clip[0]) <= 1.5f * aw &&
+          std::abs(clip[1]) <= 1.5f * aw) {
         ++ok;
       }
     }
-    return n == 0 ? -1 : (ok * 16) / n;
+    if (n == 0) {
+      return -1;
+    }
+    const float dx = qmax[0] - qmin[0];
+    const float dy = qmax[1] - qmin[1];
+    const float dz = qmax[2] - qmin[2];
+    *out_spread = std::sqrt(dx * dx + dy * dy + dz * dz);
+    return (ok * 16) / n;
   };
-  const int s_std = score(palette_base);
-  const int s_plus = score(palette_base + 1);
-  if (s_plus > s_std) {
+  // Bind-pose size of the SAMPLED span (approximates the mesh diagonal):
+  // legit skinning keeps the world spread near it; a foreign palette
+  // composes inconsistent transforms and smears the samples several times
+  // wider. Generous bound: articulation can stretch a garment's sampled
+  // span, junk palettes overshoot by ~10x.
+  float bind_diag = 0.0f;
+  for (int a = 0; a < 3; ++a) {
+    const float d = item.bbox_max[a] - item.bbox_min[a];
+    bind_diag += d * d;
+  }
+  bind_diag = std::sqrt(bind_diag);
+  const float max_spread = std::max(3.0f * bind_diag, bind_diag + 1.0f);
+  // Acceptance gate: skins into the bank's own view AND at a sane size.
+  // IMPORTANT selection constraint (offline-validated on the cap capture):
+  // a palette shifted by whole rows is a RIGID transform of the mesh, same
+  // spread, often still on screen, so "best spread/score wins" mis-picks
+  // permuted bases. Selection therefore stays conservative: keep the
+  // caller's guess (old base-vs-base+1 arbitration) whenever it passes the
+  // gate, and only on gate FAILURE fall through to the other layout homes
+  // (pre-pass c4/c5, main-pass c7/c8) in canonical order. The trucker cap
+  // is the motivating case: it draws ONCE per frame (main-pass layout,
+  // palette at c7) while leftovers at c4 pass the row-plausibility checks;
+  // the old code never looked past c4/c5 and skinned it into a ~3 m smear
+  // near the origin (the disappearing-hat bug).
+  const auto gate = [&](uint32_t pb, int* ok_out) -> bool {
+    float spread = 0.0f;
+    const int ok = score(pb, &spread);
+    if (ok_out) {
+      *ok_out = ok;
+    }
+    return ok >= 8 && spread <= max_spread;
+  };
+  int s_std = -1;
+  int s_plus = -1;
+  const bool std_pass = gate(palette_base, &s_std);
+  if (s_std < 0) {
+    // Unsupported position format / no weighted samples: nothing to judge;
+    // keep the caller's guess rather than refusing every capture.
+    return palette_base;
+  }
+  // The guess wins whenever it passes; +1 (the cloth/morph parameter-row
+  // variant) is consulted only on FAILURE. A row-shifted palette is a rigid
+  // axis-permutation of the mesh, often still on screen with a sane spread
+  // - so "switch when +1 scores strictly better" flip-flopped whenever
+  // camera rotation clipped one sample of the real base (cap teleporting
+  // while rotating). The genuine +1 layouts skin the guess-base hundreds of
+  // meters off-view, which the gate rejects decisively.
+  if (std_pass) {
+    return palette_base;
+  }
+  if (gate(palette_base + 1, &s_plus)) {
     g_palette_base_plus1.fetch_add(1, std::memory_order_relaxed);
     return palette_base + 1;
   }
-  return palette_base;
+  for (const uint32_t pb : {4u, 7u, 5u, 8u}) {
+    if (pb == palette_base || pb == palette_base + 1) {
+      continue;
+    }
+    if (gate(pb, nullptr)) {
+      return pb;
+    }
+  }
+  // No candidate skins this mesh into the bank's own view at a sane size:
+  // the bank belongs to another mesh. The caller refuses the capture (item
+  // stays pending) and the post-draw fixup re-captures from a real draw.
+  return 0;
 }
 
 // Rigid transform validation: the game uses (at least) two VS constant
@@ -1582,6 +1705,13 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   d[14 * 4 + 1] = float(fam);
   std::memcpy(item.char_rows, local, sizeof(item.char_rows));
   g_char_valid.fetch_add(1, std::memory_order_relaxed);
+  // Remember the validated rows per garment for the cross-frame fallback
+  // (see g_char_rows_cache). Runaway-growth backstop only; mesh keys are
+  // bounded by loaded character content in practice.
+  if (g_char_rows_cache.size() > 4096) {
+    g_char_rows_cache.clear();
+  }
+  std::memcpy(g_char_rows_cache[item.mesh].data(), local, sizeof(local));
 }
 
 // Copy the staged bone palette (and, for hair, the tint) out of the shadow
@@ -1752,6 +1882,12 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
     }
   } else {
     palette_base = RefinePaletteBase(base, bank, palette_base, item);
+    if (palette_base == 0) {
+      // The bank's palette provably does not skin this mesh into the bank's
+      // own view (foreign/stale bank): refuse; the caller keeps the item
+      // pending and the post-draw (ib,vb) fixup re-captures on a real draw.
+      return false;
+    }
   }
   constexpr uint32_t kPaletteFloats = 84 * 12;  // c4..c255 = up to 84 bones
   item.bones.resize(kPaletteFloats);
@@ -2955,6 +3091,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // each submission carries that pass's culled island list. Keep the fullest
   // one; a shadow-pass list can be missing body parts the main view needs.
   std::unordered_map<uint32_t, size_t> dyn_slot;
+  // First refused/pending skinned capture per mesh: candidates for the
+  // post-merge cross-frame palette rescue (see g_bones_cache).
+  std::unordered_map<uint32_t, const DrawItem*> pending_skinned_by_mesh;
   const auto total_indices = [](const DrawItem& d) {
     uint64_t n = 0;
     for (const DrawEntry& e : d.draws) n += e.index_count;
@@ -2988,7 +3127,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
       const DrawItem& cand = dynitems[r.c - 1];
       if (cand.pending) {
-        // Deferred mesh whose draw never came: no valid palette/transform.
+        // Deferred mesh whose draw never came, or a capture the palette
+        // acceptance gates refused. Remember it: if NO copy of this mesh
+        // publishes this frame, the post-merge rescue re-publishes it with
+        // LAST frame's palette (see g_bones_cache); one frame of pose lag
+        // beats a one-frame-missing hat.
+        if (cand.skinned) {
+          pending_skinned_by_mesh.try_emplace(cand.mesh, &cand);
+        }
         (cand.skinned ? g_skinned_skipped : g_rigid_dropped)
             .fetch_add(1, std::memory_order_relaxed);
         continue;
@@ -3027,6 +3173,62 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;
       }
       scene.items.push_back(std::move(item));
+    }
+  }
+  // Cross-frame palette rescue + cache refresh (see g_bones_cache): exactly
+  // one published copy of a skinned mesh -> refresh its cache entry; zero
+  // copies but a refused/pending capture -> re-publish with the cached
+  // palette (one frame of pose lag instead of a one-frame disappearance).
+  if (REXCVAR_GET(skate3_native_render_scene_dynamic_items)) {
+    std::unordered_map<uint32_t, uint32_t> pub_count;
+    for (const DrawItem& item : scene.items) {
+      if (item.skinned && !item.bones.empty()) {
+        ++pub_count[item.mesh];
+      }
+    }
+    for (const DrawItem& item : scene.items) {
+      if (item.skinned && !item.bones.empty() && pub_count[item.mesh] == 1 &&
+          g_bones_cache.size() < 512) {
+        g_bones_cache[item.mesh] = item.bones;
+      }
+    }
+    for (const auto& [mesh, cand] : pending_skinned_by_mesh) {
+      if (pub_count.find(mesh) != pub_count.end()) {
+        continue;  // a live copy published; nothing to rescue
+      }
+      const auto bit = g_bones_cache.find(mesh);
+      if (bit == g_bones_cache.end()) {
+        continue;
+      }
+      scene.items.push_back(*cand);
+      DrawItem& rescued = scene.items.back();
+      rescued.bones = bit->second;
+      rescued.pending = false;
+      g_bones_rescued.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  // Cross-frame character-lighting fallback (see g_char_rows_cache): items
+  // whose capture chain never validated THIS frame reuse their garment's
+  // last good rows instead of dropping to the empirical look (and, for
+  // hair, out of the blended sub-pass). Single-instance meshes only;
+  // clones carry per-instance rows.
+  {
+    std::unordered_map<uint32_t, uint32_t> char_mesh_count;
+    for (const DrawItem& item : scene.items) {
+      if (item.char_family != 0) {
+        ++char_mesh_count[item.mesh];
+      }
+    }
+    for (DrawItem& item : scene.items) {
+      if (item.char_family == 0 || item.char_rows[14 * 4 + 1] > 0.0f ||
+          char_mesh_count[item.mesh] != 1) {
+        continue;
+      }
+      const auto cit = g_char_rows_cache.find(item.mesh);
+      if (cit != g_char_rows_cache.end()) {
+        std::memcpy(item.char_rows, cit->second.data(), sizeof(item.char_rows));
+        g_char_rows_reused.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
   if (scene.items.empty()) {
@@ -6634,6 +6836,33 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (!skinned && std::memcmp(item.world, kIdent, sizeof(kIdent)) == 0) {
         continue;  // static world geometry never casts (baked into lightmaps)
       }
+      // Ensure the mesh decode is CURRENT before the caster draws. The old
+      // "skip stale, casts from next frame" policy never converged for
+      // cloth/ropa garments: their CPU sim rewrites the (ping-pong) vertex
+      // buffer every frame, so at shadow time the cached decode is always
+      // one frame stale; the player tee never cast and the shadow torso
+      // was hollow. Decode here exactly like the main pass would; the main
+      // pass then finds the fresh cache entry, so there is no net extra
+      // work (and newly appearing casters no longer pop in a frame late).
+      {
+        auto mit = g_r.meshes.find(item.mesh);
+        if (mit != g_r.meshes.end() && mit->second.fingerprint != item.fingerprint &&
+            REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
+          const uint64_t submission = command_processor->GetCurrentSubmission();
+          g_r.retired.emplace_back(mit->second.vb, submission);
+          g_r.retired.emplace_back(mit->second.ib, submission);
+          g_r.meshes.erase(mit);
+          mit = g_r.meshes.end();
+        }
+        if (mit == g_r.meshes.end()) {
+          MeshBuffers buffers;
+          if (!DecodeMesh(g_r.device, base, item, buffers)) {
+            continue;  // payload unreadable this frame; the main pass retries
+          }
+          buffers.fingerprint = item.fingerprint;
+          g_r.meshes.emplace(item.mesh, buffers);
+        }
+      }
       Caster c{&item, 0, false};
       if (skinned) {
         const uint32_t bytes = uint32_t(item.bones.size() * sizeof(float));
@@ -7831,7 +8060,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
-        "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={}]",
+        "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
+        "bones_rescued={}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
@@ -7844,7 +8074,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
         g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
         g_rr_tex_deferred.load(), scene.shadow_valid, shadow_ready, shadow_draws,
-        g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load());
+        g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
+        g_char_rows_reused.load(), g_bones_rescued.load());
   }
   return true;
 }
