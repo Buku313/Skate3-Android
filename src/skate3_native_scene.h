@@ -116,6 +116,21 @@ struct DrawItem {
   // Detected via the AttribulatorMaterialName channel; consumed by
   // CaptureSkinnedState.
   bool ropa;
+  // Exact world-material shading family, classified from
+  // AttribulatorMaterialName (models verified against the game's own pixel
+  // shaders):
+  // 0 = none (legacy empirical shading), 1 = environment.default
+  // (baseenvironment), 2 = environmentsimple.default (defaultenvironment),
+  // 3 = environment.decal, 4 = environment.decal_tileable(_simple),
+  // 5 = environment.reflective, 6 = environment.reflective_simple,
+  // 7 = environmentsimple.alphatest, 8 = environmentsimple.diffuse,
+  // 9 = tree.default, 10 = animated.tree, 11 = proxyworld.default,
+  // 12 = incandescent.default.
+  uint8_t env_family = 0;
+  // "specular" channel texture (spec mask / eccentricity / reflection mask)
+  // for env families; the "noise" tint texture for animated.tree. Bound in
+  // the decal slot (t4) on families that carry no decal art.
+  uint32_t spec_tex = 0;
   float tint[4];  // rgb + enable flag in w
   // The item's per-draw state (bone palette for skinned, world matrix for
   // rigid model-space props) was not available at capture time; deferred
@@ -164,7 +179,15 @@ struct FrameScene {
   // c5.x = depth bias, c8 = shadow color + floor; c6 = sun dir, c7 = camera,
   // captured for validation only).
   bool shadow_valid = false;
-  float shadow_rows[36] = {};
+  // Extended to c0..c11: c10.x = scene exposure (2.5), c11.y = the material
+  // multiplier (1.0), consumed by the exact world-shading tone chain.
+  float shadow_rows[48] = {};
+  // Frame-global rows of the OTHER world shader families, captured
+  // opportunistically from their PS banks (debug-path classified):
+  // [0..1] = tree PS c0.xy (lightmap scale 0.3435 / floor 0.02),
+  // [2] = tree PS c4.y (tint multiplier), [3] = proxyworld PS c3.y (0.45).
+  // Defaults from the day capture cover frames before the first hit.
+  float family_rows[4] = {0.3435f, 0.02f, 1.0f, 0.45f};
   // Sky-dome viewpos: sky.* meshes are camera-relative (sky.fx VS adds
   // g_vViewPos), but the game pins the sky viewpos Y at a fixed level
   // elevation (165.0 in every capture) so the skyline doesn't bob with the

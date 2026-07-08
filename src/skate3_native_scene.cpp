@@ -258,9 +258,15 @@ float g_outline_color[4] = {0.21569f, 0.64706f, 1.0f, 1.0f};
 // every environment-family draw of the pass; character/hair/tree PSes
 // allocate differently and are rejected by the sanity gate). Captured on the
 // same camera-keyed main-pass draws as the fog rows.
-float g_shadow_rows[36] = {};
+float g_shadow_rows[48] = {};
 bool g_shadow_have = false;
 bool g_shadow_frame_done = false;
+// Frame-global rows of the tree / proxyworld shader families (see
+// FrameScene::family_rows), captured from their PS banks when a draw with
+// the matching debug path runs. Guest render thread only.
+float g_family_rows[4] = {0.3435f, 0.02f, 1.0f, 0.45f};
+bool g_tree_frame_done = false;
+bool g_proxy_frame_done = false;
 // Dynamic entities (characters, movable props) live entirely in transient
 // per-frame arenas: the context, its record, mesh pointers, transforms and
 // bone palettes are all recycled before frame end. The complete DrawItem is
@@ -548,13 +554,21 @@ float GuestHalfToFloat(uint16_t h) {
 // invisible-NPC-torso bug: the torso was captured, non-pending, palette and
 // texture resolved, and rendered far outside the view.
 //
-// Discriminate by skinning a few sample vertices with both candidate bases
-// and projecting them with the pass's own viewproj (bank c0..c3,
-// column-vector rows): the game drew this mesh with these constants, so
-// only the correct base puts the samples inside the clip volume (validated
-// offline across every skinned draw of an F10 capture: correct base 1.00,
-// wrong base <= ~0.3). Only +1 is tested: a +3 shift (whole-bone
-// misalignment) also projects fine and no such layout has been seen.
+// Discriminate by skinning a few sample vertices with EVERY candidate base
+// (pre-pass c4/c5, main-pass c7/c8, plus the caller's guess) and projecting
+// them with the pass's own viewproj (bank c0..c3, column-vector rows): the
+// game drew this mesh with these constants, so the correct base puts the
+// samples inside the clip volume (validated offline across every skinned
+// draw of an F10 capture: correct base 1.00, wrong base <= ~0.3), AND keeps
+// the skinned samples' spatial spread near the mesh's bind-pose size. The
+// spread test is what rejects a FOREIGN palette that lands coincidentally
+// in view: the player's trucker cap draws exactly ONCE per frame (main
+// pass, palette at c7) while leftover rows at c4 pass the norm checks,
+// junk-skinning it into a ~3 m smear near the world origin (bind size
+// ~0.4 m) that was sometimes on screen, i.e. the sometimes-visible
+// disappearing-hat bug. Returns the winning base, or 0 when no candidate
+// both projects in-clip and keeps a sane spread; the caller then refuses
+// the capture and the post-draw fixup retries on a later draw.
 uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
                            const DrawItem& item) {
   if (item.bw_offset == 0 || item.bi_offset == 0 || item.stride == 0) {
@@ -894,6 +908,8 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.water_normal = 0;
   item.water_env = 0;
   item.unlit = false;
+  item.env_family = 0;
+  item.spec_tex = 0;
   item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
   const uint32_t material = REX_LOAD_U32(mesh + kMeshMaterial);
   if (GuestReadableApprox(base, material)) {
@@ -927,8 +943,15 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // second texcoord), the hair alpha-blend term.
           slot = &item.hair_alpha_tex;
         } else if (std::memcmp(text, "environment", 12) == 0) {
-          // Environment CUBE map: the water reflection term.
+          // Environment CUBE map, the water and environment.reflective*
+          // reflection term.
           slot = &item.water_env;
+        } else if (std::memcmp(text, "specular", 9) == 0 ||
+                   std::memcmp(text, "noise", 6) == 0) {
+          // Spec/eccentricity/reflection-mask map (environment families) /
+          // the animated.tree "noise" tint map, bound at t4 on families
+          // that carry no decal art (see DrawItem::spec_tex).
+          slot = &item.spec_tex;
         } else if (std::memcmp(text, "macroOverlayUVScale", 20) == 0 ||
                    std::memcmp(text, "macroOverlayOpacity", 20) == 0) {
           // Shader-constant channel: the float lives in the first guid word.
@@ -991,6 +1014,37 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             // fallback diffuse x near-white ocean lightmap x2).
             item.water = std::memcmp(mat_name, "water.", 6) == 0 ||
                          std::memcmp(mat_name, "ocean.", 6) == 0;
+            // Exact world-shading family (see DrawItem::env_family). The
+            // attrib <-> pixel-shader-family mapping is 1:1; the shading
+            // models were verified per-pixel against the game's own shaders.
+            const auto is = [&](const char* s, size_t n) {
+              return std::memcmp(mat_name, s, n) == 0;
+            };
+            if (is("environment.default", 20)) {
+              item.env_family = 1;
+            } else if (is("environmentsimple.default", 26)) {
+              item.env_family = 2;
+            } else if (is("environment.decal_tileable", 26)) {
+              item.env_family = 4;  // includes decal_tileable_simple
+            } else if (is("environment.decal", 18)) {
+              item.env_family = 3;
+            } else if (is("environment.reflective_simple", 30)) {
+              item.env_family = 6;
+            } else if (is("environment.reflective", 23)) {
+              item.env_family = 5;
+            } else if (is("environmentsimple.alphatest", 28)) {
+              item.env_family = 7;
+            } else if (is("environmentsimple.diffuse", 26)) {
+              item.env_family = 8;
+            } else if (is("tree.default", 13)) {
+              item.env_family = 9;
+            } else if (is("animated.tree", 14)) {
+              item.env_family = 10;
+            } else if (is("proxyworld.", 11)) {
+              item.env_family = 11;
+            } else if (is("incandescent.default", 21)) {
+              item.env_family = 12;
+            }
           }
           continue;
         }
@@ -1890,8 +1944,9 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // pass-global on environment-family draws), captured here with an
   // independent done-flag: the first main-pass draw can be a character/tree
   // whose PS allocates differently (rejected by the sanity gate below).
-  if ((!g_fog_frame_done || !g_shadow_frame_done || !g_sky_frame_done) && func == 0 &&
-      flags2d == 0 && SceneEnabled() &&
+  if ((!g_fog_frame_done || !g_shadow_frame_done || !g_sky_frame_done ||
+       !g_tree_frame_done || !g_proxy_frame_done) &&
+      func == 0 && flags2d == 0 && SceneEnabled() &&
       (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
     const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
     const float dy = LoadGuestF32(base, bank + 17 * 4) - g_fog_cam[1];
@@ -1924,10 +1979,13 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         }
       }
       const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
-      if (!g_shadow_frame_done && ps_bank != 0 &&
-          REXCVAR_GET(skate3_native_render_scene_shadows)) {
-        float rows[36];
-        for (int i = 0; i < 36; ++i) {
+      // Not gated on the shadows cvar: the captured rows also carry the
+      // scene exposure / material multiplier / sun direction consumed by the
+      // exact world shading (rows 40/45/24..26); shading must not die when
+      // dynamic shadows are toggled off.
+      if (!g_shadow_frame_done && ps_bank != 0) {
+        float rows[48];
+        for (int i = 0; i < 48; ++i) {
           rows[i] = LoadGuestF32(base, ps_bank + i * 4);
         }
         // Receiver-layout sanity:
@@ -1939,7 +1997,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         const float mx2 = rows[0] * rows[0] + rows[1] * rows[1] + rows[2] * rows[2];
         const float my2 = rows[12] * rows[12] + rows[13] * rows[13] + rows[14] * rows[14];
         const float s1 = rows[4], s2 = rows[8];
-        const bool sane =
+        bool sane =
             mx2 > 0.01f && mx2 < 4.0f && std::fabs(mx2 - my2) < 0.05f * mx2 &&
             s1 > 0.0f && s1 < 1.0f && std::fabs(rows[5] - s1) < 1e-4f &&
             s2 > 0.0f && s2 < s1 && std::fabs(rows[9] - s2) < 1e-4f &&
@@ -1947,10 +2005,98 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
             std::fabs(rows[17]) > 0.005f && std::fabs(rows[17]) < 1.0f &&
             rows[32] >= 0.0f && rows[32] <= 1.0f && rows[33] >= 0.0f &&
             rows[33] <= 1.0f && rows[34] >= 0.0f && rows[34] <= 1.0f;
+        // c5..c8 are NOT pass-global like c0..c4: only the baseenvironment /
+        // defaultenvironment-style bank keeps (bias, ..., sun dir, camera,
+        // shadow color) there. Verified in capture: the
+        // dynamicobject/livingworld/cacstamp banks pass the geometric checks
+        // above with garbage in those rows (c8 ~ (0.0025,0.005,0.012) -> a
+        // near-black shadow, c5.x = 0.0245 -> a 29 cm receiver height bias
+        // that culled the feet/board shadow); advertisement keeps the color
+        // at c7 (c8 = 0 -> pure black); wateralpha has c8 ~ (0.5,0.99,0.5)
+        // (-> no shadow at all). Discriminate on the family-specific rows:
+        // c6 = unit sun direction with normalize(cross(c0,c3)) == -c6 (the
+        // oblique projection axis), c7 = the camera position, c8 dim.
+        if (sane) {
+          const float cxx = rows[1] * rows[14] - rows[2] * rows[13];
+          const float cxy = rows[2] * rows[12] - rows[0] * rows[14];
+          const float cxz = rows[0] * rows[13] - rows[1] * rows[12];
+          const float cn = std::sqrt(cxx * cxx + cxy * cxy + cxz * cxz);
+          const float sn = std::sqrt(rows[24] * rows[24] + rows[25] * rows[25] +
+                                     rows[26] * rows[26]);
+          const float align =
+              cn > 1e-6f && sn > 1e-6f
+                  ? (cxx * rows[24] + cxy * rows[25] + cxz * rows[26]) / (cn * sn)
+                  : 0.0f;
+          const float dcx = rows[28] - g_fog_cam[0];
+          const float dcy = rows[29] - g_fog_cam[1];
+          const float dcz = rows[30] - g_fog_cam[2];
+          sane = align < -0.9f && sn > 0.9f && sn < 1.1f &&
+                 dcx * dcx + dcy * dcy + dcz * dcz < 25.0f && rows[32] <= 0.4f &&
+                 rows[33] <= 0.4f && rows[34] <= 0.4f &&
+                 // c10.x = scene exposure, c11.y = material multiplier,
+                 // consumed by the exact world tone chain.
+                 rows[40] > 0.1f && rows[40] < 16.0f && rows[45] > 0.0f &&
+                 rows[45] < 16.0f;
+        }
         if (sane) {
           std::memcpy(g_shadow_rows, rows, sizeof(rows));
           g_shadow_have = true;
           g_shadow_frame_done = true;
+        }
+      }
+      // tree / proxyworld frame rows (see FrameScene::family_rows): their PS
+      // banks keep family-global lighting constants in different registers
+      // than the environment layout. Identified by the shader debug path
+      // (cached, like the blur trigger); the camera-keyed VS c4 gate above
+      // already filtered to main-pass draws.
+      if ((!g_tree_frame_done || !g_proxy_frame_done) && ps_bank != 0) {
+        const auto world_family = [&](uint32_t obj) -> int {
+          if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
+            return 0;
+          }
+          static std::unordered_map<uint32_t, int> cache;
+          auto it = cache.find(obj);
+          if (it != cache.end()) {
+            return it->second;
+          }
+          char text[96] = {};
+          for (int k = 0; k < 95; ++k) {
+            text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+            if (text[k] == '\0') break;
+          }
+          int fam = 0;
+          if (std::strstr(text, "\\tree_defaultPS") != nullptr ||
+              std::strstr(text, "\\treeanimate_defaultPS") != nullptr) {
+            fam = 1;
+          } else if (std::strstr(text, "\\proxyworld_defaultPS") != nullptr) {
+            fam = 2;
+          }
+          if (cache.size() < 4096) {
+            cache.emplace(obj, fam);
+          }
+          return fam;
+        };
+        int fam = world_family(g_cur_ps_obj.load(std::memory_order_relaxed));
+        if (fam == 0) {
+          fam = world_family(g_cur_vs_obj.load(std::memory_order_relaxed));
+        }
+        if (fam == 1 && !g_tree_frame_done) {
+          const float c0x = LoadGuestF32(base, ps_bank + 0 * 4);
+          const float c0y = LoadGuestF32(base, ps_bank + 1 * 4);
+          const float c4y = LoadGuestF32(base, ps_bank + 17 * 4);
+          if (c0x > 0.0f && c0x < 4.0f && c0y >= 0.0f && c0y < 1.0f &&
+              c4y > 0.0f && c4y < 8.0f) {
+            g_family_rows[0] = c0x;
+            g_family_rows[1] = c0y;
+            g_family_rows[2] = c4y;
+            g_tree_frame_done = true;
+          }
+        } else if (fam == 2 && !g_proxy_frame_done) {
+          const float c3y = LoadGuestF32(base, ps_bank + 13 * 4);
+          if (c3y > 0.0f && c3y < 4.0f) {
+            g_family_rows[3] = c3y;
+            g_proxy_frame_done = true;
+          }
         }
       }
     }
@@ -2816,6 +2962,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
   }
+  std::memcpy(scene.family_rows, g_family_rows, sizeof(g_family_rows));
   if (g_sky_have) {
     scene.sky_height = g_sky_height;
   }
@@ -2839,6 +2986,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_fog_frame_done = false;
   g_shadow_frame_done = false;
   g_sky_frame_done = false;
+  g_tree_frame_done = false;
+  g_proxy_frame_done = false;
 
   if (g_recording.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(g_record_mutex);
@@ -3307,7 +3456,14 @@ cbuffer S : register(b1) {
   float4 sh_c1;     // cascade 1 scale.xy + offset.zw              [PS c1]
   float4 sh_c2;     // cascade 2 scale.xy + offset.zw              [PS c2]
   float4 sh_color;  // shadow color rgb [PS c8] + its luma in w
-  float4 sh_misc;   // x = depth bias [PS c5.x], y = enable, z = lit level L
+  float4 sh_misc;   // x = depth bias [PS c5.x], y = enable
+  // Exact world-shading frame rows (consumed by the env-family branch):
+  float4 sh_sun;    // xyz = sun direction [PS c6], w = scene exposure [c10.x]
+  float4 sh_env;    // x = material multiplier [PS c11.y], yz = tree lightmap
+                    // scale/floor [tree PS c0.xy], w = tree tint mult [c4.y]
+  float4 sh_fogp;   // xyz = global fog ramp scale/bias/exp [VS c5],
+                    // w = proxyworld scale [proxy PS c3.y]
+  float4 sh_fogc;   // fog color rgb + transmittance scale in w [VS c6]
 };
 // Character-family lighting (defaultcharacter.fx and friends): canonical
 // per-draw rows captured from the guest PIXEL constant bank at palette
@@ -3393,10 +3549,12 @@ float4 ps_main(VSOut i) : SV_Target {
   // rendered rigid (sim-active player tees, clipping their gloss alpha
   // discarded every pixel: the invisible-shirt bug; their decode writes
   // zero blend weights, so the VS skinning branch stays off).
-  if (tint.g == 0.0 && overlay.w == 0.0) {
+  if (tint.g == 0.0 && overlay.w < 0.5) {
     // environment.transparent alpha-tests its SQUARED alpha at ref 16/255
     // (transparentenvironment.xml: ALPHAREF 16, PS outputs a = diffuse.a^2).
-    clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - 0.35);
+    // Exact env families (cam_pos.w < 0) use the game's world ALPHAREF 30.
+    float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
+    clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
   }
   // Character families: the game's own lighting in LINEAR space (diffuse is
   // gamma -> square it), then the exact tone chain from the disassembly and
@@ -3452,6 +3610,132 @@ float4 ps_main(VSOut i) : SV_Target {
     float3 cc = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
     return float4(cc, out_a);
   }
+  // Exact world-material families (cam_pos.w = -family): hand-ported from
+  // the game's own pixel shaders and verified per-pixel against them with
+  // an offline ucode interpreter. All texture
+  // colors linearize IN-SHADER as x^2 (the fetch signs are unsigned on every
+  // world texture). Families: 1 baseenvironment, 2 defaultenvironment,
+  // 3/4 decalenvironment(_tileable), 5/6 reflective(_simple), 7 alphatest,
+  // 8 environmentdiffuse, 9/10 tree(animate), 11 proxyworld,
+  // 12 incandescent. v1 runs with NEUTRAL normal/detail maps (kd is the
+  // exact flat-map constant 0.39 * 2.39562); spec/reflection masks bind at
+  // t4 (overlay.w == 3) on families without decal art.
+  if (cam_pos.w < -0.5) {
+    float fam = -cam_pos.w;
+    float3 dlin = albedo.rgb * albedo.rgb;
+    // Global distance fog (VS c5/c6, captured per frame): every world PS
+    // ends with col * fog.a + fog.rgb before exposure/tonemap.
+    float fdist = length(i.rpos);
+    float f1 = saturate(fdist * sh_fogp.x + sh_fogp.y);
+    if (sh_fogp.z != 1.0) {
+      f1 = pow(max(f1, 1e-6), sh_fogp.z);
+    }
+    float3 fog_rgb = sh_fogc.rgb * f1;
+    float fog_a = 1.0 + sh_fogc.a * f1;
+    float expo = sh_sun.w;
+    float3 lin;
+    float out_a = 1.0;
+    bool reduced_tone = false;
+    if (fam > 8.5) {
+      // tree/treeanimate: D^2 * max(lm^2, floor) * scale [* tint mult];
+      // proxyworld/incandescent: D^2 * scale. No shadow receive, no kd, no
+      // material multiplier on the fog term.
+      if (fam < 10.5) {
+        float3 lmg = lightmap.Sample(smp, i.uv2).rgb;
+        lin = dlin * max(lmg * lmg, sh_env.z) * sh_env.y;
+        if (fam < 9.5) {
+          lin *= sh_env.w;
+        }
+        out_a = albedo.a;
+      } else {
+        lin = dlin * (fam < 11.5 ? sh_fogp.w : 1.0);
+      }
+    } else {
+      // Environment families: macro overlay (0.5-neutral, fades under decal
+      // art), linear decal composite, lightmap squared and min-clamped
+      // against (CSM s + shadow color), kd, phong spec vs the shader's
+      // fixed literal light, cube reflection on 5/6.
+      float3 ov = float3(1.0, 1.0, 1.0);
+      if (overlay.z > 0.0) {
+        float3 mo = macro.Sample(smp, i.uv * overlay.x).rgb;
+        ov = saturate((mo - 0.5) * overlay.y + 0.5);
+      }
+      if (fam > 2.5 && fam < 4.5 && overlay.w > 0.5) {
+        // overlay.w == 0 = art unresolved (white fallback alpha 1 would
+        // whitewash the whole surface).
+        float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
+                                    : decal_art.Sample(smp_clamp, i.uv3);
+        dlin = lerp(dlin, dk.rgb * dk.rgb, dk.a);
+        ov = lerp(float3(1.0, 1.0, 1.0), ov, 1.0 - dk.a);
+      }
+      float3 dcol = dlin * ov;
+      // CSM shadow term s = sat(infront + 1 - coverage) from the native
+      // atlas (same cascade select as the legacy receive path).
+      float s = 1.0;
+      if (sh_misc.y > 0.0) {
+        float3 wp = i.rpos + cam_pos.xyz;
+        float2 lsv =
+            float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
+        float rd = dot(sh_z.xyz, wp) + sh_z.w - sh_misc.x;
+        float2 luv = 0.0;
+        float casc = 0.0;
+        float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
+        if (max(abs(l2.x), abs(l2.y)) < 0.99) { luv = l2; casc = 3.0; }
+        float2 l1 = lsv * sh_c1.xy + sh_c1.zw;
+        if (max(abs(l1.x), abs(l1.y)) < 0.99) { luv = l1; casc = 2.0; }
+        if (max(abs(lsv.x), abs(lsv.y)) < 0.99) { luv = lsv; casc = 1.0; }
+        if (casc > 0.0) {
+          float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
+                              luv.y * -0.5 + 0.5);
+          float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
+          s = saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
+        }
+      }
+      float3 lmg = lightmap.Sample(smp, i.uv2).rgb;
+      float3 lml = min(lmg * lmg, s + sh_color.rgb);
+      // GetTangentLight with the neutral (flat) normal map:
+      // 0.39 * 2.39562 exactly.
+      lin = lml * 0.93429 * dcol;
+      if (overlay.w > 2.5) {
+        // spec/ecc/refmask at t4: phong vs the FIXED literal light
+        // (-0.14, 0.5, 0.9), power 10 + 290*ecc, tint (2.1, 1.8, 1.5),
+        // scaled by the clamped lightmap green and the spec mask.
+        float4 masks = decal_art.Sample(smp, i.uv);
+        float3 wn = dot(i.nrm, i.nrm) > 0.01
+                        ? normalize(i.nrm)
+                        : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+        float3 vd = -normalize(i.rpos);
+        float3 Ls = float3(-0.14, 0.5, 0.9);
+        float3 refl = Ls - 2.0 * wn * dot(wn, Ls);
+        float bp = saturate(dot(vd, -refl));
+        float ks = pow(max(bp, 1e-6), 10.0 + 290.0 * masks.y);
+        lin += ks * float3(2.1, 1.8, 1.5) * lml.g * masks.x;
+        if (fam > 4.5 && fam < 6.5) {
+          // Cube reflection: reflect(E, wN) with xy negated (the source's
+          // ref_vec.xy *= -1), luminosity lerped toward 1 by
+          // 0.3 * sat(4*refmask - 2.6), x refmask x reflection_scale 1.5.
+          float3 rv = vd - 2.0 * wn * dot(vd, wn);
+          float3 cube = env_cube.Sample(smp, float3(-rv.x, -rv.y, rv.z)).rgb;
+          float rl = 0.3 * saturate(4.0 * masks.z - 2.6);
+          float lum = lml.g + rl * (1.0 - lml.g);
+          lin += cube * lum * masks.z * 1.5;
+        }
+      }
+      if (fam > 6.5) {
+        out_a = albedo.a;
+        reduced_tone = fam > 7.5;  // environmentdiffuse's cheap tonemap
+      }
+      fog_a *= sh_env.x;  // material multiplier (PS c11.y)
+    }
+    // Fog -> exposure -> tonemap -> sqrt, then the postfx uber's measured
+    // 1.41 scene multiplier (same as the character branch).
+    float3 xe = (lin * fog_a + fog_rgb) * expo;
+    float3 t1e = saturate(1.0 - xe);
+    float3 tme = reduced_tone ? 1.0 - t1e * t1e
+                              : max(xe * 0.25 + 0.75, 1.0) - t1e * t1e;
+    float3 cce = saturate(sqrt(max(tme * 0.5, 0.0)) * 1.41);
+    return float4(cce, out_a);
+  }
   // Macro overlay: large-scale grime/cracks multiplied over the diffuse at
   // uv * macroOverlayUVScale, faded by macroOverlayOpacity: the ground and
   // wall weathering. WHITE is the neutral (materials without weathering
@@ -3479,30 +3763,36 @@ float4 ps_main(VSOut i) : SV_Target {
     albedo.rgb = lerp(albedo.rgb, dk.rgb, dk.a);
   }
   // tint.r > 0 marks items with a lightmap bound (2x baked lighting);
-  // otherwise fall back to derivative face shading.
-  float3 lit;
+  // otherwise fall back to derivative face shading. The lighting term stays
+  // separate from the albedo so the CSM receive below can min-clamp IT, the
+  // way the game's GetShadowedLightMap clamps the lightmap lighting.
+  float3 light;
   if (tint.b > 0.0) {
-    lit = albedo.rgb;  // unlit (sky dome)
+    light = float3(1.0, 1.0, 1.0);  // unlit (sky dome)
   } else if (tint.r > 0.0) {
-    lit = albedo.rgb * lightmap.Sample(smp, i.uv2).rgb * 2.0;
+    light = lightmap.Sample(smp, i.uv2).rgb * 2.0;
   } else {
     // Smooth per-vertex normal when the mesh has one; face normal from
     // position derivatives otherwise.
     float3 n = dot(i.nrm, i.nrm) > 0.01 ? normalize(i.nrm)
                                         : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
-    float l = abs(dot(n, normalize(float3(0.4, 0.8, 0.3)))) * 0.35 + 0.75;
-    lit = albedo.rgb * l;
+    light = abs(dot(n, normalize(float3(0.4, 0.8, 0.3)))) * 0.35 + 0.75;
   }
   // Dynamic CSM shadow receive (world geometry + rigid props; characters
   // need the game's separate PCF/bias variant; skipping them avoids
   // self-shadow acne, and the ground shadow is 95% of the visible effect).
   // Exact receiver math from the baseenvironment PS disassembly: finest
   // cascade whose |ls| < 0.99 wins; shadow = saturate(infront + 1 -
-  // coverage). The game min-clamps the LINEAR lighting to (s + shadowColor)
-  // - our empirical shading is gamma, so the equivalent saturating curve
-  // f = saturate((s + luma) / L), col *= sqrt(f) is used (a plain lerp
-  // shows the whole Gaussian penumbra and looks conspicuously blurrier
-  // than the emulated edge; L ~ lit ground lighting level, ~0.45 linear).
+  // coverage), then the game min-clamps the LINEAR lighting term:
+  //   light_linear = min(light_linear, s + c8.rgb)
+  // Full shadow clamps to the dim bluish c8 ambient, the penumbra saturates
+  // wherever the clamp exceeds the lit level (which is what keeps the edge
+  // crisp), and surfaces already darker than the clamp, baked shade under
+  // bridges/trees, show NO dynamic shadow at all. Our light term is
+  // gamma-space (light^2 ~ the game's linear term: the lightmap x2 folds
+  // its x4 linear multiplier), so the clamp maps to min(light, sqrt(s+c8))
+  // per channel. A fixed-denominator curve here read pitch-black and
+  // double-darkened baked shade.
   if (sh_misc.y > 0.0 && tint.g == 0.0 && tint.b == 0.0 && misc.x == 0.0) {
     float3 wp = i.rpos + cam_pos.xyz;
     float2 lsv = float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
@@ -3518,13 +3808,10 @@ float4 ps_main(VSOut i) : SV_Target {
       float2 uv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0, luv.y * -0.5 + 0.5);
       float2 m = shadow_atlas.Sample(smp_clamp, uv);
       float s = saturate((m.x >= rd ? 1.0 : 0.0) + (1.0 - m.y));
-      // Per-channel: the game clamps the linear lighting to s + c8.rgb, so
-      // full shadow takes on c8's cool blue cast ((0.05,0.09,0.13) in every
-      // capture so far); a scalar multiply left the shadow warm-brown.
-      float3 f = saturate((s + sh_color.rgb) / sh_misc.z);
-      lit *= sqrt(f);
+      light = min(light, sqrt(s + sh_color.rgb));
     }
   }
+  float3 lit = albedo.rgb * light;
   if (mat_tint.w > 0.0 && misc.x == 0.0) {
     lit *= mat_tint.rgb;
   }
@@ -4122,7 +4409,25 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       out[2] = float(iz) / 511.0f;
     };
     float n3[3] = {0.0f, 0.0f, 0.0f};
-    if (item.normal_fmt == 16) {
+    if (item.env_family != 0 && item.env_family <= 6 && item.uv2_fmt == 26) {
+      // Exact world families: the REAL vertex normal is packed in the
+      // lightmap-unwrap element (fmt 26 s16x4): zw = normal.xy (snorm), and
+      // the unwrap xy SIGN bits carry the handedness; sign.y flips
+      // normal.z (baseenvironment VS: vNormal.z = signs.y * sqrt(1 - xy^2);
+      // signs = saturate(65535 * lm.xy) * 2 - 1). The k_10_11_11 element on
+      // these meshes is the BINORMAL, not the normal; using it as the
+      // normal breaks the sun/spec terms of the exact shading.
+      const uint8_t* q = src_vb + size_t(v) * item.stride + item.uv2_offset;
+      const int16_t sx = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q)));
+      const int16_t sy = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q + 2)));
+      const int16_t nx = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q + 4)));
+      const int16_t ny = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q + 6)));
+      n3[0] = nx / 32767.0f;
+      n3[1] = ny / 32767.0f;
+      const float d = 1.0f - n3[0] * n3[0] - n3[1] * n3[1];
+      n3[2] = (sy > 0 ? 1.0f : -1.0f) * std::sqrt(d > 0.0f ? d : 0.0f);
+      (void)sx;  // sign.x = tangent handedness, unused until normal maps
+    } else if (item.normal_fmt == 16) {
       unpack_10_11_11(item.normal_offset, n3);
     } else if (item.tb_fmt == 16) {
       // NPC character meshes carry no normal element; the game's VS
@@ -5554,7 +5859,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       cp.InputLayout = {input, 7};
       cp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
       cp.NumRenderTargets = 1;
-      cp.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+      cp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
       cp.SampleDesc.Count = 1;
       const HRESULT hr7 =
           device->CreateGraphicsPipelineState(&cp, IID_PPV_ARGS(&g_r.pso_shadow_caster));
@@ -5569,7 +5874,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       bp.RasterizerState.DepthClipEnable = TRUE;
       bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
       bp.NumRenderTargets = 1;
-      bp.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+      bp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
       bp.SampleDesc.Count = 1;
       const HRESULT hr8 =
           device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_shadow_blur));
@@ -5640,8 +5945,10 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   if (!g_r.shadow_raw && REXCVAR_GET(skate3_native_render_scene_shadows)) {
     // Dynamic-shadow atlas chain: raw casters -> hblur intermediate ->
     // blurred final (the texture the scene pass samples). Three fixed-size
-    // R16G16_FLOAT targets, 3 tiles of tile x tile each; RTV heap slots
-    // 2/3/4.
+    // R16G16_UNORM targets (the game's atlas is fmt 25 = 16_16 fixed point;
+    // half-float ulp at the typical ~0.85 depth is ~6 mm of world height,
+    // too coarse for board/feet-height casters 1-2 cm off the ground),
+    // 3 tiles of tile x tile each; RTV heap slots 2/3/4.
     g_r.shadow_tile = uint32_t(REXCVAR_GET(skate3_native_render_scene_shadow_tile));
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -5651,7 +5958,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     desc.Height = g_r.shadow_tile;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    desc.Format = DXGI_FORMAT_R16G16_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE clear{};
@@ -6350,7 +6657,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[23] = 0.299f * sh[32] + 0.587f * sh[33] + 0.114f * sh[34];
       cb[24] = sh[20];  // depth bias (PS c5.x)
       cb[25] = 1.0f;    // enable
-      cb[26] = 0.45f;   // lit ground lighting level L for the saturating curve
+    }
+    // Exact world-shading frame rows (valid whenever the env-family PS bank
+    // was captured this frame, independent of the shadow ATLAS being
+    // rendered; draw_item only selects the exact branch when
+    // scene.shadow_valid).
+    if (scene.shadow_valid) {
+      cb[28] = sh[24];  // sun direction (PS c6), for the normal-map kd (v2)
+      cb[29] = sh[25];
+      cb[30] = sh[26];
+      cb[31] = sh[40];  // scene exposure (PS c10.x)
+      cb[32] = sh[45];  // material multiplier (PS c11.y)
+      cb[33] = scene.family_rows[0];  // tree lightmap scale (tree PS c0.x)
+      cb[34] = scene.family_rows[1];  // tree lightmap floor (tree PS c0.y)
+      cb[35] = scene.family_rows[2];  // tree tint multiplier (tree PS c4.y)
+      cb[36] = scene.fog_ramp[0];     // global fog: sat(d*x+y)^z
+      cb[37] = scene.fog_ramp[1];
+      cb[38] = scene.fog_ramp[2];
+      cb[39] = scene.family_rows[3];  // proxyworld scale (proxy PS c3.y)
+      std::memcpy(cb + 40, scene.fog_color, 4 * sizeof(float));
     }
     list.D3DSetGraphicsRootConstantBufferView(
         6, g_r.shadow_cb->GetGPUVirtualAddress() + cb_offset);
@@ -6633,6 +6958,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_char_drawn.fetch_add(1, std::memory_order_relaxed);
       }
     }
+    // cam_pos.w = -family selects the exact world-material branch. Gated on
+    // the frame rows being captured (scene.shadow_valid carries the scene
+    // exposure / material multiplier at b1); without them the tone chain
+    // would multiply by zero and render black.
+    if (debug_mode == 0 && item.env_family != 0 && scene.shadow_valid &&
+        !item.water && !item.transparent) {
+      constants[39] = -float(item.env_family);
+    }
     std::memcpy(constants + 40, item.tint, 4 * sizeof(float));
     // t3 = macro grime/crack overlay, t4 = decal art for environment.decal
     // surfaces (in-shader composite). Independent slots: decal ground/wall
@@ -6680,6 +7013,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // fallback keeps failed decodes opaque rather than invisible.
       decal_tex = resolve_texture(item.hair_alpha_tex);
     }
+    // Exact env families without decal art bind the material's spec/ecc/
+    // refmask map (or the animated.tree noise tint) in the free decal slot;
+    // overlay.w == 3 tells the shader the masks are live.
+    bool spec_bound = false;
+    if (item.env_family != 0 && !item.decal && item.env_family != 10 &&
+        item.spec_tex != 0) {
+      const GuestTexture* spec = resolve_texture(item.spec_tex);
+      if (spec != &g_r.white) {
+        decal_tex = spec;
+        spec_bound = true;
+      }
+    }
     const bool is_decal =
         item.char_family < 4 && item.decal && decal_tex != &g_r.white;
     constants[44] = item.macro_scale;
@@ -6687,8 +7032,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
     // overlay.w: 1 = single-placement decal (art clamps), 2 = tileable
     // decal (art wraps; clamping a many-period uv range stretched the
-    // border texels into the giant cliff-face streaks).
-    constants[47] = is_decal ? (item.decal_tileable ? 2.0f : 1.0f) : 0.0f;
+    // border texels into the giant cliff-face streaks), 3 = spec masks
+    // bound (exact env families).
+    constants[47] = is_decal ? (item.decal_tileable ? 2.0f : 1.0f)
+                             : (spec_bound ? 3.0f : 0.0f);
     if (item.water) {
       // overlay.x = ripple scroll time, overlay.y = real environment cube
       // bound at t6, overlay.z = ripple normal map resolved (in the macro
