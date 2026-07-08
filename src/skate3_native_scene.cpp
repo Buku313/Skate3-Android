@@ -2253,11 +2253,52 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         }
       }
       const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+      // POSITIVE family check for the receiver-row capture, by shader debug
+      // path: the value gates below cannot fully discriminate;
+      // flowingwater_defaultPS keeps the ENTIRE baseenvironment receiver
+      // layout (CSM rows, sun c6, camera c7, dim c8) but its material
+      // multiplier c11.y is 0.2, not 1.0. When the canal was in view its
+      // draw won the first-pass race and the whole world tone chain ran at
+      // x0.2 linear, the "world goes dark at some camera rotations" bug
+      // (native exactly 0.50x emulated, uniform). Only the environment
+      // families that share the c10.x/c11.y layout are eligible.
+      const auto env_receiver_ps = [&]() -> bool {
+        const auto check = [&](uint32_t obj) -> int {  // 0 unknown, 1 no, 2 yes
+          if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
+            return 0;
+          }
+          static std::unordered_map<uint32_t, int> cache;
+          auto it = cache.find(obj);
+          if (it != cache.end()) {
+            return it->second;
+          }
+          char text[120] = {};
+          for (int k = 0; k < 119; ++k) {
+            text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+            if (text[k] == '\0') break;
+          }
+          const bool hit = std::strstr(text, "\\baseenvironment") != nullptr ||
+                           std::strstr(text, "\\defaultenvironment") != nullptr ||
+                           std::strstr(text, "\\decalenvironment") != nullptr;
+          // Empty/garbled paths stay unknown (0) and are not cached-in as
+          // negatives forever.
+          const int result = text[0] == '\0' ? 0 : (hit ? 2 : 1);
+          if (result != 0 && cache.size() < 4096) {
+            cache.emplace(obj, result);
+          }
+          return result;
+        };
+        const int a = check(g_cur_ps_obj.load(std::memory_order_relaxed));
+        if (a != 0) {
+          return a == 2;
+        }
+        return check(g_cur_vs_obj.load(std::memory_order_relaxed)) == 2;
+      };
       // Not gated on the shadows cvar: the captured rows also carry the
       // scene exposure / material multiplier / sun direction consumed by the
       // exact world shading (rows 40/45/24..26); shading must not die when
       // dynamic shadows are toggled off.
-      if (!g_shadow_frame_done && ps_bank != 0) {
+      if (!g_shadow_frame_done && ps_bank != 0 && env_receiver_ps()) {
         float rows[48];
         for (int i = 0; i < 48; ++i) {
           rows[i] = LoadGuestF32(base, ps_bank + i * 4);
