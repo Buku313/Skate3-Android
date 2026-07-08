@@ -29,6 +29,20 @@ struct DrawItem {
   uint32_t ib_count;
   uint32_t diffuse_tex;   // guest renderengine::Texture address (0 = none)
   uint32_t lightmap_tex;  // guest renderengine::Texture address (0 = none)
+  // Streamed-artwork diffuse override (event posters): the Massive ad
+  // system rebinds the diffuse fetch slot at draw time with the current
+  // event-ad art: either over a 16x16 min-mip placeholder channel (the
+  // ace-of-spades "Big Event" grid) or REPLACING a full-size default
+  // poster (the letter-writing frames showing the MONDO "THE NEW VIDEO"
+  // ad). When the item's own main-pass draw (validated by slot 3 == this
+  // item's lightmap) bound a different texture at fetch slot 4, these six
+  // draw-time fetch words resolve the diffuse instead (words-keyed texture
+  // cache). All zero = no override.
+  uint32_t diffuse_fetch[6] = {};
+  // Same mechanism for environment.decal: that family samples its decal
+  // overlay art at fetch slot 4 (diffuse rides slot 6), and ad frames
+  // covered by a decal section get the event art bound there at draw time.
+  uint32_t decal_fetch[6] = {};
   // "macrooverlay" material channel (environment shaders): a large-scale
   // grime/crack overlay multiplied over the diffuse at uv *
   // macroOverlayUVScale with macroOverlayOpacity: the ground/wall

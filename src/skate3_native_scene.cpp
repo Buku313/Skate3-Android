@@ -283,6 +283,14 @@ std::unordered_multimap<uint64_t, size_t> g_frame_pending_by_buffers;
 // stale (shadowPS uploads no PS constants); re-capturing on the main-pass
 // draw (last writer) lands the real per-instance rows (stamp tints etc.).
 std::unordered_multimap<uint64_t, size_t> g_frame_char_refresh;
+// (ib_obj << 32 | vb_obj) -> device fetch-shadow slots 3+4 (12 dwords) at
+// this frame's LAST indexed 3D draw with those buffers (the z-prepass draws
+// first, so the main pass wins). Consumed at frame end by the
+// streamed-artwork diffuse override (DrawItem::diffuse_fetch): poster/advert
+// materials keep a 16x16 min-mip placeholder in the material channel while
+// the engine binds the streamed art via the fetch constants at draw time.
+// Guarded by g_palette_mutex; cleared at the end of BuildFrameScene.
+std::unordered_map<uint64_t, std::array<uint32_t, 12>> g_frame_draw_fetch;
 std::atomic<uint32_t> g_cur_ib{0};
 std::atomic<uint32_t> g_cur_vb{0};
 std::atomic<uint32_t> g_cur_vb_offset{0};
@@ -1084,6 +1092,65 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
         // channels ride AFTER their texture (macroOverlayUVScale follows
         // macrooverlay on the plaza asphalt, breaking once the textures
         // resolved left the macro tiling at 1.0 instead of 0.3).
+      }
+    }
+  }
+
+  // Streamed-artwork override (event ads): the Massive ad system rebinds
+  // texture fetch slots at draw time to show the current event-ad art in
+  // place of the asset's default poster. Two observed shapes: a 16x16
+  // min-mip stub channel whose real art exists ONLY at draw time (the
+  // ace-of-spades "Big Event" grid), and a full-size default poster (the
+  // letter-writing frames) whose diffuse is wholesale REPLACED with the
+  // current ad (the MONDO "THE NEW VIDEO" portrait). Adopt the fetch
+  // slot-4 words recorded at this mesh's LAST indexed draw this frame,
+  // but only if that draw's slot 3 is this item's own lightmap
+  // (mirror-masked base compare), which proves the recorded fetch state
+  // belongs to the mesh's MAIN-pass draw (the z-prepass leaves another
+  // material's bindings). Slot targets are family-specific (Skate 2
+  // shader source): environmentsimple.* sample the diffuse at s4;
+  // environment.decal samples its decal overlay art at s4 (diffuse rides
+  // s6); environment.default has DETAIL at s4, so its diffuse adoption
+  // stays stub-gated; never adopt a detail texture over real poster art.
+  if (item.env_family != 0 && item.diffuse_tex != 0 && item.lightmap_tex != 0) {
+    // Physical base of a fetch word-1, collapsing the 0xA0000000-style
+    // cached/uncached mirrors (the channel object records the mirror
+    // address, the draw-time fetch constant the plain one).
+    const auto phys_base = [](uint32_t w1) { return w1 & 0x1FFFF000u; };
+    const uint32_t lm_w1 = REX_LOAD_U32(item.lightmap_tex + 8 * 4);
+    std::lock_guard<std::mutex> lock(g_palette_mutex);
+    const auto fit =
+        g_frame_draw_fetch.find((uint64_t(item.ib_obj) << 32) | item.vb_obj);
+    if (fit != g_frame_draw_fetch.end()) {
+      const uint32_t* slot3 = fit->second.data();
+      const uint32_t* slot4 = fit->second.data() + 6;
+      const uint32_t art_w = (slot4[2] & 0x1FFFu) + 1;
+      const uint32_t art_h = ((slot4[2] >> 13) & 0x1FFFu) + 1;
+      const bool main_pass = (slot3[0] & 3u) == 2u && (slot4[0] & 3u) == 2u &&
+                             phys_base(slot3[1]) == phys_base(lm_w1);
+      // Dimension floor: never adopt a placeholder-sized s4 (an idle ad
+      // rotation slot) over whatever the channel resolves to.
+      if (main_pass && (art_w >= 32 || art_h >= 32)) {
+        if (item.env_family == 3) {
+          if (item.decal_art != 0 &&
+              phys_base(slot4[1]) !=
+                  phys_base(REX_LOAD_U32(item.decal_art + 8 * 4))) {
+            std::memcpy(item.decal_fetch, slot4, 6 * sizeof(uint32_t));
+          }
+        } else {
+          const uint32_t diff_w2 = REX_LOAD_U32(item.diffuse_tex + 9 * 4);
+          const uint32_t diff_w = (diff_w2 & 0x1FFFu) + 1;
+          const uint32_t diff_h = ((diff_w2 >> 13) & 0x1FFFu) + 1;
+          const bool diff_stub = diff_w <= 32 && diff_h <= 32;
+          const bool s4_is_diffuse = item.env_family == 2 ||
+                                     item.env_family == 7 ||
+                                     item.env_family == 8;
+          if ((s4_is_diffuse || diff_stub) &&
+              phys_base(slot4[1]) !=
+                  phys_base(REX_LOAD_U32(item.diffuse_tex + 8 * 4))) {
+            std::memcpy(item.diffuse_fetch, slot4, 6 * sizeof(uint32_t));
+          }
+        }
       }
     }
   }
@@ -2495,6 +2562,19 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   }
   const uint64_t key = (uint64_t(cur_ib) << 32) | cur_vb;
   std::lock_guard<std::mutex> lock(g_palette_mutex);
+  // Record this draw's texture fetch slots 3+4 (lightmap + diffuse on the
+  // environment families) for the frame-end streamed-artwork diffuse
+  // override (see g_frame_draw_fetch). Last writer wins: the z-prepass
+  // draws these buffers first with stale bindings, the main pass overwrites.
+  if (flags2d == 0 && SceneEnabled()) {
+    const uint32_t device = g_device.load(std::memory_order_relaxed);
+    if (device != 0 && g_frame_draw_fetch.size() < 4096) {
+      auto& w = g_frame_draw_fetch[key];
+      for (int i = 0; i < 12; ++i) {
+        w[size_t(i)] = REX_LOAD_U32(device + 0x480 + 3 * 24 + uint32_t(i) * 4);
+      }
+    }
+  }
   // Character-lighting refresh: items already fixed up re-read their PS rows
   // from later draws with the same buffers (commit-on-success, so the
   // main-pass draw's rows win over the stale caster-pass bank). CLONES share
@@ -3049,6 +3129,15 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
 
+  // The draw-time fetch map served this frame's item builds (streamed-artwork
+  // diffuse override); next frame's draws repopulate it. Cleared HERE, not at
+  // the top with the other per-frame structures; the world items that
+  // consume it are built above, after that swap.
+  {
+    std::lock_guard<std::mutex> lock(g_palette_mutex);
+    g_frame_draw_fetch.clear();
+  }
+
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;
   g_scene = std::move(scene);
@@ -3135,8 +3224,10 @@ void WriteRecording(const char* dir, const char* stem) {
       out << "{\"mesh\":\"" << std::hex << d.mesh << "\",\"ib_obj\":\"" << d.ib_obj
           << "\",\"vb_obj\":\"" << d.vb_obj << "\",\"vb_addr\":\"" << d.vb_addr
           << "\",\"ib_addr\":\"" << d.ib_addr << "\",\"diffuse\":\"" << d.diffuse_tex
+          << "\",\"diffuse_fetch\":\"" << d.diffuse_fetch[1]
           << "\",\"lightmap\":\"" << d.lightmap_tex << "\",\"macro\":\"" << d.macro_tex
           << "\",\"decal_art\":\"" << d.decal_art
+          << "\",\"decal_fetch\":\"" << d.decal_fetch[1]
           << "\",\"fp\":\"" << d.fingerprint
           << "\"" << std::dec << ",\"vb_bytes\":" << d.vb_bytes << ",\"ib_count\":"
           << d.ib_count << ",\"stride\":" << int(d.stride) << ",\"pos_fmt\":"
@@ -6827,6 +6918,49 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           3600.0) *
           3600.0);
 
+  // Words-keyed texture lookup with payload revalidation, shared by the
+  // streamed-artwork diffuse override and the 2D pass. The event-ad system
+  // rotates artwork IN PLACE; it streams the next poster into the same
+  // guest buffer, so the fetch words (this cache's key) never change; without
+  // the fingerprint recheck every frame keeps the first ad ever decoded at
+  // that address and the wall posters diverge from the emulated frame.
+  const auto find_words_texture = [&](uint64_t key) {
+    auto it = g_r.textures_2d.find(key);
+    if (it != g_r.textures_2d.end() && it->second.valid &&
+        frame_number >= it->second.recheck_frame &&
+        REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
+      it->second.recheck_frame = frame_number + 16;
+      const uint64_t fp = SamplePayloadFingerprint(base, it->second.payload_addr,
+                                                   it->second.payload_size);
+      if (fp != 0 && fp != it->second.payload_fp) {
+        const uint64_t submission = command_processor->GetCurrentSubmission();
+        if (it->second.texture) g_r.retired.emplace_back(it->second.texture, submission);
+        if (it->second.upload) g_r.retired.emplace_back(it->second.upload, submission);
+        g_r.textures_2d.erase(it);
+        it = g_r.textures_2d.end();
+      }
+    }
+    return it;
+  };
+  // Resolve six raw fetch-constant words (a draw-time streamed-artwork
+  // binding with no guest texture object) through the words-keyed cache.
+  // Returns null when the words fail to decode.
+  const auto resolve_fetch_words = [&](const uint32_t words[6]) -> const GuestTexture* {
+    uint64_t fkey = 1469598103934665603ull;
+    for (int k = 0; k < 6; ++k) {
+      fkey ^= words[k];
+      fkey *= 1099511628211ull;
+    }
+    auto fit = find_words_texture(fkey);
+    if (fit == g_r.textures_2d.end()) {
+      GuestTexture gt;
+      EnsureGuestTextureFromWords(context, base, words, gt);
+      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      fit = g_r.textures_2d.emplace(fkey, gt).first;
+    }
+    return fit->second.valid ? &fit->second : nullptr;
+  };
+
   const auto draw_item = [&](const DrawItem& item) {
     auto it = g_r.meshes.find(item.mesh);
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
@@ -6972,7 +7106,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       return tit->second.valid ? &tit->second : &g_r.white;
     };
-    const GuestTexture* diffuse = resolve_texture(item.diffuse_tex);
+    // Streamed-artwork diffuse override (see DrawItem::diffuse_fetch): the
+    // real art exists only as draw-time fetch words; resolve those through
+    // the words-keyed cache (shared with the 2D pass; the art has no guest
+    // object to key on).
+    const GuestTexture* diffuse =
+        item.diffuse_fetch[1] != 0 ? resolve_fetch_words(item.diffuse_fetch) : nullptr;
+    if (diffuse == nullptr) {
+      diffuse = resolve_texture(item.diffuse_tex);
+    }
     const GuestTexture* lightmap =
         item.lightmap_tex != 0 && REXCVAR_GET(skate3_native_render_scene_lightmaps)
             ? resolve_texture(item.lightmap_tex)
@@ -7126,6 +7268,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                             REXCVAR_GET(skate3_native_render_scene_decals)
                                         ? resolve_texture(item.decal_art)
                                         : &g_r.white;
+    // Streamed-artwork decal override (see DrawItem::decal_fetch): ad frames
+    // covered by an environment.decal section get the current event-ad art
+    // bound over the decal channel at draw time.
+    if (item.decal && item.decal_fetch[1] != 0 &&
+        REXCVAR_GET(skate3_native_render_scene_decals)) {
+      const GuestTexture* ad = resolve_fetch_words(item.decal_fetch);
+      if (ad != nullptr) {
+        decal_tex = ad;
+      }
+    }
     if (item.char_family >= 4 && item.char_family <= 5 &&
         item.hair_alpha_tex != 0) {
       // Hair strand coverage rides the (otherwise unused) decal slot; the
@@ -7311,7 +7463,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       key ^= fetch[k];
       key *= 1099511628211ull;
     }
-    auto it = g_r.textures_2d.find(key);
+    auto it = find_words_texture(key);
     if (it == g_r.textures_2d.end()) {
       GuestTexture gt;
       EnsureGuestTextureFromWords(context, base, fetch, gt);
