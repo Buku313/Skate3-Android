@@ -968,8 +968,12 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // variant (flag-row-switched skinned/rigid, see CaptureSkinnedState).
           const uint32_t s = REX_LOAD_U32(chan + 0x18);
           if (GuestReadableApprox(base, s)) {
-            char mat_name[28] = {};
-            for (int k = 0; k < 27; ++k) {
+            // 40 bytes: "character.livingworld_vehicles_glass" (36 chars) is
+            // the longest name that must be distinguishable; the previous
+            // 28-byte buffer truncated both vehicle names into the plain
+            // "livingworld" pedestrian prefix.
+            char mat_name[40] = {};
+            for (int k = 0; k < 39; ++k) {
               mat_name[k] = char(REX_LOAD_U8(s + k));
               if (mat_name[k] == '\0') break;
             }
@@ -987,6 +991,10 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
                 item.char_family = 1;
               } else if (std::memcmp(sub, "hair", 5) == 0) {
                 item.char_family = 4;
+              } else if (std::memcmp(sub, "livingworld_vehicles_glass", 27) == 0) {
+                item.char_family = 7;  // reflection-only blended windows
+              } else if (std::memcmp(sub, "livingworld_vehicles", 21) == 0) {
+                item.char_family = 6;  // vehicle.fx paint/spec/cube body
               } else if (std::memcmp(sub, "livingworld", 11) == 0) {
                 item.char_family = 3;
               } else {
@@ -1319,6 +1327,16 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
 //     c17 with power c11.w, exposure c8.z, strand-alpha scale c15.x.
 //   defaulthair (fam 5): light c4, key c15, ambient c14.w * 0.25, fresnel
 //     tint c10 with power c9.z, exposure c8.z, strand-alpha scale c16.x.
+//   vehicle (fam 6, character.livingworld_vehicles): light c9, key c15
+//     (fresnel power in c15.w), FLAT ambient = c19.w * (0.1, 0.175, 0.3)
+//     (same literal as livingworld), exposure c13.z, phong spec color c16
+//     with power c16.w (stored in the unused SH row 0), paint recolor
+//     colorize_red c21 / colorize_blue c22 (vehicle.fx: where diffuse green
+//     is below the mask threshold, rgb = r * red_tint + b * blue_tint;
+//     that is the taxi yellow; validated by executing the captured
+//     vehicle_defaultPS offline).
+//   vehicle glass (fam 7): same rows; glass tint c18.rgb (zero = the color
+//     is reflection-only) in the tintA slot, alpha out = c20.x * c18.w.
 // The SH irradiance evaluation is sat(c_base + s*(N.x*r1 + N.y*r2 + N.z*r3)
 // + s^2*(NxNz*r4 + NzNy*r5 + NyNx*r6) + (3 s^2 Nz^2 - 1)*r7 + s^2*(Nx^2 -
 // Ny^2)*r8); the scale and the -1 are folded into the stored rows so the
@@ -1353,7 +1371,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     uint32_t light_r = 9, key_r = 15, expo_r = 13, expo_c = 2;
     switch (f) {
       case 1: light_r = 0; key_r = 6; expo_r = 4; expo_c = 2; break;
-      case 2: case 3: break;  // defaults above
+      case 2: case 3: case 6: case 7: break;  // defaults above
       case 4: light_r = 4; key_r = 16; expo_r = 8; expo_c = 2; break;
       case 5: light_r = 4; key_r = 15; expo_r = 8; expo_c = 2; break;
     }
@@ -1454,6 +1472,34 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     }
     d[12 * 4 + 3] = 1.0f;
     d[14 * 4 + 0] = row(21u, 0);
+  } else if (fam == 6 || fam == 7) {
+    // vehicle.fx body / vehicle_glass.fx windows (row map above). The
+    // otherwise-unused SH row 0 carries the phong spec color + power.
+    const float amb = row(19u, 3);
+    if (!(amb >= 0.0f && amb < 16.0f)) return;
+    d[2 * 4 + 0] = amb * 0.1f;
+    d[2 * 4 + 1] = amb * 0.175f;
+    d[2 * 4 + 2] = amb * 0.3f;
+    d[3] = std::clamp(row(15u, 3), 1.0f, 64.0f);  // fresnel power c15.w
+    for (int c = 0; c < 4; ++c) {
+      d[3 * 4 + c] = std::clamp(row(16u, uint32_t(c)), 0.0f, 64.0f);
+    }
+    if (fam == 6) {
+      for (int c = 0; c < 3; ++c) {
+        d[12 * 4 + c] = std::clamp(row(21u, uint32_t(c)), 0.0f, 4.0f);
+        d[13 * 4 + c] = std::clamp(row(22u, uint32_t(c)), 0.0f, 4.0f);
+      }
+      d[12 * 4 + 3] = 1.0f;
+      d[14 * 4 + 0] = 1.0f;  // opaque body
+    } else {
+      // Glass tint c18.rgb multiplies the ambient/key terms (zero in every
+      // capture = reflection-only glass); alpha out = c20.x * c18.w.
+      for (int c = 0; c < 3; ++c) {
+        d[12 * 4 + c] = std::clamp(row(18u, uint32_t(c)), 0.0f, 4.0f);
+      }
+      d[12 * 4 + 3] = 1.0f;
+      d[14 * 4 + 0] = std::clamp(row(20u, 0) * row(18u, 3), 0.0f, 1.0f);
+    }
   } else {
     // Hair: flat ambient scalar + fresnel rim tint, strand-alpha scale.
     const float amb = row(14u, 3) * 0.25f;
@@ -3475,7 +3521,8 @@ cbuffer CH : register(b2) {
   float4 ch_light;  // xyz = sun direction, w = hair fresnel power
   float4 ch_key;    // rgb = key (sun) color, w = exposure
   float4 ch_amb;    // rgb = flat ambient, w = SH ambient multiplier / hair ambient
-  float4 ch_sh[9];  // SH irradiance rows, pre-scaled (see capture)
+  float4 ch_sh[9];  // SH irradiance rows, pre-scaled (see capture);
+                    // vehicles keep spec color + power in row 0 instead
   float4 ch_tintA;  // CAC diffuse tint / livingworld red-mask tint (w = apply)
   float4 ch_tintB;  // livingworld blue-mask tint / hair fresnel tint (w = strand-alpha scale)
   float4 ch_misc;   // x = alpha out, y = family
@@ -3571,7 +3618,66 @@ float4 ps_main(VSOut i) : SV_Target {
     float3 vd = -normalize(i.rpos);
     float3 lin;
     float out_a = 1.0;
-    if (fam > 3.5) {
+    if (fam > 5.5) {
+      // Traffic vehicles (vehicle.fx fam 6 body / vehicle_glass.fx fam 7
+      // windows, disassembled from vehicle_defaultPS): paint recolor where
+      // the diffuse green channel is below the mask threshold (red-channel
+      // mask * colorize_red + blue-channel mask * colorize_blue, the taxi
+      // yellow), key light + the livingworld flat ambient, phong specular
+      // along the reflected sun, and an environment-cube reflection scaled
+      // by fresnel and the gloss packed in the diffuse alpha. Glass keeps
+      // only the reflection terms (its tint rows are zero) and blends at
+      // the captured alpha. overlay.y > 0 = the material's cube resolved
+      // at t6 (same convention as water).
+      float3 sel;
+      if (fam < 6.5) {
+        sel = dlin.g > 0.001225
+                  ? dlin
+                  : ch_tintA.rgb * dlin.r + ch_tintB.rgb * dlin.b;
+      } else {
+        sel = ch_tintA.rgb;
+      }
+      // DXN panel normal map (the material's `normal` channel, riding the
+      // macro slot; overlay.z > 0 = resolved). The vertex layout carries no
+      // tangent frame, so build a screen-space cotangent frame from the
+      // position/uv derivatives; it reproduces the authored panel shading
+      // including mirrored UV islands. Skipping the map entirely shades the
+      // hinged panels by their vertex normals, which face away from the sun
+      // - the dark ambient-blue "misdrawn shadow" that stopped at the door
+      // seam (verified against the ucode: flat map = the artifact, real
+      // map = the emulated car).
+      float3 vn = cn;
+      if (overlay.z > 0.5) {
+        float2 nm = macro.Sample(smp, i.uv).rg * 2.0 - 1.0;
+        float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
+        float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
+        float3 dp2p = cross(dp2, cn), dp1p = cross(cn, dp1);
+        float3 tt = dp2p * du1.x + dp1p * du2.x;
+        float3 bb = dp2p * du1.y + dp1p * du2.y;
+        float im = rsqrt(max(max(dot(tt, tt), dot(bb, bb)), 1e-12));
+        vn = normalize(nm.x * tt * im + nm.y * bb * im +
+                       cn * sqrt(saturate(1.0 - dot(nm, nm))));
+      }
+      float vndl = saturate(dot(vn, ch_light.xyz));
+      float3 rfl = ch_light.xyz - 2.0 * dot(vn, ch_light.xyz) * vn;
+      // The sun spec is gated on N.L >= 0 (the ucode multiplies the spec
+      // term by an sge result); the cube reflection is not.
+      float spec = pow(saturate(dot(vd, -rfl)), max(ch_sh[0].w, 1.0)) *
+                   (dot(vn, ch_light.xyz) >= 0.0 ? 1.0 : 0.0);
+      float fres = pow(1.0 - saturate(dot(vn, vd)), max(ch_light.w, 1.0));
+      float3 cube = float3(0.0, 0.0, 0.0);
+      if (overlay.y > 0.5) {
+        cube = env_cube.Sample(smp, reflect(-vd, vn)).rgb;
+        cube *= cube;  // the PS consumes the cube squared (linear space)
+      }
+      // Gloss = the diffuse alpha SQUARED: the ucode squares the whole
+      // diffuse fetch (linear-space decode), alpha included; raw alpha
+      // over-specs ~5x and mottles the body panels.
+      float gloss = fam < 6.5 ? albedo.a * albedo.a : 1.0;
+      lin = sel * (ch_key.rgb * vndl + ch_amb.rgb) +
+            (spec * ch_sh[0].rgb + cube) * fres * gloss;
+      out_a = ch_misc.x;
+    } else if (fam > 3.5) {
       // Hair (cac_hair / defaulthair): key on a wrapped N.L ramp + flat
       // ambient, fresnel rim tint on a steeper ramp; strand coverage from
       // the mesh's "alpha" channel at the raw second texcoord (bound at t4)
@@ -4428,6 +4534,11 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       n3[2] = (sy > 0 ? 1.0f : -1.0f) * std::sqrt(d > 0.0f ? d : 0.0f);
       (void)sx;  // sign.x = tangent handedness, unused until normal maps
     } else if (item.normal_fmt == 16) {
+      // (Vehicle meshes: the game's VS derives cross(tangent, binormal)
+      // instead, but the stored usage-3 normal MATCHES it on every vertex
+      // with a non-degenerate tangent frame and stays sane on the ~13%
+      // interior verts where t is parallel to b and the cross vanishes,
+      // measured in capture, so the stored normal is used.)
       unpack_10_11_11(item.normal_offset, n3);
     } else if (item.tb_fmt == 16) {
       // NPC character meshes carry no normal element; the game's VS
@@ -6753,8 +6864,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // determinant) would flip winding, so those stay uncull(ed).
     // (hair items with a validated lighting capture draw in the blended
     // sub-pass under their own cull PSOs; never reset those here)
-    const bool hair_pass =
-        item.char_family >= 4 && item.char_rows[14 * 4 + 1] > 0.0f;
+    const bool hair_pass = item.char_family >= 4 && item.char_family <= 5 &&
+                           item.char_rows[14 * 4 + 1] > 0.0f;
     if (use_depth && !item.transparent && !item.water && !hair_pass &&
         g_r.pso_cullback != nullptr) {
       const float* w = item.world;
@@ -6976,16 +7087,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         item.macro_tex != 0 && REXCVAR_GET(skate3_native_render_scene_macro)
             ? resolve_texture(item.macro_tex)
             : &g_r.white;
-    if (item.water && item.water_normal != 0) {
+    if ((item.water || item.char_family >= 6) && item.water_normal != 0) {
       // Water rides its ripple normal map in the macro slot (water never
       // carries a macro overlay; overlay.z stays 0 below so the macro
-      // composite path never runs).
+      // composite path never runs). Vehicles do the same with their DXN
+      // panel normal map; without it the hinged panels' vertex normals
+      // face away from the sun and shade as a dark ambient-blue patch that
+      // stops at the door seams (the exact PS with a FLAT map reproduces
+      // that artifact; with the real map it matches the emulated car).
       macro_tex = resolve_texture(item.water_normal);
     }
-    // Water environment cube (t6, root param 8): decoded once per guest
-    // object into the cube cache; the gray fallback cube otherwise.
+    // Water / vehicle environment cube (t6, root param 8): decoded once per
+    // guest object into the cube cache; the gray fallback cube otherwise.
+    // Vehicle materials carry an `environment` channel that resolves through
+    // the same chan+0x1C path as the ocean's.
     const GuestTexture* cube_tex = &g_r.white_cube;
-    if (item.water && item.water_env != 0) {
+    if ((item.water || item.char_family >= 6 ||
+         (item.env_family >= 5 && item.env_family <= 6)) &&
+        item.water_env != 0) {
       auto cit = g_r.cube_textures.find(item.water_env);
       if (cit == g_r.cube_textures.end()) {
         GuestTexture c{};
@@ -7007,7 +7126,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                             REXCVAR_GET(skate3_native_render_scene_decals)
                                         ? resolve_texture(item.decal_art)
                                         : &g_r.white;
-    if (item.char_family >= 4 && item.hair_alpha_tex != 0) {
+    if (item.char_family >= 4 && item.char_family <= 5 &&
+        item.hair_alpha_tex != 0) {
       // Hair strand coverage rides the (otherwise unused) decal slot; the
       // PS hair branch samples it at the raw second texcoord. The white
       // fallback keeps failed decodes opaque rather than invisible.
@@ -7047,6 +7167,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
       constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
       constants[47] = item.diffuse_tex == 0 ? 1.0f : 0.0f;
+    } else if (item.char_family >= 6) {
+      // Vehicles reuse the water convention: overlay.y > 0 = a real
+      // environment cube bound at t6 (the PS vehicle branch's reflection
+      // term). Vehicles never carry macro/decal channels, so the macro
+      // defaults staged above are inert, but overlay.y must not inherit
+      // macro_opacity's 1.0 default when no cube resolved.
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
     }
     // misc.x: alpha-blended sub-pass item (1 = transparentenvironment
     // shading, 2 = water branch); fog rides in misc.yzw (ramp) and the
@@ -7116,10 +7243,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // Hair with a validated lighting capture joins the sorted alpha
     // sub-pass (strand coverage blend, depth test on / z-write off, the
     // game's own hair render state); without the capture it stays on the
-    // legacy opaque path.
-    const bool hair_blend =
-        item.char_family >= 4 && item.char_rows[14 * 4 + 1] > 0.0f;
-    if ((item.transparent || item.water || hair_blend) && debug_mode == 0) {
+    // legacy opaque path. Vehicle glass (fam 7) blends there too,
+    // reflection-only windows at the captured alpha; vehicle bodies (fam 6)
+    // stay opaque.
+    const bool char_capture_ok = item.char_rows[14 * 4 + 1] > 0.0f;
+    const bool hair_blend = item.char_family >= 4 && item.char_family <= 5 &&
+                            char_capture_ok;
+    const bool glass_blend = item.char_family == 7 && char_capture_ok;
+    if ((item.transparent || item.water || hair_blend || glass_blend) &&
+        debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
       }
@@ -7150,7 +7282,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                      });
     list.D3DSetPipelineState(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
     for (const DrawItem* item : transparent_items) {
-      const bool hair = item->char_family >= 4 && item->char_rows[14 * 4 + 1] > 0.0f;
+      const bool hair = item->char_family >= 4 && item->char_family <= 5 &&
+                        item->char_rows[14 * 4 + 1] > 0.0f;
       if (hair && use_depth && g_r.pso_hair_a != nullptr && g_r.pso_hair_b != nullptr) {
         // The game's two hair passes: cull BACK then cull FRONT with the
         // same shader: keeps far-side strands from compositing over

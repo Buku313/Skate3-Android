@@ -69,7 +69,11 @@ struct DrawItem {
   // (defaultcharacter PS layout), 2 = CAC player pieces (skin / face / cloth
   // / leather / shift / cloth_ropa: cacstamp layout), 3 =
   // character.livingworld_* pedestrians (stamp recolor), 4 = character.hair
-  // (CAC), 5 = character.default_hair (NPC hair). 0 = not a character.
+  // (CAC), 5 = character.default_hair (NPC hair), 6 =
+  // character.livingworld_vehicles (vehicle.fx: colorize_red/blue paint
+  // recolor + phong spec + environment-cube reflection), 7 =
+  // character.livingworld_vehicles_glass (reflection-only, alpha-blended
+  // windows). 0 = not a character.
   // char_rows = the canonical per-draw lighting block captured from the
   // PIXEL constant bank at palette-capture time (CaptureCharLighting):
   // 15 float4 rows consumed by the scene PS character branch (cbuffer CH,
