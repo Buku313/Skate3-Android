@@ -4122,12 +4122,22 @@ float4 ps_main(VSOut i) : SV_Target {
       // livingworld pedestrians: the diffuse is a stamp-mask atlas: red
       // regions recolor with tintA, blue with tintB (judged in linear
       // space; real-color regions have green above the threshold).
+      // The game's character PSes multiply the key light by the CSM shadow
+      // (tap >= ray = lit); characters are casters themselves, so an extra
+      // receiver bias suppresses self-shadow acne while the body-onto-board
+      // / body-onto-NPC shading survives (the sun-axis depth gap there is
+      // tens of cm). Without this the held skateboard, a big flat surface
+      // that is almost always inside the skater's own shadow, renders
+      // fully sunlit (near-white) against the emulated dark deck.
+      float csm = SampleCsmShadow(i.rpos + cam_pos.xyz, 0.012);
       float3 sel = dlin.g > 0.001225
                        ? dlin
                        : ch_tintA.rgb * dlin.r + ch_tintB.rgb * dlin.b;
-      lin = sel * (ch_key.rgb * ndl + ch_amb.rgb);
+      lin = sel * (ch_key.rgb * ndl * csm + ch_amb.rgb);
     } else {
-      // defaultcharacter / CAC pieces: key light + SH irradiance ambient.
+      // defaultcharacter / CAC pieces: key light + SH irradiance ambient,
+      // key gated by the CSM shadow (see the livingworld comment above).
+      float csm = SampleCsmShadow(i.rpos + cam_pos.xyz, 0.012);
       if (ch_tintA.w > 0.0) {
         dlin *= ch_tintA.rgb;
       }
@@ -4137,7 +4147,7 @@ float4 ps_main(VSOut i) : SV_Target {
           (cn.z * cn.y) * ch_sh[5].rgb + (cn.y * cn.x) * ch_sh[6].rgb +
           (cn.z * cn.z) * ch_sh[7].rgb +
           (cn.x * cn.x - cn.y * cn.y) * ch_sh[8].rgb);
-      lin = dlin * (ch_key.rgb * ndl + irr * ch_amb.w);
+      lin = dlin * (ch_key.rgb * ndl * csm + irr * ch_amb.w);
     }
     // Exact tone chain: sqrt(0.5 * (max(x*E/4 + 0.75, 1) - sat(1 - x*E)^2)).
     float E = max(ch_key.w, 0.01);
