@@ -15,6 +15,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -48,6 +49,17 @@ REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_stride, 1, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(skate3_native_render_snapshot_dir, "native_render_snapshots", "Skate 3",
                       "Directory for native-render guest memory snapshots and metadata")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
+                      "Pace the guest render loop to this frame rate (0 = uncapped). The "
+                      "guest produces frames at irregular 2-9 ms intervals; the display "
+                      "(especially with G-Sync/VRR, which follows present times directly) "
+                      "turns that variance into visible irregular judder that no content "
+                      "smoothing can fix. An even cap a few fps below the display refresh "
+                      "(e.g. 140 on a 144 Hz panel) is the standard VRR recipe: every "
+                      "frame arrives on a steady beat. Precise pacing: coarse sleep to "
+                      "~1.5 ms before the target, then spin.")
+    .range(0.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_render {
@@ -263,7 +275,42 @@ void OnClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t 
   g_current_frame.push_back({3, key, 0, dyn});
 }
 
+// Precise guest frame pacing (see skate3_guest_fps_cap): called on the guest
+// render thread at the swap boundary. Absolute-schedule pacing (target +=
+// interval) so sleep jitter never accumulates; resyncs when the guest falls
+// more than one interval behind (loads, hitches).
+void PaceGuestFrame() {
+  const double cap = REXCVAR_GET(skate3_guest_fps_cap);
+  static std::chrono::steady_clock::time_point s_next{};
+  if (cap < 1.0) {
+    s_next = {};
+    return;
+  }
+  const auto interval =
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(1.0 / cap));
+  const auto now = std::chrono::steady_clock::now();
+  if (s_next.time_since_epoch().count() == 0 || now > s_next + interval) {
+    s_next = now + interval;
+    return;
+  }
+  // Coarse sleep to ~1.5 ms before the target, then spin for precision.
+  while (true) {
+    const auto remaining = s_next - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+      break;
+    }
+    if (remaining > std::chrono::milliseconds(2)) {
+      std::this_thread::sleep_for(remaining - std::chrono::milliseconds(2));
+    } else if (remaining > std::chrono::microseconds(50)) {
+      std::this_thread::yield();
+    }
+  }
+  s_next += interval;
+}
+
 void OnFrameEnd(uint8_t* base) {
+  PaceGuestFrame();
   std::lock_guard<std::mutex> lock(g_mutex);
   ++g_frame_index;
   const size_t mesh_count = g_current_frame.size();
@@ -306,6 +353,18 @@ void OnFrameEnd(uint8_t* base) {
                   g_frame_index, mesh_count);
     }
     f9_was_down = f9_down;
+    // F8: flush the native texture + mesh caches. Debug/bisect aid, and the
+    // reproducible worst-case decode burst for perf work (everything visible
+    // re-decodes at once; the decode workers should absorb it with a brief
+    // white/pop-in instead of a render-thread freeze).
+    static bool f8_was_down = false;
+    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (f8_down && !f8_was_down) {
+      skate3::native_scene::FlushTextureCache();
+      skate3::native_scene::FlushMeshCache();
+      REXLOG_INFO("native-render: F8, texture + mesh caches flushed");
+    }
+    f8_was_down = f8_down;
     static bool f10_was_down = false;
     const bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (f10_down && !f10_was_down) {

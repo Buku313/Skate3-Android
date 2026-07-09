@@ -24,6 +24,10 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
+// Smoothness / pacing.
+REXCVAR_DECLARE(bool, skate3_native_render_scene_smooth_camera);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_sort_opaque);
+REXCVAR_DECLARE(double, skate3_guest_fps_cap);
 // SDK: emulated-draw suppression while the native output is active.
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
 
@@ -148,6 +152,34 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
   REXCVAR_SET(skate3_native_render_scene_splines,
               CvarCheckbox("Neon splines", REXCVAR_GET(skate3_native_render_scene_splines),
                            "Waypoint arrows / marker beams"));
+
+  ImGui::SeparatorText("Smoothness / pacing");
+  REXCVAR_SET(skate3_native_render_scene_smooth_camera,
+              CvarCheckbox("Smooth camera + entity poses",
+                           REXCVAR_GET(skate3_native_render_scene_smooth_camera),
+                           "The guest updates its camera/entities on its own ~200 Hz "
+                           "sim tick; raw poses judder at high render rates. Re-times "
+                           "them on the host clock (1 kHz camera sampler + pose "
+                           "interpolation, a few ms of camera latency)."));
+  REXCVAR_SET(skate3_native_render_scene_sort_opaque,
+              CvarCheckbox("Front-to-back opaque sort",
+                           REXCVAR_GET(skate3_native_render_scene_sort_opaque),
+                           "Early-z rejects occluded pixels before the material shading"));
+  {
+    int cap = int(REXCVAR_GET(skate3_guest_fps_cap));
+    if (ImGui::InputInt("Guest fps cap (0 = off)", &cap, 10, 30)) {
+      if (cap < 0) cap = 0;
+      if (cap > 1000) cap = 1000;
+      REXCVAR_SET(skate3_guest_fps_cap, double(cap));
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Pace guest frames on an even beat. Set a few fps below the display "
+          "refresh (with G-Sync/VRR this is what makes motion read as smooth; "
+          "uncapped, the guest's irregular frame times drive the refresh "
+          "directly).");
+    }
+  }
 
   ImGui::SeparatorText("Caches (lightmap-era plumbing)");
   REXCVAR_SET(
