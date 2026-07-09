@@ -497,6 +497,37 @@ extern "C" REX_FUNC(sub_82C9A618) {
   __imp__sub_82C9A618(ctx, base);
 }
 
+// pegasus::tRModelData::Fixup(void* model, rw::core::arena::ArenaIterator*)
+// - the rw-arena LOAD-time pointer resolve, fired once per model while its
+// arena streams in. (The `Unfix(void*, SizeAndAlignment*)` atoms are the
+// SAVE/size path; hooking tROptiMeshData::Unfix never fired during loads.)
+// Post-call the model's mesh table is live: queue its meshes for the
+// prewarm decode workers. This is the EARLY prewarm source; it fires
+// throughout the load's disk-streaming phase, hours of decode headroom
+// before the final-seconds AddRenderInstance activation burst. The atoms
+// dispatch indirectly through the recomp function table, which resolves to
+// this override at link time like any other reference.
+extern "C" REX_FUNC(sub_82963510) {
+  const uint32_t model = ctx.r3.u32;
+  __imp__sub_82963510(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnModelFixup(base, model);
+  }
+}
+
+// Sk8::WorldPresentation::AddRenderInstance(pegasus::tInstance*): the world
+// registry add, fired per placed instance while a map loads (r4 = tInstance).
+// The prewarm's primary mesh source: the instance's tRModelData mesh table
+// is walked (validated offsets) and every optimesh queued for the
+// loading-screen decode.
+extern "C" REX_FUNC(sub_82791290) {
+  const uint32_t instance = ctx.r4.u32;
+  __imp__sub_82791290(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnAddRenderInstance(base, instance);
+  }
+}
+
 // D3D::SetPending_AluConstants(device, u64 dirty_group_mask, bank, ptr):
 // bank 0x4000 = vertex constants. Called from inside the Draw* functions;
 // ptr is the device's positional constant shadow bank.

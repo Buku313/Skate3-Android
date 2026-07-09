@@ -254,6 +254,25 @@ bool Enabled();
 // renderengine::Texture object.
 void OnRegisterTexture(uint64_t guid, uint32_t texture);
 
+// Queue one mesh for the prewarm decode workers (guest thread; deduped per
+// load).
+void OnMeshRegistered(uint8_t* base, uint32_t mesh);
+
+// Called (post-call) from the pegasus::tRModelData::Fixup hook: the
+// rw-arena LOAD-time pointer resolve, fired per model while its arena
+// streams in. The EARLY prewarm source: it spreads mesh/texture decoding
+// across the load's whole disk-streaming phase instead of the
+// final-seconds activation burst. (The `Unfix` atoms are the save/size
+// path and never run at load.)
+void OnModelFixup(uint8_t* base, uint32_t model);
+
+// Called (post-call) from the WorldPresentation::AddRenderInstance hook:
+// the world registry add that fires per placed instance during the load's
+// final ACTIVATION phase. Walks tInstance -> tRModelData -> mesh table
+// (self-validating offsets) and queues every optimesh-form mesh: the
+// completeness backstop behind OnModelFixup.
+void OnAddRenderInstance(uint8_t* base, uint32_t instance);
+
 // Called from the D3D::SetPending_AluConstants hook (guest render thread,
 // invoked from inside the Draw* functions). Records the location of the
 // device's positional 256-register VS constant shadow bank.

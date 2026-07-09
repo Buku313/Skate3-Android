@@ -8,12 +8,14 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -95,6 +97,37 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_texture_decode_budget, 0, "Skate
                      "measured perf win; deferred textures render white until their "
                      "turn).")
     .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_warmup_budget_ms, 8, "Skate 3",
+                     "Per-frame milliseconds of the post-takeover settle decode pass: "
+                     "after a loading screen the native output takes over on the first "
+                     "substantial post-load scene (the registration prewarm decoded the "
+                     "world behind the load), and for a short window this budget mops "
+                     "up whatever prewarm missed while the draw path's miss budgets "
+                     "are clamped; leftovers render white/skip for a frame instead of "
+                     "freezing. 0 disables the takeover gates + settle pass entirely "
+                     "(legacy immediate behavior, stale-scene flash and all).")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_warmup_min_items, 32, "Skate 3",
+                     "Scene item count below which warmup keeps yielding to the "
+                     "emulated output: right after the gameplay flip the capture holds "
+                     "only a handful of items while the game is still fading in, and "
+                     "taking over then shows a black/empty world. Every real gameplay "
+                     "scene measures 100+ items.")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_prewarm_budget_ms, 32, "Skate 3",
+                     "Per-frame milliseconds spent decoding freshly REGISTERED world "
+                     "meshes (AddRenderInstance hook) and their textures while the "
+                     "loading screen is up; the heavy lifting happens behind the load, "
+                     "so gameplay starts with hot caches and takeover is immediate. "
+                     "The loading screen renders emulated at hundreds of fps, so even "
+                     "32 ms/frame keeps it ~30 fps; map-change loads register most of "
+                     "the world in their FINAL seconds, so the drain rate in that "
+                     "window decides how much pop-in survives into gameplay. "
+                     "0 disables registration prewarm.")
+    .range(0, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
@@ -178,6 +211,58 @@ std::atomic<bool> g_flush_textures{false};
 std::atomic<bool> g_flush_meshes{false};
 std::atomic<uint8_t*> g_guest_base{nullptr};
 std::atomic<uint64_t> g_frames_rendered{0};
+
+// Loading -> gameplay takeover. Armed while the game reports menus/loading
+// (and by the F5 enable toggle, hence the atomic); the loading-screen
+// prewarm (below) does the decode heavy lifting behind the load, and the
+// FIRST substantial post-load scene renders natively immediately, no
+// emulated-gameplay stretch. The frames right after takeover run a budgeted
+// "settle" decode pass for whatever prewarm missed (dynamic entities,
+// late-registered textures); the draw path's miss budgets are clamped while
+// settling so leftovers render white/skip for a frame instead of freezing
+// the takeover frame. Everything except the armed flag is touched on the
+// render thread only, inside RenderScene.
+std::atomic<bool> g_warmup_armed{true};
+// BuildFrameScene stops publishing during loading (no submissions / no
+// perspective view), so g_scene holds the PREVIOUS map's scene through the
+// whole loading screen. Only scenes published at or after this generation
+// (stamped while the loading screen shows) are eligible for takeover;
+// rendering the stale scene shows old-map garbage at the flip.
+uint64_t g_warmup_fresh_generation = 0;
+// Settle window: frames (of the native frame counter) still running the
+// per-frame settle decode pass after a takeover.
+uint64_t g_settle_until_frame = 0;
+
+// Loading-screen prewarm queue: world meshes pushed by the
+// tROptiMeshData::Unfix hook (the rw-arena LOAD-time pointer resolve; it
+// fires once per world mesh as its arena streams in, i.e. exactly during
+// loading screens and gameplay world streaming). The render thread drains
+// the queue in RenderScene: with the prewarm budget behind the loading
+// screen (where the heavy lifting belongs), with the warmup budget's
+// leftover while warming, and with a small fixed slice during gameplay
+// (streamed-in areas decode before their first draw instead of hitching
+// it). Entries whose buffer objects are not initialized yet retry a bounded
+// number of drains.
+struct PrewarmEntry {
+  uint32_t mesh;
+  uint16_t retries;
+};
+std::mutex g_prewarm_mutex;
+std::condition_variable g_prewarm_cv;  // wakes the decode workers
+std::vector<PrewarmEntry> g_prewarm_queue;
+// Push-side dedupe: clone instances share one tRModelData, so the same mesh
+// registers many times per load. Cleared when the game enters menus/loading
+// (arena addresses are reused across map loads).
+std::unordered_set<uint32_t> g_prewarm_seen;
+// Texture-object dedupe for the workers (they cannot read the render
+// thread's g_r caches); same lifetime as g_prewarm_seen.
+std::unordered_set<uint32_t> g_prewarm_tex_seen;
+std::atomic<uint64_t> g_prewarm_done{0};     // entries fully warm-decoded
+std::atomic<uint64_t> g_prewarm_dropped{0};  // entries given up on
+std::atomic<bool> g_prewarm_workers_started{false};
+// tInstance::m_pRModel offset, confirmed at runtime by the material
+// cross-check probe in OnAddRenderInstance (Skate 2 layout: +0x78).
+std::atomic<uint32_t> g_instance_rmodel_offset{0};
 
 // guid -> guest renderengine::Texture, from the RegisterTexture hook. Keys
 // masked of the top bit: material channel guids carry an extra flag bit
@@ -875,9 +960,23 @@ bool GuestReadableApprox(uint8_t* base, uint32_t addr) {
 // capture and decode. Own function, no C++ objects: SEH cannot share a frame
 // with unwinding.
 #if defined(_WIN32)
-bool GuestTryCopy(void* dst, const void* src, size_t size) {
+// TWO TRAPS PROVEN FROM CRASH DUMPS OF THE REGISTRY-PREWARM PROBE; both
+// silently delete the guard and let the AV kill the process:
+// 1. clang marks std::memcpy nounwind, concludes the __except is
+//    unreachable, and compiles the whole function to `jmp memcpy` (seen in
+//    the shipped binary). Calling through a VOLATILE function pointer makes
+//    the callee opaque so the SEH scope must be kept.
+// 2. When this function is INLINED into a caller using the C++ EH
+//    personality (__CxxFrameHandler3), the __except scope is dropped in the
+//    merge, hence the noinline.
+// This means plain `__try { std::memcpy(...) } __except` NEVER protected
+// anything in optimized builds; any future guarded read must go through
+// this function.
+typedef void* (*GuestMemcpyFn)(void*, const void*, size_t);
+volatile GuestMemcpyFn g_guest_memcpy_fn = std::memcpy;
+__declspec(noinline) bool GuestTryCopy(void* dst, const void* src, size_t size) {
   __try {
-    std::memcpy(dst, src, size);
+    g_guest_memcpy_fn(dst, src, size);
     return true;
   } __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
                GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR)
@@ -892,6 +991,59 @@ bool GuestTryCopy(void* dst, const void* src, size_t size) {
   return true;
 }
 #endif
+
+// SEH-guarded single-value guest loads for registry-time walks (the
+// loading-screen prewarm): unlike the capture-path walks, whose pointers
+// the game is actively rendering from, registry probes dereference
+// candidate words that may not be pointers at all, and load-time payloads
+// that may not be committed yet. GuestReadableApprox is only a null/small
+// filter; these actually survive the fault.
+bool GuestTryLoadU32(uint8_t* base, uint32_t addr, uint32_t* out) {
+  if (addr < 0x10000) {
+    return false;
+  }
+  uint32_t raw;
+  if (!GuestTryCopy(&raw, REX_RAW_ADDR(addr), 4)) {
+    return false;
+  }
+  *out = __builtin_bswap32(raw);
+  return true;
+}
+
+bool GuestTryLoadU64(uint8_t* base, uint32_t addr, uint64_t* out) {
+  if (addr < 0x10000) {
+    return false;
+  }
+  uint64_t raw;
+  if (!GuestTryCopy(&raw, REX_RAW_ADDR(addr), 8)) {
+    return false;
+  }
+  *out = __builtin_bswap64(raw);
+  return true;
+}
+
+// Guarded bounded C-string read (`out` gets up to cap-1 chars + NUL, tail
+// zeroed like the old byte-at-a-time loops). Fast path is one bulk guarded
+// copy; a short string right before an unmapped page falls back to
+// byte-wise guarded reads so it still resolves.
+void GuestTryReadString(uint8_t* base, uint32_t addr, char* out, uint32_t cap) {
+  std::memset(out, 0, cap);
+  if (addr < 0x10000) {
+    return;
+  }
+  if (GuestTryCopy(out, REX_RAW_ADDR(addr), cap - 1)) {
+    const size_t n = strnlen(out, cap - 1);
+    std::memset(out + n, 0, cap - n);
+    return;
+  }
+  for (uint32_t k = 0; k + 1 < cap; ++k) {
+    uint8_t c;
+    if (!GuestTryCopy(&c, REX_RAW_ADDR(addr + k), 1) || c == 0) {
+      break;
+    }
+    out[k] = char(c);
+  }
+}
 
 // Committed-page check for bulk reads (transient ring memory can be
 // partially uncommitted, and resources may be released between the game
@@ -936,9 +1088,35 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   }
 
   // Vertex descriptor: find the stream-0 position element and the first
-  // stream-0 texcoord (D3DDECLUSAGE 5) for the diffuse map.
-  const uint32_t num_elements = REX_LOAD_U16(vdesc + 8);
+  // stream-0 texcoord (D3DDECLUSAGE 5) for the diffuse map. Read via ONE
+  // guarded bulk copy into scratch: descriptors are runtime renderengine
+  // objects, and the registration prewarm can reach a mesh before its
+  // descriptor is initialized (a raw read there faults the thread; the
+  // capture path also gets marginally faster than the per-field volatile
+  // loads).
+  uint32_t desc_head[3];
+  if (!GuestTryCopy(desc_head, REX_RAW_ADDR(vdesc), sizeof(desc_head))) {
+    g_rej_chain.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  const uint32_t num_elements = BSwap32(desc_head[2]) >> 16;  // u16 at +8
   if (num_elements == 0 || num_elements > 32) return false;
+  // Element table at +0x10 (16 bytes per element) followed by the stride
+  // byte at +(num_elements + 1) * 16.
+  uint8_t desc_tab[32 * 16 + 1];
+  const uint32_t desc_tab_bytes = num_elements * 16 + 1;
+  if (!GuestTryCopy(desc_tab, REX_RAW_ADDR(vdesc + 0x10), desc_tab_bytes)) {
+    g_rej_chain.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  const auto elem_u16 = [&](uint32_t i, uint32_t off) -> uint32_t {
+    return (uint32_t(desc_tab[i * 16 + off]) << 8) | desc_tab[i * 16 + off + 1];
+  };
+  const auto elem_u32 = [&](uint32_t i, uint32_t off) -> uint32_t {
+    uint32_t v;
+    std::memcpy(&v, desc_tab + i * 16 + off, 4);
+    return BSwap32(v);
+  };
   bool have_pos = false;
   bool have_bw = false;
   bool have_bi = false;
@@ -957,39 +1135,38 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   bool have_bin = false;
   item.skinned = false;
   for (uint32_t i = 0; i < num_elements; ++i) {
-    const uint32_t e = vdesc + 0x10 + i * 16;
-    const uint32_t stream = REX_LOAD_U16(e);
-    const uint32_t usage = REX_LOAD_U8(e + 9);
+    const uint32_t stream = elem_u16(i, 0);
+    const uint32_t usage = desc_tab[i * 16 + 9];
     if (stream != 0) continue;
     if (usage == 0 && !have_pos) {
-      item.pos_offset = REX_LOAD_U16(e + 2);
-      item.pos_fmt = uint8_t(REX_LOAD_U32(e + 4) & 0x3F);
+      item.pos_offset = uint16_t(elem_u16(i, 2));
+      item.pos_fmt = uint8_t(elem_u32(i, 4) & 0x3F);
       have_pos = true;
     } else if (usage == 3 && item.normal_fmt == 0) {
-      const uint8_t fmt = uint8_t(REX_LOAD_U32(e + 4) & 0x3F);
+      const uint8_t fmt = uint8_t(elem_u32(i, 4) & 0x3F);
       if (fmt == 16) {  // k_10_11_11 packed normal
-        item.normal_offset = REX_LOAD_U16(e + 2);
+        item.normal_offset = uint16_t(elem_u16(i, 2));
         item.normal_fmt = fmt;
       }
     } else if (usage == 5 && item.uv_fmt == 0) {
-      item.uv_offset = REX_LOAD_U16(e + 2);
-      item.uv_fmt = uint8_t(REX_LOAD_U32(e + 4) & 0x3F);
+      item.uv_offset = uint16_t(elem_u16(i, 2));
+      item.uv_fmt = uint8_t(elem_u32(i, 4) & 0x3F);
     } else if (usage == 5 && item.uv2_fmt == 0) {
-      item.uv2_offset = REX_LOAD_U16(e + 2);
-      item.uv2_fmt = uint8_t(REX_LOAD_U32(e + 4) & 0x3F);
+      item.uv2_offset = uint16_t(elem_u16(i, 2));
+      item.uv2_fmt = uint8_t(elem_u32(i, 4) & 0x3F);
     } else if (usage == 1 && !have_bw) {  // blend weights u8x4
-      item.bw_offset = REX_LOAD_U16(e + 2);
-      have_bw = (REX_LOAD_U32(e + 4) & 0x3F) == 6;
+      item.bw_offset = uint16_t(elem_u16(i, 2));
+      have_bw = (elem_u32(i, 4) & 0x3F) == 6;
     } else if (usage == 2 && !have_bi) {  // blend indices u8x4
-      item.bi_offset = REX_LOAD_U16(e + 2);
-      have_bi = (REX_LOAD_U32(e + 4) & 0x3F) == 6;
+      item.bi_offset = uint16_t(elem_u16(i, 2));
+      have_bi = (elem_u32(i, 4) & 0x3F) == 6;
     } else if (usage == 6 && !have_tan &&
-               (REX_LOAD_U32(e + 4) & 0x3F) == 16) {  // tangent k_10_11_11
-      item.tangent_offset = REX_LOAD_U16(e + 2);
+               (elem_u32(i, 4) & 0x3F) == 16) {  // tangent k_10_11_11
+      item.tangent_offset = uint16_t(elem_u16(i, 2));
       have_tan = true;
     } else if (usage == 7 && !have_bin &&
-               (REX_LOAD_U32(e + 4) & 0x3F) == 16) {  // binormal k_10_11_11
-      item.binormal_offset = REX_LOAD_U16(e + 2);
+               (elem_u32(i, 4) & 0x3F) == 16) {  // binormal k_10_11_11
+      item.binormal_offset = uint16_t(elem_u16(i, 2));
       have_bin = true;
     }
   }
@@ -1001,7 +1178,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
     return false;
   }
   item.skinned = have_bw && have_bi;
-  item.stride = REX_LOAD_U8(vdesc + (num_elements + 1) * 16);
+  item.stride = desc_tab[num_elements * 16];  // byte at vdesc+(num+1)*16
   if (item.stride == 0) {
     g_rej_geom.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -1024,10 +1201,18 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.cloth_quads = false;
   item.vb_obj = vb;
   item.ib_obj = ib;
-  item.vb_addr = REX_LOAD_U32(vb + kBufferPhysAddr) & 0xFFFFFFFC;
-  item.vb_bytes = REX_LOAD_U32(vb + kVbBytes);
-  item.ib_addr = REX_LOAD_U32(ib + kBufferPhysAddr) & 0xFFFFFFFC;
-  item.ib_count = REX_LOAD_U32(ib + kIbCount);
+  // Guarded: the registration prewarm can reach buffer objects before they
+  // finish initializing (the capture path only ever sees live ones).
+  uint32_t vb_words[3] = {}, ib_words[3] = {};
+  if (!GuestTryCopy(vb_words, REX_RAW_ADDR(vb + kBufferPhysAddr), sizeof(vb_words)) ||
+      !GuestTryCopy(ib_words, REX_RAW_ADDR(ib + kBufferPhysAddr), sizeof(ib_words))) {
+    g_rej_chain.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  item.vb_addr = BSwap32(vb_words[0]) & 0xFFFFFFFC;
+  item.vb_bytes = BSwap32(vb_words[2]);
+  item.ib_addr = BSwap32(ib_words[0]) & 0xFFFFFFFC;
+  item.ib_count = BSwap32(ib_words[2]);
   if (item.vb_addr == 0 || item.ib_addr == 0 || item.vb_bytes == 0 ||
       item.ib_count == 0 || item.vb_bytes % item.stride != 0) {
     g_rej_geom.fetch_add(1, std::memory_order_relaxed);
@@ -1057,20 +1242,30 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.dynobj = 0;
   item.spec_tex = 0;
   item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
+  // Material header + channel array read via guarded bulk copies: the
+  // registration prewarm walks materials while their arena is still
+  // loading, where raw reads fault the thread. (The capture path gets the
+  // same copies; one memcpy per material beats ~8 volatile loads per
+  // channel anyway.)
   const uint32_t material = REX_LOAD_U32(mesh + kMeshMaterial);
-  if (GuestReadableApprox(base, material)) {
-    const uint32_t num_channels = REX_LOAD_U32(material);
-    const uint32_t channels = REX_LOAD_U32(material + 8);
-    if (num_channels <= 32 && GuestReadableApprox(base, channels)) {
+  uint32_t mat_head[3] = {};
+  if (GuestReadableApprox(base, material) &&
+      GuestTryCopy(mat_head, REX_RAW_ADDR(material), sizeof(mat_head))) {
+    const uint32_t num_channels = BSwap32(mat_head[0]);
+    const uint32_t channels = BSwap32(mat_head[2]);
+    uint8_t chan_buf[32 * 0x20];
+    if (num_channels != 0 && num_channels <= 32 && GuestReadableApprox(base, channels) &&
+        GuestTryCopy(chan_buf, REX_RAW_ADDR(channels), num_channels * 0x20)) {
+      const auto chan_u32 = [&](uint32_t idx, uint32_t off) -> uint32_t {
+        uint32_t v;
+        std::memcpy(&v, chan_buf + idx * 0x20 + off, 4);
+        return BSwap32(v);
+      };
       for (uint32_t i = 0; i < num_channels; ++i) {
-        const uint32_t chan = channels + i * 0x20;
-        const uint32_t name = REX_LOAD_U32(chan);
-        if (!GuestReadableApprox(base, name)) continue;
-        char text[20] = {};
-        for (int k = 0; k < 19; ++k) {
-          text[k] = char(REX_LOAD_U8(name + k));
-          if (text[k] == '\0') break;
-        }
+        const uint32_t name = chan_u32(i, 0);
+        char text[20];
+        GuestTryReadString(base, name, text, sizeof(text));
+        if (text[0] == '\0') continue;
         uint32_t* slot = nullptr;
         if (std::memcmp(text, "diffuse", 8) == 0) {
           slot = &item.diffuse_tex;
@@ -1101,7 +1296,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
         } else if (std::memcmp(text, "macroOverlayUVScale", 20) == 0 ||
                    std::memcmp(text, "macroOverlayOpacity", 20) == 0) {
           // Shader-constant channel: the float lives in the first guid word.
-          const float f = std::bit_cast<float>(REX_LOAD_U32(chan + 0x10));
+          const float f = std::bit_cast<float>(chan_u32(i, 0x10));
           if (f > 0.0f && f < 1e6f) {
             (text[12] == 'U' ? item.macro_scale : item.macro_opacity) = f;
           }
@@ -1112,17 +1307,14 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // per-character tint from the pixel constant bank; "sky.*" draws
           // fullbright; "character.cloth_ropa" is the Ropa cloth-sim VS
           // variant (flag-row-switched skinned/rigid, see CaptureSkinnedState).
-          const uint32_t s = REX_LOAD_U32(chan + 0x18);
+          const uint32_t s = chan_u32(i, 0x18);
           if (GuestReadableApprox(base, s)) {
             // 40 bytes: "character.livingworld_vehicles_glass" (36 chars) is
             // the longest name that must be distinguishable; the previous
             // 28-byte buffer truncated both vehicle names into the plain
             // "livingworld" pedestrian prefix.
-            char mat_name[40] = {};
-            for (int k = 0; k < 39; ++k) {
-              mat_name[k] = char(REX_LOAD_U8(s + k));
-              if (mat_name[k] == '\0') break;
-            }
+            char mat_name[40];
+            GuestTryReadString(base, s, mat_name, sizeof(mat_name));
             item.hair = std::memcmp(mat_name, "character.hair", 15) == 0;
             item.unlit = std::memcmp(mat_name, "sky.", 4) == 0;
             item.ropa = std::memcmp(mat_name, "character.cloth_ropa", 21) == 0;
@@ -1218,17 +1410,17 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // customization textures (CAS face/skin, shoes, deck, wheels)
           // are never registered under an asset GUID. Validate via the
           // fetch-constant type bits before trusting the pointer.
-          const uint32_t stream = REX_LOAD_U32(chan + 0x1C);
-          if (GuestReadableApprox(base, stream)) {
-            const uint32_t tex = REX_LOAD_U32(stream);
-            if (GuestReadableApprox(base, tex) &&
-                (REX_LOAD_U32(tex + 7 * 4) & 3u) == 2u) {
-              *slot = tex;
-            }
+          // Guarded: the prewarm walks materials whose stream records /
+          // texture objects may not be loaded yet.
+          const uint32_t stream = chan_u32(i, 0x1C);
+          uint32_t tex = 0, tex_w0 = 0;
+          if (GuestTryLoadU32(base, stream, &tex) &&
+              GuestTryLoadU32(base, tex + 7 * 4, &tex_w0) && (tex_w0 & 3u) == 2u) {
+            *slot = tex;
           }
           if (*slot == 0) {
             const uint64_t guid =
-                (uint64_t(REX_LOAD_U32(chan + 0x10)) << 32) | REX_LOAD_U32(chan + 0x14);
+                (uint64_t(chan_u32(i, 0x10)) << 32) | chan_u32(i, 0x14);
             std::lock_guard<std::mutex> lock(g_texture_map_mutex);
             auto it = g_texture_map.find(guid & kGuidMask);
             if (it != g_texture_map.end()) {
@@ -1265,28 +1457,38 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
     // cached/uncached mirrors (the channel object records the mirror
     // address, the draw-time fetch constant the plain one).
     const auto phys_base = [](uint32_t w1) { return w1 & 0x1FFFF000u; };
-    const uint32_t lm_w1 = REX_LOAD_U32(item.lightmap_tex + 8 * 4);
     std::lock_guard<std::mutex> lock(g_palette_mutex);
     const auto fit =
         g_frame_draw_fetch.find((uint64_t(item.ib_obj) << 32) | item.vb_obj);
     if (fit != g_frame_draw_fetch.end()) {
+      // Texture-object reads only on a fetch-map hit, and guarded: the map
+      // is empty on prewarm/loading frames, and the GUID registry can
+      // resolve to a freed previous-map object there (raw reads faulted).
+      uint32_t lm_w1 = 0;
       const uint32_t* slot3 = fit->second.data();
       const uint32_t* slot4 = fit->second.data() + 6;
       const uint32_t art_w = (slot4[2] & 0x1FFFu) + 1;
       const uint32_t art_h = ((slot4[2] >> 13) & 0x1FFFu) + 1;
       const bool main_pass = (slot3[0] & 3u) == 2u && (slot4[0] & 3u) == 2u &&
+                             GuestTryLoadU32(base, item.lightmap_tex + 8 * 4, &lm_w1) &&
                              phys_base(slot3[1]) == phys_base(lm_w1);
       // Dimension floor: never adopt a placeholder-sized s4 (an idle ad
       // rotation slot) over whatever the channel resolves to.
       if (main_pass && (art_w >= 32 || art_h >= 32)) {
         if (item.env_family == 3) {
+          uint32_t da_w1 = 0;
           if (item.decal_art != 0 &&
-              phys_base(slot4[1]) !=
-                  phys_base(REX_LOAD_U32(item.decal_art + 8 * 4))) {
+              GuestTryLoadU32(base, item.decal_art + 8 * 4, &da_w1) &&
+              phys_base(slot4[1]) != phys_base(da_w1)) {
             std::memcpy(item.decal_fetch, slot4, 6 * sizeof(uint32_t));
           }
         } else {
-          const uint32_t diff_w2 = REX_LOAD_U32(item.diffuse_tex + 9 * 4);
+          uint32_t diff_w2 = 0, diff_w1 = 0;
+          if (!GuestTryLoadU32(base, item.diffuse_tex + 9 * 4, &diff_w2) ||
+              !GuestTryLoadU32(base, item.diffuse_tex + 8 * 4, &diff_w1)) {
+            diff_w2 = 0;
+            diff_w1 = slot4[1];  // unreadable diffuse object: adopt nothing
+          }
           const uint32_t diff_w = (diff_w2 & 0x1FFFu) + 1;
           const uint32_t diff_h = ((diff_w2 >> 13) & 0x1FFFu) + 1;
           const bool diff_stub = diff_w <= 32 && diff_h <= 32;
@@ -1294,8 +1496,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
                                      item.env_family == 7 ||
                                      item.env_family == 8;
           if ((s4_is_diffuse || diff_stub) &&
-              phys_base(slot4[1]) !=
-                  phys_base(REX_LOAD_U32(item.diffuse_tex + 8 * 4))) {
+              phys_base(slot4[1]) != phys_base(diff_w1)) {
             std::memcpy(item.diffuse_fetch, slot4, 6 * sizeof(uint32_t));
           }
         }
@@ -1316,10 +1517,20 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   mix(item.ib_count);
   if (item.vb_bytes >= 8 && item.ib_count >= 4) {
     for (uint32_t k = 0; k < 16; ++k) {
+      // Guarded reads: capture-path payloads are always resident (the game
+      // is drawing from them), but the registration prewarm fingerprints
+      // meshes whose payload pages may not be committed yet; the failure
+      // defers the mesh instead of faulting the thread.
+      uint64_t vq = 0, iq = 0;
       const uint32_t vb_off = uint32_t(uint64_t(item.vb_bytes - 8) * k / 15u) & ~7u;
-      mix(REX_LOAD_U64(item.vb_addr + vb_off));
       const uint32_t ib_off = uint32_t(uint64_t(item.ib_count * 2 - 8) * k / 15u) & ~7u;
-      mix(REX_LOAD_U64(item.ib_addr + ib_off));
+      if (!GuestTryLoadU64(base, item.vb_addr + vb_off, &vq) ||
+          !GuestTryLoadU64(base, item.ib_addr + ib_off, &iq)) {
+        g_rej_geom.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
+      mix(vq);
+      mix(iq);
     }
   }
   item.fingerprint = h;
@@ -1398,6 +1609,10 @@ bool ToggleSceneEnabled() {
       g_scene_2d.clear();
       g_scene_spline.clear();
     }
+    // Warm up before taking over: after a long emulated stretch the decode
+    // caches can be cold/stale, and the takeover frame would pay the whole
+    // decode burst at once. A warm cache completes warmup in one frame.
+    g_warmup_armed.store(true, std::memory_order_relaxed);
   }
   REXCVAR_SET(skate3_native_render_scene, enabled);
   REXLOG_INFO("native-scene: switched to the {} renderer (runtime toggle)",
@@ -1411,6 +1626,111 @@ void OnRegisterTexture(uint64_t guid, uint32_t texture) {
   }
   std::lock_guard<std::mutex> lock(g_texture_map_mutex);
   g_texture_map[guid & kGuidMask] = texture;
+}
+
+void OnMeshRegistered(uint8_t* base, uint32_t mesh) {
+  if (mesh == 0) {
+    return;
+  }
+  // Publish the guest base here too: at boot the loading-screen prewarm
+  // workers run before the first gameplay frame would otherwise publish it.
+  g_guest_base.store(base, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+  if (g_prewarm_queue.size() < 65536 && g_prewarm_seen.insert(mesh).second) {
+    g_prewarm_queue.push_back({mesh, 60});
+    g_prewarm_cv.notify_one();
+  }
+}
+
+// Validate a candidate tRModelData against the layout the game's OWN
+// AddRenderInstance (sub_82791290) walks: mesh table pointer at model+0x24,
+// mesh COUNT as a u16 at model+0x32 (`lhz r10,50(r11)`). Table entries are
+// 8 bytes: word0 = mesh, word1 = 0 for the optimesh world form (its
+// material lives at mesh+0x24, which is also why a {mesh, material} pair
+// scan finds nothing) / non-zero for the tRMeshData character/prop form.
+// Every dereference is SEH-guarded: the offset probe feeds this arbitrary
+// instance words (bbox floats, guids) as candidates.
+static bool PlausibleRModel(uint8_t* base, uint32_t model) {
+  uint32_t count_w = 0, table = 0;
+  if (!GuestTryLoadU32(base, model + 0x30, &count_w) ||
+      !GuestTryLoadU32(base, model + 0x24, &table)) {
+    return false;
+  }
+  const uint32_t num_meshes = count_w & 0xFFFF;  // u16 at +0x32
+  if (num_meshes == 0 || num_meshes > 512) {
+    return false;
+  }
+  // Entry 0: the mesh must carry a plausible material (channel count sane).
+  uint32_t mesh0 = 0, mesh0_mat = 0, mat_channels = 0;
+  return GuestTryLoadU32(base, table, &mesh0) &&
+         GuestTryLoadU32(base, mesh0 + kMeshMaterial, &mesh0_mat) &&
+         mesh0_mat >= 0x10000 &&
+         GuestTryLoadU32(base, mesh0_mat, &mat_channels) && mat_channels != 0 &&
+         mat_channels <= 64;
+}
+
+// Queue every optimesh-form mesh of a validated tRModelData for the prewarm
+// decode workers.
+static void QueueModelMeshes(uint8_t* base, uint32_t model) {
+  uint32_t count_w = 0, table = 0;
+  if (!GuestTryLoadU32(base, model + 0x30, &count_w) ||
+      !GuestTryLoadU32(base, model + 0x24, &table)) {
+    return;
+  }
+  const uint32_t num_meshes = count_w & 0xFFFF;
+  for (uint32_t i = 0; i < num_meshes && i < 512; ++i) {
+    uint32_t mesh = 0, entry_mat = 0;
+    if (!GuestTryLoadU32(base, table + i * 8, &mesh) ||
+        !GuestTryLoadU32(base, table + i * 8 + 4, &entry_mat)) {
+      continue;
+    }
+    if (entry_mat != 0) {
+      continue;  // tRMeshData form (characters/props), wrong offsets
+    }
+    OnMeshRegistered(base, mesh);
+  }
+}
+
+void OnModelFixup(uint8_t* base, uint32_t model) {
+  // Fires per model during the load's DISK-STREAMING phase (arena fixup),
+  // the early prewarm source. The validation gate keeps non-render models
+  // (and any layout drift) out of the queue.
+  if (model != 0 && PlausibleRModel(base, model)) {
+    QueueModelMeshes(base, model);
+  }
+}
+
+void OnAddRenderInstance(uint8_t* base, uint32_t instance) {
+  if (instance == 0) {
+    return;
+  }
+  // Resolve tInstance::m_pRModel. The game's own AddRenderInstance reads it
+  // at +0x80 (`lwz r11,128(r4)`); the offset is still confirmed by the
+  // validation probe before first use so an image-version drift degrades to
+  // "prewarm off" instead of queueing garbage.
+  uint32_t off = g_instance_rmodel_offset.load(std::memory_order_relaxed);
+  if (off == 0) {
+    for (uint32_t cand = 0x80; cand < 0xC0; cand += 4) {
+      uint32_t model = 0;
+      if (GuestTryLoadU32(base, instance + cand, &model) &&
+          PlausibleRModel(base, model)) {
+        g_instance_rmodel_offset.store(cand, std::memory_order_relaxed);
+        REXLOG_INFO("native-scene: tInstance::m_pRModel offset confirmed at +0x{:X}",
+                    cand);
+        off = cand;
+        break;
+      }
+    }
+    if (off == 0) {
+      return;  // CModel-only / embedded instance, or the model is not ready
+    }
+  }
+  uint32_t model = 0;
+  if (!GuestTryLoadU32(base, instance + off, &model) ||
+      !PlausibleRModel(base, model)) {
+    return;  // instances without a renderable model are normal
+  }
+  QueueModelMeshes(base, model);
 }
 
 void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr,
@@ -3649,6 +3969,19 @@ struct GuestTexture {
   bool valid = false;
 };
 
+// Cache key for draw-time fetch-word texture bindings (streamed artwork /
+// decal ad overrides, no guest texture object to key on): FNV-1a over the
+// six raw fetch-constant words. Shared by the draw path and the warmup
+// pre-decode so both hit the same g_r.textures_2d entries.
+inline uint64_t FetchWordsKey(const uint32_t words[6]) {
+  uint64_t key = 1469598103934665603ull;
+  for (int k = 0; k < 6; ++k) {
+    key ^= words[k];
+    key *= 1099511628211ull;
+  }
+  return key;
+}
+
 // FNV-1a over 16 qwords sampled across a guest payload (SEH-guarded reads;
 // streaming can decommit the range). Returns 0 only on unreadable payloads.
 uint64_t SamplePayloadFingerprint(uint8_t* base, uint32_t addr, uint32_t size) {
@@ -3818,6 +4151,14 @@ struct RendererState {
   ID3D12DescriptorHeap* srv_heap = nullptr;
   uint32_t srv_size = 0;
   uint32_t srv_next = 0;
+  // Guest-texture SRV slot recycling: decodes are unbounded over a session
+  // (streaming re-decodes, registration prewarm) and a monotonic allocator
+  // exhausts the 8192-slot heap; every later decode then fails and renders
+  // white. Retired slots wait out their last-referencing submission before
+  // rejoining the free list (the descriptor may still be copied from while
+  // the frame is in flight).
+  std::vector<uint32_t> srv_free;
+  std::vector<std::pair<uint32_t, uint64_t>> retired_srv_slots;
   std::unordered_map<uint32_t, GuestTexture> textures;
   GuestTexture white;
   // Water environment CUBE maps (t6): separate cache; same guest object
@@ -3873,6 +4214,111 @@ struct RendererState {
 };
 
 RendererState g_r;
+
+// Allocate a guest-texture SRV slot, preferring the recycled free list.
+// Fixed/global slots (white, blur chain, MSAA, outline) keep the monotonic
+// allocator; they are never retired.
+bool AllocGuestSrvSlot(uint32_t& slot) {
+  if (!g_r.srv_free.empty()) {
+    slot = g_r.srv_free.back();
+    g_r.srv_free.pop_back();
+    return true;
+  }
+  if (g_r.srv_next >= 8192) {
+    return false;
+  }
+  slot = g_r.srv_next++;
+  return true;
+}
+
+// Retire a guest texture's GPU resources AND its SRV slot; everything waits
+// out `submission` before being freed/recycled.
+void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
+  if (t.texture) g_r.retired.emplace_back(t.texture, submission);
+  if (t.upload) g_r.retired.emplace_back(t.upload, submission);
+  if (t.valid) g_r.retired_srv_slots.emplace_back(t.srv_slot, submission);
+}
+
+// ---- Staged texture decode (worker-thread half) ---------------------------
+// The texture decoders normally finish by recording GPU copies into the
+// deferred command list, pushing a barrier and creating the SRV: all
+// render-thread-only. When `g_tex_stage_out` is set (decode worker), they
+// stop after filling the upload resource and export what the render-thread
+// commit needs instead. D3D12 resource creation and upload mapping are
+// free-threaded, so everything up to that point is safe off-thread.
+struct StagedMipCopy {
+  uint32_t offset, pitch, w, h;  // upload footprint per mip
+};
+struct StagedTexCommit {
+  DXGI_FORMAT copy_format = DXGI_FORMAT_UNKNOWN;
+  DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
+  UINT swizzle_mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  uint32_t mip_count = 0;
+  StagedMipCopy mips[16] = {};
+};
+thread_local StagedTexCommit* g_tex_stage_out = nullptr;
+
+// Render-thread half: record the staged upload's copies + barrier, create
+// the SRV, mark the texture live. On SRV-slot exhaustion the texture stays
+// invalid (renders white; slot recycling makes this near-impossible).
+void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
+                              GuestTexture& gt, const StagedTexCommit& sc) {
+  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+  for (uint32_t m = 0; m < sc.mip_count; ++m) {
+    const StagedMipCopy& p = sc.mips[m];
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = gt.texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = m;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = gt.upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = p.offset;
+    src.PlacedFootprint.Footprint.Format = sc.copy_format;
+    src.PlacedFootprint.Footprint.Width = p.w;
+    src.PlacedFootprint.Footprint.Height = p.h;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = p.pitch;
+    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
+  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                        gt.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  if (!AllocGuestSrvSlot(gt.srv_slot)) {
+    gt.valid = false;
+    return;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = sc.srv_format;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = sc.swizzle_mapping;
+  srv.Texture2D.MipLevels = sc.mip_count;
+  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+  slot.ptr += size_t(gt.srv_slot) * g_r.srv_size;
+  g_r.device->CreateShaderResourceView(gt.texture, &srv, slot);
+  gt.valid = true;
+}
+
+// Worker-pool result plumbing (see the prewarm queue globals above; these
+// live here because they need the resource/item types).
+struct StagedTexResult {
+  uint32_t key = 0;  // guest texture object address
+  GuestTexture gt;
+  StagedTexCommit commit;
+  bool valid = false;
+};
+struct PrewarmResult {
+  DrawItem item;
+  MeshBuffers buffers;
+  bool mesh_valid = false;
+  std::vector<StagedTexResult> textures;
+};
+std::mutex g_prewarm_out_mutex;
+std::vector<PrewarmResult> g_prewarm_out;
+// Failed builds (buffer objects not initialized yet) land here; the render
+// thread re-injects them each frame so retries are frame-paced instead of
+// hot-spinning the workers.
+std::vector<PrewarmEntry> g_prewarm_retry;  // under g_prewarm_out_mutex
 
 // Face-normal shading uses the camera-relative world position: interpolating
 // absolute world coordinates (hundreds of meters) destroys ddx/ddy precision
@@ -5417,47 +5863,60 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
   }
   out.upload->Unmap(0, nullptr);
 
-  auto* command_processor = context.d3d12.command_processor;
-  auto& list = command_processor->GetDeferredCommandList();
-  for (uint32_t m = 0; m < mip_count; ++m) {
-    const Plan& p = plans[m];
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = out.texture;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = m;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = out.upload;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = p.offset;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = p.w;
-    src.PlacedFootprint.Footprint.Height = p.h;
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = p.pitch;
-    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-  }
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  if (g_tex_stage_out != nullptr) {
+    // Decode worker: export the commit recipe; the render thread records
+    // the copies + barrier and creates the SRV (CommitStagedGuestTexture).
+    StagedTexCommit& sc = *g_tex_stage_out;
+    sc.copy_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sc.srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sc.swizzle_mapping =
+        ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+    sc.mip_count = std::min<uint32_t>(mip_count, 16);
+    for (uint32_t m = 0; m < sc.mip_count; ++m) {
+      sc.mips[m] = {plans[m].offset, plans[m].pitch, plans[m].w, plans[m].h};
+    }
+  } else {
+    auto* command_processor = context.d3d12.command_processor;
+    auto& list = command_processor->GetDeferredCommandList();
+    for (uint32_t m = 0; m < mip_count; ++m) {
+      const Plan& p = plans[m];
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = out.texture;
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = m;
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = out.upload;
+      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint.Offset = p.offset;
+      src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      src.PlacedFootprint.Footprint.Width = p.w;
+      src.PlacedFootprint.Footprint.Height = p.h;
+      src.PlacedFootprint.Footprint.Depth = 1;
+      src.PlacedFootprint.Footprint.RowPitch = p.pitch;
+      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-  if (g_r.srv_next >= 8192) {
-    return false;
+    if (!AllocGuestSrvSlot(out.srv_slot)) {
+      return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping =
+        ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+    srv.Texture2D.MipLevels = mip_count;
+    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+    slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
+    device->CreateShaderResourceView(out.texture, &srv, slot);
   }
-  out.srv_slot = g_r.srv_next++;
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-  srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srv.Shader4ComponentMapping =
-      ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
-  srv.Texture2D.MipLevels = mip_count;
-  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-  slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
-  device->CreateShaderResourceView(out.texture, &srv, slot);
   out.payload_addr = 0xA0000000u | info.memory.base_address;
   out.payload_size = size;
   out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
   out.recheck_frame = 0;
-  out.valid = true;
+  out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
   return true;
 }
 
@@ -5684,49 +6143,62 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   }
   out.upload->Unmap(0, nullptr);
 
-  // Record the upload copies into the deferred command list.
-  auto* command_processor = context.d3d12.command_processor;
-  auto& list = command_processor->GetDeferredCommandList();
-  for (uint32_t m = 0; m < mip_count; ++m) {
-    const MipPlan& p = plans[m];
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = out.texture;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = m;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = out.upload;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = p.offset;
-    src.PlacedFootprint.Footprint.Format = host.resource_format;
-    src.PlacedFootprint.Footprint.Width = std::max(host_width >> m, 1u);
-    src.PlacedFootprint.Footprint.Height = std::max(host_height >> m, 1u);
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = p.pitch;
-    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-  }
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  if (g_tex_stage_out != nullptr) {
+    // Decode worker: export the commit recipe; the render thread records
+    // the copies + barrier and creates the SRV (CommitStagedGuestTexture).
+    StagedTexCommit& sc = *g_tex_stage_out;
+    sc.copy_format = host.resource_format;
+    sc.srv_format = host.srv_format;
+    sc.swizzle_mapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
+    sc.mip_count = std::min<uint32_t>(mip_count, 16);
+    for (uint32_t m = 0; m < sc.mip_count; ++m) {
+      sc.mips[m] = {plans[m].offset, plans[m].pitch, std::max(host_width >> m, 1u),
+                    std::max(host_height >> m, 1u)};
+    }
+  } else {
+    // Record the upload copies into the deferred command list.
+    auto* command_processor = context.d3d12.command_processor;
+    auto& list = command_processor->GetDeferredCommandList();
+    for (uint32_t m = 0; m < mip_count; ++m) {
+      const MipPlan& p = plans[m];
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = out.texture;
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = m;
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = out.upload;
+      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint.Offset = p.offset;
+      src.PlacedFootprint.Footprint.Format = host.resource_format;
+      src.PlacedFootprint.Footprint.Width = std::max(host_width >> m, 1u);
+      src.PlacedFootprint.Footprint.Height = std::max(host_height >> m, 1u);
+      src.PlacedFootprint.Footprint.Depth = 1;
+      src.PlacedFootprint.Footprint.RowPitch = p.pitch;
+      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-  // SRV in the staging heap with the composed swizzle.
-  if (g_r.srv_next >= 8192) {
-    return false;
+    // SRV in the staging heap with the composed swizzle.
+    if (!AllocGuestSrvSlot(out.srv_slot)) {
+      return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = host.srv_format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
+    srv.Texture2D.MipLevels = mip_count;
+    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+    slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
+    device->CreateShaderResourceView(out.texture, &srv, slot);
   }
-  out.srv_slot = g_r.srv_next++;
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-  srv.Format = host.srv_format;
-  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
-  srv.Texture2D.MipLevels = mip_count;
-  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-  slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
-  device->CreateShaderResourceView(out.texture, &srv, slot);
   // Payload sample for content revalidation (see GuestTexture).
   out.payload_addr = 0xA0000000u | info.memory.base_address;
   out.payload_size = srcs[0].size;
   out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
   out.recheck_frame = 0;
-  out.valid = true;
+  out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
   return true;
 }
 
@@ -5885,10 +6357,9 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
                                         out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
                                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  if (g_r.srv_next >= 8192) {
+  if (!AllocGuestSrvSlot(out.srv_slot)) {
     return false;
   }
-  out.srv_slot = g_r.srv_next++;
   D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
   srv.Format = host.srv_format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
@@ -6914,6 +7385,389 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
+// ---- Warm decode (loading-screen prewarm + gameplay warmup) --------------
+// Decodes, within `deadline`, every GPU resource `item`'s draw would
+// resolve: the mesh VB/IB (with fingerprint revalidation) and each texture
+// slot its material binds. Mirrors the draw loop's miss paths, including
+// negative-caching of failed texture decodes and retiring replaced
+// resources, so the caches end up exactly as drawing would leave them and
+// the takeover frame has nothing left to pay. Work past the deadline counts
+// as deferred. Cached textures get ONE content revalidation per warmup
+// (recheck_frame gate; the frame counter is frozen while yielded): a
+// texture pre-decoded while its payload was still streaming in is healed
+// here, under budget, instead of by an unbudgeted re-decode burst on the
+// takeover frame.
+struct WarmCounters {
+  uint32_t decodes = 0;
+  uint32_t deferred = 0;
+};
+
+void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* base,
+                       uint64_t frame_number, const DrawItem& item,
+                       std::chrono::steady_clock::time_point deadline,
+                       WarmCounters& wc) {
+  auto* command_processor = context.d3d12.command_processor;
+  const auto within = [&] { return std::chrono::steady_clock::now() < deadline; };
+
+  bool need_mesh = false;
+  auto mit = g_r.meshes.find(item.mesh);
+  if (mit == g_r.meshes.end()) {
+    need_mesh = true;
+  } else if (mit->second.fingerprint != item.fingerprint &&
+             REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
+    // Streaming filled/replaced the payload after an earlier (pre)decode.
+    if (within()) {
+      const uint64_t submission = command_processor->GetCurrentSubmission();
+      g_r.retired.emplace_back(mit->second.vb, submission);
+      g_r.retired.emplace_back(mit->second.ib, submission);
+      g_r.meshes.erase(mit);
+      need_mesh = true;
+    } else {
+      ++wc.deferred;
+    }
+  }
+  if (need_mesh) {
+    if (!within()) {
+      ++wc.deferred;
+    } else {
+      ++wc.decodes;
+      MeshBuffers buffers;
+      if (DecodeMesh(g_r.device, base, item, buffers)) {
+        buffers.fingerprint = item.fingerprint;
+        g_r.meshes.emplace(item.mesh, buffers);
+      }
+      // Failures retry through the draw path (logged + counted there).
+    }
+  }
+
+  const auto warm_texture = [&](uint32_t tex_ptr) {
+    if (tex_ptr == 0) {
+      return;
+    }
+    auto it = g_r.textures.find(tex_ptr);
+    if (it != g_r.textures.end()) {
+      if (!it->second.valid || frame_number < it->second.recheck_frame ||
+          !REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
+        return;  // negative caches retry via the draw path's schedule
+      }
+      if (!within()) {
+        ++wc.deferred;
+        return;
+      }
+      it->second.recheck_frame = frame_number + 16;
+      const uint64_t fp = SamplePayloadFingerprint(base, it->second.payload_addr,
+                                                   it->second.payload_size);
+      if (fp == 0 || fp == it->second.payload_fp) {
+        return;
+      }
+      RetireGuestTexture(it->second, command_processor->GetCurrentSubmission());
+      g_r.textures.erase(it);
+    }
+    if (!within()) {
+      ++wc.deferred;
+      return;
+    }
+    ++wc.decodes;
+    GuestTexture gt;
+    EnsureGuestTexture(context, base, tex_ptr, gt);
+    if (!gt.valid) {
+      // Negative-cache exactly like the draw path so a permanently
+      // unreadable texture cannot hold warmup open. Guarded reads: a decode
+      // can fail precisely BECAUSE the object is unreadable right now (the
+      // prewarm sees objects mid-load); a raw re-read would fault.
+      if (gt.fetch_words[0] == 0 && gt.fetch_words[1] == 0) {
+        for (uint32_t k = 0; k < 6; ++k) {
+          uint32_t w = 0;
+          if (!GuestTryLoadU32(base, tex_ptr + (7 + k) * 4, &w)) {
+            break;
+          }
+          gt.fetch_words[k] = w;
+        }
+      }
+      gt.retry_after_frame = frame_number + 120;
+    }
+    g_r.textures.emplace(tex_ptr, gt);
+  };
+  // Draw-time fetch-word bindings (streamed artwork / decal ad overrides)
+  // share the words-keyed cache with the 2D pass.
+  const auto warm_fetch_words = [&](const uint32_t words[6]) {
+    if (words[1] == 0) {
+      return;
+    }
+    const uint64_t fkey = FetchWordsKey(words);
+    if (g_r.textures_2d.contains(fkey)) {
+      return;
+    }
+    if (!within()) {
+      ++wc.deferred;
+      return;
+    }
+    ++wc.decodes;
+    GuestTexture gt;
+    EnsureGuestTextureFromWords(context, base, words, gt);
+    g_r.textures_2d.emplace(fkey, gt);
+  };
+
+  warm_fetch_words(item.diffuse_fetch);
+  warm_texture(item.diffuse_tex);
+  if (REXCVAR_GET(skate3_native_render_scene_lightmaps)) {
+    warm_texture(item.lightmap_tex);
+  }
+  if (REXCVAR_GET(skate3_native_render_scene_macro)) {
+    warm_texture(item.macro_tex);
+  }
+  if (item.water || item.char_family >= 6) {
+    warm_texture(item.water_normal);
+  }
+  if (item.decal && REXCVAR_GET(skate3_native_render_scene_decals)) {
+    warm_texture(item.decal_art);
+    warm_fetch_words(item.decal_fetch);
+  }
+  if (item.char_family >= 4 && item.char_family <= 5) {
+    warm_texture(item.hair_alpha_tex);
+  }
+  if (item.env_family != 0 && !item.decal && item.env_family != 10) {
+    warm_texture(item.spec_tex);
+  }
+  // Environment cube (negative-cached like the draw path).
+  if ((item.water || item.char_family >= 6 ||
+       (item.env_family >= 5 && item.env_family <= 6)) &&
+      item.water_env != 0 && !g_r.cube_textures.contains(item.water_env)) {
+    if (!within()) {
+      ++wc.deferred;
+    } else {
+      ++wc.decodes;
+      GuestTexture c{};
+      if (!EnsureGuestCubeTexture(context, base, item.water_env, c)) {
+        if (c.upload) c.upload->Release();
+        if (c.texture) c.texture->Release();
+        c = GuestTexture{};
+        c.valid = false;
+      }
+      g_r.cube_textures.emplace(item.water_env, c);
+    }
+  }
+}
+
+// ---- Prewarm decode workers -----------------------------------------------
+// Process one registered mesh on a worker: build the item (same walk and
+// payload fingerprint as the capture, so cache entries are identical),
+// decode the mesh into upload-heap buffers, and stage every material
+// texture up to a filled upload resource. Results go to g_prewarm_out for
+// the render thread's commit.
+void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
+  uint8_t record[0x60];
+  DrawItem item{};
+  if (!GuestTryCopy(record, base + e.mesh, sizeof(record)) ||
+      !BuildItemFromMesh(base, e.mesh, item)) {
+    // Buffer objects can finish initializing shortly after registration;
+    // retries are re-injected frame-paced by the render thread.
+    std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
+    if (e.retries > 0) {
+      g_prewarm_retry.push_back({e.mesh, uint16_t(e.retries - 1)});
+    } else {
+      g_prewarm_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    return;
+  }
+  // One representative draw entry so DecodeMesh's two-sided-sheet detection
+  // keys off the real primitive type (empty draw lists would pass it
+  // unconditionally). Guarded: island params live outside the validated
+  // mesh record.
+  const uint32_t num_islands = REX_LOAD_U32(e.mesh + 0x38);
+  const uint32_t island_params = REX_LOAD_U32(e.mesh + 0x44);
+  uint32_t prim0 = 0;
+  if (num_islands != 0 && num_islands < 4096 &&
+      GuestTryLoadU32(base, island_params, &prim0)) {
+    item.draws.push_back(DrawEntry{prim0, 0, 0, item.ib_count});
+  }
+
+  PrewarmResult res;
+  res.mesh_valid = DecodeMesh(g_r.device, base, item, res.buffers);
+  if (res.mesh_valid) {
+    res.buffers.fingerprint = item.fingerprint;
+  }
+
+  // Stage the material textures (cube maps stay on the render thread:
+  // rare, and their decode has its own path). Dedupe through the shared
+  // per-load set: workers cannot read the render thread's g_r caches, so a
+  // texture cached from a previous map decodes once more per load; the
+  // commit discards the duplicate.
+  const auto stage_texture = [&](uint32_t tex_ptr) {
+    if (tex_ptr == 0) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+      if (!g_prewarm_tex_seen.insert(tex_ptr).second) {
+        return;
+      }
+    }
+    StagedTexResult tr;
+    tr.key = tex_ptr;
+    // Staged mode uses only context.d3d12.device (copies/barrier/SRV are
+    // exported for the commit), so a device-only context suffices.
+    NativeGuestOutputRenderContext stage_ctx{};
+    stage_ctx.backend = NativeGuestOutputBackend::kD3D12;
+    stage_ctx.d3d12.device = g_r.device;
+    g_tex_stage_out = &tr.commit;
+    tr.valid = EnsureGuestTexture(stage_ctx, base, tex_ptr, tr.gt);
+    g_tex_stage_out = nullptr;
+    if (!tr.valid && tr.gt.fetch_words[0] == 0 && tr.gt.fetch_words[1] == 0) {
+      for (uint32_t k = 0; k < 6; ++k) {
+        uint32_t w = 0;
+        if (!GuestTryLoadU32(base, tex_ptr + (7 + k) * 4, &w)) {
+          break;
+        }
+        tr.gt.fetch_words[k] = w;
+      }
+    }
+    res.textures.push_back(std::move(tr));
+  };
+  stage_texture(item.diffuse_tex);
+  if (REXCVAR_GET(skate3_native_render_scene_lightmaps)) {
+    stage_texture(item.lightmap_tex);
+  }
+  if (REXCVAR_GET(skate3_native_render_scene_macro)) {
+    stage_texture(item.macro_tex);
+  }
+  if (item.water || item.char_family >= 6) {
+    stage_texture(item.water_normal);
+  }
+  if (item.decal && REXCVAR_GET(skate3_native_render_scene_decals)) {
+    stage_texture(item.decal_art);
+  }
+  if (item.char_family >= 4 && item.char_family <= 5) {
+    stage_texture(item.hair_alpha_tex);
+  }
+  if (item.env_family != 0 && !item.decal && item.env_family != 10) {
+    stage_texture(item.spec_tex);
+  }
+
+  res.item = std::move(item);
+  std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
+  g_prewarm_out.push_back(std::move(res));
+}
+
+void PrewarmWorkerLoop() {
+#if defined(_WIN32)
+  // Below-normal priority: the workers flood in exactly when the guest's
+  // single-threaded world ACTIVATION runs (registration is the final load
+  // phase), and at normal priority they stretch the game's own black
+  // window at the loading->gameplay boundary. At below-normal they only
+  // soak idle cores and the guest always wins the contention.
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+  for (;;) {
+    if (!SceneEnabled()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    }
+    PrewarmEntry e{};
+    {
+      std::unique_lock<std::mutex> lock(g_prewarm_mutex);
+      g_prewarm_cv.wait_for(lock, std::chrono::milliseconds(500),
+                            [] { return !g_prewarm_queue.empty(); });
+      if (g_prewarm_queue.empty()) {
+        continue;
+      }
+      e = g_prewarm_queue.back();
+      g_prewarm_queue.pop_back();
+    }
+    uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
+    if (base == nullptr || g_r.device == nullptr) {
+      std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
+      g_prewarm_retry.push_back(e);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+    ProcessPrewarmEntry(base, e);
+  }
+}
+
+// Lazily start the decode workers (process-lifetime, parked on the queue's
+// condition variable when idle). Only started once the pipeline exists;
+// the workers create D3D12 resources through g_r.device.
+void EnsurePrewarmWorkers() {
+  if (g_r.device == nullptr ||
+      g_prewarm_workers_started.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  const unsigned hw = std::max(4u, std::thread::hardware_concurrency());
+  const unsigned n = std::clamp(hw / 4u, 2u, 4u);
+  for (unsigned i = 0; i < n; ++i) {
+    std::thread(PrewarmWorkerLoop).detach();
+  }
+  REXLOG_INFO("native-scene: {} prewarm decode workers started", n);
+}
+
+// Render-thread commit of the workers' results: record GPU copies +
+// barriers, create SRVs, insert into the caches, re-inject retries.
+// Microseconds per item, safe to run every frame (loading, settle and
+// gameplay alike).
+void PrewarmCommit(const NativeGuestOutputRenderContext& context,
+                   uint64_t frame_number) {
+  {
+    std::scoped_lock lock(g_prewarm_out_mutex, g_prewarm_mutex);
+    if (!g_prewarm_retry.empty()) {
+      g_prewarm_queue.insert(g_prewarm_queue.end(), g_prewarm_retry.begin(),
+                             g_prewarm_retry.end());
+      g_prewarm_retry.clear();
+      g_prewarm_cv.notify_all();
+    }
+  }
+  std::vector<PrewarmResult> done;
+  {
+    std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
+    // Soft cap per frame: during the activation burst the workers can
+    // complete hundreds of items between two refreshes, and committing
+    // them all at once records thousands of copies + SRVs into a single
+    // frame. The remainder commits next frame (a few ms later).
+    constexpr size_t kMaxCommitPerFrame = 256;
+    if (g_prewarm_out.size() <= kMaxCommitPerFrame) {
+      done.swap(g_prewarm_out);
+    } else {
+      done.assign(std::make_move_iterator(g_prewarm_out.end() - kMaxCommitPerFrame),
+                  std::make_move_iterator(g_prewarm_out.end()));
+      g_prewarm_out.resize(g_prewarm_out.size() - kMaxCommitPerFrame);
+    }
+  }
+  if (done.empty()) {
+    return;
+  }
+  bool committed_tex = false;
+  for (PrewarmResult& r : done) {
+    if (r.mesh_valid) {
+      if (g_r.meshes.contains(r.item.mesh)) {
+        // Lost the race against the draw path / an earlier result: the
+        // staged buffers were never referenced by any submission.
+        r.buffers.vb->Release();
+        r.buffers.ib->Release();
+      } else {
+        g_r.meshes.emplace(r.item.mesh, r.buffers);
+      }
+    }
+    for (StagedTexResult& t : r.textures) {
+      if (g_r.textures.contains(t.key)) {
+        if (t.gt.texture) t.gt.texture->Release();
+        if (t.gt.upload) t.gt.upload->Release();
+        continue;
+      }
+      if (t.valid) {
+        CommitStagedGuestTexture(context, t.gt, t.commit);
+        committed_tex = true;
+      } else {
+        t.gt.retry_after_frame = frame_number + 120;
+      }
+      g_r.textures.emplace(t.key, t.gt);
+    }
+    g_prewarm_done.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (committed_tex) {
+    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  }
+}
+
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
   if (!SceneEnabled() || context.backend != NativeGuestOutputBackend::kD3D12) {
     return false;
@@ -6928,11 +7782,59 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
     if (in_menus != s_in_menus) {
       s_in_menus = in_menus;
-      REXLOG_INFO("native-scene: {} (presence context)",
-                  in_menus ? "menus/pause - yielding to emulated output"
-                           : "gameplay - rendering natively");
+      if (in_menus) {
+        REXLOG_INFO(
+            "native-scene: menus/pause/loading - yielding to emulated output "
+            "(presence context)");
+        // Arena addresses are reused across map loads; let the next load's
+        // registrations re-queue meshes (and re-stage textures) at reused
+        // addresses.
+        std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+        g_prewarm_seen.clear();
+        g_prewarm_tex_seen.clear();
+      } else {
+        size_t queued = 0;
+        {
+          std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+          queued = g_prewarm_queue.size();
+        }
+        REXLOG_INFO(
+            "native-scene: gameplay (prewarm: {} meshes decoded, {} dropped, {} still "
+            "queued)",
+            g_prewarm_done.load(std::memory_order_relaxed),
+            g_prewarm_dropped.load(std::memory_order_relaxed), queued);
+      }
     }
     if (in_menus) {
+      // Re-arm the takeover gate for the next stretch of gameplay (map
+      // load, unpause).
+      g_warmup_armed.store(true, std::memory_order_relaxed);
+      {
+        // Freshness gate: only scenes published AFTER this point qualify;
+        // g_scene still holds the previous map's last scene all through the
+        // loading screen (BuildFrameScene stops publishing without a
+        // perspective view).
+        std::lock_guard<std::mutex> lock(g_scene_mutex);
+        g_warmup_fresh_generation = g_scene.generation + 1;
+      }
+      // Build the pipelines / render targets behind the loading screen so
+      // the one-time PSO compilation (~200 ms) never lands on a gameplay
+      // frame.
+      if (!g_r.failed && g_r.pso == nullptr) {
+        EnsurePipeline(context);
+      }
+      // THE loading-screen heavy lifting runs on the prewarm decode WORKER
+      // POOL (a serial render-thread drain both tanked the loading spinner
+      // to ~13 fps and still left 1500 of a map's ~2600 meshes undecoded at
+      // takeover; map-change loads register most of the world in their
+      // final seconds and drop the guest to 10-25 fps while doing it).
+      // Here the render thread only commits finished results: record the
+      // GPU copies, create SRVs, insert into the caches.
+      if (REXCVAR_GET(skate3_native_render_scene_prewarm_budget_ms) > 0 &&
+          !g_r.failed && g_r.pso != nullptr) {
+        EnsurePrewarmWorkers();
+        PrewarmCommit(context, g_frames_rendered.load(std::memory_order_relaxed));
+      }
       return false;
     }
   }
@@ -6956,21 +7858,23 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // Flush any barriers pushed by lazy resource creation (white texture).
   context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
 
-  if (!g_r.announced) {
-    g_r.announced = true;
-    REXLOG_INFO("native-scene: rendering natively ({} items, {}x{})", scene.items.size(),
-                context.guest_output_width, context.guest_output_height);
-  }
-
   auto* command_processor = context.d3d12.command_processor;
   auto& list = command_processor->GetDeferredCommandList();
 
-  // Free retired buffers whose last-referencing submission has completed.
-  if (!g_r.retired.empty()) {
+  // Free retired buffers (and recycle retired SRV slots) whose
+  // last-referencing submission has completed.
+  if (!g_r.retired.empty() || !g_r.retired_srv_slots.empty()) {
     const uint64_t completed = command_processor->GetCompletedSubmission();
     std::erase_if(g_r.retired, [completed](const auto& entry) {
       if (entry.second < completed) {
         entry.first->Release();
+        return true;
+      }
+      return false;
+    });
+    std::erase_if(g_r.retired_srv_slots, [completed](const auto& entry) {
+      if (entry.second < completed) {
+        g_r.srv_free.push_back(entry.first);
         return true;
       }
       return false;
@@ -6983,13 +7887,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (g_flush_textures.exchange(false, std::memory_order_relaxed)) {
     const uint64_t submission = command_processor->GetCurrentSubmission();
     for (auto& [key, t] : g_r.textures) {
-      if (t.texture) g_r.retired.emplace_back(t.texture, submission);
-      if (t.upload) g_r.retired.emplace_back(t.upload, submission);
+      RetireGuestTexture(t, submission);
     }
     g_r.textures.clear();
     for (auto& [key, t] : g_r.textures_2d) {
-      if (t.texture) g_r.retired.emplace_back(t.texture, submission);
-      if (t.upload) g_r.retired.emplace_back(t.upload, submission);
+      RetireGuestTexture(t, submission);
     }
     g_r.textures_2d.clear();
     REXLOG_INFO("native-scene: texture cache flushed (debug dialog)");
@@ -7011,6 +7913,75 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       uint32_t(frame_number % RendererState::kBoneRegions) *
       RendererState::kBoneRegionSize;
   g_r.bone_ring_offset = 0;
+
+  // ---- Loading -> gameplay takeover (seamless boot / map-change loads) ----
+  // The loading-screen prewarm (menus branch above) already decoded the
+  // registered world behind the load; the FIRST substantial post-load scene
+  // renders natively right away. Gates kept: staleness (g_scene holds the
+  // PREVIOUS map's scene through the whole load; rendering it shows
+  // old-map garbage) and min items (the capture holds a near-empty scene
+  // for a few frames while the game fades in; taking over there shows a
+  // black/void world; the brief yield shows the game's own fade instead).
+  // The frames after takeover run a budgeted settle pass for whatever
+  // prewarm missed (dynamic entities, late textures), and the draw path's
+  // miss budgets are clamped while settling so leftovers render white/skip
+  // for a frame instead of freezing the takeover frame.
+  const int32_t warmup_ms = REXCVAR_GET(skate3_native_render_scene_warmup_budget_ms);
+  bool settling = false;
+  if (warmup_ms > 0 && REXCVAR_GET(skate3_native_render_scene_debug) == 0) {
+    if (g_warmup_armed.load(std::memory_order_relaxed)) {
+      if (scene.generation < g_warmup_fresh_generation ||
+          scene.items.size() <
+              size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items))) {
+        // Stale or fade-in scene: yield (brief, a few frames). Keep
+        // committing worker results meanwhile; every pre-takeover frame
+        // counts on map changes.
+        PrewarmCommit(context, frame_number);
+        return false;
+      }
+      g_warmup_armed.store(false, std::memory_order_relaxed);
+      g_settle_until_frame = frame_number + 120;
+      size_t queued = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+        queued = g_prewarm_queue.size();
+      }
+      REXLOG_INFO(
+          "native-scene: taking over natively ({} items; prewarm {} done / {} dropped "
+          "/ {} queued)",
+          scene.items.size(), g_prewarm_done.load(std::memory_order_relaxed),
+          g_prewarm_dropped.load(std::memory_order_relaxed), queued);
+    }
+    settling = frame_number < g_settle_until_frame;
+    if (settling) {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(warmup_ms);
+      WarmCounters wc;
+      for (const DrawItem& item : scene.items) {
+        WarmItemResources(context, base, frame_number, item, deadline, wc);
+      }
+      if (wc.deferred != 0) {
+        // Still behind: keep the settle pass (and the draw-path budget
+        // clamp) alive until a frame clears with budget to spare.
+        g_settle_until_frame =
+            std::max<uint64_t>(g_settle_until_frame, frame_number + 8);
+      }
+      if (wc.decodes > 0) {
+        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      }
+    }
+  }
+
+  if (!g_r.announced) {
+    g_r.announced = true;
+    REXLOG_INFO("native-scene: rendering natively ({} items, {}x{})", scene.items.size(),
+                context.guest_output_width, context.guest_output_height);
+  }
+
+  // Commit finished worker decodes every frame (streamed arenas decode on
+  // the workers before their first draw instead of hitching the first frame
+  // that sees them). Near-no-op when nothing completed.
+  PrewarmCommit(context, frame_number);
 
   // ---- Dynamic-shadow atlas pass ----
   // Renders the frame's dynamic casters (skinned characters + rigid
@@ -7345,8 +8316,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // CreateCommittedResource on the render thread; unbounded, that is a
   // visible hitch. Over-budget work is deferred; at native frame rates the
   // pop-in lasts a few tens of milliseconds.
-  const int32_t mesh_budget = REXCVAR_GET(skate3_native_render_scene_mesh_decode_budget);
-  const int32_t tex_budget = REXCVAR_GET(skate3_native_render_scene_texture_decode_budget);
+  int32_t mesh_budget = REXCVAR_GET(skate3_native_render_scene_mesh_decode_budget);
+  int32_t tex_budget = REXCVAR_GET(skate3_native_render_scene_texture_decode_budget);
+  if (settling) {
+    // Post-takeover settle window: the settle pass above is still working
+    // through the backlog under its time budget; cap the draw path's own
+    // misses too, so anything it did not reach renders white/skips for a
+    // frame instead of freezing the takeover frame with an unbounded
+    // decode burst.
+    if (mesh_budget == 0 || mesh_budget > 16) mesh_budget = 16;
+    if (tex_budget == 0 || tex_budget > 8) tex_budget = 8;
+  }
   uint32_t mesh_decodes = 0;
   uint32_t tex_decodes = 0;
   // Item drawing body. environment.decal items draw in the same opaque pass:
@@ -7379,9 +8359,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       const uint64_t fp = SamplePayloadFingerprint(base, it->second.payload_addr,
                                                    it->second.payload_size);
       if (fp != 0 && fp != it->second.payload_fp) {
-        const uint64_t submission = command_processor->GetCurrentSubmission();
-        if (it->second.texture) g_r.retired.emplace_back(it->second.texture, submission);
-        if (it->second.upload) g_r.retired.emplace_back(it->second.upload, submission);
+        RetireGuestTexture(it->second, command_processor->GetCurrentSubmission());
         g_r.textures_2d.erase(it);
         it = g_r.textures_2d.end();
       }
@@ -7392,11 +8370,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // binding with no guest texture object) through the words-keyed cache.
   // Returns null when the words fail to decode.
   const auto resolve_fetch_words = [&](const uint32_t words[6]) -> const GuestTexture* {
-    uint64_t fkey = 1469598103934665603ull;
-    for (int k = 0; k < 6; ++k) {
-      fkey ^= words[k];
-      fkey *= 1099511628211ull;
-    }
+    const uint64_t fkey = FetchWordsKey(words);
     auto fit = find_words_texture(fkey);
     if (fit == g_r.textures_2d.end()) {
       GuestTexture gt;
@@ -7510,9 +8484,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                 tit->second.fetch_words[5], live[0], live[1], live[2], live[3], live[4],
                 live[5]);
           }
-          const uint64_t submission = command_processor->GetCurrentSubmission();
-          if (tit->second.texture) g_r.retired.emplace_back(tit->second.texture, submission);
-          if (tit->second.upload) g_r.retired.emplace_back(tit->second.upload, submission);
+          RetireGuestTexture(tit->second, command_processor->GetCurrentSubmission());
           g_r.textures.erase(tit);
           tit = g_r.textures.end();
         }
