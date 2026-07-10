@@ -6107,13 +6107,19 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
 // Native CSM atlas sample at a world position: finest covering cascade,
 // s = saturate(infront + 1 - coverage). Returns 1 (lit) when uncovered or
 // shadows are off. extra_bias suppresses receiver self-shadow acne on
-// surfaces that are themselves casters (characters, held board).
+// surfaces that are themselves casters (characters, held board). A NEGATIVE
+// extra_bias selects the game's dynamicobject receive bias instead: a
+// per-cascade literal 0.007 (finest) / 0.015 (outer) replacing sh_misc.x
+// (from the dynamicobject_defaultPS ucode). Props
+// are casters themselves, and with only the world bias (c5.x = 0 in every
+// capture) their flat tops compared against their own atlas depth; the
+// lit/dark whole-surface flicker on benches, signs and sails as the
+// camera-following cascades drifted frame to frame.
 float SampleCsmShadow(float3 wp, float extra_bias) {
   if (sh_misc.y <= 0.0) {
     return 1.0;
   }
   float2 lsv = float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
-  float rd = dot(sh_z.xyz, wp) + sh_z.w - sh_misc.x - extra_bias;
   float2 luv = 0.0;
   float casc = 0.0;
   float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
@@ -6124,6 +6130,9 @@ float SampleCsmShadow(float3 wp, float extra_bias) {
   if (casc <= 0.0) {
     return 1.0;
   }
+  float bias = extra_bias < 0.0 ? (casc > 1.5 ? 0.015 : 0.007)
+                                : sh_misc.x + extra_bias;
+  float rd = dot(sh_z.xyz, wp) + sh_z.w - bias;
   float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
                       luv.y * -0.5 + 0.5);
   float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
@@ -6171,8 +6180,10 @@ float4 ps_main(VSOut i) : SV_Target {
     float bounce = saturate(dot(n, float3(-dyn_sun.x, dyn_sun.y, -dyn_sun.z)));
     // CSM shadow (shared receiver rows at t5); the static world-shadow map is
     // not rendered natively, so its term is 1 and the min collapses to the
-    // CSM (bounded below by the c8.w floor, dyn_misc.y).
-    float s = SampleCsmShadow(i.rpos + cam_pos.xyz, 0.0);
+    // CSM (bounded below by the c8.w floor, dyn_misc.y). extra_bias -1 =
+    // the game's own per-cascade dynamicobject receive bias (props are
+    // casters; without it their flat tops self-shadow and flicker).
+    float s = SampleCsmShadow(i.rpos + cam_pos.xyz, -1.0);
     float shadow = min(s * (ndl >= 0.0 ? 1.0 : 0.0), max(1.0, dyn_misc.y));
     float3 lighting = key * shadow + bounce * dyn_amb.w + dyn_amb.rgb;
     // GetTangentLight with the neutral (flat) normal map: 0.39 * 2.39562.
@@ -7294,7 +7305,24 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
           }
         }
       }
-      two_sided = twins * 10 >= tris.size() * 6;
+      // Fully twinned sheets (banners ~100%), OR a meaningful twin patch
+      // inside a larger single-sided mesh (harbor sailboats: the twinned
+      // SAIL rides a hull/mast mesh at 4-8% twins; the coincident copies
+      // sit below far-field depth precision and z-fight into per-frame
+      // lit/dark shimmer at range). The twins themselves are the evidence
+      // the mesh was authored for culling-on; coincident opposite-normal
+      // copies would z-fight on console too, so cull the whole mesh.
+      // EXCEPT alpha-tested foliage (tree fams 9/10, envsimple.alphatest 7,
+      // alphatest dynobj, transparent, and unclassified fam 0): a z-fight
+      // between twinned leaf cards is invisible through the alpha test, so
+      // twins do NOT prove culling-on there; culling stripped every
+      // single-sided leaf/branch card seen from its back (the missing-
+      // foliage regression). Those keep the strict fully-twinned rule.
+      const bool partial_rule_ok =
+          !item.transparent && item.dynobj != 2 && item.env_family != 0 &&
+          item.env_family != 7 && item.env_family != 9 && item.env_family != 10;
+      two_sided = twins * 10 >= tris.size() * 6 ||
+                  (partial_rule_ok && twins >= 12 && twins * 33 >= tris.size());
       if (two_sided) {
         static std::atomic<uint32_t> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -9641,6 +9669,13 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         if (same_content || (!t.valid && tit->second.valid)) {
           // The cached decode is as good or better ("keep the old decode
           // when the payload became unreadable": mips stream out at range).
+          // A FAILED fresh decode backs the surviving entry's retry clock
+          // off (+30): the payload usually stays unreadable for a while
+          // (mid-stream upload), and the un-throttled loop re-queued a
+          // doomed decode every 4 frames for its whole duration.
+          if (!t.valid) {
+            tit->second.retry_after_frame = frame_number + 30;
+          }
           if (t.gt.texture) t.gt.texture->Release();
           if (t.gt.upload) t.gt.upload->Release();
           continue;
@@ -10414,8 +10449,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               base, tit->second.payload_addr, tit->second.payload_size);
           payload_changed = fp != 0 && fp != tit->second.payload_fp;
         }
+        // words_changed re-decodes are throttled by retry_after_frame on the
+        // VALID entry (retry_failed already gates invalid ones): streaming
+        // mip oscillation (words flapping A<->B for seconds, see the banner
+        // churn logs) re-detected the mismatch EVERY frame while a heal was
+        // already in flight or failing: thousands of queued decodes and log
+        // spam that delayed the legitimate heal and stretched the visible
+        // stale-art window.
         const bool words_changed =
-            std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0;
+            std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0 &&
+            (!tit->second.valid || frame_number >= tit->second.retry_after_frame);
         if (retry_failed || payload_changed || words_changed) {
           // Re-decode churn diagnostic: repeated fetch-word or payload
           // changes on one object = streaming oscillation, visible as
@@ -10440,6 +10483,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           EnqueueTexMiss(tex_ptr);
           if (retry_failed) {
             tit->second.retry_after_frame = frame_number + 120;
+          } else {
+            // Valid entry heal in flight: next retry no sooner than +4
+            // frames (a worker round trip is 1-3); the commit pushes this
+            // further out (+30) when the fresh decode failed.
+            tit->second.retry_after_frame = frame_number + 4;
           }
         }
       }
