@@ -8,6 +8,17 @@
 #include <string>
 #include <string_view>
 
+// NVIDIA Optimus / AMD PowerXpress discrete-GPU opt-in. The drivers only read
+// these from the executable's export table; the copies in rexruntime.dll are
+// invisible to them, which left hybrid-graphics laptops rendering on the
+// integrated GPU. They must live here, in the exe image itself.
+#if defined(_WIN32)
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) unsigned long AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
+
 class Skate3PureApp : public Skate3BaseApp {
  public:
   using Skate3BaseApp::Skate3BaseApp;
