@@ -377,6 +377,17 @@ void OnFrameEnd(uint8_t* base) {
     }
     f10_was_down = f10_down;
   }
+  // P: cycle the synthetic camera pan probe (judder isolation: a host-
+  // driven constant-rate pan injected at a selectable pipeline stage; see
+  // the skate3_native_render_scene_synthetic_pan cvar).
+  {
+    static bool p_was_down = false;
+    const bool p_down = (GetAsyncKeyState('P') & 0x8000) != 0;
+    if (p_down && !p_was_down) {
+      skate3::native_scene::CycleSyntheticPan();
+    }
+    p_was_down = p_down;
+  }
   // F11: paired A/B parity capture; one keypress produces
   // shot_<ts>_native.png + shot_<ts>_emulated.png (same viewpoint, ~half a
   // second apart while the renderer toggles) + an immediate F10-style

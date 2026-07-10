@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -174,6 +175,49 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_smooth_camera, true, "Skate 3",
                     "sim-interval behind (a few ms of added camera latency, no "
                     "overshoot). Teleports/cuts snap.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(
+    skate3_native_render_scene_smooth_camera_filter_ms, 50.0, "Skate 3",
+    "Boxcar filter window (ms) applied to the smoothed camera pose, centered "
+    "on the playback point. The game's camera pose VALUES advance in 60 "
+    "Hz-quantized lumps at high render rates (measured: +-2.2 deg off a "
+    "constant-rate stick pan, velocity CV 0.84); 50 ms = three 60 Hz "
+    "periods nulls the quantization at any render rate (measured 185 -> 7 "
+    "deg/s rms frame-to-frame velocity jitter) for ~25 ms extra camera "
+    "latency. 0 = off (raw sample interpolation).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Synthetic camera pan: a judder-isolation probe, not a feature. Replaces
+// the camera with a host-generated constant-rate horizontal pan so each
+// pipeline stage can be judged against a mathematically smooth ground truth
+// (the guest's own camera path is irregular; smooth output can never be
+// eyeballed against it). Modes pick the injection stage:
+//   1 = time-based: pose is a pure function of the host clock at scene-build
+//       time, bypassing guest pose sampling AND the smoother entirely. Still
+//       judders => the fault is downstream (frame pacing / present / display).
+//   2 = fixed-step: pose advances a constant angle per PUBLISHED FRAME
+//       (ignores time). Smooth only if displayed frames appear at even
+//       intervals, the complement of mode 1 (irregular pacing that mode 1's
+//       time base compensates for shows up here, and vice versa).
+//   3 = through-smoother: the ~1 kHz sampler thread synthesizes guest-like
+//       pose samples (~200 Hz, deliberately irregular) and the normal
+//       SmoothCamera reconstruction runs on them; reconstruction error vs
+//       the known ideal is measured numerically (err_deg in the log line).
+//       Judders here but not in mode 1 => the smoother is at fault.
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_synthetic_pan, 0, "Skate 3",
+                     "Synthetic constant-rate camera pan (judder isolation): 0 = off, "
+                     "1 = time-based at scene build, 2 = fixed angle step per frame, "
+                     "3 = synthetic samples through the camera smoother. Hotkey P "
+                     "cycles the modes.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_synthetic_pan_rate, 90.0, "Skate 3",
+                      "Synthetic pan rate in degrees/second")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_synthetic_pan_amp, 0.0, "Skate 3",
+                      "Synthetic pan amplitude in degrees: 0 = continuous full 360 "
+                      "rotation (sweep the REAL camera around once with the stick "
+                      "after engaging; the probe accumulates a union of every static "
+                      "item the game submits, filling in the full surround); > 0 = "
+                      "triangle-wave +-amp around the engage heading.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_sort_opaque, true, "Skate 3",
                     "Draw opaque scene items front-to-back (bbox-center camera "
                     "distance). Early-z rejects occluded pixels before the heavy "
@@ -221,6 +265,62 @@ uint64_t g_generation = 0;
 // instead of only for newly streamed content.
 std::atomic<bool> g_flush_textures{false};
 std::atomic<bool> g_flush_meshes{false};
+
+// ---- Camera-signal recorder (judder diagnosis) -----------------------------
+// Records the guest camera SIGNAL during a real stick pan: every distinct
+// pose the ~1 kHz sampler accepts (kind 0, precise host timestamps), the raw
+// per-frame pose at scene build (kind 2) and the smoother's output (kind 1,
+// with its playback time). Written as logs/cam_signal_<ts>.csv when the
+// window closes; offline analysis computes tick-by-tick angular velocity to
+// show whether the game's own pose sequence is irregular at the source
+// (interpolation faithfully reproduces jerky inputs; the synthetic-pan probe
+// already exonerated everything downstream).
+struct CamSigEntry {
+  double t;       // host time (sampler push / frame build)
+  double play_t;  // kind 1 only: the smoother's playback time
+  float yaw;      // heading, degrees
+  uint8_t kind;   // 0 = raw sampler pose, 1 = smoothed frame, 2 = raw frame
+};
+std::mutex g_camsig_mutex;
+std::vector<CamSigEntry> g_camsig;
+std::atomic<double> g_camsig_deadline{0.0};  // record until this host time
+
+// Heading from a row-vector view matrix: camera forward in world space is
+// the view rotation's third column (v[2], v[6], v[10]).
+float YawFromViewRows(const float view[16]) {
+  return std::atan2(view[2], view[10]) * float(180.0 / 3.14159265358979323846);
+}
+
+// ---- Bone-signal recorder (wheel-guard diagnosis) --------------------------
+// Records the raw per-entity pose stream (every ring push: bone palettes /
+// rigid worlds with timestamps, kind 0) plus what the interpolation actually
+// output each frame (kind 1, with the playback time) to
+// logs/bone_signal_<ts>.bin. Offline analysis replays candidate filter/guard
+// strategies against the REAL board data and scores wheel-vs-deck lag/orbit
+// numerically before anything ships (the cam_signal playbook). Binary
+// records after a "BSIG1\n" header: u8 kind, u64 key, f64 t, f64 play,
+// u32 n, float[n]. Guest render thread only (written off-thread at close).
+std::vector<uint8_t> g_bonesig;
+std::atomic<double> g_bonesig_deadline{0.0};
+// Armed from the UI thread (F12 button), consumed on the guest thread; the
+// blob itself is guest-thread-only.
+std::atomic<double> g_bonesig_request{0.0};
+
+void BoneSigAppend(uint8_t kind, uint64_t key, double t, double play, const float* v,
+                   uint32_t n) {
+  if (g_bonesig.size() > (200u << 20)) {
+    return;  // runaway cap
+  }
+  const size_t off = g_bonesig.size();
+  g_bonesig.resize(off + 29 + size_t(n) * 4);
+  uint8_t* p = g_bonesig.data() + off;
+  *p = kind;
+  std::memcpy(p + 1, &key, 8);
+  std::memcpy(p + 9, &t, 8);
+  std::memcpy(p + 17, &play, 8);
+  std::memcpy(p + 25, &n, 4);
+  std::memcpy(p + 29, v, size_t(n) * 4);
+}
 std::atomic<uint8_t*> g_guest_base{nullptr};
 std::atomic<uint64_t> g_frames_rendered{0};
 
@@ -464,6 +564,26 @@ std::atomic<uint64_t> g_char_rows_reused{0};
 // clones share meshes with per-instance poses. Guest-render-thread only.
 std::unordered_map<uint32_t, std::vector<float>> g_bones_cache;
 std::atomic<uint64_t> g_bones_rescued{0};
+// mesh -> last RESOLVED ropa garment state (rigid world OR skinned palette).
+// Ropa items must NOT ride the g_bones_cache rescue above: a ropa capture is
+// refused exactly when the bank is stale (g_ropa_stale), and while the cloth
+// sim is ACTIVE the VB holds sim-deformed root-local positions; skinning
+// those with a cached palette is the mangled-ribbon interpretation (verified
+// 0/31 in-clip; on-screen as map-length stretched strips, with matching
+// shadows since the caster pass shares the item). And with no rescue at all
+// a refused frame drops the garment (the momentary invisible torso). The
+// dyn decode workers already keep the drawn cloth VB one frame behind the
+// sim, so re-publishing last frame's resolved MODE + transform is exactly
+// age-consistent with the vertices being drawn. Single-instance meshes only,
+// like g_bones_cache; clones share meshes with per-instance transforms.
+// Guest-render-thread only.
+struct RopaResolvedState {
+  bool skinned = false;
+  float world[16] = {};
+  std::vector<float> bones;
+};
+std::unordered_map<uint32_t, RopaResolvedState> g_ropa_state_cache;
+std::atomic<uint64_t> g_ropa_rescued{0};
 std::atomic<uint32_t> g_cur_ib{0};
 std::atomic<uint32_t> g_cur_vb{0};
 std::atomic<uint32_t> g_cur_vb_offset{0};
@@ -1809,6 +1929,42 @@ bool Enabled() { return SceneEnabled(); }
 void FlushTextureCache() { g_flush_textures.store(true, std::memory_order_relaxed); }
 void FlushMeshCache() { g_flush_meshes.store(true, std::memory_order_relaxed); }
 
+int CycleSyntheticPan() {
+  const int mode =
+      (std::clamp(int(REXCVAR_GET(skate3_native_render_scene_synthetic_pan)), 0, 3) + 1) %
+      4;
+  REXCVAR_SET(skate3_native_render_scene_synthetic_pan, mode);
+  static const char* kModeNames[] = {"off", "time-based (host clock at scene build)",
+                                     "fixed angle step per frame",
+                                     "synthetic samples through the smoother"};
+  REXLOG_INFO("native-scene synthetic-pan: hotkey -> mode {} ({})", mode,
+              kModeNames[mode]);
+  return mode;
+}
+
+void RecordBoneSignal(double seconds) {
+  g_bonesig_request.store(seconds, std::memory_order_release);
+  REXLOG_INFO(
+      "native-scene bone-signal: recording {} s; skate past the camera at a steady "
+      "speed NOW",
+      seconds);
+}
+
+void RecordCameraSignal(double seconds) {
+  {
+    std::lock_guard<std::mutex> lock(g_camsig_mutex);
+    g_camsig.clear();
+    g_camsig.reserve(size_t(seconds * 1400.0));
+  }
+  const double now =
+      std::chrono::duration<double>(PerfClock::now().time_since_epoch()).count();
+  g_camsig_deadline.store(now + seconds, std::memory_order_release);
+  REXLOG_INFO(
+      "native-scene cam-signal: recording {} s; pan the camera with the stick at a "
+      "steady rate NOW",
+      seconds);
+}
+
 bool ToggleSceneEnabled() {
   if (!REXCVAR_GET(skate3_native_render)) {
     REXLOG_WARN(
@@ -2407,8 +2563,23 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
           LoadGuestF32(base, bank + ((m + 2) * 4 + 3) * 4));
     }
     if (flag_x > 0.0f) {
-      // Sim inactive: the layout is exact (no refine needed).
-      palette_base = main_pass ? 8u : 5u;
+      // Sim inactive: the palette sits one register late (c5/c8). The LAYOUT
+      // is exact, but the BANK can still be foreign, the same stale-bank
+      // hazard the rigid branch below scores against (the flag itself was
+      // read from the foreign bank, so a positive x proves nothing). Blind
+      // acceptance here staged whatever the foreign bank held as an 84-bone
+      // palette; when the garment's sim was actually ACTIVE (skating NPCs
+      // toggle with distance/activity) that skinned the sim-deformed
+      // vertices, the mangled map-length ribbon (ScoreRigidAffine's 0/31
+      // interpretation), shadows matching because the caster pass shares the
+      // item. Gate through the same sample-projection acceptance as every
+      // other palette; on refusal the item stays pending (post-draw fixup /
+      // ropa state rescue).
+      palette_base = RefinePaletteBase(base, bank, main_pass ? 8u : 5u, item);
+      if (palette_base == 0) {
+        g_ropa_stale.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
     } else {
       const uint32_t m = main_pass ? 191u : 188u;
       float rows[12];
@@ -3552,6 +3723,96 @@ struct CamPose {
 // all the sim stepping on the skater ("he definitively judders now").
 double g_smooth_play = 0.0;
 bool g_smooth_active = false;
+// Last pose SmoothCamera produced (guest render thread), read by the
+// synthetic-pan probe (mode 3) to measure reconstruction error against the
+// known ideal pose.
+CamPose g_smooth_pose;
+
+// ---- Synthetic camera pan (judder isolation probe) -------------------------
+// See the skate3_native_render_scene_synthetic_pan cvar comment for the mode
+// semantics. Engage state is captured from the RAW guest camera on the guest
+// render thread; the sampler thread reads it for mode 3 under g_synpan_mutex.
+std::atomic<int> g_synpan_active{0};  // engaged mode (0 = off)
+std::mutex g_synpan_mutex;
+float g_synpan_view0[16];  // raw guest view at engage
+float g_synpan_proj0[16];
+float g_synpan_c0[3];   // camera world position at engage (held fixed)
+double g_synpan_t0 = 0.0;
+double g_synpan_step_phase = 0.0;  // mode 2: accumulated phase (degrees)
+double g_synpan_ema_dt = 0.0;      // mode 2: slow EMA of the publish dt
+// Telemetry (guest render thread only).
+uint64_t g_synpan_frames = 0;
+double g_synpan_last_build = 0.0;
+double g_synpan_dt_sum = 0.0, g_synpan_dt_sum2 = 0.0;
+double g_synpan_dt_min = 0.0, g_synpan_dt_max = 0.0;
+double g_synpan_err_sum2 = 0.0, g_synpan_err_max = 0.0;
+uint64_t g_synpan_err_n = 0;
+
+// Full-surround world union for the probe: the game only submits what ITS
+// frustum sees each frame, so a synthetic pan away from the real heading
+// would show an empty world (sky dome only). While the probe is engaged,
+// every static item published is accumulated by identity and appended to
+// each frame's scene; sweep the REAL camera around once with the stick
+// after engaging and the union fills in the whole surround, making a full
+// 360-degree spin (amplitude 0) usable. Guest render thread only.
+std::unordered_map<uint64_t, DrawItem> g_synpan_union;
+
+uint64_t SynPanItemKey(const DrawItem& it) {
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&h](uint64_t v) {
+    h ^= v;
+    h *= 1099511628211ull;
+  };
+  mix(it.mesh);
+  mix(it.vb_obj);
+  mix(it.ib_obj);
+  mix(std::bit_cast<uint32_t>(it.world[12]));
+  mix(std::bit_cast<uint32_t>(it.world[13]));
+  mix(std::bit_cast<uint32_t>(it.world[14]));
+  return h;
+}
+
+// Pan phase (degrees of accumulated rotation) -> heading angle in degrees.
+// Triangle wave in [-amp, +amp] starting at 0 heading upward; amp <= 0 =
+// unbounded continuous rotation.
+double SynPanAngleDeg(double phase_deg, double amp) {
+  if (amp <= 0.0) {
+    return phase_deg;
+  }
+  const double period = 4.0 * amp;
+  double m = std::fmod(phase_deg, period);
+  if (m < 0.0) {
+    m += period;
+  }
+  return m < amp ? m : (m < 3.0 * amp ? 2.0 * amp - m : m - period);
+}
+
+// View matrix for the engage pose yawed by `angle_deg` about world up (+Y),
+// camera position held at the engage position. Row-vector convention
+// throughout (p_view = p * V): the 3x3 becomes Ry * R0 (world rotates first,
+// then the engage view, a level pan; direction sign is irrelevant for the
+// probe), translation row rebuilt as -c0 * R'.
+void SynPanView(double angle_deg, float view_out[16]) {
+  const double a = angle_deg * (3.14159265358979323846 / 180.0);
+  const float c = float(std::cos(a)), s = float(std::sin(a));
+  const float ry[3][3] = {{c, 0.0f, -s}, {0.0f, 1.0f, 0.0f}, {s, 0.0f, c}};
+  std::memset(view_out, 0, 16 * sizeof(float));
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      float sum = 0.0f;
+      for (int k = 0; k < 3; ++k) {
+        sum += ry[i][k] * g_synpan_view0[k * 4 + j];
+      }
+      view_out[i * 4 + j] = sum;
+    }
+  }
+  for (int k = 0; k < 3; ++k) {
+    view_out[12 + k] = -(g_synpan_c0[0] * view_out[0 * 4 + k] +
+                         g_synpan_c0[1] * view_out[1 * 4 + k] +
+                         g_synpan_c0[2] * view_out[2 * 4 + k]);
+  }
+  view_out[15] = 1.0f;
+}
 
 // ---- High-rate camera sampler ---------------------------------------------
 // Pose samples taken once per RENDERED frame alias as soon as the render
@@ -3576,12 +3837,51 @@ std::atomic<uint64_t> g_cam_sampler_pushes{0};  // telemetry
 
 void CamSamplerLoop() {
   float last_view[16] = {};
+  double syn_next_emit = 0.0;
+  int syn_cadence_i = 0;
   for (;;) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (!SceneEnabled()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
       continue;
     }
+    // Synthetic pan mode 3: synthesize guest-like pose samples instead of
+    // reading the guest camera, ~200 Hz with a deliberately irregular
+    // cadence (the real sim tick is irregular; the smoother must cope). The
+    // downstream path (ring, period EMA, playback clock, slerp) runs
+    // unmodified on them, and its output is compared numerically against
+    // the ideal pose in BuildFrameScene.
+    if (g_synpan_active.load(std::memory_order_acquire) == 3) {
+      static constexpr double kCadenceMs[6] = {4.0, 5.0, 6.0, 4.0, 6.0, 5.0};
+      const double now =
+          std::chrono::duration<double>(PerfClock::now().time_since_epoch()).count();
+      if (syn_next_emit == 0.0) {
+        syn_next_emit = now;
+      }
+      if (now < syn_next_emit) {
+        continue;
+      }
+      syn_next_emit += kCadenceMs[syn_cadence_i++ % 6] * 1e-3;
+      if (syn_next_emit < now) {
+        syn_next_emit = now;  // fell behind (OS scheduling hitch): re-anchor
+      }
+      RawCamSample s;
+      s.t = now;
+      {
+        std::lock_guard<std::mutex> lock(g_synpan_mutex);
+        const double rate = REXCVAR_GET(skate3_native_render_scene_synthetic_pan_rate);
+        const double amp = REXCVAR_GET(skate3_native_render_scene_synthetic_pan_amp);
+        SynPanView(SynPanAngleDeg((now - g_synpan_t0) * rate, amp), s.view);
+        std::memcpy(s.proj, g_synpan_proj0, sizeof(s.proj));
+      }
+      std::lock_guard<std::mutex> lock(g_cam_samples_mutex);
+      if (g_cam_samples.size() < 256) {
+        g_cam_samples.push_back(s);
+        g_cam_sampler_pushes.fetch_add(1, std::memory_order_relaxed);
+      }
+      continue;
+    }
+    syn_next_emit = 0.0;
     const uint32_t vc = g_sampler_viewcam.load(std::memory_order_relaxed);
     uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
     if (vc == 0 || base == nullptr) {
@@ -3614,6 +3914,14 @@ void CamSamplerLoop() {
       continue;  // pose unchanged
     }
     std::memcpy(last_view, s.view, sizeof(last_view));
+    // Camera-signal recorder: every DISTINCT pose the guest produced, with
+    // the sampler's precise host timestamp (kind 0).
+    if (now < g_camsig_deadline.load(std::memory_order_relaxed)) {
+      std::lock_guard<std::mutex> lock(g_camsig_mutex);
+      if (g_camsig.size() < 200000) {
+        g_camsig.push_back({now, 0.0, YawFromViewRows(s.view), 0});
+      }
+    }
     std::lock_guard<std::mutex> lock(g_cam_samples_mutex);
     if (g_cam_samples.size() < 256) {
       g_cam_samples.push_back(s);
@@ -3779,7 +4087,13 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   const double frame_dt =
       s_play_valid ? std::clamp(now - s_last_now, 0.0, 0.05) : 0.0;
   s_last_now = now;
-  const double target = s_ring[s_newest].t - 2.0 * s_period;
+  // Boxcar pose filter (see below): the playback point must lag far enough
+  // that the CENTERED window has ring samples on both sides.
+  const double filter_w = std::clamp(
+      REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) *
+      1e-3;
+  const double lag = std::max(2.0 * s_period, filter_w * 0.5 + s_period);
+  const double target = s_ring[s_newest].t - lag;
   if (!s_play_valid) {
     s_play = target;
     s_play_valid = true;
@@ -3800,28 +4114,79 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   // seamless.
   s_play = std::min(s_play, s_ring[s_newest].t);
 
-  // Bracket s_play in the ring (samples are time-ordered oldest -> newest).
-  int hi = s_newest;
-  int lo = (s_newest + kRing - 1) % kRing;
-  for (int step = 1; step < s_count - 1; ++step) {
-    if (s_ring[lo].t <= s_play) {
-      break;
+  // Evaluate the piecewise-linear pose signal at an arbitrary time by
+  // bracketing in the ring (samples are time-ordered oldest -> newest) and
+  // slerping. Clamps to the ring's ends.
+  const auto eval_ring = [&](double t_eval) {
+    int hi = s_newest;
+    int lo = (s_newest + kRing - 1) % kRing;
+    for (int step = 1; step < s_count - 1; ++step) {
+      if (s_ring[lo].t <= t_eval) {
+        break;
+      }
+      hi = lo;
+      lo = (lo + kRing - 1) % kRing;
     }
-    hi = lo;
-    lo = (lo + kRing - 1) % kRing;
-  }
-  const CamPose& p0 = s_ring[lo];
-  const CamPose& p1 = s_ring[hi];
-  const double span = std::max(p1.t - p0.t, 0.0005);
-  const double alpha = std::clamp((s_play - p0.t) / span, 0.0, 1.0);
+    const CamPose& p0 = s_ring[lo];
+    const CamPose& p1 = s_ring[hi];
+    const double span = std::max(p1.t - p0.t, 0.0005);
+    const double alpha = std::clamp((t_eval - p0.t) / span, 0.0, 1.0);
+    CamPose r;
+    r.t = t_eval;
+    QuatSlerp(p0.q, p1.q, float(alpha), r.q);
+    for (int k = 0; k < 3; ++k) {
+      r.c[k] = p0.c[k] + (p1.c[k] - p0.c[k]) * float(alpha);
+    }
+    return r;
+  };
+
   CamPose p;
-  p.t = s_play;
-  QuatSlerp(p0.q, p1.q, float(alpha), p.q);
-  for (int k = 0; k < 3; ++k) {
-    p.c[k] = p0.c[k] + (p1.c[k] - p0.c[k]) * float(alpha);
+  if (filter_w > 0.0005 && s_count >= 4) {
+    // Boxcar pose filter: average the interpolated signal over a window
+    // CENTERED on the playback point (zero phase error at constant
+    // velocity). Root-caused need (camera-signal recordings): the
+    // game's camera pose VALUES advance in 60 Hz-quantized lumps at high
+    // render rates; during a measured constant stick pan the per-tick
+    // angular velocity had sd 144 deg/s on a 172 deg/s mean, +-2.2 deg off
+    // a constant-rate path. A 50 ms window (three 60 Hz periods) nulls the
+    // quantization at any render rate: measured frame-to-frame velocity
+    // jitter fell 185 -> 7 deg/s rms on the recorded signal. Taps past the
+    // newest sample clamp to it, so a pan STOP still settles exactly onto
+    // the raw stop pose (never extrapolates).
+    constexpr int kTaps = 16;
+    double qacc[4] = {};
+    double cacc[3] = {};
+    float qref[4] = {};
+    for (int k = 0; k < kTaps; ++k) {
+      const double tt = std::min(s_play - filter_w * 0.5 + (k + 0.5) * filter_w / kTaps,
+                                 s_ring[s_newest].t);
+      const CamPose s = eval_ring(tt);
+      float sq[4] = {s.q[0], s.q[1], s.q[2], s.q[3]};
+      if (k == 0) {
+        std::memcpy(qref, sq, sizeof(qref));
+      } else if (sq[0] * qref[0] + sq[1] * qref[1] + sq[2] * qref[2] +
+                     sq[3] * qref[3] <
+                 0.0f) {
+        for (float& v : sq) v = -v;
+      }
+      for (int j = 0; j < 4; ++j) qacc[j] += sq[j];
+      for (int j = 0; j < 3; ++j) cacc[j] += s.c[j];
+    }
+    const double qn = std::sqrt(qacc[0] * qacc[0] + qacc[1] * qacc[1] +
+                                qacc[2] * qacc[2] + qacc[3] * qacc[3]);
+    p.t = s_play;
+    for (int j = 0; j < 4; ++j) {
+      p.q[j] = float(qacc[j] / std::max(qn, 1e-12));
+    }
+    for (int j = 0; j < 3; ++j) {
+      p.c[j] = float(cacc[j] / kTaps);
+    }
+  } else {
+    p = eval_ring(s_play);
   }
   ComposeViewProj(p, proj, vp_out, cam_out);
   g_smooth_play = s_play;
+  g_smooth_pose = p;
   g_smooth_active = true;
   return true;
 }
@@ -3839,10 +4204,12 @@ void InterpolateDynamicItems(FrameScene& scene, double now) {
   // Per-entity pose RING, like the camera's: the playback clock sits ~2 sim
   // periods behind `now`, so a two-pose history never brackets it (the
   // interpolation alpha pinned at 0 and entities rendered STALE STEPPED
-  // poses, "the skater still judders and looks blurry"). Eight poses cover
-  // ~35 ms; the shared g_smooth_play is bracketed and lerped exactly like
-  // the camera ring.
-  constexpr int kRing = 8;
+  // poses: "the skater still judders and looks blurry"). Sixteen poses
+  // cover ~115 ms at 140 fps: the camera filter pushes the play clock
+  // ~(W/2 + period) back AND the entity boxcar (below) reaches another W/2
+  // past that. The shared g_smooth_play keeps entities in phase with the
+  // camera.
+  constexpr int kRing = 16;
   struct DynPose {
     double t = 0.0;
     std::vector<float> b;  // bone palette (skinned), raw captured rows
@@ -3857,6 +4224,40 @@ void InterpolateDynamicItems(FrameScene& scene, double now) {
   static std::unordered_map<uint64_t, DynHist> s_hist;
   static uint64_t s_frame = 0;
   ++s_frame;
+  // Bone-signal recorder window state (see BoneSigAppend). Written on a
+  // detached thread once the window closes.
+  bool bs_rec = false;
+  {
+    const double req = g_bonesig_request.exchange(0.0, std::memory_order_acq_rel);
+    if (req > 0.0) {
+      g_bonesig.clear();
+      g_bonesig.reserve(16u << 20);
+      g_bonesig_deadline.store(now + req, std::memory_order_relaxed);
+    }
+    const double dl = g_bonesig_deadline.load(std::memory_order_relaxed);
+    if (dl > 0.0) {
+      if (now < dl) {
+        bs_rec = true;
+      } else {
+        std::vector<uint8_t> blob;
+        blob.swap(g_bonesig);
+        g_bonesig_deadline.store(0.0, std::memory_order_release);
+        std::thread([blob = std::move(blob)]() {
+          std::error_code ec;
+          std::filesystem::create_directories("logs", ec);
+          char path[128];
+          std::snprintf(path, sizeof(path), "logs/bone_signal_%lld.bin",
+                        static_cast<long long>(std::time(nullptr)));
+          std::ofstream f(path, std::ios::binary);
+          f.write("BSIG1\n", 6);
+          f.write(reinterpret_cast<const char*>(blob.data()),
+                  std::streamsize(blob.size()));
+          REXLOG_INFO("native-scene bone-signal: wrote {} bytes -> {}", blob.size() + 6,
+                      path);
+        }).detach();
+      }
+    }
+  }
   static const float kIdent[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
   std::unordered_map<uint32_t, uint32_t> occurrence;
   for (DrawItem& item : scene.items) {
@@ -3914,39 +4315,182 @@ void InterpolateDynamicItems(FrameScene& scene, double now) {
       p.b = item.bones;
       std::memcpy(p.w, item.world, sizeof(p.w));
       h.count = std::min(h.count + 1, kRing);
+      if (bs_rec) {
+        BoneSigAppend(0, key, p.t, 0.0,
+                      skinned ? item.bones.data() : item.world,
+                      skinned ? uint32_t(item.bones.size()) : 16u);
+      }
     }
     if (h.count < 3 || now - h.ring[h.newest].t > 0.1) {
       continue;  // not enough history yet: raw stepped pose (one-time snap)
     }
-    // Bracket the shared playback clock in this entity's ring.
-    int hi = h.newest;
-    int lo = (h.newest + kRing - 1) % kRing;
-    for (int step = 1; step < h.count - 1; ++step) {
-      if (h.ring[lo].t <= g_smooth_play) {
-        break;
+    // Evaluate the ring's piecewise-linear pose signal at time tt into
+    // `out_b` (skinned, weighted-accumulated) / `out_w` (rigid), scaled by
+    // `weight`. Returns false on a palette-size mismatch inside the window
+    // (LOD/garment swap); the caller keeps the raw pose that frame.
+    const auto accum_at = [&](double tt, float weight, float* out_b,
+                              float out_w[16]) {
+      int hi = h.newest;
+      int lo = (h.newest + kRing - 1) % kRing;
+      for (int step = 1; step < h.count - 1; ++step) {
+        if (h.ring[lo].t <= tt) {
+          break;
+        }
+        hi = lo;
+        lo = (lo + kRing - 1) % kRing;
       }
-      hi = lo;
-      lo = (lo + kRing - 1) % kRing;
-    }
-    const DynPose& p0 = h.ring[lo];
-    const DynPose& p1 = h.ring[hi];
-    if (skinned && (p0.b.size() != item.bones.size() ||
-                    p1.b.size() != item.bones.size())) {
-      continue;
-    }
-    const double span = std::max(p1.t - p0.t, 0.0005);
-    // Clamp at 1.0 (no extrapolation): entities that stop moving must
-    // settle exactly onto their raw pose, like the camera.
-    const float a =
-        float(std::clamp((g_smooth_play - p0.t) / span, 0.0, 1.0));
-    if (skinned) {
-      for (size_t i = 0; i < item.bones.size(); ++i) {
-        item.bones[i] = p0.b[i] + (p1.b[i] - p0.b[i]) * a;
+      const DynPose& p0 = h.ring[lo];
+      const DynPose& p1 = h.ring[hi];
+      if (skinned && (p0.b.size() != item.bones.size() ||
+                      p1.b.size() != item.bones.size())) {
+        return false;
+      }
+      const double span = std::max(p1.t - p0.t, 0.0005);
+      // Clamp at 1.0 (no extrapolation): entities that stop moving must
+      // settle exactly onto their raw pose, like the camera.
+      const float a = float(std::clamp((tt - p0.t) / span, 0.0, 1.0));
+      if (skinned) {
+        for (size_t i = 0; i < item.bones.size(); ++i) {
+          out_b[i] += (p0.b[i] + (p1.b[i] - p0.b[i]) * a) * weight;
+        }
+      } else {
+        for (int i = 0; i < 16; ++i) {
+          out_w[i] += (p0.w[i] + (p1.w[i] - p0.w[i]) * a) * weight;
+        }
+      }
+      return true;
+    };
+    // Boxcar filter, same as the camera's: the guest's ANIMATION poses are
+    // 60 Hz-quantized like its camera; once the camera glides, the 60-vs-
+    // render-rate pose alternation reads as skater judder/ghosting against
+    // the smooth background. Averaging bone affines componentwise over the
+    // window slightly shrinks fast-swinging limb rotations (a subtle motion
+    // blur), the trade the game's own 60 Hz presentation makes anyway.
+    const double filter_w = std::clamp(
+        REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) *
+        1e-3;
+    static std::vector<float> acc;  // guest render thread only
+    float wacc[16] = {};
+    bool ok = true;
+    if (filter_w > 0.0005 && h.count >= 4) {
+      constexpr int kTaps = 8;
+      acc.assign(skinned ? item.bones.size() : 0, 0.0f);
+      for (int tap = 0; tap < kTaps && ok; ++tap) {
+        const double tt =
+            std::min(g_smooth_play - filter_w * 0.5 + (tap + 0.5) * filter_w / kTaps,
+                     h.ring[h.newest].t);
+        ok = accum_at(tt, 1.0f / kTaps, acc.data(), wacc);
       }
     } else {
-      for (int i = 0; i < 16; ++i) {
-        item.world[i] = p0.w[i] + (p1.w[i] - p0.w[i]) * a;
+      acc.assign(skinned ? item.bones.size() : 0, 0.0f);
+      ok = accum_at(g_smooth_play, 1.0f, acc.data(), wacc);
+    }
+    if (!ok) {
+      continue;  // palette-size mismatch in the window: raw pose this frame
+    }
+    // Fast-spinning bones (skateboard wheels: hundreds of degrees inside
+    // the window) COLLAPSE under componentwise averaging; the rotation
+    // entries cancel toward zero and the wheel shrinks into the truck /
+    // sinks into the ground. Guard per bone: if the averaged 3x3's
+    // Frobenius norm dropped versus a raw sample's, the window spans too
+    // much rotation; fall back to the plain TWO-ADJACENT-SAMPLE lerp at
+    // the playback point for that bone (the pre-filter behavior: samples
+    // ~7.5 ms apart lerp with only a few % shrink, and rotation +
+    // translation come from the SAME pose pair). Failed alternatives, do
+    // not revisit: whole-bone nearest-sample snap = wheels lag the filtered
+    // board and snap to catch up; nearest ROTATION + averaged TRANSLATION =
+    // wheels ORBIT the axle ~10 cm (palette affines are model->world; the
+    // rotation pivots about the MODEL origin and the translation carries
+    // the axle-pivot compensation; the pair must stay consistent). Slow
+    // bones (the judder sources) pass untouched.
+    int b_lo = h.newest, b_hi = h.newest;
+    {
+      int hi2 = h.newest;
+      int lo2 = (h.newest + kRing - 1) % kRing;
+      for (int step = 1; step < h.count - 1; ++step) {
+        if (h.ring[lo2].t <= g_smooth_play) {
+          break;
+        }
+        hi2 = lo2;
+        lo2 = (lo2 + kRing - 1) % kRing;
       }
+      b_lo = lo2;
+      b_hi = hi2;
+    }
+    const DynPose& q0 = h.ring[b_lo];
+    const DynPose& q1 = h.ring[b_hi];
+    const double bspan = std::max(q1.t - q0.t, 0.0005);
+    const float ba = float(std::clamp((g_smooth_play - q0.t) / bspan, 0.0, 1.0));
+    if (skinned) {
+      if (q0.b.size() == item.bones.size() && q1.b.size() == item.bones.size()) {
+        // Pass 1: flag collapsed bones (the churning staged-constant rows
+        // past the real skeleton, e.g. rows 53..83 of the 84-row character
+        // bank, flag every frame too; they are unreferenced by vertices,
+        // so rewriting them is harmless).
+        static std::vector<uint8_t> s_collapsed;  // guest render thread only
+        const size_t nbones = acc.size() / 12;
+        s_collapsed.assign(nbones, 0);
+        size_t ncollapsed = 0;
+        for (size_t b = 0; b < nbones; ++b) {
+          const size_t bi = b * 12;
+          double fa = 0.0, fr = 0.0;
+          for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+              const float av = acc[bi + r * 4 + c];
+              const float rv = q1.b[bi + r * 4 + c];
+              fa += double(av) * av;
+              fr += double(rv) * rv;
+            }
+          }
+          if (fa < fr * 0.94) {  // norm ratio < ~0.97: rotation collapsed
+            s_collapsed[b] = 1;
+            ++ncollapsed;
+          }
+        }
+        if (ncollapsed > 0) {
+          // Collapsed bone (rotating too fast inside the window to
+          // average, spinning wheels, and briefly fast-swinging limbs):
+          // plain adjacent-sample lerp at the playback point. R and t come
+          // from the same pose pair (no orbit), samples are ~7.5 ms apart
+          // (only a few % midpoint shrink), and limbs that trip the
+          // detector during tricks render essentially correctly. KNOWN
+          // COSMETIC LIMIT: wheels ride the raw 60 Hz-lumpy path while the
+          // deck rides the boxcar, a subtle lag/catch-up between wheels
+          // and board at speed. Smarter per-frame constructions all failed
+          // WORSE; do not iterate live again; solve offline against the
+          // bone_signal captures.
+          for (size_t b = 0; b < nbones; ++b) {
+            if (!s_collapsed[b]) {
+              continue;
+            }
+            const size_t bi = b * 12;
+            for (int i = 0; i < 12; ++i) {
+              acc[bi + i] = q0.b[bi + i] + (q1.b[bi + i] - q0.b[bi + i]) * ba;
+            }
+          }
+        }
+      }
+      std::copy(acc.begin(), acc.end(), item.bones.begin());
+    } else {
+      double fa = 0.0, fr = 0.0;
+      for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+          fa += double(wacc[r * 4 + c]) * wacc[r * 4 + c];
+          fr += double(q1.w[r * 4 + c]) * q1.w[r * 4 + c];
+        }
+      }
+      if (fa < fr * 0.94) {
+        for (int i = 0; i < 16; ++i) {
+          item.world[i] = q0.w[i] + (q1.w[i] - q0.w[i]) * ba;
+        }
+      } else {
+        std::memcpy(item.world, wacc, sizeof(wacc));
+      }
+    }
+    if (bs_rec) {
+      BoneSigAppend(1, key, now, g_smooth_play,
+                    skinned ? item.bones.data() : item.world,
+                    skinned ? uint32_t(item.bones.size()) : 16u);
     }
   }
   // Prune entities not seen recently (map otherwise grows with streaming).
@@ -4277,8 +4821,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // one; a shadow-pass list can be missing body parts the main view needs.
   std::unordered_map<uint32_t, size_t> dyn_slot;
   // First refused/pending skinned capture per mesh: candidates for the
-  // post-merge cross-frame palette rescue (see g_bones_cache).
+  // post-merge cross-frame palette rescue (see g_bones_cache). Ropa garments
+  // are kept apart: their rescue must restore last frame's resolved MODE
+  // (rigid vs skinned), never blindly re-skin (see g_ropa_state_cache).
   std::unordered_map<uint32_t, const DrawItem*> pending_skinned_by_mesh;
+  std::unordered_map<uint32_t, const DrawItem*> pending_ropa_by_mesh;
   const auto total_indices = [](const DrawItem& d) {
     uint64_t n = 0;
     for (const DrawEntry& e : d.draws) n += e.index_count;
@@ -4317,7 +4864,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         // publishes this frame, the post-merge rescue re-publishes it with
         // LAST frame's palette (see g_bones_cache); one frame of pose lag
         // beats a one-frame-missing hat.
-        if (cand.skinned) {
+        if (cand.ropa) {
+          pending_ropa_by_mesh.try_emplace(cand.mesh, &cand);
+        } else if (cand.skinned) {
           pending_skinned_by_mesh.try_emplace(cand.mesh, &cand);
         }
         (cand.skinned ? g_skinned_skipped : g_rigid_dropped)
@@ -4367,13 +4916,28 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (REXCVAR_GET(skate3_native_render_scene_dynamic_items)) {
     std::unordered_map<uint32_t, uint32_t> pub_count;
     for (const DrawItem& item : scene.items) {
-      if (item.skinned && !item.bones.empty()) {
+      // Ropa garments count in EITHER resolved mode (a rigid-resolved copy
+      // has no bones but is very much alive; rescuing a pending clone next
+      // to it would draw a duplicate garment).
+      if (item.ropa || (item.skinned && !item.bones.empty())) {
         ++pub_count[item.mesh];
       }
     }
     for (const DrawItem& item : scene.items) {
-      if (item.skinned && !item.bones.empty() && pub_count[item.mesh] == 1 &&
-          g_bones_cache.size() < 512) {
+      if (!(item.ropa || (item.skinned && !item.bones.empty())) ||
+          pub_count[item.mesh] != 1) {
+        continue;
+      }
+      if (item.ropa) {
+        // Remember the resolved mode + transform (see g_ropa_state_cache).
+        if (g_ropa_state_cache.size() < 512) {
+          RopaResolvedState& c = g_ropa_state_cache[item.mesh];
+          c.skinned = item.skinned && !item.bones.empty();
+          std::memcpy(c.world, item.world, sizeof(c.world));
+          c.bones = item.bones;
+        }
+      } else if (item.skinned && !item.bones.empty() &&
+                 g_bones_cache.size() < 512) {
         g_bones_cache[item.mesh] = item.bones;
       }
     }
@@ -4390,6 +4954,25 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       rescued.bones = bit->second;
       rescued.pending = false;
       g_bones_rescued.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Refused ropa captures re-publish last frame's resolved state: mode,
+    // world AND palette together (mixing frames' interpretations is the
+    // mangled-ribbon bug; see g_ropa_state_cache).
+    for (const auto& [mesh, cand] : pending_ropa_by_mesh) {
+      if (pub_count.find(mesh) != pub_count.end()) {
+        continue;  // a live copy published; nothing to rescue
+      }
+      const auto rit = g_ropa_state_cache.find(mesh);
+      if (rit == g_ropa_state_cache.end()) {
+        continue;
+      }
+      scene.items.push_back(*cand);
+      DrawItem& rescued = scene.items.back();
+      rescued.skinned = rit->second.skinned;
+      rescued.bones = rit->second.bones;
+      std::memcpy(rescued.world, rit->second.world, sizeof(rescued.world));
+      rescued.pending = false;
+      g_ropa_rescued.fetch_add(1, std::memory_order_relaxed);
     }
   }
   // Cross-frame character-lighting fallback (see g_char_rows_cache): items
@@ -4509,6 +5092,218 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       // Keep the skater/NPCs/props in phase with the smoothed camera:
       // interpolate their palettes/worlds at the same playback time.
       InterpolateDynamicItems(scene, now_s);
+    }
+  }
+
+  // Camera-signal recorder (see CamSigEntry): per-frame raw + smoothed
+  // heading while the window is open; write + reset when it closes.
+  {
+    const double dl = g_camsig_deadline.load(std::memory_order_relaxed);
+    if (dl > 0.0) {
+      const double rec_now =
+          std::chrono::duration<double>(build_t0.time_since_epoch()).count();
+      if (rec_now < dl) {
+        std::lock_guard<std::mutex> lock(g_camsig_mutex);
+        if (g_camsig.size() < 200000) {
+          g_camsig.push_back({rec_now, 0.0, YawFromViewRows(cam_view), 2});
+          if (g_smooth_active) {
+            float rot[16] = {};
+            ViewRotFromQuat(g_smooth_pose.q, rot);
+            g_camsig.push_back({rec_now, g_smooth_play, YawFromViewRows(rot), 1});
+          }
+        }
+      } else {
+        std::vector<CamSigEntry> entries;
+        {
+          std::lock_guard<std::mutex> lock(g_camsig_mutex);
+          entries.swap(g_camsig);
+        }
+        g_camsig_deadline.store(0.0, std::memory_order_release);
+        std::thread([entries = std::move(entries)]() {
+          std::error_code ec;
+          std::filesystem::create_directories("logs", ec);
+          char path[128];
+          std::snprintf(path, sizeof(path), "logs/cam_signal_%lld.csv",
+                        static_cast<long long>(std::time(nullptr)));
+          std::ofstream f(path);
+          f << "kind,t,play_t,yaw_deg\n";
+          char line[128];
+          for (const CamSigEntry& e : entries) {
+            std::snprintf(line, sizeof(line), "%d,%.6f,%.6f,%.5f\n", int(e.kind), e.t,
+                          e.play_t, double(e.yaw));
+            f << line;
+          }
+          REXLOG_INFO("native-scene cam-signal: wrote {} entries -> {}", entries.size(),
+                      path);
+        }).detach();
+      }
+    }
+  }
+
+  // Synthetic camera pan probe (see the synthetic_pan cvar comment for the
+  // mode semantics). Runs AFTER the smoothing block: modes 1/2 override the
+  // published pose outright (their point is to bypass the guest pose path);
+  // mode 3 leaves the smoothed pose in place, the sampler thread is feeding
+  // the smoother synthetic samples, and measures reconstruction error
+  // against the known ideal.
+  {
+    const double syn_now =
+        std::chrono::duration<double>(build_t0.time_since_epoch()).count();
+    int syn_mode =
+        std::clamp(int(REXCVAR_GET(skate3_native_render_scene_synthetic_pan)), 0, 3);
+    if (syn_mode == 3 && !REXCVAR_GET(skate3_native_render_scene_smooth_camera)) {
+      static bool s_warned = false;
+      if (!s_warned) {
+        s_warned = true;
+        REXLOG_WARN(
+            "native-scene synthetic-pan: mode 3 needs smooth_camera ON; "
+            "running mode 1 instead");
+      }
+      syn_mode = 1;
+    }
+    static int s_engaged_mode = 0;
+    if (syn_mode != s_engaged_mode) {
+      s_engaged_mode = syn_mode;
+      if (syn_mode == 0) {
+        g_synpan_active.store(0, std::memory_order_release);
+        g_synpan_union.clear();
+        REXLOG_INFO("native-scene synthetic-pan: off (guest camera restored)");
+      } else {
+        // (Re-)engage from THIS frame's raw guest pose: heading, position
+        // and projection are frozen; only the synthetic yaw moves.
+        std::lock_guard<std::mutex> lock(g_synpan_mutex);
+        std::memcpy(g_synpan_view0, cam_view, sizeof(g_synpan_view0));
+        for (int i = 0; i < 16; ++i) {
+          g_synpan_proj0[i] = LoadGuestF32(base, viewcam + 0x60 + i * 4);
+        }
+        for (int j = 0; j < 3; ++j) {
+          g_synpan_c0[j] =
+              -(cam_view[12] * cam_view[j * 4 + 0] + cam_view[13] * cam_view[j * 4 + 1] +
+                cam_view[14] * cam_view[j * 4 + 2]);
+        }
+        g_synpan_t0 = syn_now;
+        g_synpan_step_phase = 0.0;
+        g_synpan_ema_dt = 0.0;
+        g_synpan_frames = 0;
+        g_synpan_last_build = 0.0;
+        g_synpan_dt_sum = g_synpan_dt_sum2 = 0.0;
+        g_synpan_dt_min = g_synpan_dt_max = 0.0;
+        g_synpan_err_sum2 = g_synpan_err_max = 0.0;
+        g_synpan_err_n = 0;
+        g_synpan_union.clear();
+        g_synpan_active.store(syn_mode, std::memory_order_release);
+        static const char* kModeNames[] = {"off", "time-based", "fixed-step",
+                                           "through-smoother"};
+        REXLOG_INFO(
+            "native-scene synthetic-pan: ENGAGED mode={} ({}) rate={:.1f} deg/s "
+            "amp=+-{:.1f} deg",
+            syn_mode, kModeNames[syn_mode],
+            REXCVAR_GET(skate3_native_render_scene_synthetic_pan_rate),
+            REXCVAR_GET(skate3_native_render_scene_synthetic_pan_amp));
+      }
+    }
+    if (syn_mode != 0) {
+      const double rate = REXCVAR_GET(skate3_native_render_scene_synthetic_pan_rate);
+      const double amp = REXCVAR_GET(skate3_native_render_scene_synthetic_pan_amp);
+      const double prev_build = g_synpan_last_build;
+      g_synpan_last_build = syn_now;
+      const double dt = prev_build > 0.0 ? std::clamp(syn_now - prev_build, 0.0, 0.05) : 0.0;
+      if (dt > 0.0) {
+        g_synpan_dt_sum += dt;
+        g_synpan_dt_sum2 += dt * dt;
+        g_synpan_dt_min = g_synpan_dt_min == 0.0 ? dt : std::min(g_synpan_dt_min, dt);
+        g_synpan_dt_max = std::max(g_synpan_dt_max, dt);
+      }
+      if (syn_mode == 1 || syn_mode == 2) {
+        double phase;
+        if (syn_mode == 1) {
+          phase = (syn_now - g_synpan_t0) * rate;
+        } else {
+          // Fixed step: constant angle per published frame. The step is
+          // rate * (slow EMA of dt) so deg/s stays roughly honest while the
+          // per-frame advance is effectively constant over any short window.
+          if (dt > 0.0) {
+            g_synpan_ema_dt =
+                g_synpan_ema_dt == 0.0 ? dt : g_synpan_ema_dt * 0.995 + dt * 0.005;
+          }
+          g_synpan_step_phase += rate * g_synpan_ema_dt;
+          phase = g_synpan_step_phase;
+        }
+        float sview[16];
+        SynPanView(SynPanAngleDeg(phase, amp), sview);
+        CamPose pose;
+        QuatFromView(sview, pose.q);
+        std::memcpy(pose.c, g_synpan_c0, sizeof(pose.c));
+        ComposeViewProj(pose, g_synpan_proj0, scene.view_proj, scene.cam_pos);
+      } else if (g_smooth_active) {
+        // Mode 3: the smoother just reconstructed a pose from the synthetic
+        // samples at playback time g_smooth_play; compare against the ideal
+        // pose at that exact time (both are functions of the same clock).
+        float iview[16];
+        SynPanView(SynPanAngleDeg((g_smooth_play - g_synpan_t0) * rate, amp), iview);
+        float qi[4];
+        QuatFromView(iview, qi);
+        const float dq =
+            std::fabs(qi[0] * g_smooth_pose.q[0] + qi[1] * g_smooth_pose.q[1] +
+                      qi[2] * g_smooth_pose.q[2] + qi[3] * g_smooth_pose.q[3]);
+        const double err_deg =
+            2.0 * std::acos(std::min(dq, 1.0f)) * (180.0 / 3.14159265358979323846);
+        g_synpan_err_sum2 += err_deg * err_deg;
+        g_synpan_err_max = std::max(g_synpan_err_max, err_deg);
+        ++g_synpan_err_n;
+      }
+      // World union: accumulate this frame's static items and append every
+      // previously seen one the game didn't submit this frame (it culls to
+      // ITS frustum; the probe camera looks elsewhere). Statics only:
+      // skinned/cloth poses go stale immediately.
+      {
+        std::unordered_set<uint64_t> cur;
+        cur.reserve(scene.items.size());
+        const size_t published = scene.items.size();
+        for (size_t i = 0; i < published; ++i) {
+          const DrawItem& it = scene.items[i];
+          if (it.skinned || it.cloth_quads || it.ropa || it.pending ||
+              !it.bones.empty()) {
+            continue;
+          }
+          const uint64_t key = SynPanItemKey(it);
+          cur.insert(key);
+          if (g_synpan_union.size() < 20000) {
+            auto [slot, inserted] = g_synpan_union.try_emplace(key, it);
+            if (!inserted &&
+                std::memcmp(slot->second.world, it.world, sizeof(it.world)) != 0) {
+              slot->second = it;  // a movable prop moved: refresh
+            }
+          }
+        }
+        for (const auto& [key, it] : g_synpan_union) {
+          if (cur.find(key) == cur.end()) {
+            scene.items.push_back(it);
+          }
+        }
+      }
+      if (++g_synpan_frames % 600 == 0) {
+        const double n = std::max<double>(1.0, double(g_synpan_frames - 1));
+        const double avg = g_synpan_dt_sum / n;
+        const double sd =
+            std::sqrt(std::max(0.0, g_synpan_dt_sum2 / n - avg * avg));
+        if (syn_mode == 3) {
+          REXLOG_INFO(
+              "native-scene synthetic-pan: mode=3 frames={} build_dt_ms[avg/min/max/sd]="
+              "{:.2f}/{:.2f}/{:.2f}/{:.2f} smoother_err_deg[rms/max]={:.4f}/{:.4f} (n={}) "
+              "union={}",
+              g_synpan_frames, avg * 1e3, g_synpan_dt_min * 1e3, g_synpan_dt_max * 1e3,
+              sd * 1e3,
+              std::sqrt(g_synpan_err_sum2 / std::max<uint64_t>(1, g_synpan_err_n)),
+              g_synpan_err_max, g_synpan_err_n, g_synpan_union.size());
+        } else {
+          REXLOG_INFO(
+              "native-scene synthetic-pan: mode={} frames={} build_dt_ms[avg/min/max/sd]="
+              "{:.2f}/{:.2f}/{:.2f}/{:.2f} union={}",
+              syn_mode, g_synpan_frames, avg * 1e3, g_synpan_dt_min * 1e3,
+              g_synpan_dt_max * 1e3, sd * 1e3, g_synpan_union.size());
+        }
+      }
     }
   }
 
@@ -10435,7 +11230,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={}] skinned={} skinned_skipped={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={}] skinned={} skinned_skipped={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
@@ -10446,7 +11241,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
         g_r.meshes.size(), g_r.textures.size(),
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
-        g_ropa_rigid.load(), g_ropa_stale.load(), g_skinned_items.load(),
+        g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
+        g_skinned_items.load(),
         g_skinned_skipped.load(), g_rigid_pending.load(), g_rigid_dropped.load(),
         g_world_props.load(),
         g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
@@ -10479,6 +11275,9 @@ namespace skate3::native_scene {
 void Install() {}
 void FlushTextureCache() {}
 void FlushMeshCache() {}
+int CycleSyntheticPan() { return 0; }
+void RecordCameraSignal(double) {}
+void RecordBoneSignal(double) {}
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12

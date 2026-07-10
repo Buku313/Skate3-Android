@@ -26,8 +26,12 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
 // Smoothness / pacing.
 REXCVAR_DECLARE(bool, skate3_native_render_scene_smooth_camera);
+REXCVAR_DECLARE(double, skate3_native_render_scene_smooth_camera_filter_ms);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_sort_opaque);
 REXCVAR_DECLARE(double, skate3_guest_fps_cap);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_synthetic_pan);
+REXCVAR_DECLARE(double, skate3_native_render_scene_synthetic_pan_rate);
+REXCVAR_DECLARE(double, skate3_native_render_scene_synthetic_pan_amp);
 // SDK: emulated-draw suppression while the native output is active.
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
 
@@ -161,6 +165,20 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                            "sim tick; raw poses judder at high render rates. Re-times "
                            "them on the host clock (1 kHz camera sampler + pose "
                            "interpolation, a few ms of camera latency)."));
+  {
+    float w = float(REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms));
+    if (ImGui::SliderFloat("camera filter (ms, 0 = off)", &w, 0.0f, 100.0f, "%.0f")) {
+      REXCVAR_SET(skate3_native_render_scene_smooth_camera_filter_ms, double(w));
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Boxcar average over the camera pose signal. The game's camera "
+          "advances in 60 Hz-quantized lumps at high fps (the measured cause "
+          "of stick-pan stutter); 50 ms = three 60 Hz periods cancels it "
+          "exactly for ~25 ms extra camera latency. 0 reverts to raw "
+          "interpolation.");
+    }
+  }
   REXCVAR_SET(skate3_native_render_scene_sort_opaque,
               CvarCheckbox("Front-to-back opaque sort",
                            REXCVAR_GET(skate3_native_render_scene_sort_opaque),
@@ -178,6 +196,59 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
           "refresh (with G-Sync/VRR this is what makes motion read as smooth; "
           "uncapped, the guest's irregular frame times drive the refresh "
           "directly).");
+    }
+  }
+  {
+    int mode = REXCVAR_GET(skate3_native_render_scene_synthetic_pan);
+    const char* kPanModes[] = {"0: off", "1: time-based (build clock)",
+                               "2: fixed step per frame", "3: through smoother"};
+    if (ImGui::Combo("Synthetic pan (P)", &mode, kPanModes, 4)) {
+      REXCVAR_SET(skate3_native_render_scene_synthetic_pan, mode);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Judder isolation probe: replaces the camera with a host-generated "
+          "constant-rate 360-degree pan. AFTER ENGAGING, SWEEP THE REAL CAMERA "
+          "AROUND ONCE WITH THE STICK; the game only submits what its own "
+          "frustum sees; the sweep fills a static-world union so the full "
+          "circle is populated.\n1 smooth = camera path is fine; 1 judders = "
+          "frame pacing / present / display, not the camera.\n2 = constant "
+          "angle per FRAME (smooth only if displayed frames are evenly spaced "
+          ", the complement of 1).\n3 = feeds synthetic ~200 Hz samples "
+          "through the camera smoother and logs reconstruction error "
+          "(synthetic-pan: lines).");
+    }
+    float rate = float(REXCVAR_GET(skate3_native_render_scene_synthetic_pan_rate));
+    if (ImGui::SliderFloat("pan rate (deg/s)", &rate, 5.0f, 720.0f, "%.0f")) {
+      REXCVAR_SET(skate3_native_render_scene_synthetic_pan_rate, double(rate));
+    }
+    float amp = float(REXCVAR_GET(skate3_native_render_scene_synthetic_pan_amp));
+    if (ImGui::SliderFloat("pan amplitude (0 = full spin)", &amp, 0.0f, 60.0f, "%.0f")) {
+      REXCVAR_SET(skate3_native_render_scene_synthetic_pan_amp, double(amp));
+    }
+    if (ImGui::Button("Record camera signal (8 s)")) {
+      skate3::native_scene::RecordCameraSignal(8.0);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Record bone signal (6 s)")) {
+      skate3::native_scene::RecordBoneSignal(6.0);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Click, then skate at a steady speed for 6 seconds. Records every "
+          "raw entity pose (bone palettes with timestamps) + the rendered "
+          "interpolation output to logs\\bone_signal_<ts>.bin, so wheel-vs-"
+          "deck lag/orbit can be measured and candidate fixes replayed "
+          "offline against real data.");
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Click, then IMMEDIATELY pan the camera with the right stick at a "
+          "steady rate for 8 seconds (synthetic pan should be OFF). Records "
+          "every distinct guest camera pose with 1 kHz-sampler timestamps + "
+          "the smoothed output, to logs\\cam_signal_<ts>.csv; offline "
+          "analysis shows whether the game's own camera signal is jerky at "
+          "the source.");
     }
   }
 

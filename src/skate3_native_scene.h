@@ -376,4 +376,26 @@ bool ToggleSceneEnabled();
 void FlushTextureCache();
 void FlushMeshCache();
 
+// Synthetic camera pan probe (judder isolation, hotkey P): cycles
+// skate3_native_render_scene_synthetic_pan 0 -> 1 -> 2 -> 3 -> 0 and returns
+// the new mode. 1 = time-based constant-rate pan injected at scene build,
+// 2 = fixed angle step per published frame, 3 = synthetic pose samples fed
+// through the camera smoother (reconstruction error logged numerically).
+int CycleSyntheticPan();
+
+// Camera-signal recorder (judder diagnosis): for `seconds`, records every
+// distinct guest camera pose (1 kHz sampler timestamps) plus the per-frame
+// raw and smoothed headings, then writes logs/cam_signal_<ts>.csv. Pan the
+// camera with the stick at a steady rate while it runs; offline analysis
+// shows whether the game's own pose sequence is irregular at the source.
+void RecordCameraSignal(double seconds);
+
+// Bone-signal recorder (wheel-guard diagnosis): for `seconds`, records every
+// raw entity pose (ring pushes: bone palettes / rigid worlds, timestamps)
+// and each frame's interpolated output, then writes
+// logs/bone_signal_<ts>.bin. Skate at a steady speed while it runs;
+// offline analysis replays candidate guard strategies against the real
+// board data.
+void RecordBoneSignal(double seconds);
+
 }  // namespace skate3::native_scene
