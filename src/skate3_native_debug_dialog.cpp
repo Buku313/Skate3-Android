@@ -24,6 +24,11 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_refl_mode);
+REXCVAR_DECLARE(double, skate3_native_render_scene_refl_lod);
+REXCVAR_DECLARE(double, skate3_native_render_scene_refl_bias_x);
+REXCVAR_DECLARE(double, skate3_native_render_scene_refl_bias_y);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_refl_bias_auto);
 // Smoothness / pacing.
 REXCVAR_DECLARE(bool, skate3_native_render_scene_smooth_camera);
 REXCVAR_DECLARE(double, skate3_native_render_scene_smooth_camera_filter_ms);
@@ -133,6 +138,65 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
               CvarCheckbox("Dynamic shadows",
                            REXCVAR_GET(skate3_native_render_scene_shadows),
                            "Native CSM: skater/NPC/prop shadows onto the world"));
+
+  ImGui::SeparatorText("Reflective glass isolation (env fam 5/6)");
+  {
+    int mode = REXCVAR_GET(skate3_native_render_scene_refl_mode);
+    const char* kReflModes[] = {"0: normal",
+                                "1: cube reflection OFF",
+                                "2: cube at absolute LOD (slider)",
+                                "3: flat normal (no normal map)",
+                                "4: visualize cube sample only",
+                                "5: body only (no spec, no cube)",
+                                "6: normal-map LOD bias (slider)"};
+    if (ImGui::Combo("refl mode", &mode, kReflModes, 7)) {
+      REXCVAR_SET(skate3_native_render_scene_refl_mode, mode);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Live isolation of the glass-facade reflection term. Flip F5 to "
+          "compare against the emulated frame at each setting:\n"
+          "1 removes the cube term; if the artifact survives, it is NOT "
+          "the reflection.\n2 + slider finds which mip level (if any) "
+          "matches the emulated look.\n3 tests the normal-map perturbation."
+          "\n4 shows exactly what the reflection vector samples.\n5 leaves "
+          "only diffuse x lightmap.");
+    }
+    float lod = float(REXCVAR_GET(skate3_native_render_scene_refl_lod));
+    if (ImGui::SliderFloat("refl LOD / extra bias", &lod, -4.0f, 12.0f, "%.1f")) {
+      REXCVAR_SET(skate3_native_render_scene_refl_lod, double(lod));
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Mode 2: the absolute cube mip level (0 = sharpest; ~9 = the "
+          "face average).\nOther modes: extra LOD bias added to the "
+          "automatic 640p-parity bias.");
+    }
+    REXCVAR_SET(skate3_native_render_scene_refl_bias_auto,
+                CvarCheckbox("auto normal tilt (derive from material)",
+                             REXCVAR_GET(skate3_native_render_scene_refl_bias_auto),
+                             "Compute the constant tilt from each material's own "
+                             "detail texture (hardware-exact BC1 decode), the "
+                             "principled source of the hand-tuned reference "
+                             "values. Uncheck to drive the sliders below "
+                             "instead."));
+    float bx = float(REXCVAR_GET(skate3_native_render_scene_refl_bias_x));
+    if (ImGui::SliderFloat("normal tilt X (horizontal)", &bx, -0.2f, 0.2f, "%.3f")) {
+      REXCVAR_SET(skate3_native_render_scene_refl_bias_x, double(bx));
+    }
+    float by = float(REXCVAR_GET(skate3_native_render_scene_refl_bias_y));
+    if (ImGui::SliderFloat("normal tilt Y (vertical)", &by, -0.2f, 0.2f, "%.3f")) {
+      REXCVAR_SET(skate3_native_render_scene_refl_bias_y, double(by));
+    }
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+      ImGui::SetTooltip(
+          "Constant normal tilt on the glass, applied in EVERY mode; "
+          "rotates all reflections. Drag until the reflected content sits "
+          "where the emulated frame puts it (F5 to compare). Defaults "
+          "(0.028, 0.012) = the exact detail-map constant. 0.01 here is "
+          "roughly 1 degree of reflection rotation.");
+    }
+  }
 
   ImGui::SeparatorText("Scene items");
   REXCVAR_SET(skate3_native_render_scene_world_items,

@@ -157,6 +157,10 @@ struct DrawItem {
   // for env families; the "noise" tint texture for animated.tree. Bound in
   // the decal slot (t4) on families that carry no decal art.
   uint32_t spec_tex = 0;
+  // "detail" channel texture (env families 5/6): a constant 16x16 BC1 whose
+  // hardware-decoded value folds into the normal composition as 2*d - 1,
+  // derived per material at draw time (see the refl_bias cvars).
+  uint32_t detail_tex = 0;
   float tint[4];  // rgb + enable flag in w
   // The item's per-draw state (bone palette for skinned, world matrix for
   // rigid model-space props) was not available at capture time; deferred

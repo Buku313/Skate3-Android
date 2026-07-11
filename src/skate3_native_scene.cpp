@@ -149,6 +149,50 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 1024, "Skate 3",
                      "matches the edge crispness players currently see.")
     .range(256, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Reflective-glass (env families 5/6) isolation controls for the F12
+// dialog: live A/B of each stage of the cube-reflection term against the
+// emulated look (F5).
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_refl_mode, 0, "Skate 3",
+                     "Reflective glass debug: 0 normal, 1 cube term off, 2 cube at "
+                     "the absolute LOD in refl_lod, 3 flat normal (no normal-map "
+                     "perturb), 4 visualize the cube sample only, 5 body only (no "
+                     "spec, no cube), 6 normal-map LOD bias from the slider.")
+    .range(0, 6)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_refl_lod, 0.0, "Skate 3",
+                      "Reflective glass debug: mode 2 = absolute cube mip level; "
+                      "other modes = EXTRA LOD bias on top of the automatic "
+                      "640p-parity bias.")
+    .range(-4.0, 12.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Constant tangent-space normal tilt on the reflective glass, live-tunable
+// (F12). The defaults are DERIVED, not tuned: the material's 16x16 detail
+// texture is a constant BC1 block whose endpoints expand on HARDWARE by bit
+// replication: 5-bit red 16 -> (16<<3)|(16>>2) = 132/255, 6-bit green 32
+// -> (32<<2)|(32>>4) = 130/255; so the shader's 2*d - 1 fold is exactly
+// (0.035294, 0.019608). An earlier fold used our CPU decoder's
+// integer-division expansion (131/129 -> 0.028/0.012), leaving a ~0.8 deg
+// constant normal tilt = the residual reflection-position offset that was
+// dialed out by hand to (0.036, 0.019), matching the hardware value to
+// the slider step and confirming the derivation.
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_refl_bias_x, 0.035294, "Skate 3",
+                      "Reflective glass: constant tangent-X (horizontal) normal "
+                      "tilt added to the normal-map sample (= the detail "
+                      "constant's hardware-BC1 fold).")
+    .range(-0.2, 0.2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_refl_bias_y, 0.019608, "Skate 3",
+                      "Reflective glass: constant binormal-Y (vertical) normal "
+                      "tilt added to the normal-map sample (= the detail "
+                      "constant's hardware-BC1 fold).")
+    .range(-0.2, 0.2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_refl_bias_auto, true, "Skate 3",
+                    "Derive the reflective-glass normal tilt from each material's "
+                    "own detail texture (hardware-exact BC1 decode of its constant "
+                    "color) instead of the refl_bias_x/y values. The sliders "
+                    "remain the fallback/override with auto off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // Fine-grained feature gates for the F12 native-render debug dialog: each
 // isolates one subsystem so regressions (flicker, wrong shading) can be
 // bisected live without rebuilds. All hot-reload, default on.
@@ -760,6 +804,15 @@ std::atomic<uint64_t> g_palette_snapshots{0};
 // Palettes captured at base+1 (the cloth/morph VS layout with an extra
 // parameter row before the palette, see RefinePaletteBase).
 std::atomic<uint64_t> g_palette_base_plus1{0};
+// Reflective-glass (fam 5/6) normal-map pair telemetry: pair = draws with
+// the masks+normal t4/t5 descriptor pair bound (overlay.w == 4), flat =
+// spec-bound reflective draws still on the flat-normal path, gate = the
+// last no-pair reason bitmask (1 no spec masks, 2 no normal channel, 4
+// masks SRV recipe missing, 8 normal unresolved/white, 16 normal invalid,
+// 32 normal recipe missing, 64 pair slots exhausted).
+std::atomic<uint64_t> g_refl_pair{0};
+std::atomic<uint64_t> g_refl_flat{0};
+std::atomic<uint32_t> g_refl_gate{0};
 // Character-lighting capture telemetry: attempts vs validated captures per
 // family (see CaptureCharLighting).
 std::atomic<uint64_t> g_char_attempts{0};
@@ -1650,6 +1703,11 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // Environment CUBE map, the water and environment.reflective*
           // reflection term.
           slot = &item.water_env;
+        } else if (std::memcmp(text, "detail", 7) == 0) {
+          // Exact match ("detailNormalUVScale" is a different channel).
+          // Constant detail texture folded into the fam 5/6 normal
+          // composition (see DrawItem::detail_tex).
+          slot = &item.detail_tex;
         } else if (std::memcmp(text, "specular", 9) == 0 ||
                    std::memcmp(text, "noise", 6) == 0) {
           // Spec/eccentricity/reflection-mask map (environment families) /
@@ -6301,6 +6359,13 @@ struct GuestTexture {
   uint32_t payload_size = 0;
   uint64_t payload_fp = 0;
   uint64_t recheck_frame = 0;
+  // SRV recipe (2D textures) so EXTRA views of this resource can be created
+  // into paired descriptor slots (the fam 5/6 masks+normal 2-descriptor
+  // table at t4/t5); descriptors can't be copied out of the shader-visible
+  // heap, so pairs re-create views from the recipe instead.
+  DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
+  UINT srv_mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  uint32_t srv_mips = 0;
   bool valid = false;
 };
 
@@ -6544,6 +6609,14 @@ struct RendererState {
   // textures through the device fetch shadow, not renderengine objects.
   // Keyed by an FNV hash of the 6 fetch words.
   std::unordered_map<uint64_t, GuestTexture> textures_2d;
+  // Paired material descriptors for the fam 5/6 masks+normal 2-descriptor
+  // table (t4 = spec/ecc/refl masks, t5 = the material's normal map):
+  // (spec_tex << 32 | normal_tex) -> {base heap slot, last refresh frame}.
+  // Both views are (re)created every frame on first use so texture
+  // replacement (content revalidation / prewarm swaps) can never leave a
+  // stale descriptor. Slots come from the monotonic allocator and are never
+  // retired (bounded by the distinct reflective materials seen).
+  std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> mat_pairs;
   bool failed = false;
   bool announced = false;
 };
@@ -6589,10 +6662,18 @@ struct StagedTexCommit {
   DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
   UINT swizzle_mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   uint32_t mip_count = 0;
-  // Cube map (environment cubes): mips[0..5] are the six FACES (subresource
-  // = index, single mip) and the SRV is TEXTURECUBE.
+  // Cube map (environment cubes): mips[] holds face-major (face * levels +
+  // mip) subresource copies, matching D3D12 subresource numbering, and
+  // the SRV is TEXTURECUBE with cube_mip_levels levels. The cube MIP CHAIN
+  // is load-bearing: the game's reflective glass perturbs its reflection
+  // vector with a per-pixel normal map, so the hardware cube fetch runs at
+  // a DEEP gradient-derived LOD; a mip-0-only cube shows the plaza cube's
+  // baked streetlight heads as a sharp magnified smear the real console
+  // output blurs away.
   bool cube = false;
-  StagedMipCopy mips[16] = {};
+  uint32_t cube_mip_levels = 1;
+  // 6 faces x up to 10 levels (512 -> 1 full generated chain).
+  StagedMipCopy mips[64] = {};
 };
 thread_local StagedTexCommit* g_tex_stage_out = nullptr;
 
@@ -6631,10 +6712,13 @@ void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
   srv.Shader4ComponentMapping = sc.swizzle_mapping;
   if (sc.cube) {
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-    srv.TextureCube.MipLevels = 1;
+    srv.TextureCube.MipLevels = sc.cube_mip_levels;
   } else {
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Texture2D.MipLevels = sc.mip_count;
+    gt.srv_format = sc.srv_format;
+    gt.srv_mapping = sc.swizzle_mapping;
+    gt.srv_mips = sc.mip_count;
   }
   D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
   slot.ptr += size_t(gt.srv_slot) * g_r.srv_size;
@@ -6741,7 +6825,10 @@ Texture2D<float4> diffuse : register(t0);
 Texture2D<float4> lightmap : register(t1);
 Texture2D<float4> macro : register(t3);
 Texture2D<float4> decal_art : register(t4);
-Texture2D<float2> shadow_atlas : register(t5);
+// Paired second descriptor of the t4 table: the reflective families'
+// (fam 5/6) normal map. Only valid, and only sampled, when overlay.w == 4.
+Texture2D<float4> normal_map : register(t5);
+Texture2D<float2> shadow_atlas : register(t7);
 TextureCube<float4> env_cube : register(t6);
 // Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
 // applied with explicit dots (StructuredBuffer<float4x4> default packing is
@@ -7136,21 +7223,117 @@ float4 ps_main(VSOut i) : SV_Target {
         float3 wn = dot(i.nrm, i.nrm) > 0.01
                         ? normalize(i.nrm)
                         : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+        // misc.z = 3 (F12 reflection isolation): force the flat normal.
+        if (overlay.w > 3.5 && abs(misc.z - 3.0) > 0.5) {
+          // Per-pixel normal map (t5, paired descriptor): the real PS
+          // (baseenvironmentreflective_defaultPS) reflects off the
+          // normal-mapped normal: tangent normal = 2*(n + detail - 1) on
+          // xy, 2*n.z - 1 on z (the material's detail map is a constant
+          // neutral 16x16, folded here as 0.5). With the FLAT vertex normal
+          // every panel of a glass facade reflects the same tiny cube
+          // region: one giant magnified smear of the plaza cube's
+          // lamp-heads/trees (the "streetlight head" artifact, ucode-traced
+          // on a captured pixel; flat N lands on the
+          // face-0 tree/lamp texels, the mapped N tilts onto sky). The
+          // per-panel tilts break the reflection up exactly like the
+          // emulated frame. Screen-space cotangent frame (same shape as
+          // the vehicle DXN branch; the world VS carries no tangent
+          // attributes we decode).
+          // F12 mode 6: the slider drives the normal-map LOD bias live;
+          // the console fetches the nm at its 640p gradient LOD (blurrier,
+          // weaker bump tilts), so the matching bias is the remaining
+          // reflection-rotation candidate. Default stays SHARP (bias 0):
+          // an unconditional misc.y bias visibly degraded the glass;
+          // tune with the
+          // slider first, promote the found value to a default after.
+          float nm_bias = misc.z > 5.5 ? misc.w : 0.0;
+          float3 nmv = normal_map.SampleBias(smp, i.uv, nm_bias).rgb;
+          // Exact composition: xy = 2*normal + 2*detail - 2, z = 2*n.z - 1.
+          // The detail map is a CONSTANT 16x16 (0.514, 0.506), NOT the
+          // formula's 0.5 neutral, so its fold is a constant tangent tilt.
+          // The tilt rides the two F12 trim sliders (packed in misc.x;
+          // defaults = the exact fold) so the residual reflection rotation
+          // can be dialed live against the emulated frame.
+          float trim_yi = floor(misc.x / 1000.0);
+          float2 trim = float2(misc.x - trim_yi * 1000.0 - 500.0, trim_yi - 500.0) *
+                        0.001;
+          float3 nt = float3(nmv.xy * 2.0 - 1.0 + trim, nmv.z * 2.0 - 1.0);
+          float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
+          float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
+          float3 dp2p = cross(dp2, wn), dp1p = cross(wn, dp1);
+          float3 tt = dp2p * du1.x + dp1p * du2.x;
+          float3 bb = dp2p * du1.y + dp1p * du2.y;
+          // Signs/lengths calibrated against the mesh's REAL stored TBN
+          // (10_11_11 tangent @ +24, s16 normal xy @ +20, handedness in the
+          // unwrap sign bits, decoded mesh-wide):
+          // stored T == +dP/dU on 100% of tris (this formula's tt comes out
+          // as -dP/dU -> negate), stored B == this bb direction (dot 0.999),
+          // and the game's rows are UNIT so each axis normalizes SEPARATELY
+          // - the shared max-normalizer both halved and (with the flip)
+          // mirrored the horizontal tilt, which pushed the reflection
+          // DEEPER into the dark cube region instead of off it (first
+          // deploy looked unchanged). With these signs the reconstruction
+          // matches the ucode's mapped normal to 4 decimals at the traced
+          // pixel. An inward geometric wn flips all three terms together;
+          // reflect() is invariant to that.
+          tt *= -rsqrt(max(dot(tt, tt), 1e-12));
+          bb *= rsqrt(max(dot(bb, bb), 1e-12));
+          // The mesh's STORED TBN (what the game's VS interpolates) is the
+          // world-up frame, not the exact UV-gradient frame: B = up
+          // projected into the surface, T = cross(B, N), verified on the
+          // decoded window vertices (B = (0, 0.999, 0), T = horizontal).
+          // The screen-space frame lands ~3 deg off it (authored TBN vs UV
+          // gradients), which rotates reflections by degrees, visible as
+          // parallax against the emulated frame. Use the analytic axes and
+          // keep only the screen-space frame's SIGNS (mirrored UV islands
+          // flip the tangent; derivatives track that, the analytic frame
+          // cannot). Near-horizontal surfaces keep the screen frame.
+          float3 bb2 = float3(0.0, 1.0, 0.0) - wn * wn.y;
+          float lb2 = length(bb2);
+          if (lb2 > 0.05) {
+            bb2 /= lb2;
+            float3 tt2 = cross(bb2, wn);
+            tt = tt2 * (dot(tt2, tt) >= 0.0 ? 1.0 : -1.0);
+            bb = bb2 * (dot(bb2, bb) >= 0.0 ? 1.0 : -1.0);
+          }
+          wn = normalize(nt.x * tt + nt.y * bb + wn * max(nt.z, 0.05));
+        }
         float3 vd = -normalize(i.rpos);
         float3 Ls = float3(-0.14, 0.5, 0.9);
         float3 refl = Ls - 2.0 * wn * dot(wn, Ls);
         float bp = saturate(dot(vd, -refl));
         float ks = pow(max(bp, 1e-6), 10.0 + 290.0 * masks.y);
-        lin += ks * float3(2.1, 1.8, 1.5) * lml.g * masks.x;
-        if (fam > 4.5 && fam < 6.5) {
+        // misc.z = 5 (F12 reflection isolation): body only, no spec/cube.
+        if (abs(misc.z - 5.0) > 0.5) {
+          lin += ks * float3(2.1, 1.8, 1.5) * lml.g * masks.x;
+        }
+        if (fam > 4.5 && fam < 6.5 && abs(misc.z - 5.0) > 0.5 &&
+            abs(misc.z - 1.0) > 0.5) {
           // Cube reflection: reflect(E, wN) with xy negated (the source's
           // ref_vec.xy *= -1), luminosity lerped toward 1 by
           // 0.3 * sat(4*refmask - 2.6), x refmask x reflection_scale 1.5.
           float3 rv = vd - 2.0 * wn * dot(vd, wn);
-          float3 cube = env_cube.Sample(smp, float3(-rv.x, -rv.y, rv.z)).rgb;
+          // misc.y = cube LOD bias log2(render_height / 640): the guest
+          // computes the cube fetch's gradient LOD at its own 1152x640
+          // render; at 4K our per-pixel gradients are ~3.4x smaller, so
+          // without the bias baked cube detail (the plaza streetlight
+          // heads) survives through mips the console's fetch blurs away.
+          // F12 isolation (misc.z): mode 2 samples the ABSOLUTE level in
+          // misc.w; other modes add misc.w as extra bias; mode 4 shows the
+          // raw cube sample in place of the shaded result.
+          float3 dir = float3(-rv.x, -rv.y, rv.z);
+          // Mode 6 gives the slider to the NM fetch; the cube keeps just
+          // the automatic bias there.
+          float cube_extra = misc.z > 5.5 ? 0.0 : misc.w;
+          float3 cube = abs(misc.z - 2.0) < 0.5
+                            ? env_cube.SampleLevel(smp, dir, misc.w).rgb
+                            : env_cube.SampleBias(smp, dir, misc.y + cube_extra).rgb;
           float rl = 0.3 * saturate(4.0 * masks.z - 2.6);
           float lum = lml.g + rl * (1.0 - lml.g);
           lin += cube * lum * masks.z * 1.5;
+          if (abs(misc.z - 4.0) < 0.5) {
+            lin = cube * cube;
+          }
         }
       }
       if (fam > 6.5) {
@@ -8075,10 +8258,17 @@ void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4]) {
   const uint16_t c0 = uint16_t(b[0] | (b[1] << 8));
   const uint16_t c1 = uint16_t(b[2] | (b[3] << 8));
   uint8_t col[4][4];
+  // Endpoint expansion by BIT REPLICATION, what GPU hardware does. The
+  // previous integer-division expansion (v*255/31) reads up to 1/255 dark;
+  // on the reflective glass that error, folded through the constant detail
+  // texture, tilted every reflection ~0.8 deg (found empirically via the
+  // F12 trim sliders: the hand-matched values equaled the
+  // replication expansion exactly).
   const auto expand = [](uint16_t c, uint8_t* o) {
-    o[0] = uint8_t(((c >> 11) & 31) * 255 / 31);
-    o[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
-    o[2] = uint8_t((c & 31) * 255 / 31);
+    const uint32_t r5 = (c >> 11) & 31, g6 = (c >> 5) & 63, b5 = c & 31;
+    o[0] = uint8_t((r5 << 3) | (r5 >> 2));
+    o[1] = uint8_t((g6 << 2) | (g6 >> 4));
+    o[2] = uint8_t((b5 << 3) | (b5 >> 2));
     o[3] = 255;
   };
   expand(c0, col[0]);
@@ -8324,6 +8514,9 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
     srv.Shader4ComponentMapping =
         ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
     srv.Texture2D.MipLevels = mip_count;
+    out.srv_format = srv.Format;
+    out.srv_mapping = srv.Shader4ComponentMapping;
+    out.srv_mips = mip_count;
     D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
     slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
     device->CreateShaderResourceView(out.texture, &srv, slot);
@@ -8605,6 +8798,9 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
     srv.Texture2D.MipLevels = mip_count;
+    out.srv_format = srv.Format;
+    out.srv_mapping = srv.Shader4ComponentMapping;
+    out.srv_mips = mip_count;
     D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
     slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
     device->CreateShaderResourceView(out.texture, &srv, slot);
@@ -8634,8 +8830,11 @@ bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* 
   return EnsureGuestTextureFromWords(context, base, words, out);
 }
 
-// Environment CUBE map for the water reflection term (t6). Mip 0 only, six
-// faces untiled independently (Xenos cubes are 2D-tiled per face slice).
+// Environment CUBE map for the water / reflective-glass reflection term
+// (t6). Six faces untiled independently per level (Xenos cubes are 2D-tiled
+// per face slice), WITH the guest mip chain; gradient-derived LOD on the
+// normal-mapped reflection vector is what blurs baked cube detail
+// (streetlight heads) into the soft reflections of the real console output.
 bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8_t* base,
                             uint32_t tex_ptr, GuestTexture& out) {
   uint32_t words[6] = {};
@@ -8683,27 +8882,265 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   const uint32_t block_h = format_info->block_height;
   const uint32_t host_width = ((width + block_w - 1) / block_w) * block_w;
   const uint32_t host_height = ((height + block_h - 1) / block_h) * block_h;
-  const uint32_t cols = (width + block_w - 1) / block_w;
-  const uint32_t rows = (height + block_h - 1) / block_h;
-  const uint32_t pitch_blocks = info.extent.block_pitch_h;
-  const uint32_t slice_blocks = info.extent.block_pitch_h * info.extent.block_pitch_v;
-  const uint32_t slice_bytes = slice_blocks * bytes_per_block;
-  const uint32_t total = slice_bytes * 6;
-  if (total == 0 || total > 16u * 1024u * 1024u) {
+  // A FULL mip chain is load-bearing for the reflective families. The real
+  // baseenvironmentreflective PS perturbs its reflection vector with a
+  // per-pixel normal map, so adjacent pixels reflect degrees apart; the
+  // hardware cube fetch runs at a VERY deep gradient-derived LOD and the
+  // whole reflection resolves to a near-face-average wash (the emulated
+  // frame's uniform blue glass; offline: a CUBE_LOD=8 box-downsample probe
+  // reproduces the emulated facade's uniformity where mip 0 shows a sharp
+  // baked tree/streetlight blob). A truncated chain
+  // clamps the LOD shallow and leaves that blob visible. DXT1 cubes (every
+  // env cube observed) decode mip 0 to RGBA8 and generate the complete
+  // chain down to 1x1 below; other formats fall back to copying the guest
+  // chain (down to 32px: smaller levels live packed inside a shared 32x32
+  // tile, see GetPackedTileOffset).
+  const bool rgba_chain =
+      rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_DXT1 &&
+      width >= 8 && (width & (width - 1)) == 0 && width == height;
+  uint32_t mip_levels = 1;
+  if (!rgba_chain && info.memory.mip_address != 0 && (width & (width - 1)) == 0 &&
+      (height & (height - 1)) == 0) {
+    const uint32_t avail = std::min(info.mip_levels(), info.GetMaxMipLevels());
+    while (mip_levels < avail && (width >> mip_levels) >= 32 &&
+           (height >> mip_levels) >= 32) {
+      uint32_t ox = 0, oy = 0;
+      if (info.GetMipLocation(mip_levels, &ox, &oy, true) == 0 || ox != 0 || oy != 0) {
+        break;
+      }
+      ++mip_levels;
+    }
+  }
+  // Per-level guest layout: each level stores the six face slices
+  // consecutively (extent depth = 6; GetMipLocation walks whole levels).
+  struct CubeLevel {
+    uint32_t addr, pitch_blocks, slice_bytes, cols, rows, scratch_off;
+    uint32_t up_pitch, up_face_bytes, w, h;
+  };
+  CubeLevel lv[6] = {};
+  uint32_t scratch_total = 0;
+  for (uint32_t m = 0; m < mip_levels; ++m) {
+    CubeLevel& L = lv[m];
+    const auto ext = m == 0 ? info.extent : info.GetMipExtent(m, true);
+    uint32_t ox = 0, oy = 0;
+    L.addr = m == 0 ? info.memory.base_address : info.GetMipLocation(m, &ox, &oy, true);
+    L.pitch_blocks = ext.block_pitch_h;
+    L.slice_bytes = ext.block_pitch_h * ext.block_pitch_v * bytes_per_block;
+    const uint32_t mw = std::max(width >> m, 1u);
+    const uint32_t mh = std::max(height >> m, 1u);
+    L.cols = (mw + block_w - 1) / block_w;
+    L.rows = (mh + block_h - 1) / block_h;
+    L.w = L.cols * block_w;
+    L.h = L.rows * block_h;
+    L.up_pitch = (L.cols * bytes_per_block + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+                 ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    L.up_face_bytes =
+        (L.up_pitch * L.rows + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
+        ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+    L.scratch_off = scratch_total;
+    scratch_total += L.slice_bytes * 6;
+  }
+  if (scratch_total == 0 || scratch_total > 24u * 1024u * 1024u) {
     return false;
   }
   static thread_local std::vector<uint8_t> cube_scratch;
-  cube_scratch.resize(total);
-  if (!GuestTryCopy(cube_scratch.data(), base + (0xA0000000u | info.memory.base_address),
-                    total)) {
-    return false;
+  cube_scratch.resize(scratch_total);
+  for (uint32_t m = 0; m < mip_levels; ++m) {
+    if (!GuestTryCopy(cube_scratch.data() + lv[m].scratch_off,
+                      base + (0xA0000000u | lv[m].addr), lv[m].slice_bytes * 6)) {
+      if (m == 0) {
+        return false;
+      }
+      mip_levels = m;  // truncate the chain at the first unreadable level
+      break;
+    }
   }
 
-  const uint32_t row_bytes = cols * bytes_per_block;
-  const uint32_t pitch = (row_bytes + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-                         ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-  const uint32_t face_upload = ((pitch * rows + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
-                                ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u));
+  if (rgba_chain) {
+    // Decode DXT1 mip 0 -> RGBA8 per face, box-filter the full chain to
+    // 1x1, upload as an RGBA cube. CPU cost is one-time per cube (runs on
+    // the decode workers).
+    ID3D12Device* device = context.d3d12.device;
+    const uint32_t levels = 1u + uint32_t(std::countr_zero(width));
+    struct Level {
+      uint32_t w, pitch, face_bytes, upload_off;  // upload_off within a face
+    };
+    Level lvs[16] = {};
+    uint32_t face_upload = 0;
+    for (uint32_t m = 0; m < levels; ++m) {
+      Level& L = lvs[m];
+      L.w = std::max(width >> m, 1u);
+      L.pitch = (L.w * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+                ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+      L.face_bytes = (L.pitch * L.w + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
+                     ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+      L.upload_off = face_upload;
+      face_upload += L.face_bytes;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 6;
+    desc.MipLevels = UINT16(levels);
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&out.texture)))) {
+      out.texture = nullptr;
+      return false;
+    }
+    out.upload = CreateUploadBuffer(device, face_upload * 6);
+    if (!out.upload) {
+      out.texture->Release();
+      out.texture = nullptr;
+      return false;
+    }
+    uint8_t* mapping = nullptr;
+    out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+    static thread_local std::vector<uint8_t> rgba;   // level 0 of one face
+    static thread_local std::vector<uint8_t> down;   // downsample scratch
+    static thread_local std::vector<uint8_t> bc_row; // one untiled block row
+    const CubeLevel& L0 = lv[0];
+    bc_row.resize(size_t(L0.cols) * bytes_per_block);
+    for (uint32_t face = 0; face < 6; ++face) {
+      // Per-face: the downsample loop below SWAPS rgba/down, so their sizes
+      // end the chain tiny; the next face's full-size decode writes must
+      // not index a shrunken buffer.
+      rgba.resize(size_t(width) * height * 4);
+      down.resize(size_t(width / 2) * (height / 2) * 4);
+      const uint8_t* guest =
+          cube_scratch.data() + L0.scratch_off + size_t(face) * L0.slice_bytes;
+      for (uint32_t by = 0; by < L0.rows; ++by) {
+        for (uint32_t bx = 0; bx < L0.cols; ++bx) {
+          uint32_t source_offset;
+          if (info.is_tiled) {
+            source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+                int32_t(bx), int32_t(by), L0.pitch_blocks, bytes_per_block_log2));
+          } else {
+            source_offset = (by * L0.pitch_blocks + bx) * bytes_per_block;
+          }
+          if (source_offset + bytes_per_block > L0.slice_bytes) {
+            std::memset(&bc_row[size_t(bx) * bytes_per_block], 0, bytes_per_block);
+            continue;
+          }
+          std::memcpy(&bc_row[size_t(bx) * bytes_per_block], guest + source_offset,
+                      bytes_per_block);
+        }
+        SwapGuestEndian(bc_row.data(), uint32_t(bc_row.size()), info.endianness);
+        for (uint32_t bx = 0; bx < L0.cols; ++bx) {
+          uint8_t px[16][4];
+          DecodeBc1Block(&bc_row[size_t(bx) * bytes_per_block], px);
+          for (uint32_t r = 0; r < 4; ++r) {
+            std::memcpy(&rgba[(size_t(by * 4 + r) * width + bx * 4) * 4], px[r * 4],
+                        16);
+          }
+        }
+      }
+      // Upload level 0, then box-filter down the chain in place.
+      const uint8_t* src = rgba.data();
+      uint32_t w = width;
+      for (uint32_t m = 0; m < levels; ++m) {
+        uint8_t* up = mapping + size_t(face) * face_upload + lvs[m].upload_off;
+        for (uint32_t y = 0; y < w; ++y) {
+          std::memcpy(up + size_t(y) * lvs[m].pitch, src + size_t(y) * w * 4,
+                      size_t(w) * 4);
+        }
+        if (m + 1 >= levels) {
+          break;
+        }
+        const uint32_t hw = w / 2;
+        for (uint32_t y = 0; y < hw; ++y) {
+          for (uint32_t x = 0; x < hw; ++x) {
+            for (uint32_t c = 0; c < 4; ++c) {
+              const uint32_t s =
+                  uint32_t(src[((y * 2) * w + x * 2) * 4 + c]) +
+                  uint32_t(src[((y * 2) * w + x * 2 + 1) * 4 + c]) +
+                  uint32_t(src[((y * 2 + 1) * w + x * 2) * 4 + c]) +
+                  uint32_t(src[((y * 2 + 1) * w + x * 2 + 1) * 4 + c]);
+              down[(size_t(y) * hw + x) * 4 + c] = uint8_t((s + 2) / 4);
+            }
+          }
+        }
+        rgba.swap(down);
+        src = rgba.data();
+        w = hw;
+      }
+    }
+    out.upload->Unmap(0, nullptr);
+    REXLOG_INFO("native-scene: cube {:08X} {}x{} DXT1 -> RGBA full chain ({} levels)",
+                tex_ptr, width, height, levels);
+    const UINT swizzle_mapping =
+        ComposeSrvSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+    if (g_tex_stage_out != nullptr) {
+      StagedTexCommit& sc = *g_tex_stage_out;
+      sc.copy_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      sc.srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      sc.swizzle_mapping = swizzle_mapping;
+      sc.cube = true;
+      sc.cube_mip_levels = levels;
+      sc.mip_count = 6 * levels;
+      for (uint32_t face = 0; face < 6; ++face) {
+        for (uint32_t m = 0; m < levels; ++m) {
+          sc.mips[face * levels + m] = {face * face_upload + lvs[m].upload_off,
+                                        lvs[m].pitch, lvs[m].w, lvs[m].w};
+        }
+      }
+      out.payload_addr = 0xA0000000u | info.memory.base_address;
+      out.payload_size = lv[0].slice_bytes * 6;
+      out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
+      out.recheck_frame = 0;
+      out.valid = false;  // live only after commit
+      return true;
+    }
+    auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+    for (uint32_t face = 0; face < 6; ++face) {
+      for (uint32_t m = 0; m < levels; ++m) {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = out.texture;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = face * levels + m;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = out.upload;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = size_t(face) * face_upload + lvs[m].upload_off;
+        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        src.PlacedFootprint.Footprint.Width = lvs[m].w;
+        src.PlacedFootprint.Footprint.Height = lvs[m].w;
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = lvs[m].pitch;
+        list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      }
+    }
+    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                          out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!AllocGuestSrvSlot(out.srv_slot)) {
+      return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    srv.Shader4ComponentMapping = swizzle_mapping;
+    srv.TextureCube.MipLevels = levels;
+    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+    slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
+    device->CreateShaderResourceView(out.texture, &srv, slot);
+    out.payload_addr = 0xA0000000u | info.memory.base_address;
+    out.payload_size = lv[0].slice_bytes * 6;
+    out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
+    out.recheck_frame = 0;
+    out.valid = true;
+    return true;
+  }
+
+  uint32_t face_upload = 0;  // one face's full mip chain in the upload buffer
+  for (uint32_t m = 0; m < mip_levels; ++m) {
+    face_upload += lv[m].up_face_bytes;
+  }
   ID3D12Device* device = context.d3d12.device;
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -8712,7 +9149,7 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   desc.Width = host_width;
   desc.Height = host_height;
   desc.DepthOrArraySize = 6;
-  desc.MipLevels = 1;
+  desc.MipLevels = UINT16(mip_levels);
   desc.Format = host.resource_format;
   desc.SampleDesc.Count = 1;
   if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
@@ -8729,43 +9166,67 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   }
   uint8_t* mapping = nullptr;
   out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+  const auto upload_offset = [&](uint32_t face, uint32_t m) {
+    uint32_t off = face * face_upload;
+    for (uint32_t k = 0; k < m; ++k) {
+      off += lv[k].up_face_bytes;
+    }
+    return off;
+  };
+  // (The "Xenos cube T runs bottom-up" flip that briefly lived here was
+  // WRONG; it matched two probe pixels by coincidence and turned every
+  // facade pavement-white in game. The stored face orientation is correct
+  // as-is; the emulated look comes from LOD depth, not orientation.)
   for (uint32_t face = 0; face < 6; ++face) {
-    const uint8_t* guest = cube_scratch.data() + size_t(face) * slice_bytes;
-    for (uint32_t by = 0; by < rows; ++by) {
-      uint8_t* out_row = mapping + size_t(face) * face_upload + size_t(by) * pitch;
-      for (uint32_t bx = 0; bx < cols; ++bx) {
-        uint32_t source_offset;
-        if (info.is_tiled) {
-          source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
-              int32_t(bx), int32_t(by), pitch_blocks, bytes_per_block_log2));
-        } else {
-          source_offset = (by * pitch_blocks + bx) * bytes_per_block;
+    for (uint32_t m = 0; m < mip_levels; ++m) {
+      const CubeLevel& L = lv[m];
+      const uint8_t* guest =
+          cube_scratch.data() + L.scratch_off + size_t(face) * L.slice_bytes;
+      uint8_t* up = mapping + upload_offset(face, m);
+      const uint32_t row_bytes = L.cols * bytes_per_block;
+      for (uint32_t by = 0; by < L.rows; ++by) {
+        uint8_t* out_row = up + size_t(by) * L.up_pitch;
+        for (uint32_t bx = 0; bx < L.cols; ++bx) {
+          uint32_t source_offset;
+          if (info.is_tiled) {
+            source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+                int32_t(bx), int32_t(by), L.pitch_blocks, bytes_per_block_log2));
+          } else {
+            source_offset = (by * L.pitch_blocks + bx) * bytes_per_block;
+          }
+          if (source_offset + bytes_per_block > L.slice_bytes) {
+            std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+            continue;
+          }
+          std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + source_offset,
+                      bytes_per_block);
         }
-        if (source_offset + bytes_per_block > slice_bytes) {
-          std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
-          continue;
-        }
-        std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + source_offset,
-                    bytes_per_block);
+        SwapGuestEndian(out_row, row_bytes, info.endianness);
       }
-      SwapGuestEndian(out_row, row_bytes, info.endianness);
     }
   }
   out.upload->Unmap(0, nullptr);
 
+  REXLOG_INFO("native-scene: cube {:08X} {}x{} fmt={} mips={} (of {} avail)", tex_ptr,
+              width, height, uint32_t(info.format), mip_levels, info.mip_levels());
   if (g_tex_stage_out != nullptr) {
-    // Decode worker: export the commit recipe (mips[0..5] = the six faces).
+    // Decode worker: export the commit recipe, face-major (face * levels +
+    // mip) entries matching D3D12 subresource numbering.
     StagedTexCommit& sc = *g_tex_stage_out;
     sc.copy_format = host.resource_format;
     sc.srv_format = host.srv_format;
     sc.swizzle_mapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
     sc.cube = true;
-    sc.mip_count = 6;
+    sc.cube_mip_levels = mip_levels;
+    sc.mip_count = 6 * mip_levels;
     for (uint32_t face = 0; face < 6; ++face) {
-      sc.mips[face] = {uint32_t(face) * face_upload, pitch, host_width, host_height};
+      for (uint32_t m = 0; m < mip_levels; ++m) {
+        sc.mips[face * mip_levels + m] = {upload_offset(face, m), lv[m].up_pitch,
+                                          lv[m].w, lv[m].h};
+      }
     }
     out.payload_addr = 0xA0000000u | info.memory.base_address;
-    out.payload_size = total;
+    out.payload_size = lv[0].slice_bytes * 6;
     out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
     out.recheck_frame = 0;
     out.valid = false;  // live only after commit
@@ -8774,20 +9235,22 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
 
   auto& list = context.d3d12.command_processor->GetDeferredCommandList();
   for (uint32_t face = 0; face < 6; ++face) {
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = out.texture;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = face;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = out.upload;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = size_t(face) * face_upload;
-    src.PlacedFootprint.Footprint.Format = host.resource_format;
-    src.PlacedFootprint.Footprint.Width = host_width;
-    src.PlacedFootprint.Footprint.Height = host_height;
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = pitch;
-    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (uint32_t m = 0; m < mip_levels; ++m) {
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = out.texture;
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = face * mip_levels + m;
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = out.upload;
+      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint.Offset = upload_offset(face, m);
+      src.PlacedFootprint.Footprint.Format = host.resource_format;
+      src.PlacedFootprint.Footprint.Width = lv[m].w;
+      src.PlacedFootprint.Footprint.Height = lv[m].h;
+      src.PlacedFootprint.Footprint.Depth = 1;
+      src.PlacedFootprint.Footprint.RowPitch = lv[m].up_pitch;
+      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
   }
   context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
                                         out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
@@ -8799,12 +9262,12 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   srv.Format = host.srv_format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
   srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
-  srv.TextureCube.MipLevels = 1;
+  srv.TextureCube.MipLevels = mip_levels;
   D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
   slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
   device->CreateShaderResourceView(out.texture, &srv, slot);
   out.payload_addr = 0xA0000000u | info.memory.base_address;
-  out.payload_size = total;
+  out.payload_size = lv[0].slice_bytes * 6;
   out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
   out.recheck_frame = 0;
   out.valid = true;
@@ -8835,9 +9298,15 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     srv_range[2] = srv_range[0];
     srv_range[2].BaseShaderRegister = 3;  // macro overlay (t3)
     srv_range[3] = srv_range[0];
-    srv_range[3].BaseShaderRegister = 4;  // environment.decal art (t4)
+    srv_range[3].BaseShaderRegister = 4;  // decal art / spec masks (t4)
+    // Second descriptor of the t4 table = the fam 5/6 normal map (t5), a
+    // paired heap slot (see RendererState::mat_pairs). Range growth is free
+    // root-space-wise; draws without a pair leave t5 pointing at whatever
+    // follows their single slot; the shader only samples t5 when
+    // overlay.w == 4 (pair bound).
+    srv_range[3].NumDescriptors = 2;
     srv_range[4] = srv_range[0];
-    srv_range[4].BaseShaderRegister = 5;  // shadow atlas (t5)
+    srv_range[4].BaseShaderRegister = 7;  // shadow atlas (t7)
     srv_range[5] = srv_range[0];
     srv_range[5].BaseShaderRegister = 6;  // water environment cube (t6)
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -10771,14 +11240,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       bool bones;
     };
     std::vector<Caster> casters;
-    static const float kIdent[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     for (const DrawItem& item : scene.items) {
       if (item.transparent || item.unlit || item.cloth_quads) {
         continue;
       }
       const bool skinned = item.skinned && !item.bones.empty();
-      if (!skinned && std::memcmp(item.world, kIdent, sizeof(kIdent)) == 0) {
-        continue;  // static world geometry never casts (baked into lightmaps)
+      // The game's CSM casts only DYNAMIC content: characters/vehicles
+      // (skinned), Ropa cloth, and dynamicobject props (the truck's caster
+      // draws, F10-verified). Static world scenery has its shadows BAKED
+      // into the lightmaps, and that includes world-PLACED instances
+      // (streetlights, trees, rails), which carry real world transforms.
+      // The old identity-matrix test let every placed prop into the caster
+      // pass, painting phantom streetlight-head/tree silhouettes onto the
+      // plaza glass towers (a "reflection-like" soft dark blob high on the
+      // facade, geometrically impossible as a real shadow: sun at 47 deg,
+      // lamp 8 m tall, blob at 96 m; the emulated frame has no such
+      // shadow).
+      if (!skinned && item.dynobj == 0 && !item.ropa && item.char_family == 0) {
+        continue;
       }
       // NO inline decode here (this block used to re-decode every cloth
       // garment every frame, ~2.9 ms, the 160 fps cap during real play).
@@ -11500,6 +11979,69 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     const bool is_decal =
         item.char_family < 4 && item.decal && decal_tex != &g_r.white;
+    // Fam 5/6 masks+normal descriptor pair (t4/t5): the reflective PS
+    // perturbs its reflection/spec with the material's normal map (shader
+    // overlay.w == 4 branch: the fix for the giant flat-normal cube smear
+    // on glass facades). Both views are re-created into the pair's two
+    // consecutive heap slots once per frame, so prewarm/revalidation
+    // texture swaps can never leave a stale descriptor. Until the normal
+    // map decodes, overlay.w stays 3 (flat-normal reflection, the old
+    // behavior).
+    uint32_t pair_base = 0;
+    bool normal_paired = false;
+    if (item.env_family >= 5 && item.env_family <= 6) {
+      uint32_t gate = 0;
+      if (!spec_bound) gate |= 1;
+      if (item.water_normal == 0) gate |= 2;
+      if (spec_bound && (!decal_tex->valid || decal_tex->srv_mips == 0)) gate |= 4;
+      if (gate == 0) {
+        const GuestTexture* nrm = resolve_texture(item.water_normal);
+        if (nrm == &g_r.white) {
+          gate |= 8;
+        } else {
+          if (!nrm->valid) gate |= 16;
+          if (nrm->srv_mips == 0) gate |= 32;
+        }
+        if (gate == 0) {
+          const uint64_t pkey =
+              (uint64_t(item.spec_tex) << 32) | item.water_normal;
+          auto pit = g_r.mat_pairs.find(pkey);
+          if (pit == g_r.mat_pairs.end() && g_r.srv_next + 2 <= 8192) {
+            pit = g_r.mat_pairs.emplace(pkey, std::make_pair(g_r.srv_next, ~0ull))
+                      .first;
+            g_r.srv_next += 2;
+          }
+          if (pit == g_r.mat_pairs.end()) {
+            gate |= 64;
+          } else {
+            if (pit->second.second != frame_number) {
+              pit->second.second = frame_number;
+              const auto make_view = [&](const GuestTexture* t, uint32_t slot_idx) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = t->srv_format;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping = t->srv_mapping;
+                srv.Texture2D.MipLevels = t->srv_mips;
+                D3D12_CPU_DESCRIPTOR_HANDLE h =
+                    g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+                h.ptr += size_t(slot_idx) * g_r.srv_size;
+                g_r.device->CreateShaderResourceView(t->texture, &srv, h);
+              };
+              make_view(decal_tex, pit->second.first);
+              make_view(nrm, pit->second.first + 1);
+            }
+            pair_base = pit->second.first;
+            normal_paired = true;
+          }
+        }
+      }
+      if (normal_paired) {
+        g_refl_pair.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        g_refl_flat.fetch_add(1, std::memory_order_relaxed);
+        g_refl_gate.store(gate, std::memory_order_relaxed);
+      }
+    }
     constants[44] = item.macro_scale;
     constants[45] = item.macro_opacity;
     constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
@@ -11508,7 +12050,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // border texels into the giant cliff-face streaks), 3 = spec masks
     // bound (exact env families).
     constants[47] = is_decal ? (item.decal_tileable ? 2.0f : 1.0f)
-                             : (spec_bound ? 3.0f : 0.0f);
+                             : (spec_bound ? (normal_paired ? 4.0f : 3.0f)
+                                           : 0.0f);
     if (item.water) {
       // overlay.x = ripple scroll time, overlay.y = real environment cube
       // bound at t6, overlay.z = ripple normal map resolved (in the macro
@@ -11538,6 +12081,80 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[50] = scene.fog_ramp[1];
       constants[51] = scene.fog_ramp[2];
       std::memcpy(constants + 40, scene.fog_color, 4 * sizeof(float));
+    } else if (item.env_family >= 5 && item.env_family <= 6) {
+      // misc.y = cube LOD bias for the reflective families: the guest's
+      // cube fetch computes its gradient LOD at the game's own 1152x640
+      // render; at 4K our reflection-vector gradients are ~3.4x smaller
+      // per pixel, so mips alone leave baked cube detail (the streetlight
+      // heads) visible that the console blurs away.
+      // misc.z/misc.w = the F12 reflection-isolation controls (see the
+      // refl_mode cvar; both spare on opaque items; the fog packing only
+      // uses these slots on transparent/water).
+      constants[49] =
+          log2f(std::max(1.0f, float(context.guest_output_height) / 640.0f));
+      constants[50] = float(REXCVAR_GET(skate3_native_render_scene_refl_mode));
+      constants[51] = float(REXCVAR_GET(skate3_native_render_scene_refl_lod));
+      // misc.x (spare on opaque fam 5/6): both constant normal-tilt trims,
+      // fixed-point packed (each mapped to 0..999 around 500; float-exact).
+      // Only when the EXACT branch will run (same gate as cam_pos.w = -fam)
+      // - the legacy fallback reads misc.x as the transparent/water flag.
+      if (debug_mode == 0 && scene.shadow_valid) {
+        double bx = REXCVAR_GET(skate3_native_render_scene_refl_bias_x);
+        double by = REXCVAR_GET(skate3_native_render_scene_refl_bias_y);
+        if (REXCVAR_GET(skate3_native_render_scene_refl_bias_auto) &&
+            item.detail_tex != 0) {
+          // Derive the fold from the material's own detail texture: its
+          // first BC1 block decoded with hardware bit replication, texels
+          // averaged, folded as 2*d - 1. Cached per texture object; the
+          // packed-tile quirk of <=16px textures is benign here (neighbor
+          // packed mips of a constant texture hold the same constant).
+          // Implausible results (non-DXT1 / unreadable / |fold| > 0.1)
+          // keep the cvar values.
+          static std::unordered_map<uint32_t, std::pair<float, float>> fold_cache;
+          auto fit = fold_cache.find(item.detail_tex);
+          if (fit == fold_cache.end()) {
+            std::pair<float, float> fold{float(bx), float(by)};
+            uint32_t raw[6];
+            if (GuestTryCopy(raw, base + item.detail_tex + 7 * 4, sizeof(raw))) {
+              const uint32_t w0 = SwapU32(raw[0]);
+              const uint32_t w1 = SwapU32(raw[1]);
+              uint8_t block[8];
+              if ((w0 & 3) == 2 && (w1 & 0x3F) == 0x12 &&
+                  GuestTryCopy(block,
+                               base + (0xA0000000u | ((w1 >> 12) << 12)), 8)) {
+                uint8_t le[8];
+                for (int k = 0; k < 8; k += 2) {  // k_8in16 guest endianness
+                  le[k] = block[k + 1];
+                  le[k + 1] = block[k];
+                }
+                uint8_t px[16][4];
+                DecodeBc1Block(le, px);
+                float ax = 0.0f, ay = 0.0f;
+                for (int k = 0; k < 16; ++k) {
+                  ax += px[k][0];
+                  ay += px[k][1];
+                }
+                const float fx = (ax / 16.0f) * (2.0f / 255.0f) - 1.0f;
+                const float fy = (ay / 16.0f) * (2.0f / 255.0f) - 1.0f;
+                if (std::fabs(fx) < 0.1f && std::fabs(fy) < 0.1f) {
+                  fold = {fx, fy};
+                }
+                REXLOG_INFO(
+                    "native-scene: detail fold tex={:08X} = ({:+.6f}, {:+.6f})",
+                    item.detail_tex, fx, fy);
+              }
+            }
+            fit = fold_cache.emplace(item.detail_tex, fold).first;
+          }
+          bx = fit->second.first;
+          by = fit->second.second;
+        }
+        const auto pack_trim = [](double v) {
+          int i = int(std::lround(v * 1000.0)) + 500;
+          return std::clamp(i, 0, 999);
+        };
+        constants[48] = float(pack_trim(bx) + 1000 * pack_trim(by));
+      }
     }
     // cam_pos.w = -40 selects the exact sky branch: the game computes the
     // sun glow inside the dome shader (see the PS sky branch). Needs the
@@ -11574,7 +12191,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     context.d3d12.set_graphics_root_descriptor_table(
         context.d3d12.command_processor_user_data, 4, macro_gpu);
     D3D12_GPU_DESCRIPTOR_HANDLE decal_gpu = heap_start;
-    decal_gpu.ptr += size_t(decal_tex->srv_slot) * g_r.srv_size;
+    decal_gpu.ptr +=
+        size_t(normal_paired ? pair_base : decal_tex->srv_slot) * g_r.srv_size;
     context.d3d12.set_graphics_root_descriptor_table(
         context.d3d12.command_processor_user_data, 5, decal_gpu);
     D3D12_GPU_DESCRIPTOR_HANDLE cube_gpu = heap_start;
@@ -12107,7 +12725,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
-        "bones_rescued={}] dynobj[valid={} drawn={}]",
+        "bones_rescued={}] dynobj[valid={} drawn={}] refl[pair={} flat={} gate={:#x}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
@@ -12124,7 +12742,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_rr_tex_deferred.load(), scene.shadow_valid, shadow_ready, shadow_draws,
         g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
         g_char_rows_reused.load(), g_bones_rescued.load(), scene.dynobj_valid,
-        g_dynobj_drawn.load());
+        g_dynobj_drawn.load(), g_refl_pair.load(), g_refl_flat.load(),
+        g_refl_gate.load());
   }
   return true;
 }
@@ -12146,11 +12765,6 @@ void Install() {
 
 namespace skate3::native_scene {
 void Install() {}
-void FlushTextureCache() {}
-void FlushMeshCache() {}
-int CycleSyntheticPan() { return 0; }
-void RecordCameraSignal(double) {}
-void RecordBoneSignal(double) {}
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12
