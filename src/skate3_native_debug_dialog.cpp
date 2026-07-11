@@ -21,6 +21,8 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_splines);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_quadlists);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_world_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynamic_items);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_retain_offscreen);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_lookaside);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
@@ -221,6 +223,22 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                            REXCVAR_GET(skate3_native_render_scene_quadlists),
                            "Non-indexed quad-list captures (particle systems; off by "
                            "default: render as white squares without sprite textures)"));
+  REXCVAR_SET(
+      skate3_native_render_scene_retain_offscreen,
+      CvarCheckbox("Retain off-screen statics",
+                   REXCVAR_GET(skate3_native_render_scene_retain_offscreen),
+                   "Keep recently seen statics drawn while the game view-culls "
+                   "them: the smoothed render camera trails the guest pose, so "
+                   "without this world geometry visibly tears down right at the "
+                   "screen edges during pans/traversal"));
+  REXCVAR_SET(
+      skate3_native_render_scene_tex_lookaside,
+      CvarCheckbox("Texture mip lookaside",
+                   REXCVAR_GET(skate3_native_render_scene_tex_lookaside),
+                   "Keep decodes displaced by streaming mip rebinds parked by "
+                   "their fetch words and swap them back in instantly when the "
+                   "words return; kills the black/white-then-reload decal "
+                   "recycling while approaching"));
 
   ImGui::SeparatorText("Overlays");
   REXCVAR_SET(skate3_native_render_scene_2d,

@@ -212,6 +212,21 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynamic_items, true, "Skate 3",
                     "Publish dynamic entities (characters, props, cloth)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_lookaside, true, "Skate 3",
+                    "Park texture decodes displaced by streaming mip rebinds in a "
+                    "words-keyed lookaside and swap them back in instantly when the "
+                    "words return (mip flap A<->B) or a fresh object binds already-"
+                    "decoded content. Off = every rebind costs a worker re-decode "
+                    "round trip (stale/white art for the duration).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_retain_offscreen, true, "Skate 3",
+                    "Keep recently seen static items in the scene while the game "
+                    "view-culls them: the re-timed (smoothed) render camera trails "
+                    "the guest pose by up to the filter window, so items leaving "
+                    "the guest frustum were visibly torn down right at the screen "
+                    "edges during pans/traversal. Items the guest frustum can see "
+                    "but stopped submitting (LOD switch, despawn) drop immediately.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_revalidate, true, "Skate 3",
                     "Re-fingerprint cached texture payloads every 16 frames and "
                     "re-decode on change (heals late-composed lightmap pages)")
@@ -347,6 +362,10 @@ uint64_t g_generation = 0;
 // instead of only for newly streamed content.
 std::atomic<bool> g_flush_textures{false};
 std::atomic<bool> g_flush_meshes{false};
+// Off-screen retention clear request (see g_retained_items further down):
+// set on the menus/loading flip (render thread) and the F5 re-enable,
+// consumed at the top of BuildFrameScene's retention block (guest thread).
+std::atomic<bool> g_retained_clear{false};
 
 // ---- Camera-signal recorder (judder diagnosis) -----------------------------
 // Records the guest camera SIGNAL during a real stick pan: every distinct
@@ -452,10 +471,19 @@ struct PrewarmEntry {
   // cube decode measured up to ~100 ms, the largest remaining traversal
   // hitch when a vehicle / reflective area streamed in.
   bool cube = false;
+  // Draw-path miss (vs speculative prewarm registration): the result is
+  // visible RIGHT NOW, so the commit takes it this frame regardless of the
+  // gameplay per-frame commit cap.
+  bool miss = false;
 };
 std::mutex g_prewarm_mutex;
 std::condition_variable g_prewarm_cv;  // wakes the decode workers
 std::vector<PrewarmEntry> g_prewarm_queue;
+// Draw-path misses (EnqueueMeshMiss/EnqueueTexMiss/EnqueueWordsMiss/
+// EnqueueCubeMiss): content that is visible RIGHT NOW (white / skipped),
+// served FIFO with strict priority over the speculative registration
+// backlog in g_prewarm_queue. Guarded by g_prewarm_mutex.
+std::vector<PrewarmEntry> g_miss_queue;
 // Steady-state draw-path misses currently being decoded on the workers (one
 // in-flight decode per key; the commit erases). Guarded by g_prewarm_mutex.
 // This is the panning-hitch fix: a texture decode averages ~10 ms (max ~70 ms
@@ -649,7 +677,14 @@ std::atomic<uint64_t> g_char_rows_reused{0};
 // disappearance (the "momentary blip" while rotating the camera). One frame
 // of pose lag is invisible; a missing hat is not. Single-instance only;
 // clones share meshes with per-instance poses. Guest-render-thread only.
-std::unordered_map<uint32_t, std::vector<float>> g_bones_cache;
+struct CachedBones {
+  std::vector<float> bones;
+  // g_guest_frame at refresh: rescues/heals must be FRESH; a close-pass
+  // refusal resurrecting a seconds-old palette rendered the vehicle 10-20 m
+  // BEHIND its live position (the momentary ghost-back).
+  uint64_t frame = 0;
+};
+std::unordered_map<uint32_t, CachedBones> g_bones_cache;
 std::atomic<uint64_t> g_bones_rescued{0};
 // mesh -> last RESOLVED ropa garment state (rigid world OR skinned palette).
 // Ropa items must NOT ride the g_bones_cache rescue above: a ropa capture is
@@ -1176,6 +1211,7 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     int ok = 0;
     int loose = 0;
     int n = 0;
+    bool rows_sane = true;
     float qmin[3] = {1e9f, 1e9f, 1e9f};
     float qmax[3] = {-1e9f, -1e9f, -1e9f};
     for (uint32_t s = 0; s < kSamples; ++s) {
@@ -1219,6 +1255,14 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
           for (int i = 0; i < 4; ++i) {
             row[i] = LoadGuestF32(base, bank + ((r0 + a) * 4 + i) * 4);
           }
+          // A weighted bone's rotation row must be rotation-shaped (norm
+          // near the entity scale). The vehicle-flick captures carried
+          // WORLD POSITIONS in the rotation slots (norm ~140); those can
+          // still project on-screen and pass the geometric gate below.
+          const float rn = row[0] * row[0] + row[1] * row[1] + row[2] * row[2];
+          if (rn < 0.04f || rn > 25.0f) {
+            rows_sane = false;
+          }
           q[a] += float(w) * (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]);
         }
       }
@@ -1250,6 +1294,9 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     if (n == 0) {
       return -1;
     }
+    if (!rows_sane) {
+      return -2;  // provably not a palette (vs -1 = nothing to judge)
+    }
     if (out_front_all) {
       *out_front_all = n >= 2 && loose == n;
     }
@@ -1271,6 +1318,12 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
   }
   bind_diag = std::sqrt(bind_diag);
   const float max_spread = std::max(3.0f * bind_diag, bind_diag + 1.0f);
+  // Bounded from BELOW too: a palette of non-pose rows can skin every
+  // sample to nearly one point that happens to project on-screen (the
+  // vehicle-flick garbage). Samples span the whole VB, so legit skinning
+  // keeps a large fraction of the bind size; small items (hats: samples
+  // can cluster on one bone) skip the floor.
+  const float min_spread = bind_diag > 1.0f ? 0.2f * bind_diag : 0.0f;
   // Acceptance gate: skins into the bank's own view AND at a sane size.
   // IMPORTANT selection constraint (offline-validated on the cap capture):
   // a palette shifted by whole rows is a RIGID transform of the mesh, same
@@ -1289,14 +1342,15 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     if (ok_out) {
       *ok_out = ok;
     }
-    return ok >= 8 && spread <= max_spread;
+    return ok >= 8 && spread <= max_spread && spread >= min_spread;
   };
   int s_std = -1;
   int s_plus = -1;
   const bool std_pass = gate(palette_base, &s_std);
-  if (s_std < 0) {
+  if (s_std == -1) {
     // Unsupported position format / no weighted samples: nothing to judge;
-    // keep the caller's guess rather than refusing every capture.
+    // keep the caller's guess rather than refusing every capture. (-2 =
+    // provably-insane rows falls through: try the other homes, else refuse.)
     return palette_base;
   }
   // The guess wins whenever it passes; +1 (the cloth/morph parameter-row
@@ -1355,7 +1409,17 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
   const auto home_ok = [&](uint32_t pb) -> bool {
     switch (pb) {
       case 4:
-        return true;
+        // Never fall back to the pre-pass home on a structurally MAIN-pass
+        // bank (camera at c4): palette@4 is then the ONE-BONE-SHIFTED
+        // palette: bone 0 = the camera + parameter rows, every other bone
+        // = its neighbor's affine. A close vehicle whose real palette@7
+        // fails the strict projection gate (screen-filling: samples clip
+        // out of the band) fell through here, and the shifted palette
+        // skins adjacent bones plausibly enough to PASS, the
+        // camera-position-as-bone-0 vehicle mangle (proven in capture:
+        // main bank c4 = frame camera, c6.w = -0.5 =
+        // the published bone0_t, real palette at c7).
+        return !cam_at_c4();
       case 5:
         return param_like(4);
       case 7:
@@ -1376,6 +1440,30 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     }
     if (home_ok(pb) && gate(pb, nullptr)) {
       return pb;
+    }
+  }
+  // Camera-pinned MAIN-pass home: a close vehicle fills the screen and
+  // clips most samples out of the strict band, so gate(7/8) fails even on
+  // the REAL palette; with the pre-pass fallback (correctly) blocked
+  // above, the capture then refused every frame and the vehicle
+  // flickered/vanished during close passes. The camera key at c4 proves
+  // the layout structurally; accept on the loose front-of-projection
+  // criterion (same relaxation as the ropa structural path below).
+  if (cam_at_c4()) {
+    const uint32_t pb_main = param_like(7) ? 8u : 7u;
+    float spread = 0.0f;
+    bool front_all = false;
+    const int sc = score(pb_main, &spread, &front_all);
+    if (sc >= 0 && front_all && spread <= max_spread && spread >= min_spread) {
+      static std::atomic<uint64_t> s_main_relaxed{0};
+      const uint64_t n = s_main_relaxed.fetch_add(1, std::memory_order_relaxed);
+      if (n < 8 || (n & 1023u) == 0) {
+        REXLOG_INFO(
+            "native-scene: main-pass palette relaxed-accept mesh={:08X} "
+            "base={} score={} spread={:.2f} bind={:.2f} (n={})",
+            item.mesh, pb_main, sc, spread, bind_diag, n);
+      }
+      return pb_main;
     }
   }
   // Structurally-proven guess (ropa flag row, own-draw bank): near-camera
@@ -2326,6 +2414,8 @@ bool ToggleSceneEnabled() {
     // caches can be cold/stale, and the takeover frame would pay the whole
     // decode burst at once. A warm cache completes warmup in one frame.
     g_warmup_armed.store(true, std::memory_order_relaxed);
+    // The off-screen retention map is equally stale after the gap.
+    g_retained_clear.store(true, std::memory_order_relaxed);
   }
   REXCVAR_SET(skate3_native_render_scene, enabled);
   REXLOG_INFO("native-scene: switched to the {} renderer (runtime toggle)",
@@ -4481,6 +4571,108 @@ uint64_t SynPanItemKey(const DrawItem& it) {
   return h;
 }
 
+// ---- Off-screen retention (edge-of-view teardown fix) ----------------------
+// The game culls its submission stream to ITS camera pose; the native frame
+// renders with the re-timed (smoothed) pose, which TRAILS the guest pose by
+// up to the boxcar window (~25-50 ms). During a pan the guest stops
+// submitting items that left its (leading) frustum while the (trailing)
+// rendered view still contains them; world geometry visibly tore down right
+// at the screen edges (the emulated frame can never show this: it IS the
+// guest frame). Recently seen statics stay retained here and are re-appended
+// while the RAW guest frustum can NOT see them (i.e. the cull was
+// view-driven). An item the guest frustum CAN see but did not submit was
+// really removed (LOD switch, despawn, streaming) and drops immediately;
+// retaining those would z-fight the replacement LOD. Statics only: dynamic
+// poses go stale the moment they stop being captured. Guest render thread
+// only (BuildFrameScene); flips request a clear via the atomic.
+struct RetainedItem {
+  DrawItem item;
+  uint64_t last_seen = 0;  // g_guest_frame of the last live submission
+};
+std::unordered_map<uint64_t, RetainedItem> g_retained_items;
+// Dynamic sibling for traffic VEHICLES (char families 6/7): a vehicle
+// passing CLOSE leaves the guest frustum while the trailing rendered pose
+// still shows it; its captures stop and it tore down in view (and the
+// frames just before that alternated perspective / stale caster-bank
+// captures; see the caster ingest guard in InterpolateDynamicItems).
+// Entries hold the last live NON-caster capture; matched by mesh +
+// bone-derived position (clones). Guest render thread only. Characters/
+// NPCs are deliberately excluded: their ropa garments cannot be retained
+// coherently (a body without its shirt is worse than the teardown).
+struct DynRetained {
+  DrawItem item;
+  uint64_t last_seen = 0;
+  float pos[3] = {};  // plausible-bone average (world)
+  float half = 2.0f;  // bbox-diagonal half-extent for the frustum test
+};
+std::vector<DynRetained> g_dyn_retained;
+
+// True when all 8 world-space corners fall outside one clip plane of `vp`
+// (row-vector view*proj). `margin` scales the tested frustum: < 1 shrinks
+// it (bounds poking just inside an edge still count as outside; the
+// game's own cull volumes are tighter than a mesh bbox), > 1 widens it
+// (only clearly-outside counts).
+bool CornersOutsideFrustum(const float (&corners)[8][3], const float vp[16],
+                           float margin) {
+  int outside[6] = {};
+  for (int c = 0; c < 8; ++c) {
+    const float* p = corners[c];
+    float clip[4];
+    for (int k = 0; k < 4; ++k) {
+      clip[k] = p[0] * vp[0 * 4 + k] + p[1] * vp[1 * 4 + k] + p[2] * vp[2 * 4 + k] +
+                vp[3 * 4 + k];
+    }
+    // D3D clip volume: -w <= x <= w, -w <= y <= w, 0 <= z <= w. The game's
+    // negative projection x-scale only swaps left/right; the tests are
+    // symmetric. Corners behind the camera land in z < 0.
+    const float m = margin * clip[3];
+    if (clip[0] < -m) ++outside[0];
+    if (clip[0] > m) ++outside[1];
+    if (clip[1] < -m) ++outside[2];
+    if (clip[1] > m) ++outside[3];
+    if (clip[2] < 0.0f) ++outside[4];
+    if (clip[2] > clip[3]) ++outside[5];
+  }
+  for (int k = 0; k < 6; ++k) {
+    if (outside[k] == 8) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The item's world-space bbox against the frustum (statics: bbox is
+// mesh-local, world transforms it; fmt-57 absolute geometry carries an
+// identity world with world-space bounds).
+bool ItemOutsideFrustum(const DrawItem& it, const float vp[16], float margin) {
+  float corners[8][3];
+  for (int c = 0; c < 8; ++c) {
+    const float l[3] = {c & 1 ? it.bbox_max[0] : it.bbox_min[0],
+                        c & 2 ? it.bbox_max[1] : it.bbox_min[1],
+                        c & 4 ? it.bbox_max[2] : it.bbox_min[2]};
+    const float* w = it.world;
+    for (int k = 0; k < 3; ++k) {
+      corners[c][k] = l[0] * w[0 * 4 + k] + l[1] * w[1 * 4 + k] +
+                      l[2] * w[2 * 4 + k] + w[3 * 4 + k];
+    }
+  }
+  return CornersOutsideFrustum(corners, vp, margin);
+}
+
+// Axis-aligned cube of half-extent `half` around `center` against the
+// frustum, the skinned-item variant (a palette's world position lives in
+// its bone translations, not the identity item world).
+bool BoxOutsideFrustum(const float center[3], float half, const float vp[16],
+                       float margin) {
+  float corners[8][3];
+  for (int c = 0; c < 8; ++c) {
+    corners[c][0] = center[0] + (c & 1 ? half : -half);
+    corners[c][1] = center[1] + (c & 2 ? half : -half);
+    corners[c][2] = center[2] + (c & 4 ? half : -half);
+  }
+  return CornersOutsideFrustum(corners, vp, margin);
+}
+
 // Pan phase (degrees of accumulated rotation) -> heading angle in degrees.
 // Triangle wave in [-amp, +amp] starting at 0 heading upward; amp <= 0 =
 // unbounded continuous rotation.
@@ -4946,6 +5138,17 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     uint32_t cen_vb = 0;
     uint32_t cen_bytes = 0;
     std::vector<std::array<float, 4>> cen;
+    // Last RENDERED pose on this ring (post-interpolation / raw fallback):
+    // the flick detector's reference. Vehicles only (fam 6/7).
+    std::vector<float> last_final;
+    uint64_t last_final_frame = 0;
+    uint8_t last_final_src = 0;
+    bool last_final_caster = false;
+    // Timestamp of the last PERSPECTIVE-sourced (non-caster, non-retained)
+    // sample ingested: decides whether a caster pose tracks (caster-only
+    // stream) or holds (perspective stream fresh; interleaving the two
+    // sawtooths the wheel phase).
+    double last_persp_t = 0.0;
   };
   static std::unordered_map<uint64_t, DynHist> s_hist;
   static uint64_t s_frame = 0;
@@ -5175,7 +5378,194 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     if (skinned) {
       ensure_cen(h, item.bones.size() / 12);
     }
+    // Flick FIREWALL ("vehicle suddenly points sideways/upright"): compare
+    // the pose about to RENDER against last frame's rendered pose on this
+    // ring. No vehicle chassis legally rotates ~45 deg in one frame at any
+    // sim rate, while every bad-palette path (mis-located ortho rows,
+    // foreign bank, mispaired clone, bad rescue) rotates the whole chassis
+    // - minimum over the centroid-weighted bones, so spinning wheels can
+    // never trip it. Returns true = suppress this frame's draws (the
+    // reference pose is KEPT so a one-off bad palette never renders); four
+    // consecutive suppressions accept the new pose stream (a real teleport
+    // or respawn appears ~30 ms late instead of never).
+    const auto flick_check = [&](const char* path) -> bool {
+      if (!skinned || (item.char_family != 6 && item.char_family != 7)) {
+        return false;
+      }
+      if (h.last_final_frame + 1 == s_frame &&
+          h.last_final.size() == item.bones.size()) {
+        const size_t nb = item.bones.size() / 12;
+        const size_t ncen = std::min(h.cen.size(), nb);
+        float min_ang = 1e9f;
+        float move_at_min = 0.0f;
+        int checked = 0;
+        for (size_t b = 0; b < nb; ++b) {
+          if (ncen != 0 && (b >= ncen || h.cen[b][0] <= 0.5f)) {
+            continue;  // not vertex-weighted (junk palette row)
+          }
+          const size_t bi = b * 12;
+          double tr = 0.0, na = 0.0, nb2 = 0.0;
+          for (int r = 0; r < 3; ++r) {
+            for (int c2 = 0; c2 < 3; ++c2) {
+              const double av = item.bones[bi + r * 4 + c2];
+              const double bv = h.last_final[bi + r * 4 + c2];
+              tr += av * bv;
+              na += av * av;
+              nb2 += bv * bv;
+            }
+          }
+          // Orthonormal 3x3 rows sum to 3; anything far off is not a
+          // rotation and cannot be angle-compared.
+          if (na < 1.5 || na > 6.0 || nb2 < 1.5 || nb2 > 6.0) {
+            continue;
+          }
+          const double cth = std::clamp((tr - 1.0) * 0.5, -1.0, 1.0);
+          const float ang = float(std::acos(cth) * 57.2957795);
+          if (ang < min_ang) {
+            min_ang = ang;
+            const float dx = item.bones[bi + 3] - h.last_final[bi + 3];
+            const float dy = item.bones[bi + 7] - h.last_final[bi + 7];
+            const float dz = item.bones[bi + 11] - h.last_final[bi + 11];
+            move_at_min = std::sqrt(dx * dx + dy * dy + dz * dz);
+          }
+          ++checked;
+        }
+        if (checked > 0 && min_ang > 40.0f) {
+          // Detector only, suppression is retired: the sighting logs
+          // showed every trigger was a clone RING-SWAP (the sort lists
+          // reshuffle same-mesh clones; poses 20-75 m apart are different
+          // vehicles' VALID poses), so hiding them blinked legit traffic,
+          // while the real artifact (per-bone garbage) slides under the
+          // min-over-sane-bones angle and is handled by the bone repair
+          // above.
+          static std::atomic<uint64_t> s_flicks{0};
+          const uint64_t n = s_flicks.fetch_add(1, std::memory_order_relaxed);
+          if (n < 24 || (n & 127u) == 0) {
+            const float* c0 = item.bones.data();
+            const float* p0 = h.last_final.data();
+            REXLOG_INFO(
+                "native-scene FLICK: mesh={:08X} fam={} path={} ang={:.0f} "
+                "move={:.2f} cur[src={} pend={} caster={} retained={}] "
+                "prev[src={} caster={}] ring[count={} age_ms={:.0f}] "
+                "cur_r0=({:.3f},{:.3f},{:.3f},{:.2f}) "
+                "prev_r0=({:.3f},{:.3f},{:.3f},{:.2f}) (n={})",
+                item.mesh, item.char_family, path, min_ang, move_at_min,
+                item.dbg_src, item.pending ? 1 : 0, item.caster_bank ? 1 : 0,
+                item.retained ? 1 : 0, h.last_final_src,
+                h.last_final_caster ? 1 : 0, h.count,
+                h.count > 0 ? (now - h.ring[h.newest].t) * 1e3 : -1.0, c0[0],
+                c0[1], c0[2], c0[3], p0[0], p0[1], p0[2], p0[3], n);
+          }
+        }
+      }
+      h.last_final = item.bones;
+      h.last_final_frame = s_frame;
+      h.last_final_src = item.dbg_src;
+      h.last_final_caster = item.caster_bank;
+      return false;
+    };
     const DynPose& latest = h.ring[h.newest];
+    // Per-bone palette repair (vehicles): the sighting captures carried
+    // garbage on SOME weighted bones, world positions in the rotation
+    // rows, bone 0 gliding along the vehicle's own path, while every
+    // sampled-vert gate upstream judged only the bones its samples happen
+    // to reference. The survivors rendered as mangled vehicles with zero
+    // refusals in the telemetry. Repair the insane bones from the ring's
+    // newest pose (the body keeps its live motion; a repaired wheel
+    // freezes for the frames its rows are junk); with no sane source for
+    // a weighted bone, hide the item for the frame instead.
+    if (skinned && (item.char_family == 6 || item.char_family == 7) &&
+        !h.cen.empty()) {
+      const size_t nbones = item.bones.size() / 12;
+      const size_t ncen = std::min(h.cen.size(), nbones);
+      const bool ring_ok = h.count > 0 && latest.b.size() == item.bones.size();
+      const auto rows_sane = [](const float* bones, size_t bi) {
+        for (int r = 0; r < 3; ++r) {
+          const float* row = bones + bi + size_t(r) * 4;
+          const float n2 = row[0] * row[0] + row[1] * row[1] + row[2] * row[2];
+          if (n2 < 0.04f || n2 > 25.0f) {
+            return false;
+          }
+        }
+        return true;
+      };
+      uint32_t repaired = 0;
+      bool unrepairable = false;
+      for (size_t b = 0; b < ncen && !unrepairable; ++b) {
+        if (h.cen[b][0] <= 0.5f) {
+          continue;  // not vertex-weighted: staging leftovers are normal
+        }
+        const size_t bi = b * 12;
+        if (rows_sane(item.bones.data(), bi)) {
+          continue;
+        }
+        if (ring_ok && rows_sane(latest.b.data(), bi)) {
+          std::memcpy(item.bones.data() + bi, latest.b.data() + bi,
+                      12 * sizeof(float));
+          ++repaired;
+        } else {
+          unrepairable = true;
+        }
+      }
+      if (repaired != 0 || unrepairable) {
+        static std::atomic<uint64_t> s_repairs{0};
+        const uint64_t n = s_repairs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 24 || (n & 255u) == 0) {
+          REXLOG_INFO(
+              "native-scene: vehicle palette {} mesh={:08X} fam={} src={} "
+              "caster={} bones={} (n={})",
+              unrepairable ? "UNREPAIRABLE (hidden)" : "bone-repair",
+              item.mesh, item.char_family, item.dbg_src,
+              item.caster_bank ? 1 : 0, repaired, n);
+        }
+        if (unrepairable) {
+          item.draws.clear();
+          continue;
+        }
+      }
+    }
+    // Caster-bank palettes carry ~40 ms-stale FINE animation but a fresh
+    // GROSS pose, when they are the only capture stream they must keep
+    // TRACKING (the old 0.5 s ring-hold froze passing vehicles mid-motion
+    // in plain view, and the seed/hold/drift-out cycle re-seeded every
+    // ~100 ms: "cars stop in their tracks and vanish"). Only while
+    // PERSPECTIVE samples are fresh does a caster pose hold the ring pose
+    // instead (ingesting both interleaves a wheel-phase sawtooth), a
+    // <= 50 ms hold until the next perspective sample, imperceptible.
+    // Retained re-publishes always hold: their stored pose is frames old
+    // and ingesting it would step the ring backward. Ropa garments
+    // included: the gate requires SKINNED mode with an identical palette
+    // size, so the substitution cannot mix modes.
+    // Stale caster bank: the ortho banks occasionally hold a genuinely OLD
+    // palette (not just 40 ms of wheel phase), rendered raw, the vehicle
+    // momentarily ghosted 10-20 m back along its own trail. A pose > 3 m
+    // from a ring pose younger than 100 ms is physically impossible
+    // (> 30 m/s of error); hold the fresh ring pose for the frame. The
+    // 30 m ceiling keeps clone ring-swaps (45-75 m in the sighting logs,
+    // valid poses of DIFFERENT vehicles) rendering raw.
+    const bool caster_stale_jump = [&] {
+      if (!skinned || !item.caster_bank || h.count == 0 ||
+          latest.b.size() != item.bones.size() || now - latest.t > 0.1) {
+        return false;
+      }
+      const float d2 = skinned_dist2(item.bones, latest.b, h);
+      return d2 > 9.0f && d2 < 900.0f;
+    }();
+    if (skinned && h.count > 0 && latest.b.size() == item.bones.size() &&
+        ((item.caster_bank && now - h.last_persp_t <= 0.05) || item.retained ||
+         caster_stale_jump)) {
+      if (caster_stale_jump) {
+        static std::atomic<uint64_t> s_stale_caster{0};
+        const uint64_t n = s_stale_caster.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16 || (n & 255u) == 0) {
+          REXLOG_INFO(
+              "native-scene: stale caster pose held mesh={:08X} fam={} "
+              "ring_age_ms={:.0f} (n={})",
+              item.mesh, item.char_family, (now - latest.t) * 1e3, n);
+        }
+      }
+      item.bones = latest.b;
+    }
     const bool changed =
         h.count == 0 ||
         (skinned ? latest.b != item.bones
@@ -5232,6 +5622,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       p.b = item.bones;
       std::memcpy(p.w, item.world, sizeof(p.w));
       h.count = std::min(h.count + 1, kRing);
+      if (skinned && !item.caster_bank && !item.retained) {
+        h.last_persp_t = p.t;
+      }
       if (bs_rec) {
         BoneSigAppend(0, key, p.t, 0.0,
                       skinned ? item.bones.data() : item.world,
@@ -5239,6 +5632,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       }
     }
     if (h.count < 3 || now - h.ring[h.newest].t > 0.1) {
+      if (flick_check("raw")) {
+        item.draws.clear();
+      }
       continue;  // not enough history yet: raw stepped pose (one-time snap)
     }
     // Evaluate the ring's piecewise-linear pose signal at time tt into
@@ -5317,6 +5713,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       ok = accum_at(play_e, 1.0f, acc.data(), wacc);
     }
     if (!ok) {
+      if (flick_check("raw-size")) {
+        item.draws.clear();
+      }
       continue;  // palette-size mismatch in the window: raw pose this frame
     }
     // Fast-spinning bones (skateboard wheels: hundreds of degrees inside
@@ -5517,6 +5916,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       } else {
         std::memcpy(item.world, wacc, sizeof(wacc));
       }
+    }
+    if (flick_check("interp")) {
+      item.draws.clear();
     }
     if (bs_rec) {
       BoneSigAppend(1, key, now, play_e,
@@ -6050,8 +6452,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       } else {
         const auto bit = g_bones_cache.find(item.mesh);
         if (bit != g_bones_cache.end() &&
-            bit->second.size() == item.bones.size()) {
-          item.bones = bit->second;
+            bit->second.bones.size() == item.bones.size() &&
+            g_guest_frame - bit->second.frame <= 10) {
+          item.bones = bit->second.bones;
           item.dbg_src = 6;
           healed = true;
         }
@@ -6104,9 +6507,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           std::memcpy(c.world, item.world, sizeof(c.world));
           c.bones = item.bones;
         }
-      } else if (item.skinned && !item.bones.empty() &&
+      } else if (item.skinned && !item.bones.empty() && !item.caster_bank &&
                  g_bones_cache.size() < 512) {
-        g_bones_cache[item.mesh] = item.bones;
+        // caster_bank palettes are ~40 ms stale; a rescue re-publishing
+        // one would jump the entity backwards (see the ring ingest guard).
+        CachedBones& cb = g_bones_cache[item.mesh];
+        cb.bones = item.bones;
+        cb.frame = g_guest_frame;
       }
     }
     for (const auto& [mesh, cand] : pending_skinned_by_mesh) {
@@ -6114,12 +6521,16 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;  // a live copy published; nothing to rescue
       }
       const auto bit = g_bones_cache.find(mesh);
-      if (bit == g_bones_cache.end()) {
+      if (bit == g_bones_cache.end() ||
+          g_guest_frame - bit->second.frame > 10) {
+        // Stale cache = an OLD pose: for a moving vehicle the rescue
+        // rendered it 10-20 m behind its live position (the momentary
+        // ghost-back). One missing frame beats a teleport.
         continue;
       }
       scene.items.push_back(*cand);
       DrawItem& rescued = scene.items.back();
-      rescued.bones = bit->second;
+      rescued.bones = bit->second.bones;
       rescued.pending = false;
       rescued.dbg_src = 3;
       g_bones_rescued.fetch_add(1, std::memory_order_relaxed);
@@ -6242,6 +6653,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   for (int i = 0; i < 16; ++i) {
     scene.view_proj[i] = LoadGuestF32(base, viewcam + kViewCamViewProj + i * 4);
   }
+  // RAW guest view*proj, the pose the game culled its submissions with,
+  // kept for the off-screen retention frustum tests below (smoothing
+  // replaces scene.view_proj with the re-timed pose).
+  float guest_vp[16];
+  std::memcpy(guest_vp, scene.view_proj, sizeof(guest_vp));
   // Camera cadence telemetry (see g_cam_changes): does the guest publish a
   // NEW camera every rendered frame, or step it on a slower sim tick?
   {
@@ -6274,6 +6690,147 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // The game's projection uses a negative x scale which already yields
   // correct D3D NDC orientation; use the view*proj matrix as captured.
   // (Negating column 0 here mirrors the image left-right.)
+
+  // Vehicle retention (see g_dyn_retained): re-publish the last live
+  // capture of a view-culled vehicle for a short window. Runs BEFORE the
+  // smoothing block on purpose; the re-published copy re-claims its pose
+  // ring in InterpolateDynamicItems (position re-pairing) and renders the
+  // ring's coherent history instead of a frozen step.
+  if (REXCVAR_GET(skate3_native_render_scene_retain_offscreen) &&
+      REXCVAR_GET(skate3_native_render_scene_dynamic_items) &&
+      g_synpan_active.load(std::memory_order_relaxed) == 0) {
+    // Covers the camera-smoothing lag only; vehicle pose data just ages.
+    constexpr uint64_t kDynRetainFrames = 10;
+    const uint64_t rnow = g_guest_frame;
+    // World center from the palette: average the plausible bone
+    // translations (junk rows past the real skeleton carry garbage; gate
+    // on finiteness and distance to bone 0).
+    const auto bone_center = [](const DrawItem& it, float out[3]) -> bool {
+      const size_t nb = it.bones.size() / 12;
+      if (nb == 0) {
+        return false;
+      }
+      const float b0[3] = {it.bones[3], it.bones[7], it.bones[11]};
+      double sum[3] = {0.0, 0.0, 0.0};
+      int n = 0;
+      for (size_t b = 0; b < nb; ++b) {
+        const float t[3] = {it.bones[b * 12 + 3], it.bones[b * 12 + 7],
+                            it.bones[b * 12 + 11]};
+        if (!std::isfinite(t[0]) || !std::isfinite(t[1]) ||
+            !std::isfinite(t[2])) {
+          continue;
+        }
+        const float dx = t[0] - b0[0], dy = t[1] - b0[1], dz = t[2] - b0[2];
+        if (dx * dx + dy * dy + dz * dz > 100.0f) {
+          continue;  // > 10 m from bone 0: junk row
+        }
+        sum[0] += t[0];
+        sum[1] += t[1];
+        sum[2] += t[2];
+        ++n;
+      }
+      if (n == 0) {
+        return false;
+      }
+      out[0] = float(sum[0] / n);
+      out[1] = float(sum[1] / n);
+      out[2] = float(sum[2] / n);
+      return true;
+    };
+    struct LivePos {
+      uint32_t mesh;
+      float p[3];
+    };
+    std::vector<LivePos> live;
+    live.reserve(16);
+    for (const DrawItem& it : scene.items) {
+      if ((it.char_family != 6 && it.char_family != 7) || !it.skinned ||
+          it.bones.empty() || it.pending || it.retained) {
+        continue;
+      }
+      float p[3];
+      if (!bone_center(it, p)) {
+        continue;
+      }
+      live.push_back({it.mesh, {p[0], p[1], p[2]}});
+      if (it.caster_bank) {
+        continue;  // stale ortho pose: never store as the rescue state
+      }
+      DynRetained* slot = nullptr;
+      for (DynRetained& r : g_dyn_retained) {
+        const float dx = r.pos[0] - p[0], dy = r.pos[1] - p[1],
+                    dz = r.pos[2] - p[2];
+        if (r.item.mesh == it.mesh && dx * dx + dy * dy + dz * dz < 4.0f) {
+          slot = &r;
+          break;
+        }
+      }
+      if (slot == nullptr) {
+        if (g_dyn_retained.size() >= 64) {
+          continue;
+        }
+        g_dyn_retained.emplace_back();
+        slot = &g_dyn_retained.back();
+      }
+      slot->item = it;
+      slot->item.retained = true;
+      slot->item.selected = false;
+      std::memcpy(slot->pos, p, sizeof(slot->pos));
+      const float ex = it.bbox_max[0] - it.bbox_min[0];
+      const float ey = it.bbox_max[1] - it.bbox_min[1];
+      const float ez = it.bbox_max[2] - it.bbox_min[2];
+      slot->half = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez);
+      slot->last_seen = rnow;
+    }
+    for (size_t i = 0; i < g_dyn_retained.size();) {
+      DynRetained& r = g_dyn_retained[i];
+      if (r.last_seen == rnow) {
+        ++i;
+        continue;
+      }
+      bool keep = rnow - r.last_seen <= kDynRetainFrames;
+      bool publish = keep;
+      if (keep) {
+        for (const LivePos& lp : live) {
+          const float dx = lp.p[0] - r.pos[0], dy = lp.p[1] - r.pos[1],
+                      dz = lp.p[2] - r.pos[2];
+          if (lp.mesh == r.item.mesh && dx * dx + dy * dy + dz * dz < 36.0f) {
+            // A live copy nearby (caster-only capture frame, or the 2 m
+            // matcher missed a fast mover): keep the entry warm for the
+            // frame the captures stop, but never double the vehicle.
+            r.last_seen = rnow;
+            publish = false;
+            break;
+          }
+        }
+      }
+      if (publish) {
+        // Unsubmitted + visible to the guest camera = really gone
+        // (despawn); only view-culled vehicles re-publish.
+        if (!BoxOutsideFrustum(r.pos, r.half, guest_vp, 0.97f)) {
+          keep = false;
+        }
+      }
+      if (!keep) {
+        g_dyn_retained[i] = std::move(g_dyn_retained.back());
+        g_dyn_retained.pop_back();
+        continue;
+      }
+      if (publish) {
+        scene.items.push_back(r.item);
+        static std::atomic<uint64_t> s_dyn_retained_pub{0};
+        const uint64_t n =
+            s_dyn_retained_pub.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n & 1023u) == 0) {
+          REXLOG_INFO(
+              "native-scene: vehicle retention re-publish mesh={:08X} fam={} "
+              "age_frames={} (n={})",
+              r.item.mesh, r.item.char_family, rnow - r.last_seen, n);
+        }
+      }
+      ++i;
+    }
+  }
 
   // Camera re-timing (see SmoothCamera): replace the guest's sim-stepped
   // pose with a host-clock-interpolated one so panning is smooth at render
@@ -6364,6 +6921,74 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       // Keep the skater/NPCs/props in phase with the smoothed camera:
       // interpolate their palettes/worlds at the same playback time.
       InterpolateDynamicItems(base, scene, now_s);
+    }
+  }
+
+  // Off-screen retention (see g_retained_items): re-append statics the game
+  // view-culled this frame while the trailing rendered pose can still see
+  // them. Runs AFTER the smoothing block so retained copies never enter the
+  // dynamic pose histories, and stands down while the synthetic-pan probe
+  // maintains its own full-surround union.
+  if (REXCVAR_GET(skate3_native_render_scene_retain_offscreen) &&
+      g_synpan_active.load(std::memory_order_relaxed) == 0) {
+    if (g_retained_clear.exchange(false, std::memory_order_relaxed)) {
+      g_retained_items.clear();
+      g_dyn_retained.clear();
+    }
+    const uint64_t now = g_guest_frame;
+    std::unordered_set<uint64_t> submitted;
+    const size_t published = scene.items.size();
+    submitted.reserve(published);
+    for (size_t i = 0; i < published; ++i) {
+      const DrawItem& it = scene.items[i];
+      if (it.skinned || it.cloth_quads || it.ropa || it.pending ||
+          !it.bones.empty()) {
+        continue;
+      }
+      const uint64_t key = SynPanItemKey(it);
+      submitted.insert(key);
+      if (g_retained_items.size() >= 20000 &&
+          g_retained_items.find(key) == g_retained_items.end()) {
+        continue;  // growth backstop
+      }
+      auto [slot, inserted] = g_retained_items.try_emplace(key);
+      slot->second.last_seen = now;
+      // Copy the item core on first sight and whenever its payload identity
+      // or transform moved on; a retained copy with a stale fingerprint
+      // skips at draw (see draw_item's retained gate) and would re-tear.
+      if (inserted || slot->second.item.fingerprint != it.fingerprint ||
+          std::memcmp(slot->second.item.world, it.world, sizeof(it.world)) != 0) {
+        slot->second.item = it;
+        slot->second.item.retained = true;
+        slot->second.item.selected = false;
+      }
+    }
+    // TTL bounds how long a never-resubmitted entry lives (streaming reuses
+    // arena addresses; the render side additionally fingerprint-gates
+    // retained draws). ~90 guest frames = 0.6-1.5 s across fps caps,
+    // far beyond the smoothing lag it needs to cover.
+    constexpr uint64_t kRetainTtlFrames = 90;
+    for (auto rit = g_retained_items.begin(); rit != g_retained_items.end();) {
+      if (submitted.find(rit->first) != submitted.end()) {
+        ++rit;
+        continue;
+      }
+      const RetainedItem& r = rit->second;
+      // Unsubmitted + visible to the guest camera = the game really removed
+      // it. The 0.97 margin shrinks the tested frustum so bounds poking
+      // just inside an edge still count as view-culled.
+      if (now - r.last_seen > kRetainTtlFrames ||
+          !ItemOutsideFrustum(r.item, guest_vp, 0.97f)) {
+        rit = g_retained_items.erase(rit);
+        continue;
+      }
+      // Draw it only if the RENDERED pose can actually see it (widened
+      // frustum: only clearly-outside skips); after a fast 180 the trail
+      // behind the camera stays retained but costs nothing.
+      if (!ItemOutsideFrustum(r.item, scene.view_proj, 1.05f)) {
+        scene.items.push_back(r.item);
+      }
+      ++rit;
     }
   }
 
@@ -7080,6 +7705,17 @@ struct GuestTexture {
   uint32_t payload_size = 0;
   uint64_t payload_fp = 0;
   uint64_t recheck_frame = 0;
+  // Consecutive failed decodes of this entry (payload still streaming in):
+  // drives the escalating retry backoff at commit; the first failure
+  // retries fast (the payload usually lands within a few frames; a fixed
+  // +120 held freshly streamed textures white for ~half a second), repeat
+  // failures back off toward the old cadence.
+  uint8_t fail_count = 0;
+  // Successful payload rechecks so far: fresh entries re-verify fast
+  // (2/4/8 frames; a mid-stream garbage decode otherwise stays on screen
+  // up to the full recheck interval) before settling at the 16-frame
+  // steady-state cadence.
+  uint8_t recheck_count = 0;
   // SRV recipe (2D textures) so EXTRA views of this resource can be created
   // into paired descriptor slots (the fam 5/6 masks+normal 2-descriptor
   // table at t4/t5); descriptors can't be copied out of the shader-visible
@@ -7102,6 +7738,16 @@ inline uint64_t FetchWordsKey(const uint32_t words[6]) {
   }
   return key;
 }
+
+// Escalating retry backoff (native frames) for failed texture decodes: the
+// payload is usually mid-stream and lands within a few frames; the first
+// retry is fast (a fixed +120 held freshly streamed textures white for
+// ~half a second); repeated failures back off toward the old cadence.
+inline uint64_t RetryBackoff(uint8_t fails) {
+  const uint32_t n = fails > 0 ? uint32_t(fails) - 1 : 0u;
+  return std::min<uint64_t>(120, 8ull << std::min(n, 4u));
+}
+inline uint8_t BumpFail(uint8_t v) { return v < 250 ? uint8_t(v + 1) : v; }
 
 // FNV-1a guest-payload fingerprint (SEH-guarded reads; streaming can
 // decommit the range). Returns 0 only on unreadable payloads.
@@ -7355,6 +8001,11 @@ struct RendererState {
   // textures through the device fetch shadow, not renderengine objects.
   // Keyed by an FNV hash of the 6 fetch words.
   std::unordered_map<uint64_t, GuestTexture> textures_2d;
+  // Last successfully resolved words-key per streamed-art site
+  // (mesh << 1 | slot; slot 0 = diffuse override, 1 = decal override).
+  // Serves the site's previous art while a new-mip-words decode is in
+  // flight (see resolve_fetch_words). Render thread only.
+  std::unordered_map<uint64_t, uint64_t> words_sticky;
   // Paired material descriptors for the fam 5/6 masks+normal 2-descriptor
   // table (t4 = spec/ecc/refl masks, t5 = the material's normal map):
   // (spec_tex << 32 | normal_tex) -> {base heap slot, last refresh frame}.
@@ -7363,6 +8014,14 @@ struct RendererState {
   // stale descriptor. Slots come from the monotonic allocator and are never
   // retired (bounded by the distinct reflective materials seen).
   std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> mat_pairs;
+  // Words-keyed LOOKASIDE of decodes displaced from `textures` by a
+  // streaming mip rebind (see ParkGuestTexture): both states of a words
+  // flap A<->B stay resident, so the flap swaps decodes instantly instead
+  // of costing a worker re-decode round trip per flip (the "decal goes
+  // black/white then reloads on approach" churn). Bounded (LRU-evicted);
+  // parked entries keep their SRV slot until retired. Render thread only.
+  std::unordered_map<uint64_t, GuestTexture> tex_lookaside;
+  std::unordered_map<uint64_t, uint64_t> tex_lookaside_used;  // key -> frame
   bool failed = false;
   bool announced = false;
 };
@@ -7391,6 +8050,82 @@ void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
   if (t.texture) g_r.retired.emplace_back(t.texture, submission);
   if (t.upload) g_r.retired.emplace_back(t.upload, submission);
   if (t.valid) g_r.retired_srv_slots.emplace_back(t.srv_slot, submission);
+}
+
+// ---- Words-keyed decode lookaside ------------------------------------------
+// The guest streamer oscillates one texture OBJECT between two mip states for
+// seconds at a time (fetch words flapping A<->B, the banner churn logs) and
+// binds fresh objects onto content another object already carried. The
+// object-keyed cache holds exactly ONE decode per object, so every rebind
+// cost a full worker re-decode round trip, serving stale or white art for
+// the duration. Displaced decodes now PARK here keyed by their fetch words;
+// a rebind whose new words match a parked decode swaps it back in with zero
+// decode. The payload fingerprint is re-verified on every take; the shared
+// physical mip pool reuses addresses for different content over time.
+std::atomic<uint64_t> g_look_hit{0};
+std::atomic<uint64_t> g_look_stale{0};
+std::atomic<uint64_t> g_look_park{0};
+
+void ParkGuestTexture(GuestTexture&& t, uint64_t frame, uint64_t submission) {
+  if (!t.valid || !REXCVAR_GET(skate3_native_render_scene_tex_lookaside)) {
+    RetireGuestTexture(t, submission);
+    return;
+  }
+  const uint64_t key = FetchWordsKey(t.fetch_words);
+  auto [it, fresh] = g_r.tex_lookaside.try_emplace(key);
+  if (!fresh) {
+    RetireGuestTexture(it->second, submission);
+  }
+  it->second = std::move(t);
+  g_r.tex_lookaside_used[key] = frame;
+  g_look_park.fetch_add(1, std::memory_order_relaxed);
+  if (g_r.tex_lookaside.size() > 1024) {
+    // Evict the least-recently-used half (parked entries hold SRV slots).
+    std::vector<std::pair<uint64_t, uint64_t>> ages;  // (last-used frame, key)
+    ages.reserve(g_r.tex_lookaside_used.size());
+    for (const auto& [k, f] : g_r.tex_lookaside_used) {
+      ages.emplace_back(f, k);
+    }
+    std::nth_element(ages.begin(), ages.begin() + ages.size() / 2, ages.end());
+    for (size_t i = 0; i < ages.size() / 2; ++i) {
+      const auto lit = g_r.tex_lookaside.find(ages[i].second);
+      if (lit != g_r.tex_lookaside.end()) {
+        RetireGuestTexture(lit->second, submission);
+        g_r.tex_lookaside.erase(lit);
+      }
+      g_r.tex_lookaside_used.erase(ages[i].second);
+    }
+  }
+}
+
+// On a verified hit the parked decode's ownership (SRV slot included) moves
+// to `out` and the function returns true.
+bool TakeParkedTexture(uint8_t* base, const uint32_t words[6],
+                       uint64_t submission, GuestTexture* out) {
+  if (!REXCVAR_GET(skate3_native_render_scene_tex_lookaside)) {
+    return false;
+  }
+  const uint64_t key = FetchWordsKey(words);
+  const auto it = g_r.tex_lookaside.find(key);
+  if (it == g_r.tex_lookaside.end()) {
+    return false;
+  }
+  const uint64_t fp = SamplePayloadFingerprint(base, it->second.payload_addr,
+                                               it->second.payload_size);
+  if (fp == 0 || fp != it->second.payload_fp) {
+    // The mip pool reused this address range for different content since
+    // parking; the parked decode is stale, drop it.
+    RetireGuestTexture(it->second, submission);
+    g_r.tex_lookaside.erase(it);
+    g_r.tex_lookaside_used.erase(key);
+    g_look_stale.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  *out = std::move(it->second);
+  g_r.tex_lookaside.erase(it);
+  g_r.tex_lookaside_used.erase(key);
+  g_look_hit.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 // ---- Staged texture decode (worker-thread half) ---------------------------
@@ -7487,6 +8222,9 @@ struct PrewarmResult {
   MeshBuffers buffers;
   bool mesh_valid = false;
   std::vector<StagedTexResult> textures;
+  // Draw-path miss result (visible right now): the commit takes it this
+  // frame regardless of the gameplay per-frame cap.
+  bool miss = false;
 };
 std::mutex g_prewarm_out_mutex;
 std::vector<PrewarmResult> g_prewarm_out;
@@ -11310,16 +12048,20 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
 // change every frame, so an async result would always be stale.
 void EnqueueMeshMiss(uint32_t mesh) {
   std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-  if (g_prewarm_queue.size() < 65536 && g_miss_inflight_mesh.insert(mesh).second) {
-    g_prewarm_queue.push_back({mesh, 8});
+  if (g_miss_queue.size() < 65536 && g_miss_inflight_mesh.insert(mesh).second) {
+    PrewarmEntry e{mesh, 8};
+    e.miss = true;
+    g_miss_queue.push_back(e);
     g_prewarm_cv.notify_one();
   }
 }
 
 void EnqueueTexMiss(uint32_t tex) {
   std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-  if (g_prewarm_queue.size() < 65536 && g_miss_inflight_tex.insert(tex).second) {
-    g_prewarm_queue.push_back({0, 0, tex});
+  if (g_miss_queue.size() < 65536 && g_miss_inflight_tex.insert(tex).second) {
+    PrewarmEntry e{0, 0, tex};
+    e.miss = true;
+    g_miss_queue.push_back(e);
     g_prewarm_cv.notify_one();
   }
 }
@@ -11331,10 +12073,11 @@ void EnqueueTexMiss(uint32_t tex) {
 // (the placeholder poster), not white.
 void EnqueueWordsMiss(uint64_t key, const uint32_t words[6]) {
   std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-  if (g_prewarm_queue.size() < 65536 && g_miss_inflight_words.insert(key).second) {
+  if (g_miss_queue.size() < 65536 && g_miss_inflight_words.insert(key).second) {
     PrewarmEntry e{0, 0, 0, key};
     std::memcpy(e.words, words, sizeof(e.words));
-    g_prewarm_queue.push_back(e);
+    e.miss = true;
+    g_miss_queue.push_back(e);
     g_prewarm_cv.notify_one();
   }
 }
@@ -11343,10 +12086,11 @@ void EnqueueWordsMiss(uint64_t key, const uint32_t words[6]) {
 // the gray fallback cube shows for the 1-3 frames the workers need instead.
 void EnqueueCubeMiss(uint32_t tex) {
   std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-  if (g_prewarm_queue.size() < 65536 && g_miss_inflight_tex.insert(tex).second) {
+  if (g_miss_queue.size() < 65536 && g_miss_inflight_tex.insert(tex).second) {
     PrewarmEntry e{0, 0, tex};
     e.cube = true;
-    g_prewarm_queue.push_back(e);
+    e.miss = true;
+    g_miss_queue.push_back(e);
     g_prewarm_cv.notify_one();
   }
 }
@@ -11372,6 +12116,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     PrewarmResult res;
     res.item.mesh = 0;
     res.mesh_valid = false;
+    res.miss = e.miss;
     res.textures.push_back(std::move(tr));
     std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
     g_prewarm_out.push_back(std::move(res));
@@ -11403,6 +12148,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     PrewarmResult res;
     res.item.mesh = 0;  // texture-only result (DrawItem::mesh has no default)
     res.mesh_valid = false;
+    res.miss = e.miss;
     res.textures.push_back(std::move(tr));
     std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
     g_prewarm_out.push_back(std::move(res));
@@ -11445,6 +12191,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   }
 
   PrewarmResult res;
+  res.miss = e.miss;
   res.mesh_valid = DecodeMesh(g_r.device, base, item, res.buffers);
   if (res.mesh_valid) {
     res.buffers.fingerprint = item.fingerprint;
@@ -11532,7 +12279,8 @@ void PrewarmWorkerLoop() {
     {
       std::unique_lock<std::mutex> lock(g_prewarm_mutex);
       g_prewarm_cv.wait_for(lock, std::chrono::milliseconds(500), [] {
-        return !g_prewarm_queue.empty() || !g_dyn_jobs.empty();
+        return !g_prewarm_queue.empty() || !g_miss_queue.empty() ||
+               !g_dyn_jobs.empty();
       });
       if (!g_dyn_jobs.empty()) {
         // Dynamic cloth first: these are per-frame payloads whose result
@@ -11540,6 +12288,13 @@ void PrewarmWorkerLoop() {
         dyn = std::move(g_dyn_jobs.front());
         g_dyn_jobs.erase(g_dyn_jobs.begin());
         have_dyn = true;
+      } else if (!g_miss_queue.empty()) {
+        // Draw-path misses next: this content is visible RIGHT NOW (white /
+        // skipped geometry). On the old shared LIFO queue a streaming
+        // registration burst kept cutting the line ahead of the visible
+        // miss; medium-distance pop-in lasted the whole backlog.
+        e = g_miss_queue.front();
+        g_miss_queue.erase(g_miss_queue.begin());
       } else if (!g_prewarm_queue.empty()) {
         e = g_prewarm_queue.back();
         g_prewarm_queue.pop_back();
@@ -11565,6 +12320,7 @@ void PrewarmWorkerLoop() {
         res.buffers.fingerprint = dyn.item.fingerprint;
         res.buffers.dyn_seq = dyn.seq;
         res.item = std::move(dyn.item);
+        res.miss = true;  // per-frame cloth: never behind the commit cap
         std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
         g_prewarm_out.push_back(std::move(res));
       }
@@ -11583,7 +12339,12 @@ void EnsurePrewarmWorkers() {
     return;
   }
   const unsigned hw = std::max(4u, std::thread::hardware_concurrency());
-  const unsigned n = std::clamp(hw / 4u, 2u, 4u);
+  // Below-normal priority makes extra workers near-free (they only soak
+  // idle cores; the guest always wins the contention) while the pool size
+  // governs how fast a gameplay streaming burst decodes; 4 workers left
+  // medium-distance pop-in on big sectors visibly behind the emulated
+  // renderer.
+  const unsigned n = std::clamp(hw / 3u, 2u, 8u);
   for (unsigned i = 0; i < n; ++i) {
     std::thread(PrewarmWorkerLoop).detach();
   }
@@ -11618,9 +12379,30 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
     if (g_prewarm_out.size() <= kMaxCommitPerFrame) {
       done.swap(g_prewarm_out);
     } else {
-      done.assign(std::make_move_iterator(g_prewarm_out.end() - kMaxCommitPerFrame),
-                  std::make_move_iterator(g_prewarm_out.end()));
-      g_prewarm_out.resize(g_prewarm_out.size() - kMaxCommitPerFrame);
+      // Oldest first: draining from the END starved early results under a
+      // sustained streaming burst (they sat behind an ever-refilling tail,
+      // so exactly the content that had waited longest stayed popped-out).
+      // Draw-path MISS results (content visible right now: white/skipped)
+      // bypass the cap entirely: under a big sector streaming burst they
+      // otherwise queued behind hundreds of speculative prewarm results
+      // for several frames of visible pop-in. Only a handful arrive per
+      // frame, so the bypass cannot recreate the commit hitch the cap
+      // exists to prevent.
+      std::vector<PrewarmResult> rest;
+      rest.reserve(g_prewarm_out.size());
+      size_t taken = 0;
+      for (PrewarmResult& r : g_prewarm_out) {
+        const bool is_miss = r.miss;
+        if (is_miss || taken < kMaxCommitPerFrame) {
+          if (!is_miss) {
+            ++taken;
+          }
+          done.push_back(std::move(r));
+        } else {
+          rest.push_back(std::move(r));
+        }
+      }
+      g_prewarm_out.swap(rest);
     }
   }
   if (done.empty()) {
@@ -11628,6 +12410,8 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
   }
   const auto commit_t0 = PerfClock::now();
   bool committed_tex = false;
+  // For the payload-stability verify below (SEH-guarded sampled reads).
+  uint8_t* verify_base = g_guest_base.load(std::memory_order_relaxed);
   auto* command_processor = context.d3d12.command_processor;
   for (PrewarmResult& r : done) {
     if (r.mesh_valid) {
@@ -11671,6 +12455,28 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       }
     }
     for (StagedTexResult& t : r.textures) {
+      // Payload-stability verify: a decode read while its payload was still
+      // STREAMING IN is a garbage interleave (the mip-churn "goes black,
+      // then reloads" flash; fresh mip words repoint mid-upload, and the
+      // fingerprint sampled right after the worker's read can look stable).
+      // The commit runs 1-3 frames later: re-sample here and FAIL unstable
+      // results, so the cache keeps the previous good decode and the retry
+      // clock re-runs the heal once the payload settles. Cubes are exempt
+      // (static assets; a failed cube negative-caches permanently).
+      if (t.valid && !t.cube && verify_base != nullptr &&
+          t.gt.payload_addr != 0 &&
+          SamplePayloadFingerprint(verify_base, t.gt.payload_addr,
+                                   t.gt.payload_size) != t.gt.payload_fp) {
+        if (t.gt.texture) {
+          t.gt.texture->Release();
+          t.gt.texture = nullptr;
+        }
+        if (t.gt.upload) {
+          t.gt.upload->Release();
+          t.gt.upload = nullptr;
+        }
+        t.valid = false;
+      }
       if (t.cube) {
         // Environment cube: lands in the cube cache. Cubes are static
         // assets: an existing valid entry wins; a failed decode
@@ -11703,6 +12509,9 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
             if (t.gt.upload) t.gt.upload->Release();
             continue;
           }
+          if (!t.valid) {
+            t.gt.fail_count = wit->second.fail_count;  // keep the backoff arc
+          }
           RetireGuestTexture(wit->second, command_processor->GetCurrentSubmission());
           g_r.textures_2d.erase(wit);
         }
@@ -11710,7 +12519,8 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           CommitStagedGuestTexture(context, t.gt, t.commit);
           committed_tex = true;
         } else {
-          t.gt.retry_after_frame = frame_number + 120;
+          t.gt.fail_count = BumpFail(t.gt.fail_count);
+          t.gt.retry_after_frame = frame_number + RetryBackoff(t.gt.fail_count);
         }
         g_r.textures_2d.emplace(t.words_key, t.gt);
         continue;
@@ -11730,22 +12540,39 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           // (mid-stream upload), and the un-throttled loop re-queued a
           // doomed decode every 4 frames for its whole duration.
           if (!t.valid) {
-            tit->second.retry_after_frame = frame_number + 30;
+            tit->second.fail_count = BumpFail(tit->second.fail_count);
+            tit->second.retry_after_frame =
+                frame_number + RetryBackoff(tit->second.fail_count);
           }
           if (t.gt.texture) t.gt.texture->Release();
           if (t.gt.upload) t.gt.upload->Release();
           continue;
         }
         // Miss-driven revalidation heal (words/payload changed, or a failed
-        // entry that now decodes): swap the entry, retiring the old decode.
-        RetireGuestTexture(tit->second, command_processor->GetCurrentSubmission());
+        // entry that now decodes): swap the entry. A displaced decode whose
+        // WORDS differ from the incoming one parks in the lookaside: a mip
+        // flap (words A<->B for seconds) then swaps straight back with zero
+        // decode instead of another worker round trip. A same-words
+        // displacement (payload changed in place) is stale content: retire.
+        if (!t.valid) {
+          t.gt.fail_count = tit->second.fail_count;  // keep the backoff arc
+        }
+        const uint64_t heal_submission = command_processor->GetCurrentSubmission();
+        if (tit->second.valid && t.valid &&
+            std::memcmp(tit->second.fetch_words, t.gt.fetch_words,
+                        sizeof(t.gt.fetch_words)) != 0) {
+          ParkGuestTexture(std::move(tit->second), frame_number, heal_submission);
+        } else {
+          RetireGuestTexture(tit->second, heal_submission);
+        }
         g_r.textures.erase(tit);
       }
       if (t.valid) {
         CommitStagedGuestTexture(context, t.gt, t.commit);
         committed_tex = true;
       } else {
-        t.gt.retry_after_frame = frame_number + 120;
+        t.gt.fail_count = BumpFail(t.gt.fail_count);
+        t.gt.retry_after_frame = frame_number + RetryBackoff(t.gt.fail_count);
         // Failed decodes render white; log each once (capped) so white
         // meshes stay attributable to a specific texture.
         static std::unordered_set<uint32_t> logged_failed;
@@ -11808,6 +12635,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // registrations re-queue meshes (and re-stage textures) at reused
         // addresses, and drop the cached item cores built from them.
         ClearItemCache();
+        // Off-screen retention holds guest-address-keyed copies too.
+        g_retained_clear.store(true, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(g_prewarm_mutex);
         g_prewarm_seen.clear();
         g_prewarm_tex_seen.clear();
@@ -11988,6 +12817,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       RetireGuestTexture(t, submission);
     }
     g_r.textures_2d.clear();
+    g_r.words_sticky.clear();
+    for (auto& [key, t] : g_r.tex_lookaside) {
+      RetireGuestTexture(t, submission);
+    }
+    g_r.tex_lookaside.clear();
+    g_r.tex_lookaside_used.clear();
     REXLOG_INFO("native-scene: texture cache flushed (debug dialog)");
   }
   if (g_flush_meshes.exchange(false, std::memory_order_relaxed)) {
@@ -12456,17 +13291,38 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   };
   // Resolve six raw fetch-constant words (a draw-time streamed-artwork
   // binding with no guest texture object) through the words-keyed cache.
-  // Returns null while the decode is in flight on the workers (the item then
-  // falls back to its channel diffuse, the placeholder poster) or when the
-  // words fail to decode.
-  const auto resolve_fetch_words = [&](const uint32_t words[6]) -> const GuestTexture* {
+  // `site` identifies the consuming slot (mesh << 1 | slot) for the sticky
+  // fallback: streaming rebinds NEW mip words as you approach the art (the
+  // cache key changes wholesale), and dropping to the placeholder / channel
+  // diffuse for the worker round trip was the visible poster/decal flash;
+  // the site's previous art keeps serving until the new decode lands.
+  // Returns null only when nothing ever decoded for this site.
+  const auto resolve_fetch_words = [&](const uint32_t words[6], uint64_t site,
+                                       bool retained) -> const GuestTexture* {
     const uint64_t fkey = FetchWordsKey(words);
     auto fit = find_words_texture(fkey);
     if (fit == g_r.textures_2d.end()) {
+      if (!retained) {
+        EnqueueWordsMiss(fkey, words);
+      }
+    } else if (fit->second.valid) {
+      g_r.words_sticky[site] = fkey;
+      return &fit->second;
+    } else if (!retained && frame_number >= fit->second.retry_after_frame) {
+      // Failed words decode (payload was mid-stream at first sight): keep
+      // retrying; without this the entry negative-cached until the words
+      // changed again.
       EnqueueWordsMiss(fkey, words);
-      return nullptr;
+      fit->second.retry_after_frame = frame_number + 30;
     }
-    return fit->second.valid ? &fit->second : nullptr;
+    const auto pit = g_r.words_sticky.find(site);
+    if (pit != g_r.words_sticky.end() && pit->second != fkey) {
+      const auto old = g_r.textures_2d.find(pit->second);
+      if (old != g_r.textures_2d.end() && old->second.valid) {
+        return &old->second;
+      }
+    }
+    return nullptr;
   };
 
   const auto draw_item = [&](const DrawItem& item) {
@@ -12481,6 +13337,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // inline on change; it has no job route.
     const bool dynamic_payload = item.skinned || item.cloth_quads || item.ropa;
     auto it = g_r.meshes.find(item.mesh);
+    if (item.retained &&
+        (it == g_r.meshes.end() || it->second.fingerprint != item.fingerprint)) {
+      // Retained off-screen items (edge-of-view guard band) outlive their
+      // guest-side lifetime guarantees; the arena may have streamed out or
+      // been reused since capture. Draw only the exact cached decode; no
+      // guest reads, no heals, no miss enqueues from here.
+      return;
+    }
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
         REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
       if (item.cloth_quads) {
@@ -12580,6 +13444,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (tex_ptr == 0) {
         return &g_r.white;
       }
+      if (item.retained) {
+        // Retained item: the guest texture object may be gone; no live
+        // fetch-word reads, no revalidation, no miss enqueues. Serve the
+        // cached decode or white.
+        const auto rit = g_r.textures.find(tex_ptr);
+        return rit != g_r.textures.end() && rit->second.valid ? &rit->second
+                                                              : &g_r.white;
+      }
       auto tit = g_r.textures.find(tex_ptr);
       if (tit != g_r.textures.end()) {
         uint32_t live[6];
@@ -12596,7 +13468,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         bool payload_changed = false;
         if (tit->second.valid && frame_number >= tit->second.recheck_frame &&
             REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
-          tit->second.recheck_frame = frame_number + 16;
+          // Escalating cadence (2/4/8 then 16): a decode taken while the
+          // payload was still streaming in reads back garbage (the "goes
+          // black, then reloads" flash); a fixed 16-frame recheck left it
+          // on screen for up to the full interval. Fresh entries re-verify
+          // fast, then settle back to the cheap steady-state cadence.
+          tit->second.recheck_frame =
+              frame_number + (tit->second.recheck_count < 3
+                                  ? (2ull << tit->second.recheck_count)
+                                  : 16ull);
+          if (tit->second.recheck_count < 3) {
+            ++tit->second.recheck_count;
+          }
           const uint64_t fp = SamplePayloadFingerprint(
               base, tit->second.payload_addr, tit->second.payload_size);
           payload_changed = fp != 0 && fp != tit->second.payload_fp;
@@ -12612,6 +13495,33 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0 &&
             (!tit->second.valid || frame_number >= tit->second.retry_after_frame);
         if (retry_failed || payload_changed || words_changed) {
+          if (words_changed) {
+            // Streaming mip rebind: when the new words match a parked
+            // decode (mip flap A<->B, or content this object was rebound
+            // onto), swap it in NOW: zero decode round trip, no stale-art
+            // window. The displaced decode parks in its place.
+            GuestTexture parked;
+            const uint64_t look_submission =
+                command_processor->GetCurrentSubmission();
+            if (TakeParkedTexture(base, live, look_submission, &parked)) {
+              ParkGuestTexture(std::move(tit->second), frame_number,
+                               look_submission);
+              tit->second = std::move(parked);
+              // Re-verify soon: the fingerprint matched this frame, but the
+              // payload may still be settling under the streamer.
+              tit->second.recheck_frame = frame_number + 2;
+              tit->second.recheck_count = 0;
+              static std::atomic<uint32_t> s_look_logs{0};
+              if (s_look_logs.fetch_add(1) < 32) {
+                REXLOG_INFO(
+                    "native-scene: texture lookaside swap obj={:08X} "
+                    "words=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                    tex_ptr, live[0], live[1], live[2], live[3], live[4],
+                    live[5]);
+              }
+              return tit->second.valid ? &tit->second : &g_r.white;
+            }
+          }
           // Re-decode churn diagnostic: repeated fetch-word or payload
           // changes on one object = streaming oscillation, visible as
           // texture flicker on the affected meshes.
@@ -12644,9 +13554,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
       if (tit == g_r.textures.end()) {
-        // New texture: decode on the workers; white for the 1-3 frames that
-        // takes (inline decode measured ~10 ms avg / ~70 ms max, the
-        // panning lag spikes).
+        // New texture object: streaming routinely binds fresh objects onto
+        // content another object already had decoded (and parked); serve a
+        // words-matched parked decode instantly instead of a white flash.
+        uint32_t nwords[6];
+        for (uint32_t k = 0; k < 6; ++k) {
+          nwords[k] = REX_LOAD_U32(tex_ptr + (7 + k) * 4);
+        }
+        GuestTexture parked;
+        if (TakeParkedTexture(base, nwords,
+                              command_processor->GetCurrentSubmission(),
+                              &parked)) {
+          parked.recheck_frame = frame_number + 2;
+          parked.recheck_count = 0;
+          tit = g_r.textures.emplace(tex_ptr, std::move(parked)).first;
+          return &tit->second;
+        }
+        // Decode on the workers; white for the 1-3 frames that takes
+        // (inline decode measured ~10 ms avg / ~70 ms max, the panning
+        // lag spikes).
         EnqueueTexMiss(tex_ptr);
         ++tex_decodes;
         g_rr_tex_deferred.fetch_add(1, std::memory_order_relaxed);
@@ -12659,7 +13585,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // the words-keyed cache (shared with the 2D pass; the art has no guest
     // object to key on).
     const GuestTexture* diffuse =
-        item.diffuse_fetch[1] != 0 ? resolve_fetch_words(item.diffuse_fetch) : nullptr;
+        item.diffuse_fetch[1] != 0
+            ? resolve_fetch_words(item.diffuse_fetch, uint64_t(item.mesh) << 1,
+                                  item.retained)
+            : nullptr;
     if (diffuse == nullptr) {
       diffuse = resolve_texture(item.diffuse_tex);
     }
@@ -12810,7 +13739,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         item.water_env != 0) {
       auto cit = g_r.cube_textures.find(item.water_env);
       if (cit == g_r.cube_textures.end()) {
-        EnqueueCubeMiss(item.water_env);
+        if (!item.retained) {
+          EnqueueCubeMiss(item.water_env);
+        }
       } else if (cit->second.valid) {
         cube_tex = &cit->second;
       }
@@ -12824,7 +13755,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // bound over the decal channel at draw time.
     if (item.decal && item.decal_fetch[1] != 0 &&
         REXCVAR_GET(skate3_native_render_scene_decals)) {
-      const GuestTexture* ad = resolve_fetch_words(item.decal_fetch);
+      const GuestTexture* ad = resolve_fetch_words(
+          item.decal_fetch, (uint64_t(item.mesh) << 1) | 1, item.retained);
       if (ad != nullptr) {
         decal_tex = ad;
       }
@@ -13643,6 +14575,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
+        "look[hit={} stale={} park={} held={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
         "bones_rescued={}] dynobj[valid={} drawn={}] refl[pair={} flat={} gate={:#x}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
@@ -13661,7 +14594,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
         g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
         g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
-        g_rr_tex_deferred.load(), scene.shadow_valid, shadow_ready, shadow_draws,
+        g_rr_tex_deferred.load(), g_look_hit.load(), g_look_stale.load(),
+        g_look_park.load(), g_r.tex_lookaside.size(), scene.shadow_valid,
+        shadow_ready, shadow_draws,
         g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
         g_char_rows_reused.load(), g_bones_rescued.load(), scene.dynobj_valid,
         g_dynobj_drawn.load(), g_refl_pair.load(), g_refl_flat.load(),

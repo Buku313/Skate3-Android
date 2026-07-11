@@ -195,6 +195,13 @@ struct DrawItem {
   // (ib_obj, vb_obj, world translation) render into the native outline mask
   // (see kOutlineShaderSource).
   bool selected = false;
+  // Re-appended from the off-screen retention map (edge-of-view guard band):
+  // the game view-culled this item this frame, but the re-timed render
+  // camera trails the guest pose and can still see it. Retained items
+  // outlive their guest-side lifetime guarantees, so the render path draws
+  // only their exact cached decodes: no guest-memory reads, no heals, no
+  // miss enqueues.
+  bool retained = false;
   // Bone palette snapshot taken on the game thread: raw staged rows, 3
   // float4s per bone (column-vector affine [R | t], model -> world). The
   // guest staging bank is reused draw to draw, hence the copy.
