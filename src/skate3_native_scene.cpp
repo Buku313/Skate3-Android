@@ -826,6 +826,18 @@ std::atomic<uint64_t> g_ropa_rigid{0};
 // or projected the garment off-clip (stale bank from another mesh's draw);
 // the item stays pending for the post-draw fixup.
 std::atomic<uint64_t> g_ropa_stale{0};
+// ropa garments whose resolved mode CHANGED between frames (skinned <->
+// rigid: the cloth sim toggling with distance/activity). The flip frames
+// are where mode/payload races live; see the dyn-job coherence guard.
+std::atomic<uint64_t> g_ropa_flip{0};
+// SKINNED-mode ropa payload snapshots whose frame-end VB no longer skins at
+// bind size (the cloth sim rewrote it with sim-deformed vertices after the
+// draw-time capture): the re-decode is skipped so the GPU keeps last
+// frame's coherent verts instead of rendering the mangled ribbon.
+std::atomic<uint64_t> g_ropa_mismatch{0};
+// skinned/ropa meshes that published after a 1-3 frame publish GAP (was on
+// screen, vanished, came back): the "flickered invisible" telemetry.
+std::atomic<uint64_t> g_dyn_gap{0};
 std::atomic<uint64_t> g_skinned_items{0};
 std::atomic<uint64_t> g_skinned_skipped{0};
 // Rigid items whose transform had to wait for the post-draw fixup (deferred
@@ -1736,9 +1748,33 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             // "livingworld" pedestrian prefix.
             char mat_name[40];
             GuestTryReadString(base, s, mat_name, sizeof(mat_name));
+            // character.*_ropa = the Ropa cloth-sim VS variant (flag-row
+            // switched skinned/rigid, see CaptureSkinnedState). The suffix
+            // composes with the base family name: cloth_ropa (player tees),
+            // default_cloth_ropa (NPC jackets), hair_ropa and
+            // default_hair_ropa all exist in the attrib table; so detect it
+            // generically and STRIP it, letting the family idioms below see
+            // the base name. Matching only the player's character.cloth_ropa
+            // left NPC ropa garments on the generic skinned path, where
+            // every palette home is refused: the layout's guess register is
+            // this VS's FLAG row (scores 0), and the true +1 home fails the
+            // (0,0,0,w)/(1,0,0,0) parameter-row signature because this
+            // variant's row is (1, junk, junk, junk), the persistent
+            // invisible-torso NPC (observed: a
+            // character.default_cloth_ropa mesh refused all three captures every
+            // frame while the draw-time banks pass the gate at c5/c8).
+            item.ropa = false;
+            {
+              const size_t len = strnlen(mat_name, sizeof(mat_name));
+              if (len >= 5 && len < sizeof(mat_name) &&
+                  std::memcmp(mat_name, "character.", 10) == 0 &&
+                  std::memcmp(mat_name + len - 5, "_ropa", 5) == 0) {
+                item.ropa = true;
+                mat_name[len - 5] = '\0';
+              }
+            }
             item.hair = std::memcmp(mat_name, "character.hair", 15) == 0;
             item.unlit = std::memcmp(mat_name, "sky.", 4) == 0;
-            item.ropa = std::memcmp(mat_name, "character.cloth_ropa", 21) == 0;
             // Character shading family (see DrawItem::char_family). Order
             // matters: "default_hair" before the "default" prefix, exact
             // "hair" after (memcmp includes the NUL for exact names).
@@ -2701,6 +2737,111 @@ int ScoreRigidAffine(uint8_t* base, uint32_t bank, uint32_t m, const DrawItem& i
   return n == 0 ? -1 : (ok * 16) / n;
 }
 
+// Frame-end coherence check for SKINNED-mode ropa payloads (dyn decode
+// jobs). The item's mode and palette were captured at draw time, but the
+// cloth VB is snapshotted at BuildFrameScene, and the game's cloth sim
+// runs concurrently: when it ACTIVATES between the draws and the snapshot
+// (skating NPCs toggle with distance, "when he got near"), the copied
+// buffer holds sim-deformed root-local vertices, i.e. the ropa VS's OTHER
+// branch's input. Skinning those with the palette is the map-length-ribbon
+// interpretation (the offline-validated 0/31). Skin the acceptance gate's
+// sample vertices from the JUST-COPIED payload and require the same
+// bind-size spread the capture gate does; on failure the caller keeps last
+// frame's decode (coherent) and retries next frame, when the capture will
+// have flipped the mode to match the payload.
+bool RopaPayloadCoherent(const DrawItem& item, const std::vector<uint8_t>& vb) {
+  if (item.stride == 0 || item.bones.size() < 12 || item.bw_offset == 0 ||
+      item.bi_offset == 0) {
+    return true;
+  }
+  const uint32_t count = item.vb_bytes / item.stride;
+  if (count < 2) {
+    return true;
+  }
+  float bind_diag = 0.0f;
+  for (int a = 0; a < 3; ++a) {
+    const float d = item.bbox_max[a] - item.bbox_min[a];
+    bind_diag += d * d;
+  }
+  bind_diag = std::sqrt(bind_diag);
+  const float max_spread = std::max(3.0f * bind_diag, bind_diag + 1.0f);
+  float qmin[3] = {1e9f, 1e9f, 1e9f};
+  float qmax[3] = {-1e9f, -1e9f, -1e9f};
+  int n = 0;
+  constexpr uint32_t kSamples = 6;
+  for (uint32_t s = 0; s < kSamples; ++s) {
+    const uint32_t v = (s * (count - 1) / (kSamples - 1)) * item.stride;
+    if (uint64_t(v) + item.stride > vb.size()) {
+      return true;
+    }
+    const uint8_t* vp = vb.data() + v;
+    // Guest payload copied raw = big-endian attributes.
+    float p[3];
+    switch (item.pos_fmt) {
+      case 57:
+        for (int a = 0; a < 3; ++a) {
+          const uint8_t* b = vp + item.pos_offset + a * 4;
+          const uint32_t w = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 |
+                             uint32_t(b[2]) << 8 | b[3];
+          p[a] = std::bit_cast<float>(w);
+        }
+        break;
+      case 32:
+        for (int a = 0; a < 3; ++a) {
+          const uint8_t* b = vp + item.pos_offset + a * 2;
+          p[a] = GuestHalfToFloat(uint16_t(uint16_t(b[0]) << 8 | b[1]));
+        }
+        break;
+      case 26: {
+        constexpr float kScale = 2.0f / 32767.0f;
+        for (int a = 0; a < 3; ++a) {
+          const uint8_t* b = vp + item.pos_offset + a * 2;
+          p[a] = int16_t(uint16_t(b[0]) << 8 | b[1]) * kScale +
+                 (a == 1 ? 0.8f : 0.0f);
+        }
+        break;
+      }
+      default:
+        return true;
+    }
+    if (!(p[0] > -1e7f && p[0] < 1e7f && p[1] > -1e7f && p[1] < 1e7f &&
+          p[2] > -1e7f && p[2] < 1e7f)) {
+      return false;  // NaN/garbage positions mid-sim-write
+    }
+    // u8x4 weights/indices: component k = guest byte k (matches the
+    // capture path's byte-(24-8k)-of-host-load convention).
+    const uint8_t* bw = vp + item.bw_offset;
+    const uint8_t* bi = vp + item.bi_offset;
+    uint32_t total = 0;
+    float q[3] = {0.0f, 0.0f, 0.0f};
+    for (int k = 0; k < 4; ++k) {
+      const uint32_t w = bw[k];
+      if (w == 0) continue;
+      const uint32_t r0 = 3u * bi[k];
+      if ((r0 + 3) * 4 > item.bones.size()) continue;
+      total += w;
+      for (int a = 0; a < 3; ++a) {
+        const float* row = item.bones.data() + (r0 + uint32_t(a)) * 4;
+        q[a] += float(w) * (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]);
+      }
+    }
+    if (total == 0) continue;
+    ++n;
+    for (int a = 0; a < 3; ++a) {
+      q[a] /= float(total);
+      qmin[a] = std::min(qmin[a], q[a]);
+      qmax[a] = std::max(qmax[a], q[a]);
+    }
+  }
+  if (n < 2) {
+    return true;  // nothing to judge
+  }
+  const float dx = qmax[0] - qmin[0];
+  const float dy = qmax[1] - qmin[1];
+  const float dz = qmax[2] - qmin[2];
+  return std::sqrt(dx * dx + dy * dy + dz * dz) <= max_spread;
+}
+
 // Returns false when the bank could not be consumed for this item (ropa
 // rigid matrix implausible or off-clip = stale bank); the caller must
 // leave/mark the item pending so a later matching draw re-captures it.
@@ -2788,6 +2929,9 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
         item.skinned = false;
         item.bones.clear();
         g_ropa_rigid.fetch_add(1, std::memory_order_relaxed);
+        if (item.hair) {
+          CaptureHairTint(base, item);
+        }
         CaptureCharLighting(base, item);
         return true;
       }
@@ -5608,8 +5752,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (item.ropa) {
         // Remember the resolved mode + transform (see g_ropa_state_cache).
         if (g_ropa_state_cache.size() < 512) {
-          RopaResolvedState& c = g_ropa_state_cache[item.mesh];
-          c.skinned = item.skinned && !item.bones.empty();
+          const bool now_skinned = item.skinned && !item.bones.empty();
+          auto [cit, fresh] = g_ropa_state_cache.try_emplace(item.mesh);
+          RopaResolvedState& c = cit->second;
+          if (!fresh && c.skinned != now_skinned) {
+            g_ropa_flip.fetch_add(1, std::memory_order_relaxed);
+          }
+          c.skinned = now_skinned;
           std::memcpy(c.world, item.world, sizeof(c.world));
           c.bones = item.bones;
         }
@@ -5675,6 +5824,42 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (cit != g_char_rows_cache.end()) {
         std::memcpy(item.char_rows, cit->second.data(), sizeof(item.char_rows));
         g_char_rows_reused.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+  // Publish-gap telemetry ("skater flickered invisible for a moment"): a
+  // skinned/ropa/character mesh that published recently, vanished for 1-3
+  // built frames, and came back. Rate-limited log names the mesh and gap so
+  // the next flicker sighting is diagnosable from the log alone.
+  {
+    static std::unordered_map<uint32_t, uint64_t> s_last_pub;
+    static uint64_t s_pub_frame = 0;
+    ++s_pub_frame;
+    if (s_last_pub.size() > 4096) {
+      s_last_pub.clear();
+    }
+    for (const DrawItem& item : scene.items) {
+      if (!(item.ropa || item.char_family != 0 ||
+            (item.skinned && !item.bones.empty()))) {
+        continue;
+      }
+      auto [it, fresh] = s_last_pub.try_emplace(item.mesh, s_pub_frame);
+      if (fresh) {
+        continue;
+      }
+      const uint64_t gap = s_pub_frame - it->second;
+      it->second = s_pub_frame;
+      if (gap >= 2 && gap <= 4) {
+        g_dyn_gap.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> gap_logged{0};
+        const uint32_t ln = gap_logged.fetch_add(1, std::memory_order_relaxed);
+        if (ln < 16 || (ln & 255u) == 0) {
+          REXLOG_INFO(
+              "native-scene: dyn publish GAP mesh={:08X} missing {} frame(s) "
+              "ropa={} skinned={} fam={} src={}",
+              item.mesh, gap - 1, item.ropa ? 1 : 0, item.skinned ? 1 : 0,
+              item.char_family, item.dbg_src);
+        }
       }
     }
   }
@@ -6116,11 +6301,20 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (!(item.skinned || item.ropa) || item.cloth_quads || item.ib_addr == 0) {
         continue;
       }
-      auto [fit, first_sight] = s_dyn_fp_sent.try_emplace(item.mesh, item.fingerprint);
-      if (!first_sight && fit->second == item.fingerprint) {
+      if (item.ropa && item.dbg_src == 4) {
+        // Rescued ropa re-publishes LAST frame's resolved state (mode +
+        // palette + world); decoding THIS frame's payload under it mixes
+        // frames, at a sim flip that is the ribbon. Keep the previous
+        // decode on the GPU: a fully coherent N-1 garment (the draw path
+        // tolerates the fingerprint mismatch for dynamic payloads).
         continue;
       }
-      fit->second = item.fingerprint;
+      const auto prev = s_dyn_fp_sent.find(item.mesh);
+      const bool first_sight = prev == s_dyn_fp_sent.end();
+      const uint64_t prev_fp = first_sight ? 0 : prev->second;
+      if (!first_sight && prev_fp == item.fingerprint) {
+        continue;
+      }
       DynDecodeJob job;
       job.item = item;
       job.item.bones.clear();
@@ -6129,10 +6323,21 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (!GuestTryCopy(job.vb.data(), base + item.vb_addr, item.vb_bytes)) {
         continue;
       }
+      if (item.ropa && item.skinned && !item.bones.empty() &&
+          !RopaPayloadCoherent(item, job.vb)) {
+        // The cloth sim rewrote this VB between the draw-time capture and
+        // this frame-end snapshot (mode flip in flight): decoding it under
+        // the skinned palette is the mangled ribbon. Keep the old decode
+        // this frame; next frame's capture sees the flipped flag and
+        // resolves mode and payload together.
+        g_ropa_mismatch.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
       job.ib.resize(size_t(item.ib_count) * 2);
       if (!GuestTryCopy(job.ib.data(), base + item.ib_addr, job.ib.size())) {
         continue;
       }
+      s_dyn_fp_sent[item.mesh] = item.fingerprint;
       jobs.push_back(std::move(job));
     }
     if (!jobs.empty()) {
@@ -12720,7 +12925,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={}] skinned={} skinned_skipped={} foreign_bank={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
@@ -12732,6 +12937,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_r.meshes.size(), g_r.textures.size(),
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
+        g_ropa_flip.load(), g_ropa_mismatch.load(), g_dyn_gap.load(),
         g_skinned_items.load(),
         g_skinned_skipped.load(), g_capture_foreign_bank.load(),
         g_rigid_pending.load(), g_rigid_dropped.load(),
