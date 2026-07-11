@@ -15,6 +15,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_macro);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_decals);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_transparents);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_backface_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_2d);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_splines);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_quadlists);
@@ -138,8 +139,13 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
               CvarCheckbox("Dynamic shadows",
                            REXCVAR_GET(skate3_native_render_scene_shadows),
                            "Native CSM: skater/NPC/prop shadows onto the world"));
+  REXCVAR_SET(skate3_native_render_scene_backface_cull,
+              CvarCheckbox("Backface cull (game parity)",
+                           REXCVAR_GET(skate3_native_render_scene_backface_cull),
+                           "World env materials cull FRONT like the game's material "
+                           "XMLs; off = legacy cull-none (shows interior faces)"));
 
-  ImGui::SeparatorText("Reflective glass isolation (env fam 5/6)");
+  ImGui::SeparatorText("Reflective glass isolation (env fam 5/6/13)");
   {
     int mode = REXCVAR_GET(skate3_native_render_scene_refl_mode);
     const char* kReflModes[] = {"0: normal",
@@ -148,8 +154,11 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                                 "3: flat normal (no normal map)",
                                 "4: visualize cube sample only",
                                 "5: body only (no spec, no cube)",
-                                "6: normal-map LOD bias (slider)"};
-    if (ImGui::Combo("refl mode", &mode, kReflModes, 7)) {
+                                "6: normal-map LOD bias (slider)",
+                                "7: visualize lightmap sample",
+                                "8: visualize lightmap UV (frac x16)",
+                                "9: lightmap resolve status (blue = missing)"};
+    if (ImGui::Combo("refl mode", &mode, kReflModes, 10)) {
       REXCVAR_SET(skate3_native_render_scene_refl_mode, mode);
     }
     if (ImGui::IsItemHovered()) {

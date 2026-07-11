@@ -216,6 +216,21 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_revalidate, true, "Skate 3",
                     "Re-fingerprint cached texture payloads every 16 frames and "
                     "re-decode on change (heals late-composed lightmap pages)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lm_dump, false, "Skate 3",
+                    "Diagnostic: dump the decoded mip 0 of every generated-mip "
+                    "(no-chain composed page) texture to native_texture_dumps/ "
+                    "as raw RGBA for offline diffing against the gsnap decode")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_backface_cull, true, "Skate 3",
+                    "Backface-cull world env materials like the game does: the "
+                    "material XMLs set CULLMODE=FRONT on every environment "
+                    "family (banners calibrated game-kept faces = our D3D12 "
+                    "BACK faces -> CULL_FRONT). CULL_NONE stacked hidden faces "
+                    "into the frame: double glass panes + interior wall faces "
+                    "behind the translucent canopy glass = the too-bright "
+                    "slope / too-dark awning deltas. Trees/alphatest (fams "
+                    "7/9/10) and mirrored instances stay uncull(ed).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_mesh_revalidate, true, "Skate 3",
                     "Re-decode cached meshes when their payload fingerprint changes "
                     "(streaming arena reuse; also picks up CPU-animated buffers)")
@@ -1833,6 +1848,12 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
               item.env_family = 3;
             } else if (is("environment.reflective_simple", 30)) {
               item.env_family = 6;
+            } else if (is("environment.reflective_trans", 29)) {
+              // transparentenvironmentreflective: the sloped glass canopy /
+              // awning panels. Blended in the sorted alpha sub-pass with the
+              // fam-5 shading minus kd/macro, premultiplied body, out a^2
+              // (model verified 0.0-error against the ucode).
+              item.env_family = 13;
             } else if (is("environment.reflective", 23)) {
               item.env_family = 5;
             } else if (is("environmentsimple.alphatest", 28)) {
@@ -6587,15 +6608,40 @@ inline uint64_t FetchWordsKey(const uint32_t words[6]) {
   return key;
 }
 
-// FNV-1a over 16 qwords sampled across a guest payload (SEH-guarded reads;
-// streaming can decommit the range). Returns 0 only on unreadable payloads.
+// FNV-1a guest-payload fingerprint (SEH-guarded reads; streaming can
+// decommit the range). Returns 0 only on unreadable payloads.
+// Payloads up to 64 KB hash FULLY: the runtime-composed lightmap atlas
+// pages (32 KB DXT1) receive REGIONAL in-place writes as the game composes
+// late-streamed cells into a page we already decoded; the old 16-qword
+// probe missed writes that fell between its samples, so the revalidation
+// pass never re-decoded and the affected cells served the half-composed
+// first decode forever (the 2x-bright canopy / dark awning reflective_trans
+// glass: one texture, early-composed cells correct, late cells
+// stale). Larger payloads (streamed assets whose fetch words change when
+// content moves) keep a strided sample, densified 16 -> 64 qwords.
 uint64_t SamplePayloadFingerprint(uint8_t* base, uint32_t addr, uint32_t size) {
   if (addr == 0 || size < 8) {
     return 0;
   }
   uint64_t h = 1469598103934665603ull;
-  for (uint32_t k = 0; k < 16; ++k) {
-    const uint32_t off = uint32_t(uint64_t(size - 8) * k / 15u) & ~7u;
+  if (size <= 65536) {
+    uint64_t buf[512];
+    for (uint32_t off = 0; off < size; off += sizeof(buf)) {
+      const uint32_t n = std::min<uint32_t>(sizeof(buf), (size - off) & ~7u);
+      if (n == 0) {
+        break;
+      }
+      if (!GuestTryCopy(buf, base + addr + off, n)) {
+        return 0;
+      }
+      for (uint32_t k = 0; k < n / 8; ++k) {
+        h = (h ^ buf[k]) * 1099511628211ull;
+      }
+    }
+    return h;
+  }
+  for (uint32_t k = 0; k < 64; ++k) {
+    const uint32_t off = uint32_t(uint64_t(size - 8) * k / 63u) & ~7u;
     uint64_t v = 0;
     if (!GuestTryCopy(&v, base + addr + off, sizeof(v))) {
       return 0;
@@ -7138,8 +7184,12 @@ float4 ps_main(VSOut i) : SV_Target {
     // Exact env families (cam_pos.w < 0) use the game's world ALPHAREF 30.
     // dynamicobject items (cam_pos.w <= -21) are excluded here and clip in
     // their own branch (only the .alphatest variant tests, at ALPHAREF 30).
-    float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
-    clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
+    // Fam 13 (reflective_trans glass, cam_pos.w = -13) never alpha-tests;
+    // it alpha-BLENDS in the sorted sub-pass.
+    if (cam_pos.w > -12.5 || cam_pos.w < -13.5) {
+      float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
+      clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
+    }
   }
   // Exact sky dome (cam_pos.w = -40; sky_defaultPS transcribed from the
   // Skate 3 ucode in a live capture). The emulated frame's big sun
@@ -7360,7 +7410,7 @@ float4 ps_main(VSOut i) : SV_Target {
     float3 lin;
     float out_a = 1.0;
     bool reduced_tone = false;
-    if (fam > 8.5) {
+    if (fam > 8.5 && fam < 12.5) {
       // tree/treeanimate: D^2 * max(lm^2, floor) * scale [* tint mult];
       // proxyworld/incandescent: D^2 * scale. No shadow receive, no kd, no
       // material multiplier on the fog term.
@@ -7380,7 +7430,8 @@ float4 ps_main(VSOut i) : SV_Target {
       // against (CSM s + shadow color), kd, phong spec vs the shader's
       // fixed literal light, cube reflection on 5/6.
       float3 ov = float3(1.0, 1.0, 1.0);
-      if (overlay.z > 0.0) {
+      // Fam 13 (transparentenvironmentreflective) carries no macro term.
+      if (overlay.z > 0.0 && fam < 12.5) {
         float3 mo = macro.Sample(smp, i.uv * overlay.x).rgb;
         ov = saturate((mo - 0.5) * overlay.y + 0.5);
       }
@@ -7415,11 +7466,37 @@ float4 ps_main(VSOut i) : SV_Target {
           s = saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
         }
       }
-      float3 lmg = lightmap.Sample(smp, i.uv2).rgb;
+      // Lightmap fetch = the console's semantics: BILINEAR, CLAMPED, mip 0.
+      // The composed atlas pages are single-level on console and the fetch
+      // constants carry clamp_x/clamp_y = 2. Sampling them with the aniso-8
+      // WRAP sampler over our generated mip chain averaged NEIGHBORING
+      // atlas cells together at grazing angles (deep aniso LOD), and at the
+      // page border the wrap pulled in the opposite edge of the page: the
+      // reflective_trans canopy slope (cells at v ~ 0.996, white-cliff
+      // cells wrapping in from v ~ 0) glowed ~2x bright while the right
+      // awning went dark, with the decode, UVs and constants all verified
+      // exact (diagnosed via the mode-7 raw-lightmap isolation view).
+      float3 lmg = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
+      // F12 isolation mode 7: visualize the RAW lightmap sample; mode 8:
+      // visualize the lightmap unwrap coordinate (frac(uv2*16) in rg).
+      // Debug-only taps on fams 5/6/13 (misc.z is 0 on the other fams).
+      if (abs(misc.z - 7.0) < 0.5) {
+        return float4(lmg, 1.0);
+      }
+      if (abs(misc.z - 8.0) < 0.5) {
+        return float4(frac(i.uv2 * 16.0), 0.0, 1.0);
+      }
+      // Mode 9: lightmap-resolve status; RED = a real lightmap is bound
+      // (tint.r set by the C++ resolve), BLUE = white fallback in t1.
+      if (abs(misc.z - 9.0) < 0.5) {
+        return float4(tint.r, 0.0, 1.0 - tint.r, 1.0);
+      }
       float3 lml = min(lmg * lmg, s + sh_color.rgb);
       // GetTangentLight with the neutral (flat) normal map:
-      // 0.39 * 2.39562 exactly.
-      lin = lml * 0.93429 * dcol;
+      // 0.39 * 2.39562 exactly. Fam 13 has no kd term at all; its body is
+      // D^2 * lml * ALPHA, premultiplied once in the shader on top of the
+      // a^2 blend factor (verified 0.0-error vs the ucode).
+      lin = fam > 12.5 ? lml * dcol * albedo.a : lml * 0.93429 * dcol;
       if (overlay.w > 2.5) {
         // spec/ecc/refmask at t4: phong vs the FIXED literal light
         // (-0.14, 0.5, 0.9), power 10 + 290*ecc, tint (2.1, 1.8, 1.5),
@@ -7512,8 +7589,8 @@ float4 ps_main(VSOut i) : SV_Target {
         if (abs(misc.z - 5.0) > 0.5) {
           lin += ks * float3(2.1, 1.8, 1.5) * lml.g * masks.x;
         }
-        if (fam > 4.5 && fam < 6.5 && abs(misc.z - 5.0) > 0.5 &&
-            abs(misc.z - 1.0) > 0.5) {
+        if (((fam > 4.5 && fam < 6.5) || fam > 12.5) &&
+            abs(misc.z - 5.0) > 0.5 && abs(misc.z - 1.0) > 0.5) {
           // Cube reflection: reflect(E, wN) with xy negated (the source's
           // ref_vec.xy *= -1), luminosity lerped toward 1 by
           // 0.3 * sat(4*refmask - 2.6), x refmask x reflection_scale 1.5.
@@ -7541,7 +7618,12 @@ float4 ps_main(VSOut i) : SV_Target {
           }
         }
       }
-      if (fam > 6.5) {
+      if (fam > 12.5) {
+        // Fam 13 blend factor: the PS outputs a^2 (straight-alpha blend on
+        // top of the in-shader premultiplied body; wisps thin as ~a^3,
+        // same convention as transparentenvironment).
+        out_a = albedo.a * albedo.a;
+      } else if (fam > 6.5) {
         out_a = albedo.a;
         reduced_tone = fam > 7.5;  // environmentdiffuse's cheap tonemap
       }
@@ -8243,7 +8325,9 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       out[2] = float(iz) / 511.0f;
     };
     float n3[3] = {0.0f, 0.0f, 0.0f};
-    if (item.env_family != 0 && item.env_family <= 6 && item.uv2_fmt == 26) {
+    if (item.env_family != 0 &&
+        (item.env_family <= 6 || item.env_family == 13) &&
+        item.uv2_fmt == 26) {
       // Exact world families: the REAL vertex normal is packed in the
       // lightmap-unwrap element (fmt 26 s16x4): zw = normal.xy (snorm), and
       // the unwrap xy SIGN bits carry the handedness; sign.y flips
@@ -8431,7 +8515,8 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       // foliage regression). Those keep the strict fully-twinned rule.
       const bool partial_rule_ok =
           !item.transparent && item.dynobj != 2 && item.env_family != 0 &&
-          item.env_family != 7 && item.env_family != 9 && item.env_family != 10;
+          item.env_family != 7 && item.env_family != 9 &&
+          item.env_family != 10 && item.env_family != 13;
       two_sided = twins * 10 >= tris.size() * 6 ||
                   (partial_rule_ok && twins >= 12 && twins * 33 >= tris.size());
       if (two_sided) {
@@ -8591,6 +8676,22 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
     for (uint32_t y = 0; y < height; ++y) {
       std::memcpy(&rgba[size_t(y) * width * 4], linear.data() + size_t(y) * cols * 4,
                   size_t(width) * 4);
+    }
+  }
+
+  // Diagnostic dump: what the RUNTIME decoded, for an offline byte diff
+  // against gsnap_tex_decode of the same fetch words (the reflective_trans
+  // glass panels' wrong-brightness hunt: their composed lightmap pages take
+  // exactly this generated-mips path).
+  if (REXCVAR_GET(skate3_native_render_scene_lm_dump)) {
+    char path[260];
+    std::snprintf(path, sizeof(path),
+                  "native_texture_dumps/gen_%08X_%ux%u_t%u.rgba",
+                  info.memory.base_address, width, height,
+                  info.is_tiled ? 1u : 0u);
+    if (FILE* f = std::fopen(path, "wb")) {
+      std::fwrite(rgba.data(), 1, rgba.size(), f);
+      std::fclose(f);
     }
   }
 
@@ -8953,6 +9054,26 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
           std::memcpy(out_row + i, &value, sizeof(value));
         }
       }
+    }
+  }
+  // Diagnostic dump (skate3_native_render_scene_lm_dump): no-chain textures
+  // through the PLAIN path (the >512px composed lightmap pages the
+  // generated-mips gate excludes): mip 0 as linear block rows, raw guest
+  // block format post-endian-swap, for offline decode + byte-diff against
+  // gsnap_tex_decode of the same fetch words.
+  if (mip_count == 1 && REXCVAR_GET(skate3_native_render_scene_lm_dump)) {
+    char path[260];
+    std::snprintf(path, sizeof(path),
+                  "native_texture_dumps/plain_%08X_%ux%u_f%u_t%u.blk",
+                  info.memory.base_address, width, height,
+                  uint32_t(info.format), info.is_tiled ? 1u : 0u);
+    if (FILE* f = std::fopen(path, "wb")) {
+      const MipPlan& p0 = plans[0];
+      for (uint32_t by = 0; by < p0.rows; ++by) {
+        std::fwrite(mapping + p0.offset + size_t(by) * p0.pitch, 1,
+                    size_t(p0.cols) * bytes_per_block, f);
+      }
+      std::fclose(f);
     }
   }
   out.upload->Unmap(0, nullptr);
@@ -10641,7 +10762,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   }
   // Environment cube (negative-cached like the draw path).
   if ((item.water || item.char_family >= 6 ||
-       (item.env_family >= 5 && item.env_family <= 6)) &&
+       (item.env_family >= 5 && item.env_family <= 6) ||
+       item.env_family == 13) &&
       item.water_env != 0 && !g_r.cube_textures.contains(item.water_env)) {
     if (!within()) {
       ++wc.deferred;
@@ -11879,14 +12001,34 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // sub-pass under their own cull PSOs; never reset those here)
     const bool hair_pass = item.char_family >= 4 && item.char_family <= 5 &&
                            item.char_rows[14 * 4 + 1] > 0.0f;
+    // reflective_trans glass draws in the blended sub-pass whenever its
+    // exact branch is live (same gate as the sub-pass routing below); the
+    // opaque cull-PSO reset must not fire there.
+    const bool refl_trans_pass =
+        item.env_family == 13 && debug_mode == 0 && scene.shadow_valid;
     if (use_depth && !item.transparent && !item.water && !hair_pass &&
-        g_r.pso_cullback != nullptr) {
+        !refl_trans_pass && g_r.pso_cullback != nullptr) {
       const float* w = item.world;
       const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
                          w[1] * (w[4] * w[10] - w[6] * w[8]) +
                          w[2] * (w[4] * w[9] - w[5] * w[8]);
+      // Game-parity backface culling: every world environment material's
+      // XML sets CULLMODE=FRONT (== our CULL_FRONT; the banner work
+      // calibrated game-kept faces as our D3D12 BACK faces). CULL_NONE
+      // showed interior/away faces the game never renders, e.g. the
+      // building wall's inside face stacking behind the translucent canopy
+      // glass. Trees/alphatest (fams 7/9/10: leaf/fence cards read from
+      // both sides) and mirrored instances (flipped winding) stay
+      // uncull(ed), matching the two-sided-sheet rules.
+      const bool cull_family =
+          REXCVAR_GET(skate3_native_render_scene_backface_cull) &&
+          item.env_family != 0 && item.env_family != 7 &&
+          item.env_family != 9 && item.env_family != 10 &&
+          item.env_family != 13;
       ID3D12PipelineState* want =
-          (buffers.two_sided_sheet && det3 >= 0.0f) ? g_r.pso_cullback : g_r.pso;
+          ((buffers.two_sided_sheet || cull_family) && det3 >= 0.0f)
+              ? g_r.pso_cullback
+              : g_r.pso;
       if (want != scene_pso_bound) {
         list.D3DSetPipelineState(want);
         scene_pso_bound = want;
@@ -12128,7 +12270,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // invisible.
     const GuestTexture* cube_tex = &g_r.white_cube;
     if ((item.water || item.char_family >= 6 ||
-         (item.env_family >= 5 && item.env_family <= 6)) &&
+         (item.env_family >= 5 && item.env_family <= 6) ||
+         item.env_family == 13) &&
         item.water_env != 0) {
       auto cit = g_r.cube_textures.find(item.water_env);
       if (cit == g_r.cube_textures.end()) {
@@ -12286,7 +12429,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[50] = scene.fog_ramp[1];
       constants[51] = scene.fog_ramp[2];
       std::memcpy(constants + 40, scene.fog_color, 4 * sizeof(float));
-    } else if (item.env_family >= 5 && item.env_family <= 6) {
+    } else if ((item.env_family >= 5 && item.env_family <= 6) ||
+               item.env_family == 13) {
       // misc.y = cube LOD bias for the reflective families: the guest's
       // cube fetch computes its gradient LOD at the game's own 1152x640
       // render; at 4K our reflection-vector gradients are ~3.4x smaller
@@ -12303,7 +12447,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // fixed-point packed (each mapped to 0..999 around 500; float-exact).
       // Only when the EXACT branch will run (same gate as cam_pos.w = -fam)
       // - the legacy fallback reads misc.x as the transparent/water flag.
-      if (debug_mode == 0 && scene.shadow_valid) {
+      // Fam 13 has no normal map (its PS reflects off the vertex normal),
+      // so its misc.x stays 0.
+      if (debug_mode == 0 && scene.shadow_valid && item.env_family != 13) {
         double bx = REXCVAR_GET(skate3_native_render_scene_refl_bias_x);
         double by = REXCVAR_GET(skate3_native_render_scene_refl_bias_y);
         if (REXCVAR_GET(skate3_native_render_scene_refl_bias_auto) &&
@@ -12466,7 +12612,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const bool hair_blend = item.char_family >= 4 && item.char_family <= 5 &&
                             char_capture_ok;
     const bool glass_blend = item.char_family == 7 && char_capture_ok;
-    if ((item.transparent || item.water || hair_blend || glass_blend) &&
+    // environment.reflective_trans (fam 13): blended glass canopies, joins
+    // the sorted alpha sub-pass whenever its exact branch is live (same
+    // shadow_valid gate as cam_pos.w = -fam; the legacy fallback renders it
+    // opaque exactly as before classification).
+    const bool refl_trans_blend =
+        item.env_family == 13 && scene.shadow_valid;
+    if ((item.transparent || item.water || hair_blend || glass_blend ||
+         refl_trans_blend) &&
         debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
@@ -12488,6 +12641,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                        return view_dist2(*a) > view_dist2(*b);
                      });
     list.D3DSetPipelineState(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
+    ID3D12PipelineState* blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
     for (const DrawItem* item : transparent_items) {
       const bool hair = item->char_family >= 4 && item->char_family <= 5 &&
                         item->char_rows[14 * 4 + 1] > 0.0f;
@@ -12499,8 +12653,33 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         draw_item(*item);
         list.D3DSetPipelineState(g_r.pso_hair_b);
         draw_item(*item);
-        list.D3DSetPipelineState(g_r.pso_transparent);
+        list.D3DSetPipelineState(blend_bound);
         continue;
+      }
+      // reflective_trans glass culls like the game (its material family's
+      // XML: CULLMODE=FRONT): the canopy panels are double-glazed pane
+      // PAIRS a few cm apart; uncull(ed) we composited BOTH panes (an
+      // extra a^2 blend layer the emulated frame doesn't have).
+      // pso_hair_b IS the transparent state with CULL_FRONT.
+      if (item->env_family == 13 && use_depth && g_r.pso_hair_b != nullptr &&
+          REXCVAR_GET(skate3_native_render_scene_backface_cull)) {
+        const float* w = item->world;
+        const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
+                           w[1] * (w[4] * w[10] - w[6] * w[8]) +
+                           w[2] * (w[4] * w[9] - w[5] * w[8]);
+        ID3D12PipelineState* want =
+            det3 >= 0.0f ? g_r.pso_hair_b
+                         : (use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
+        if (want != blend_bound) {
+          list.D3DSetPipelineState(want);
+          blend_bound = want;
+        }
+        draw_item(*item);
+        continue;
+      }
+      if (blend_bound != (use_depth ? g_r.pso_transparent : g_r.pso_nodepth)) {
+        blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
+        list.D3DSetPipelineState(blend_bound);
       }
       draw_item(*item);
     }

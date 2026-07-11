@@ -143,7 +143,8 @@ struct DrawItem {
   // 5 = environment.reflective, 6 = environment.reflective_simple,
   // 7 = environmentsimple.alphatest, 8 = environmentsimple.diffuse,
   // 9 = tree.default, 10 = animated.tree, 11 = proxyworld.default,
-  // 12 = incandescent.default.
+  // 12 = incandescent.default, 13 = environment.reflective_trans
+  // (transparentenvironmentreflective: blended glass, alpha sub-pass).
   uint8_t env_family = 0;
   // dynamicobject.fx family (movable props: dispensers, dumpsters, benches,
   // cans, ...). 0 = not a dynamic object, 1 = dynamicobject.default,
