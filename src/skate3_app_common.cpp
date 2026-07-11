@@ -7,6 +7,7 @@
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
+#include "skate3_win_icon.h"
 #include "skate3_title_update_installer.h"
 #include "skate3_user_settings.h"
 
@@ -687,6 +688,15 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     }
     runtime_paths = std::move(tu_paths);
   }
+#endif
+#if defined(_WIN32)
+  // Window/taskbar + Explorer icon sourced from the user's OWN game art at
+  // runtime (game/nxeart); the shipped exe and the repo carry no EA
+  // artwork (see skate3_win_icon.h). Game files are guaranteed installed by
+  // this point on Windows (the install wizards above run blocking).
+  skate3::ApplyGameIconFromGameData(
+      runtime_paths.game_data_root,
+      window() ? window()->GetNativeWindowHandle() : nullptr);
 #endif
   return runtime_paths;
 }

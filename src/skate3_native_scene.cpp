@@ -5332,7 +5332,8 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     };
     uint64_t key = (uint64_t(item.mesh) << 8) | (k & 0xFF);
     DynHist* hp = &s_hist[key];
-    if (hp->seen == s_frame || hist_dist2(*hp) > 2.25f) {
+    const float own_d2 = hp->seen == s_frame ? 1e30f : hist_dist2(*hp);
+    if (own_d2 > 1e-4f) {
       // The k-th slot mispairs: the game's sort lists RESHUFFLE same-mesh
       // clones as they and the camera move. For static props the
       // reset-on-jump guard below was enough (a mispair rendered raw for a
@@ -5341,7 +5342,24 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       // stepped poses (the vehicle judder/catch-up). Re-pair by POSITION
       // instead: claim the unclaimed history of this mesh whose newest
       // pose is nearest, within the same 1.5 m one-tick jump gate.
-      float best = 2.25f;
+      // The search runs whenever the slot is not an (almost) EXACT
+      // continuation, not only past the 1.5 m gate: clone placements
+      // CLOSER than 1.5 m (the paired newspaper holders, 0.78 m apart)
+      // otherwise inherit each other's history on every reshuffle, and the
+      // interpolator renders them sliding between the two placements ("the
+      // props jitter in and out of position"). Seeding `best` with the own
+      // slot's distance keeps a claim strictly-nearer-only, so a genuinely
+      // moving entity still prefers its own ring.
+      // RIGID claims get a far tighter cap than the vehicles' 1.5 m: when a
+      // close clone's OWN ring goes stale (its submission flapped for a few
+      // frames), strictly-nearer alone still claims the TWIN's fresh ring
+      // (own = 1e30) and slides once, the residual single jitter seen
+      // after the strictly-nearer fix. No rigid prop moves 0.3 m in one sim
+      // tick (18 m/s at 60 Hz), while clone placements sit >= 0.78 m apart;
+      // a rigid item with no history inside 0.3 m starts a fresh ring and
+      // renders raw at its correct placement instead.
+      const float claim_cap = skinned ? 2.25f : 0.09f;
+      float best = std::min(own_d2, claim_cap);
       DynHist* alt = nullptr;
       uint64_t alt_key = key;
       uint32_t fresh_k = 256;  // first index past the dense key range
@@ -5596,7 +5614,23 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             const float dz = item.world[14] - latest.w[14];
             d2 = dx * dx + dy * dy + dz * dz;
           }
-          discontinuity = d2 > 2.25f;  // > 1.5 m
+          // Rigid uses the same tight one-tick bound as the claim cap
+          // above: 0.78 m clone placements sit inside the vehicles' 1.5 m
+          // gate, and lerping across a mispair IS the prop jitter.
+          discontinuity = d2 > (skinned ? 2.25f : 0.09f);
+          if (discontinuity && !skinned && d2 < 2.25f) {
+            // A rigid step that only the tightened bound caught = a
+            // close-clone mispair that would have LERPED (the prop jitter).
+            static std::atomic<uint64_t> s_rigid_mispair{0};
+            const uint64_t n =
+                s_rigid_mispair.fetch_add(1, std::memory_order_relaxed);
+            if (n < 24 || (n & 255u) == 0) {
+              REXLOG_INFO(
+                  "native-scene: rigid close-clone mispair reset mesh={:08X} "
+                  "k={} d={:.2f}m (n={})",
+                  item.mesh, k, std::sqrt(d2), n);
+            }
+          }
         }
         if (discontinuity) {
           h.count = 0;

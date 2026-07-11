@@ -234,6 +234,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_shader_disasm.cpp
     src/skate3_title_update_installer.cpp
     src/skate3_user_settings.cpp
+    src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )
 if(APPLE)
