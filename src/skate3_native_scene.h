@@ -171,7 +171,10 @@ struct DrawItem {
   bool pending;
   // Diagnosis: which path staged this item's palette/world. 0 = none/raw,
   // 1 = submit-exit capture, 2 = post-draw (ib,vb) fixup, 3 = bones-cache
-  // rescue, 4 = ropa state rescue.
+  // rescue, 4 = ropa state rescue, 5 = ropa mode-flip hold (previous state
+  // re-published while the flipped mode's decode is still in flight),
+  // 6 = publish-time incoherent-palette heal (cached palette substituted
+  // after the dense 32-sample spread gate failed).
   uint8_t dbg_src = 0;
   // The palette was captured from an ORTHOGRAPHIC (CSM caster-cascade)
   // bank. The game does not reliably re-evaluate fine bone animation for

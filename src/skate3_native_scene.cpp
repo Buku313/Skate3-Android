@@ -216,6 +216,13 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_revalidate, true, "Skate 3",
                     "Re-fingerprint cached texture payloads every 16 frames and "
                     "re-decode on change (heals late-composed lightmap pages)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_stretch_guard, true, "Skate 3",
+                    "Draw-time stretch veto: skin cached sample verts of each "
+                    "skinned mesh's GPU-resident decode with the final palette "
+                    "every frame; wider than bind size = the 1-frame mangled-"
+                    "ribbon flash: skip the item's draws (blink) and dump the "
+                    "palette to logs/stretch_*.txt for diagnosis")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lm_dump, false, "Skate 3",
                     "Diagnostic: dump the decoded mip 0 of every generated-mip "
                     "(no-chain composed page) texture to native_texture_dumps/ "
@@ -664,6 +671,51 @@ struct RopaResolvedState {
 };
 std::unordered_map<uint32_t, RopaResolvedState> g_ropa_state_cache;
 std::atomic<uint64_t> g_ropa_rescued{0};
+// mesh -> payload identity + resolved MODE of the ropa decode currently
+// RESIDENT on the GPU (written by PrewarmCommit on the render thread when a
+// dyn decode job lands; read by BuildFrameScene on the guest thread, hence
+// the mutex). The dyn decode workers run 1-2 frames behind the capture, and
+// the draw path deliberately tolerates a fingerprint mismatch on dynamic
+// payloads (cloth one frame behind the sim). At a sim MODE FLIP that
+// tolerance was the residual ribbon: the flip frame publishes the NEW
+// mode's interpretation (skinned palette) while the GPU still draws the OLD
+// payload's decode (sim-deformed root-local verts) until the worker's
+// re-decode commits: skinned-over-sim content for 1-2 frames, the brief
+// hard-to-catch stretched-strip flash. The frame-end coherence guard cannot
+// see this (ropa[mismatch] stayed 0 in testing): the
+// SNAPSHOT it checks is coherent with the new mode; the RESIDENT decode is
+// not. BuildFrameScene's flip-hold pass keeps publishing the previous
+// resolved state until the resident decode matches the published mode.
+struct RopaResidentDecode {
+  uint64_t fp = 0;
+  bool skinned = false;
+};
+std::mutex g_ropa_resident_mutex;
+std::unordered_map<uint32_t, RopaResidentDecode> g_ropa_resident;
+// mesh -> sample verts of the most recent DECODE of a skinned mesh (bind-
+// space position + raw blend attribs, ~32 evenly spaced), written by
+// DecodeMesh on whichever thread decodes (workers / render), read by the
+// guest thread's draw-time STRETCH VETO in BuildFrameScene. The veto skins
+// these samples with the FINAL post-interpolation palette, i.e. it judges
+// what the GPU will ACTUALLY draw. Every upstream gate (capture acceptance,
+// publish coherence) judges the LIVE guest VB instead, so a decode-content
+// vs palette pairing mismatch, or junk introduced by the interpolation
+// substitutions, passes all of them and still flashes the 1-frame
+// map-length ribbon (observed with every ropa[] counter clean).
+// `fp` = the decode's payload fingerprint so the veto can log whether the
+// drawn content even matches the frame's payload (content lag vs junk
+// palette: the decisive diagnostic split).
+struct SkinProbeSample {
+  float p[3];
+  uint32_t bw;
+  uint32_t bi;
+};
+struct SkinProbe {
+  std::vector<SkinProbeSample> s;
+  uint64_t fp = 0;
+};
+std::mutex g_skin_probe_mutex;
+std::unordered_map<uint32_t, SkinProbe> g_skin_probe;
 std::atomic<uint32_t> g_cur_ib{0};
 std::atomic<uint32_t> g_cur_vb{0};
 std::atomic<uint32_t> g_cur_vb_offset{0};
@@ -850,6 +902,34 @@ std::atomic<uint64_t> g_ropa_flip{0};
 // draw-time capture): the re-decode is skipped so the GPU keeps last
 // frame's coherent verts instead of rendering the mangled ribbon.
 std::atomic<uint64_t> g_ropa_mismatch{0};
+// ropa captures accepted through the RELAXED near-camera criterion (all
+// samples in FRONT of the projection inside a loose 6x guard band + sane
+// spread) after the strict half-in-clip score refused them. Up close the
+// garment fills/overflows the screen and most of the 6 sample verts clip;
+// the strict gate refused the CORRECT palette every frame, and with no
+// cached resolved state to rescue from the torso stayed invisible until the
+// NPC was far enough away again (log signature: `ropa mesh=... score=2
+// flag=(1.000,...)` repeating while stale climbed with rescued flat).
+std::atomic<uint64_t> g_ropa_relaxed{0};
+// Frames a ropa garment was HELD on its previous resolved state (or dropped
+// when no previous state existed) because the GPU-resident decode still
+// pairs with the other mode; see g_ropa_resident.
+std::atomic<uint64_t> g_ropa_hold{0};
+// Ropa garments PUBLISHED with a caster-cascade (ortho) bank's palette:
+// the ~40 ms-stale rows behind the garment-offset-from-body symptom. The
+// same-mode graft in the dyn_slot merge should keep this at ~0 whenever a
+// perspective capture exists in the same frame.
+std::atomic<uint64_t> g_ropa_caster{0};
+// Published skinned items whose palette FAILED the dense 32-sample
+// publish-time coherence gate (see PublishedPaletteSane): the 1-frame
+// junk-palette ribbon flash that passes every 6-sample capture gate. The
+// item re-publishes its cached state instead (or drops for one frame).
+std::atomic<uint64_t> g_pub_incoherent{0};
+// Draw-time STRETCH VETO trips (see g_skin_probe): the final palette skins
+// the resident decode's sample verts wider than bind size; the item's
+// draws are cleared for the frame (blink, not ribbon) and the first events
+// dump full palette + samples to logs/stretch_*.txt for offline diagnosis.
+std::atomic<uint64_t> g_stretch_veto{0};
 // skinned/ropa meshes that published after a 1-3 frame publish GAP (was on
 // screen, vanished, came back): the "flickered invisible" telemetry.
 std::atomic<uint64_t> g_dyn_gap{0};
@@ -1060,8 +1140,19 @@ float GuestHalfToFloat(uint16_t h) {
 // disappearing-hat bug. Returns the winning base, or 0 when no candidate
 // both projects in-clip and keeps a sane spread; the caller then refuses
 // the capture and the post-draw fixup retries on a later draw.
+// structural_guess: the caller PROVED the guess base's layout structurally
+// (the ropa flag row read exactly (1,...) from the mesh's own bank; every
+// capture site guarantees own-draw provenance now, so the foreign-bank
+// hypothesis the strict gate defends against is off the table). When the
+// strict half-in-clip score still refuses every home, accept the guess if
+// all samples skin IN FRONT of the projection inside a loose 6x guard band
+// at a sane spread: up close the garment fills/overflows the screen and
+// most sample verts clip the tight 1.5x band; the strict gate refused the
+// CORRECT palette every frame and the torso stayed invisible until the NPC
+// walked far enough away. A row-shifted palette still fails this (skins
+// hundreds of meters off-view or behind the camera).
 uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
-                           const DrawItem& item) {
+                           const DrawItem& item, bool structural_guess = false) {
   if (item.bw_offset == 0 || item.bi_offset == 0 || item.stride == 0) {
     return palette_base;
   }
@@ -1077,9 +1168,13 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
   constexpr uint32_t kSamples = 6;
   // score: fraction (0..16) of samples that skin in front of and inside the
   // bank's own clip volume; *out_spread = the skinned samples' bbox diagonal
-  // (world units) for the bind-size sanity test below.
-  const auto score = [&](uint32_t pb, float* out_spread) -> int {
+  // (world units) for the bind-size sanity test below. *out_front_all (when
+  // asked): every sample is in FRONT of the projection within a loose 6x
+  // guard band, the relaxed near-camera criterion (see structural_guess).
+  const auto score = [&](uint32_t pb, float* out_spread,
+                         bool* out_front_all = nullptr) -> int {
     int ok = 0;
+    int loose = 0;
     int n = 0;
     float qmin[3] = {1e9f, 1e9f, 1e9f};
     float qmax[3] = {-1e9f, -1e9f, -1e9f};
@@ -1147,9 +1242,16 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
           std::abs(clip[1]) <= 1.5f * aw) {
         ++ok;
       }
+      if (clip[3] > 0.0f && std::abs(clip[0]) <= 6.0f * aw &&
+          std::abs(clip[1]) <= 6.0f * aw) {
+        ++loose;
+      }
     }
     if (n == 0) {
       return -1;
+    }
+    if (out_front_all) {
+      *out_front_all = n >= 2 && loose == n;
     }
     const float dx = qmax[0] - qmin[0];
     const float dy = qmax[1] - qmin[1];
@@ -1274,6 +1376,18 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     }
     if (home_ok(pb) && gate(pb, nullptr)) {
       return pb;
+    }
+  }
+  // Structurally-proven guess (ropa flag row, own-draw bank): near-camera
+  // relaxed acceptance; see the function comment. Tried LAST so a strictly
+  // passing home always wins first.
+  if (structural_guess) {
+    float spread = 0.0f;
+    bool front_all = false;
+    if (score(palette_base, &spread, &front_all) >= 0 && front_all &&
+        spread <= max_spread) {
+      g_ropa_relaxed.fetch_add(1, std::memory_order_relaxed);
+      return palette_base;
     }
   }
   // No candidate skins this mesh into the bank's own view at a sane size:
@@ -2700,7 +2814,13 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
 // other object's matrix at c188/c191; geometry projected with it lands
 // far off-clip, while the true matrix scores full (validated offline:
 // 31/31 vs 0/31 on an F10 capture).
-int ScoreRigidAffine(uint8_t* base, uint32_t bank, uint32_t m, const DrawItem& item) {
+// *out_front_all (when asked): every sample lands IN FRONT of the
+// projection within a loose 6x guard band, the relaxed near-camera
+// criterion (a sim-active garment right at the camera clips most of its
+// samples out of the tight 1.5x band, and the strict >=8 gate refused the
+// CORRECT rigid matrix; same failure mode as the skinned branch).
+int ScoreRigidAffine(uint8_t* base, uint32_t bank, uint32_t m, const DrawItem& item,
+                     bool* out_front_all = nullptr) {
   if (item.stride == 0) return -1;
   const uint32_t count = item.vb_bytes / item.stride;
   if (count < 2) return -1;
@@ -2715,6 +2835,7 @@ int ScoreRigidAffine(uint8_t* base, uint32_t bank, uint32_t m, const DrawItem& i
   }
   constexpr uint32_t kSamples = 6;
   int ok = 0;
+  int loose = 0;
   int n = 0;
   for (uint32_t s = 0; s < kSamples; ++s) {
     const uint32_t v = item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
@@ -2754,6 +2875,13 @@ int ScoreRigidAffine(uint8_t* base, uint32_t bank, uint32_t m, const DrawItem& i
     if (std::abs(clip[0]) <= 1.5f * aw && std::abs(clip[1]) <= 1.5f * aw) {
       ++ok;
     }
+    if (clip[3] > 0.0f && std::abs(clip[0]) <= 6.0f * aw &&
+        std::abs(clip[1]) <= 6.0f * aw) {
+      ++loose;
+    }
+  }
+  if (out_front_all) {
+    *out_front_all = n >= 2 && loose == n;
   }
   return n == 0 ? -1 : (ok * 16) / n;
 }
@@ -2863,6 +2991,105 @@ bool RopaPayloadCoherent(const DrawItem& item, const std::vector<uint8_t>& vb) {
   return std::sqrt(dx * dx + dy * dy + dz * dz) <= max_spread;
 }
 
+// Dense publish-time coherence gate: skin ~32 samples of the LIVE guest VB
+// with the item's PUBLISHED palette and require bind-pose spread. The
+// capture acceptance gates sample only 6 verts, so a palette whose junk
+// rows sit on UNSAMPLED bones (e.g. a staging bank partially overwritten
+// by the next entity's rows between this mesh's draw and our capture)
+// passes them and stretches the unsampled islands into the map-length-
+// ribbon flash, with zero refusals, zero mismatches, zero gaps in the
+// telemetry (ropa[stale=0 mismatch=0 hold=0
+// caster=0] yet a momentary stretch on screen). 32 evenly-spaced samples
+// cover the islands the 6-vert gates miss. Returns the measured spread via
+// out_spread for the diagnosis log.
+bool PublishedPaletteSane(uint8_t* base, const DrawItem& item,
+                          float* out_spread) {
+  *out_spread = 0.0f;
+  if (item.stride == 0 || item.bones.size() < 12 || item.bw_offset == 0 ||
+      item.bi_offset == 0 || item.vb_addr == 0) {
+    return true;
+  }
+  const uint32_t count = item.vb_bytes / item.stride;
+  if (count < 2) {
+    return true;
+  }
+  float bind_diag = 0.0f;
+  for (int a = 0; a < 3; ++a) {
+    const float d = item.bbox_max[a] - item.bbox_min[a];
+    bind_diag += d * d;
+  }
+  bind_diag = std::sqrt(bind_diag);
+  // 6x, NOT the capture gates' 3x: this judges already-ACCEPTED palettes,
+  // where the observed junk measures 183-405 while legit articulation on
+  // small meshes (a 0.5 m accessory mid-stride) reached 3.1-3.3x and
+  // tripped a 3x bound repeatedly (log 1285 mesh=436E7210, spread 1.6 vs
+  // 1.56 - real world-space palette, needlessly healed/frozen).
+  const float max_spread = std::max(6.0f * bind_diag, bind_diag + 2.0f);
+  constexpr uint32_t kSamples = 32;
+  float qmin[3] = {1e9f, 1e9f, 1e9f};
+  float qmax[3] = {-1e9f, -1e9f, -1e9f};
+  int n = 0;
+  for (uint32_t s = 0; s < kSamples; ++s) {
+    const uint32_t v =
+        item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
+    const uint32_t pa = v + item.pos_offset;
+    float p[3];
+    switch (item.pos_fmt) {
+      case 57:
+        for (int a = 0; a < 3; ++a) p[a] = LoadGuestF32(base, pa + a * 4);
+        break;
+      case 32:
+        for (int a = 0; a < 3; ++a) {
+          p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
+        }
+        break;
+      case 26: {
+        constexpr float kScale = 2.0f / 32767.0f;
+        for (int a = 0; a < 3; ++a) {
+          p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale + (a == 1 ? 0.8f : 0.0f);
+        }
+        break;
+      }
+      default:
+        return true;
+    }
+    if (!(p[0] > -1e7f && p[0] < 1e7f && p[1] > -1e7f && p[1] < 1e7f &&
+          p[2] > -1e7f && p[2] < 1e7f)) {
+      continue;
+    }
+    const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
+    const uint32_t bi = REX_LOAD_U32(v + item.bi_offset);
+    uint32_t total = 0;
+    float q[3] = {0.0f, 0.0f, 0.0f};
+    for (int k = 0; k < 4; ++k) {
+      const uint32_t w = (bw >> (24 - 8 * k)) & 0xFF;
+      if (w == 0) continue;
+      const uint32_t r0 = 3u * ((bi >> (24 - 8 * k)) & 0xFF);
+      if ((r0 + 3) * 4 > item.bones.size()) continue;
+      total += w;
+      for (int a = 0; a < 3; ++a) {
+        const float* row = item.bones.data() + (r0 + uint32_t(a)) * 4;
+        q[a] += float(w) * (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]);
+      }
+    }
+    if (total == 0) continue;
+    ++n;
+    for (int a = 0; a < 3; ++a) {
+      q[a] /= float(total);
+      qmin[a] = std::min(qmin[a], q[a]);
+      qmax[a] = std::max(qmax[a], q[a]);
+    }
+  }
+  if (n < 4) {
+    return true;  // nothing to judge
+  }
+  const float dx = qmax[0] - qmin[0];
+  const float dy = qmax[1] - qmin[1];
+  const float dz = qmax[2] - qmin[2];
+  *out_spread = std::sqrt(dx * dx + dy * dy + dz * dz);
+  return *out_spread <= max_spread;
+}
+
 // Returns false when the bank could not be consumed for this item (ropa
 // rigid matrix implausible or off-clip = stale bank); the caller must
 // leave/mark the item pending so a later matching draw re-captures it.
@@ -2913,8 +3140,13 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
       // interpretation), shadows matching because the caster pass shares the
       // item. Gate through the same sample-projection acceptance as every
       // other palette; on refusal the item stays pending (post-draw fixup /
-      // ropa state rescue).
-      palette_base = RefinePaletteBase(base, bank, main_pass ? 8u : 5u, item);
+      // ropa state rescue). The game writes exactly 1.0 into the flag row's
+      // x for sim-inactive (observed on every live capture, incl. the
+      // (1,junk,junk,junk) NPC variant); a bit-exact 1.0 is the structural
+      // proof that unlocks the relaxed near-camera acceptance; any other
+      // positive x (a bone row of some other layout) keeps the strict gate.
+      palette_base = RefinePaletteBase(base, bank, main_pass ? 8u : 5u, item,
+                                       /*structural_guess=*/flag_x == 1.0f);
       if (palette_base == 0) {
         g_ropa_stale.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -2937,7 +3169,17 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
         plausible = plausible && n > 0.0025f && n < 400.0f &&
                     rows[r * 4 + 3] > -20000.f && rows[r * 4 + 3] < 20000.f;
       }
-      if (plausible && ScoreRigidAffine(base, bank, m, item) >= 8) {
+      bool front_all = false;
+      const int rigid_score =
+          plausible ? ScoreRigidAffine(base, bank, m, item, &front_all) : -1;
+      // Relaxed near-camera acceptance mirrors the skinned branch: a
+      // sim-active garment right at the camera clips most samples out of
+      // the strict band, but a stale/foreign matrix throws them behind the
+      // projection or far outside even the loose band.
+      if (plausible && (rigid_score >= 8 || front_all)) {
+        if (rigid_score < 8) {
+          g_ropa_relaxed.fetch_add(1, std::memory_order_relaxed);
+        }
         // Column-vector [R | t] rows -> item.world (row-vector, t in row 3).
         for (int i = 0; i < 3; ++i) {
           for (int j = 0; j < 3; ++j) {
@@ -5694,9 +5936,16 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         // State/geometry grafts require the same resolved mode: ropa
         // garments flip between rigid and skinned per capture, and mixing
         // one copy's palette with another's interpretation is the
-        // mangled-ribbon bug.
-        const bool graftable = cand.skinned == cur.skinned && !cand.ropa &&
-                               !cur.ropa && cand.mesh == cur.mesh;
+        // mangled-ribbon bug. Same-mode ropa IS graftable; excluding ropa
+        // wholesale meant a fuller caster-cascade list wholesale-won the
+        // merge and the garment published the ortho bank's ~40 ms-stale
+        // bone rows while the body meshes (graftable) got fresh palettes:
+        // the garment rode ~10 cm off the moving body (speed x 40 ms), the
+        // visible successor of the invisible-torso bug once the near-camera
+        // acceptance landed. The mode equality check is what prevents the
+        // ribbon, not the ropa flag.
+        const bool graftable = cand.skinned == cur.skinned &&
+                               cand.ropa == cur.ropa && cand.mesh == cur.mesh;
         if (fresher && fuller) {
           cur = cand;
         } else if (fresher && graftable) {
@@ -5751,11 +6000,73 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       scene.items.push_back(std::move(item));
     }
   }
+  // Ropa garments whose resolved mode FLIPPED this frame: state as published
+  // LAST frame, stashed before the cache refresh overwrites it: the
+  // flip-hold pass below (after the dyn-job enqueue) may need to re-publish
+  // it while the new mode's decode is still in flight (see g_ropa_resident).
+  std::unordered_map<uint32_t, RopaResolvedState> ropa_flip_prev;
   // Cross-frame palette rescue + cache refresh (see g_bones_cache): exactly
   // one published copy of a skinned mesh -> refresh its cache entry; zero
   // copies but a refused/pending capture -> re-publish with the cached
   // palette (one frame of pose lag instead of a one-frame disappearance).
   if (REXCVAR_GET(skate3_native_render_scene_dynamic_items)) {
+    // Dense publish-time coherence gate (see PublishedPaletteSane): a
+    // 1-frame junk palette that passed the 6-sample capture gates would
+    // otherwise draw the map-length-ribbon flash AND poison the rescue
+    // caches (this runs before the refresh below). Re-publish the cached
+    // state when a same-mode one exists; else drop the draws; a 1-frame
+    // blink beats the ribbon.
+    for (DrawItem& item : scene.items) {
+      if (!item.skinned || item.bones.empty() || item.pending) {
+        continue;
+      }
+      float spread = 0.0f;
+      if (PublishedPaletteSane(base, item, &spread)) {
+        continue;
+      }
+      g_pub_incoherent.fetch_add(1, std::memory_order_relaxed);
+      static std::atomic<uint32_t> incoh_logged{0};
+      const uint32_t ln = incoh_logged.fetch_add(1, std::memory_order_relaxed);
+      if (ln < 32 || (ln & 255u) == 0) {
+        REXLOG_INFO(
+            "native-scene: publish INCOHERENT palette mesh={:08X} fam={} "
+            "ropa={} src={} spread={:.2f} bind=({:.2f},{:.2f},{:.2f}) "
+            "bone0_t=({:.1f},{:.1f},{:.1f})",
+            item.mesh, item.char_family, item.ropa ? 1 : 0, item.dbg_src,
+            spread, item.bbox_max[0] - item.bbox_min[0],
+            item.bbox_max[1] - item.bbox_min[1],
+            item.bbox_max[2] - item.bbox_min[2], item.bones[3], item.bones[7],
+            item.bones[11]);
+      }
+      bool healed = false;
+      if (item.ropa) {
+        const auto cit = g_ropa_state_cache.find(item.mesh);
+        if (cit != g_ropa_state_cache.end() && cit->second.skinned &&
+            cit->second.bones.size() == item.bones.size()) {
+          item.bones = cit->second.bones;
+          item.dbg_src = 6;
+          healed = true;
+        }
+      } else {
+        const auto bit = g_bones_cache.find(item.mesh);
+        if (bit != g_bones_cache.end() &&
+            bit->second.size() == item.bones.size()) {
+          item.bones = bit->second;
+          item.dbg_src = 6;
+          healed = true;
+        }
+      }
+      if (!healed) {
+        item.draws.clear();
+        // CRITICAL: also drop the junk palette. Leaving it on the item let
+        // the cache-refresh loop below store it into the rescue caches;
+        // the NEXT frame's trip then "healed" with the poisoned entry and
+        // published the ribbon with draws intact (log 1284/1285: the
+        // fam=6/fam=1 spread 183-405 bind-local palettes, bone0_t=(0,0,-.5),
+        // were re-captured every frame by the src=2 fixup).
+        item.bones.clear();
+      }
+    }
     std::unordered_map<uint32_t, uint32_t> pub_count;
     for (const DrawItem& item : scene.items) {
       // Ropa garments count in EITHER resolved mode (a rigid-resolved copy
@@ -5764,10 +6075,19 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (item.ropa || (item.skinned && !item.bones.empty())) {
         ++pub_count[item.mesh];
       }
+      if (item.ropa && item.caster_bank) {
+        g_ropa_caster.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     for (const DrawItem& item : scene.items) {
       if (!(item.ropa || (item.skinned && !item.bones.empty())) ||
           pub_count[item.mesh] != 1) {
+        continue;
+      }
+      if (item.draws.empty()) {
+        // Vetoed/dropped this frame (incoherent-palette trip, flip-hold
+        // clone drop): whatever state it carries must not become the
+        // "last good" rescue entry.
         continue;
       }
       if (item.ropa) {
@@ -5778,6 +6098,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           RopaResolvedState& c = cit->second;
           if (!fresh && c.skinned != now_skinned) {
             g_ropa_flip.fetch_add(1, std::memory_order_relaxed);
+            ropa_flip_prev.emplace(item.mesh, c);  // pre-flip published state
           }
           c.skinned = now_skinned;
           std::memcpy(c.world, item.world, sizeof(c.world));
@@ -6330,10 +6651,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         // tolerates the fingerprint mismatch for dynamic payloads).
         continue;
       }
+      // The decode is MODE-dependent for ropa (rigid decodes zero the blend
+      // weight/index attributes, see DecodeMesh), so a mode flip must
+      // re-enqueue even when the payload bytes did not change: fold the
+      // resolved mode into the dedup key.
+      const uint64_t fp_key =
+          item.fingerprint ^
+          ((item.ropa && item.skinned && !item.bones.empty()) ? 1u : 0u);
       const auto prev = s_dyn_fp_sent.find(item.mesh);
       const bool first_sight = prev == s_dyn_fp_sent.end();
       const uint64_t prev_fp = first_sight ? 0 : prev->second;
-      if (!first_sight && prev_fp == item.fingerprint) {
+      if (!first_sight && prev_fp == fp_key) {
         continue;
       }
       DynDecodeJob job;
@@ -6370,6 +6698,173 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         g_dyn_jobs.push_back(std::move(j));
       }
       g_prewarm_cv.notify_all();
+    }
+  }
+
+  // Ropa mode-flip HOLD (must run AFTER the dyn-job enqueue above so the
+  // new mode's decode is already in flight with the fresh capture): the
+  // GPU-resident decode still pairs with the OTHER mode; drawing the new
+  // mode over it is the 1-2 frame ribbon (skinned palette over sim-deformed
+  // verts) or a collapsed garment (rigid decodes zero the blend attributes;
+  // skinning them lands every vert at the origin). Re-publish the pre-flip
+  // state until the flipped decode commits and g_ropa_resident catches up;
+  // with no pre-flip state to hold (clones: the cache is single-instance)
+  // drop the garment for the flip frames: a blink beats the ribbon.
+  if (REXCVAR_GET(skate3_native_render_scene_dynamic_items)) {
+    for (DrawItem& item : scene.items) {
+      if (!item.ropa || item.pending || item.dbg_src == 4 ||
+          item.fingerprint == 0 || item.draws.empty()) {
+        continue;
+      }
+      const bool mode_skinned = item.skinned && !item.bones.empty();
+      RopaResidentDecode res;
+      {
+        std::lock_guard<std::mutex> lock(g_ropa_resident_mutex);
+        const auto rit = g_ropa_resident.find(item.mesh);
+        if (rit == g_ropa_resident.end()) {
+          continue;  // nothing resident yet: the draw defers until commit
+        }
+        res = rit->second;
+      }
+      if (res.skinned == mode_skinned) {
+        continue;  // resident decode pairs with the published mode
+      }
+      const auto pit = ropa_flip_prev.find(item.mesh);
+      if (pit != ropa_flip_prev.end() && pit->second.skinned == res.skinned) {
+        item.skinned = pit->second.skinned;
+        item.bones = pit->second.bones;
+        std::memcpy(item.world, pit->second.world, sizeof(item.world));
+        item.dbg_src = 5;
+        // Keep the cache on the HELD state so a multi-frame hold (decode
+        // still in flight next frame) re-detects the flip and re-stashes.
+        if (g_ropa_state_cache.size() < 512) {
+          g_ropa_state_cache[item.mesh] = pit->second;
+        }
+      } else {
+        item.draws.clear();
+      }
+      g_ropa_hold.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Draw-time STRETCH VETO: the last line of defense, judging what the GPU
+  // will ACTUALLY draw: the RESIDENT decode's sample verts (g_skin_probe,
+  // cached by DecodeMesh) skinned with the FINAL palette (after the merge,
+  // rescues, interpolation and flip-hold above). Every upstream gate judges
+  // the LIVE guest VB, so a decode-content/palette pairing mismatch, or
+  // junk introduced by an interpolation substitution, passes all of them
+  // and still flashes the 1-frame map-length ribbon (every ropa[] counter
+  // stayed clean in testing). Trip: clear the item's draws (a blink,
+  // and the caster pass shares the item so no ribbon shadow either), log,
+  // and dump palette + samples for offline diagnosis.
+  if (REXCVAR_GET(skate3_native_render_scene_stretch_guard)) {
+    for (DrawItem& item : scene.items) {
+      if (!item.skinned || item.bones.size() < 12 || item.pending ||
+          item.draws.empty()) {
+        continue;
+      }
+      SkinProbe probe;
+      {
+        std::lock_guard<std::mutex> lock(g_skin_probe_mutex);
+        const auto pit = g_skin_probe.find(item.mesh);
+        if (pit == g_skin_probe.end()) {
+          continue;  // not decoded yet: nothing will be drawn either
+        }
+        probe = pit->second;
+      }
+      float bind_diag = 0.0f;
+      for (int a = 0; a < 3; ++a) {
+        const float d = item.bbox_max[a] - item.bbox_min[a];
+        bind_diag += d * d;
+      }
+      bind_diag = std::sqrt(bind_diag);
+      // 6x like PublishedPaletteSane: judging accepted palettes, where junk
+      // measures 100-400x and legit small-mesh articulation reaches ~3.3x.
+      const float max_spread = std::max(6.0f * bind_diag, bind_diag + 2.0f);
+      float qmin[3] = {1e9f, 1e9f, 1e9f};
+      float qmax[3] = {-1e9f, -1e9f, -1e9f};
+      int n = 0;
+      for (const SkinProbeSample& ps : probe.s) {
+        uint32_t total = 0;
+        float q[3] = {0.0f, 0.0f, 0.0f};
+        // Decoded-buffer convention: component k = byte k (see DecodeMesh's
+        // SwapU32 + per-byte extraction).
+        for (int k = 0; k < 4; ++k) {
+          const uint32_t w = (ps.bw >> (8 * k)) & 0xFF;
+          if (w == 0) continue;
+          const uint32_t r0 = 3u * ((ps.bi >> (8 * k)) & 0xFF);
+          if ((r0 + 3) * 4 > item.bones.size()) continue;
+          total += w;
+          for (int a = 0; a < 3; ++a) {
+            const float* row = item.bones.data() + (r0 + uint32_t(a)) * 4;
+            q[a] += float(w) *
+                    (row[0] * ps.p[0] + row[1] * ps.p[1] + row[2] * ps.p[2] +
+                     row[3]);
+          }
+        }
+        if (total == 0) continue;
+        ++n;
+        for (int a = 0; a < 3; ++a) {
+          q[a] /= float(total);
+          qmin[a] = std::min(qmin[a], q[a]);
+          qmax[a] = std::max(qmax[a], q[a]);
+        }
+      }
+      if (n < 4) {
+        continue;
+      }
+      const float dx = qmax[0] - qmin[0];
+      const float dy = qmax[1] - qmin[1];
+      const float dz = qmax[2] - qmin[2];
+      const float spread = std::sqrt(dx * dx + dy * dy + dz * dz);
+      if (spread <= max_spread) {
+        continue;
+      }
+      g_stretch_veto.fetch_add(1, std::memory_order_relaxed);
+      static std::atomic<uint32_t> s_stretch_logged{0};
+      const uint32_t ln =
+          s_stretch_logged.fetch_add(1, std::memory_order_relaxed);
+      if (ln < 24 || (ln & 255u) == 0) {
+        REXLOG_INFO(
+            "native-scene: STRETCH veto mesh={:08X} fam={} ropa={} src={} "
+            "caster={} spread={:.1f} bind={:.2f} n={} fp_match={} "
+            "bone0_t=({:.1f},{:.1f},{:.1f})",
+            item.mesh, item.char_family, item.ropa ? 1 : 0, item.dbg_src,
+            item.caster_bank ? 1 : 0, spread, bind_diag, n,
+            probe.fp == item.fingerprint ? 1 : 0, item.bones[3],
+            item.bones[7], item.bones[11]);
+      }
+      if (ln < 6) {
+        // Full palette + probe dump for offline diagnosis (which rows are
+        // junk, which bones the stretched samples weight to).
+        char path[128];
+        std::snprintf(path, sizeof(path), "logs/stretch_%u_%08X.txt", ln,
+                      item.mesh);
+        if (FILE* f = std::fopen(path, "wb")) {
+          std::fprintf(f,
+                       "mesh=%08X fam=%u ropa=%d src=%u caster=%d spread=%f "
+                       "bind=%f fp=%016llX probe_fp=%016llX vb=%08X\n",
+                       item.mesh, item.char_family, item.ropa ? 1 : 0,
+                       item.dbg_src, item.caster_bank ? 1 : 0, spread,
+                       bind_diag, (unsigned long long)item.fingerprint,
+                       (unsigned long long)probe.fp, item.vb_addr);
+          const uint32_t bones = uint32_t(item.bones.size() / 12);
+          for (uint32_t b = 0; b < bones; ++b) {
+            const float* r = item.bones.data() + b * 12;
+            std::fprintf(f,
+                         "bone %3u | %9.4f %9.4f %9.4f %10.3f | %9.4f %9.4f "
+                         "%9.4f %10.3f | %9.4f %9.4f %9.4f %10.3f\n",
+                         b, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                         r[8], r[9], r[10], r[11]);
+          }
+          for (const SkinProbeSample& ps : probe.s) {
+            std::fprintf(f, "vert p=(%f,%f,%f) bw=%08X bi=%08X\n", ps.p[0],
+                         ps.p[1], ps.p[2], ps.bw, ps.bi);
+          }
+          std::fclose(f);
+        }
+      }
+      item.draws.clear();
     }
   }
 
@@ -8368,6 +8863,30 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     dst[v * 14 + 9] = n3[0];
     dst[v * 14 + 10] = n3[1];
     dst[v * 14 + 11] = n3[2];
+  }
+  // Stretch-veto probe (see g_skin_probe): cache ~32 decoded sample verts
+  // so the guest thread can cheaply skin what the GPU will actually draw.
+  if (item.skinned) {
+    constexpr uint32_t kProbe = 32;
+    const uint32_t pn = std::min(kProbe, num_verts);
+    SkinProbe probe;
+    probe.fp = item.fingerprint;
+    probe.s.reserve(pn);
+    for (uint32_t s = 0; s < pn; ++s) {
+      const uint32_t v = pn > 1 ? (s * (num_verts - 1) / (pn - 1)) : 0;
+      SkinProbeSample ps;
+      ps.p[0] = dst[v * 14 + 0];
+      ps.p[1] = dst[v * 14 + 1];
+      ps.p[2] = dst[v * 14 + 2];
+      std::memcpy(&ps.bw, &dst[v * 14 + 7], 4);
+      std::memcpy(&ps.bi, &dst[v * 14 + 8], 4);
+      probe.s.push_back(ps);
+    }
+    std::lock_guard<std::mutex> lock(g_skin_probe_mutex);
+    if (g_skin_probe.size() > 4096) {
+      g_skin_probe.clear();
+    }
+    g_skin_probe[item.mesh] = std::move(probe);
   }
   vb->Unmap(0, nullptr);
   // Blend indices outside the captured palette read garbage rows and mangle
@@ -11113,9 +11632,25 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
   for (PrewarmResult& r : done) {
     if (r.mesh_valid) {
       auto mit = g_r.meshes.find(r.item.mesh);
+      const bool superseded =
+          mit != g_r.meshes.end() && mit->second.dyn_seq > r.buffers.dyn_seq;
+      if (r.item.ropa && r.buffers.dyn_seq != 0 && !superseded) {
+        // Record the payload identity + mode this ropa decode pairs with:
+        // the guest thread's flip-hold pass keeps publishing the previous
+        // resolved state until the resident decode matches the published
+        // mode (see g_ropa_resident). Also correct on the identical-
+        // fingerprint drop below: the cached content equals this job's, so
+        // the pairing is this job's mode either way.
+        std::lock_guard<std::mutex> lock(g_ropa_resident_mutex);
+        if (g_ropa_resident.size() > 512) {
+          g_ropa_resident.clear();
+        }
+        RopaResidentDecode& res = g_ropa_resident[r.item.mesh];
+        res.fp = r.buffers.fingerprint;
+        res.skinned = r.item.skinned;
+      }
       if (mit != g_r.meshes.end() &&
-          (mit->second.fingerprint == r.buffers.fingerprint ||
-           mit->second.dyn_seq > r.buffers.dyn_seq)) {
+          (mit->second.fingerprint == r.buffers.fingerprint || superseded)) {
         // Identical content already cached (lost the race against the draw
         // path / an earlier result), or a NEWER dynamic decode already
         // landed (multi-worker reordering must not step the cloth
@@ -13104,7 +13639,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
@@ -13116,7 +13651,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_r.meshes.size(), g_r.textures.size(),
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
-        g_ropa_flip.load(), g_ropa_mismatch.load(), g_dyn_gap.load(),
+        g_ropa_flip.load(), g_ropa_mismatch.load(), g_ropa_relaxed.load(),
+        g_ropa_hold.load(), g_ropa_caster.load(), g_pub_incoherent.load(),
+        g_stretch_veto.load(), g_dyn_gap.load(),
         g_skinned_items.load(),
         g_skinned_skipped.load(), g_capture_foreign_bank.load(),
         g_rigid_pending.load(), g_rigid_dropped.load(),
