@@ -123,6 +123,16 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_prewarm_budget_ms, 32, "Skate 3"
                      "0 disables registration prewarm.")
     .range(0, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_photo_yield, true, "Skate 3",
+                    "Yield to the emulated output while a photo-mission's photo editor "
+                    "(the FE PhotoSelect screen) is up. The editor's depth of field / "
+                    "saturation / brightness / contrast / lens vignette are the game's "
+                    "own postfx chain, which native rendering suppresses; natively "
+                    "the photo showed the raw scene and the effect controls did "
+                    "nothing. The scene is frozen there, so emulated-path performance "
+                    "is fine. Detected by polling the FrontEndManager NIS push-state "
+                    "stack (plus the PhotoReplayController heartbeat as a backup).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
                     "60 (large .draws.bin; for targeted investigations)")
@@ -454,6 +464,11 @@ bool g_fog_frame_done = false;
 float g_sky_height = 165.0f;  // every Port Carverton capture to date
 bool g_sky_have = false;
 bool g_sky_frame_done = false;
+// Sky sun rows from the same draw's PIXEL bank (see FrameScene::sky_sun):
+// light dir (c0.xyz), sun angular scale (c4.x), pre-tone multiplier (c4.y),
+// exposure (c3.x). Persist like g_sky_height once captured.
+float g_sky_sun[6] = {};
+bool g_sky_sun_have = false;
 // UI background blur (see FrameScene::ui_blur and kBlurShaderSource): while
 // a frontend popup is up the game appends blur_hBlur/vBlur + basictex passes
 // after the postfx uber. g_ui_blur holds the captured kernel scale (PS c0.x,
@@ -2135,6 +2150,19 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
   g_vs_bank.store(ptr, std::memory_order_relaxed);
 }
 
+// Last PhotoReplayController::Update heartbeat, nanoseconds on PerfClock
+// (steady). -1 until the first heartbeat. Written from the guest thread,
+// read by RenderScene on the render thread.
+static std::atomic<int64_t> g_photo_replay_last_ns{-1};
+
+void OnPhotoReplayUpdate() {
+  g_photo_replay_last_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          PerfClock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+}
+
 void On2dPhase(uint32_t bit, bool enter) {
   if (bit >= 6) {
     return;
@@ -2958,6 +2986,33 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       g_sky_height = LoadGuestF32(base, bank + 17 * 4);
       g_sky_have = true;
       g_sky_frame_done = true;
+      // Same draw, PIXEL bank (sky_defaultPS layout, verified in
+      // capture): c0.xyz = g_vLightDir (unit vector
+      // toward the sun), c4.x = sun angular scale (m_params[0].x, 0.75),
+      // c4.y = sky pre-tone multiplier (m_params[0].y, 0.35), c3.x = scene
+      // exposure (g_envattributes[2].x, 2.5). Sanity-gated: a stale bank
+      // here would put the sun glow in a wrong spot or blow out the tone.
+      const uint32_t sky_ps = g_ps_bank.load(std::memory_order_relaxed);
+      if (sky_ps != 0) {
+        float dir[3];
+        for (int k = 0; k < 3; ++k) {
+          dir[k] = LoadGuestF32(base, sky_ps + uint32_t(k) * 4);
+        }
+        const float n2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        const float scale = LoadGuestF32(base, sky_ps + (4 * 4 + 0) * 4);
+        const float mult = LoadGuestF32(base, sky_ps + (4 * 4 + 1) * 4);
+        const float expo = LoadGuestF32(base, sky_ps + (3 * 4 + 0) * 4);
+        if (n2 > 0.8f && n2 < 1.2f && scale > 1e-3f && scale < 100.0f &&
+            mult > 1e-3f && mult < 100.0f && expo > 0.01f && expo < 100.0f) {
+          g_sky_sun[0] = dir[0];
+          g_sky_sun[1] = dir[1];
+          g_sky_sun[2] = dir[2];
+          g_sky_sun[3] = scale;
+          g_sky_sun[4] = mult;
+          g_sky_sun[5] = expo;
+          g_sky_sun_have = true;
+        }
+      }
     }
     if (dx * dx + dy * dy + dz * dz < 25.0f) {
       if (!g_fog_frame_done) {
@@ -4200,7 +4255,7 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
 // order, so the k-th copy pairs with last frame's k-th copy. Componentwise
 // lerp is exact enough at adjacent-sim-tick deltas (~5 ms of motion).
 // Guest render thread only.
-void InterpolateDynamicItems(FrameScene& scene, double now) {
+void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
   // Per-entity pose RING, like the camera's: the playback clock sits ~2 sim
   // periods behind `now`, so a two-pose history never brackets it (the
   // interpolation alpha pinned at 0 and entities rendered STALE STEPPED
@@ -4220,6 +4275,17 @@ void InterpolateDynamicItems(FrameScene& scene, double now) {
     int count = 0;
     int newest = 0;
     uint64_t seen = 0;
+    // Per-bone skin-weighted vertex centroids in BIND space (w, x, y, z),
+    // lazily computed from the mesh's own vertex buffer the first time a
+    // bone of this entity trips the spin-collapse guard. The centroid IS
+    // the wheel's geometric center (verified in capture:
+    // wheel-mesh bone centroids match the motion-solved spin pivot to a
+    // millimeter), so the collapse guard can pin it to the boxcar path
+    // exactly, no runtime estimation (every estimator variant tested was
+    // noisier than the artifact it fixed).
+    uint32_t cen_vb = 0;
+    uint32_t cen_bytes = 0;
+    std::vector<std::array<float, 4>> cen;
   };
   static std::unordered_map<uint64_t, DynHist> s_hist;
   static uint64_t s_frame = 0;
@@ -4449,24 +4515,173 @@ void InterpolateDynamicItems(FrameScene& scene, double now) {
         }
         if (ncollapsed > 0) {
           // Collapsed bone (rotating too fast inside the window to
-          // average, spinning wheels, and briefly fast-swinging limbs):
-          // plain adjacent-sample lerp at the playback point. R and t come
-          // from the same pose pair (no orbit), samples are ~7.5 ms apart
-          // (only a few % midpoint shrink), and limbs that trip the
-          // detector during tricks render essentially correctly. KNOWN
-          // COSMETIC LIMIT: wheels ride the raw 60 Hz-lumpy path while the
-          // deck rides the boxcar, a subtle lag/catch-up between wheels
-          // and board at speed. Smarter per-frame constructions all failed
-          // WORSE; do not iterate live again; solve offline against the
-          // bone_signal captures.
+          // average, spinning wheels, and briefly fast-swinging limbs).
+          // Base fallback: plain adjacent-sample lerp at the playback point
+          // (R and t from the SAME pose pair, no orbit; ~7.5 ms spacing
+          // keeps shrink to a few %). Bones whose mesh vertices yield a
+          // skin-weighted BIND-SPACE CENTROID get the exact PIVOT-BOXCAR
+          // form instead: render the orthonormalized lerp rotation
+          // translated so the centroid rides the same boxcar path as every
+          // other filtered bone: t_out = tbar + Rbar*c - Ro*c, where
+          // Rbar/tbar is the boxcar affine already in acc[] (its action on
+          // ANY fixed bind-space point IS that point's smoothed path). The
+          // centroid is the wheel's geometric center (a wheel is symmetric
+          // about its axle; verified in capture: mesh
+          // centroids match the motion-solved spin pivot to a millimeter),
+          // so the wheel is exact at its center and sub-mm across its
+          // ~4 cm extent; a limb pins its own centroid to its smoothed
+          // path (full-norm rotation, no lerp shrink). Offline-validated:
+          // wheel-vs-deck
+          // high-frequency wobble 1.3 -> 0.02 cm rms at constant speed /
+          // 1.0 -> 0.29 cm at 25 m/s with speed changes, better than the
+          // game's own 60 Hz output (0.05-0.56 cm). DO NOT replace the
+          // centroid with a motion-ESTIMATED pivot: every estimator shape
+          // tried (shared / per-window velocity elimination, quadratic
+          // motion models, theta gates, consistency resets, axis
+          // projection) was noisier than the artifact it fixed.
+          // Junk palette rows
+          // (unreferenced by vertices) get no centroid weight and keep the
+          // lerp.
+          if ((h.cen_vb != item.vb_addr || h.cen_bytes != item.vb_bytes) &&
+              item.stride != 0 && item.bw_offset != 0 && item.bi_offset != 0) {
+            // One-time bind-space centroid pass over this entity's vertex
+            // buffer (guest thread; raw guest reads are safe here, same
+            // as RefinePaletteBase). u8x4 attributes are big-endian per
+            // 32-bit word: component k is byte (24 - 8k) of the host-order
+            // load.
+            h.cen_vb = item.vb_addr;
+            h.cen_bytes = item.vb_bytes;
+            h.cen.assign(nbones, std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
+            const uint32_t vcount =
+                std::min<uint32_t>(item.vb_bytes / item.stride, 200000);
+            for (uint32_t vtx = 0; vtx < vcount; ++vtx) {
+              const uint32_t v = item.vb_addr + vtx * item.stride;
+              float p[3];
+              const uint32_t pa = v + item.pos_offset;
+              bool ok_fmt = true;
+              switch (item.pos_fmt) {
+                case 57:
+                  for (int a = 0; a < 3; ++a) {
+                    const uint32_t u = REX_LOAD_U32(pa + a * 4);
+                    std::memcpy(&p[a], &u, 4);
+                  }
+                  break;
+                case 32:
+                  for (int a = 0; a < 3; ++a) {
+                    p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
+                  }
+                  break;
+                case 26: {
+                  constexpr float kScale = 2.0f / 32767.0f;
+                  for (int a = 0; a < 3; ++a) {
+                    p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale +
+                           (a == 1 ? 0.8f : 0.0f);
+                  }
+                  break;
+                }
+                default:
+                  ok_fmt = false;
+                  break;
+              }
+              if (!ok_fmt) {
+                break;
+              }
+              const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
+              const uint32_t bidx = REX_LOAD_U32(v + item.bi_offset);
+              for (int k = 0; k < 4; ++k) {
+                const uint32_t wgt = (bw >> (24 - 8 * k)) & 0xFF;
+                if (wgt == 0) {
+                  continue;
+                }
+                const uint32_t bone = (bidx >> (24 - 8 * k)) & 0xFF;
+                if (bone >= nbones) {
+                  continue;
+                }
+                auto& cb = h.cen[bone];
+                const float wf = float(wgt) * (1.0f / 255.0f);
+                cb[0] += wf;
+                cb[1] += wf * p[0];
+                cb[2] += wf * p[1];
+                cb[3] += wf * p[2];
+              }
+            }
+            for (auto& cb : h.cen) {
+              if (cb[0] > 0.5f) {
+                cb[1] /= cb[0];
+                cb[2] /= cb[0];
+                cb[3] /= cb[0];
+              }
+            }
+          }
+          uint64_t pivot_upgraded = 0;
           for (size_t b = 0; b < nbones; ++b) {
             if (!s_collapsed[b]) {
               continue;
             }
             const size_t bi = b * 12;
+            float lp[12];
             for (int i = 0; i < 12; ++i) {
-              acc[bi + i] = q0.b[bi + i] + (q1.b[bi + i] - q0.b[bi + i]) * ba;
+              lp[i] = q0.b[bi + i] + (q1.b[bi + i] - q0.b[bi + i]) * ba;
             }
+            const bool upgraded = [&]() {
+              if (filter_w <= 0.0005 || b >= h.cen.size() ||
+                  h.cen[b][0] <= 0.5f) {
+                return false;  // no centroid (junk row / undecodable VB)
+              }
+              const float c[3] = {h.cen[b][1], h.cen[b][2], h.cen[b][3]};
+              const float* bar = acc.data() + bi;
+              // Orthonormalize the lerped rotation (rows): recovers the
+              // full-norm midpoint rotation from the shrunk chord.
+              double r0[3] = {lp[0], lp[1], lp[2]};
+              double r1[3] = {lp[4], lp[5], lp[6]};
+              double n0 = std::sqrt(r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2]);
+              if (n0 < 1e-4) {
+                return false;
+              }
+              for (double& v : r0) v /= n0;
+              const double d01 = r0[0] * r1[0] + r0[1] * r1[1] + r0[2] * r1[2];
+              for (int i = 0; i < 3; ++i) r1[i] -= d01 * r0[i];
+              const double n1 =
+                  std::sqrt(r1[0] * r1[0] + r1[1] * r1[1] + r1[2] * r1[2]);
+              if (n1 < 1e-4) {
+                return false;
+              }
+              for (double& v : r1) v /= n1;
+              const double r2[3] = {r0[1] * r1[2] - r0[2] * r1[1],
+                                    r0[2] * r1[0] - r0[0] * r1[2],
+                                    r0[0] * r1[1] - r0[1] * r1[0]};
+              const double* rows[3] = {r0, r1, r2};
+              // t_out = tbar + Rbar*c - Ro*c: the pivot lands exactly on
+              // the boxcar path (in phase with the deck and every other
+              // filtered bone), spin phase comes from the lerp pair.
+              for (int r = 0; r < 3; ++r) {
+                double rb = 0.0, ro = 0.0;
+                for (int c2 = 0; c2 < 3; ++c2) {
+                  rb += double(bar[r * 4 + c2]) * c[c2];
+                  ro += rows[r][c2] * c[c2];
+                }
+                acc[bi + r * 4 + 0] = float(rows[r][0]);
+                acc[bi + r * 4 + 1] = float(rows[r][1]);
+                acc[bi + r * 4 + 2] = float(rows[r][2]);
+                acc[bi + r * 4 + 3] = float(double(bar[r * 4 + 3]) + rb - ro);
+              }
+              return true;
+            }();
+            if (upgraded) {
+              ++pivot_upgraded;
+            } else {
+              for (int i = 0; i < 12; ++i) {
+                acc[bi + i] = lp[i];
+              }
+            }
+          }
+          // Sparse telemetry: how many bones ride the pivot upgrade.
+          static uint64_t s_pivot_frames = 0, s_pivot_bones = 0;
+          s_pivot_bones += pivot_upgraded;
+          if (++s_pivot_frames % 3000 == 0 && s_pivot_bones > 0) {
+            REXLOG_INFO("native-scene pivot: {} bone-upgrades / 3000 frames",
+                        s_pivot_bones);
+            s_pivot_bones = 0;
           }
         }
       }
@@ -4675,8 +4890,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     ++g_scene_2d_generation;
   }
   // Publish this frame's in-world spline draws: evaluate the guest B-spline
-  // VS on the CPU (see SplineDraw for the decoded algorithm) into final
-  // clip-space strip vertices so the render side is a passthrough draw.
+  // VS on the CPU (see SplineDraw for the decoded algorithm) into WORLD-space
+  // strip vertices; the render side projects them with the scene's (smoothed)
+  // view_proj like every other world item, keeping them in phase with the
+  // re-timed camera.
   {
     std::vector<SplineDraw> frame_spline;
     {
@@ -4731,10 +4948,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           wp[a] = wp[a] * (1.0f / 6.0f) +
                   (wr[0] * off[0] + wr[1] * off[1] + wr[2] * off[2] + wr[3] * off[3]);
         }
-        float clip[4];
-        for (int a = 0; a < 4; ++a) {
-          const float* pr = row(a);
-          clip[a] = pr[0] * wp[0] + pr[1] * wp[1] + pr[2] * wp[2] + pr[3];
+        // Fade still evaluates against the draw's own clip z (the ramps
+        // span hundreds of meters; the ~30 ms offset from the smoothed
+        // camera is invisible), but the PUBLISHED position is WORLD-space:
+        // the render side projects with the scene's (smoothed) view_proj so
+        // the neon signs ride the exact same camera timeline as the world.
+        // Baking the guest VP here was the "waypoint sign judders / lags
+        // and catches up" bug once smooth_camera re-timed everything else.
+        float clip_z;
+        {
+          const float* pr = row(2);
+          clip_z = pr[0] * wp[0] + pr[1] * wp[1] + pr[2] * wp[2] + pr[3];
         }
         // Near/far fade against i_clipvalues (clip-space z, pre-divide). A
         // zero range degenerates to a step, like the shader's rcp(0) = inf.
@@ -4747,11 +4971,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           return z - start > 0.0f ? 1.0f : 0.0f;
         };
         const float fade =
-            std::min(ramp(clip[2], cv[0], cv[1]), 1.0f - ramp(clip[2], cv[2], cv[3]));
-        dst[0] = clip[0];
-        dst[1] = clip[1];
-        dst[2] = clip[2];
-        dst[3] = clip[3];
+            std::min(ramp(clip_z, cv[0], cv[1]), 1.0f - ramp(clip_z, cv[2], cv[3]));
+        dst[0] = wp[0];
+        dst[1] = wp[1];
+        dst[2] = wp[2];
+        dst[3] = 1.0f;
         dst[4] = p[1];
         dst[5] = p[2];
         dst[6] = fade;
@@ -5091,7 +5315,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       std::memcpy(scene.cam_pos, smooth_cam, sizeof(smooth_cam));
       // Keep the skater/NPCs/props in phase with the smoothed camera:
       // interpolate their palettes/worlds at the same playback time.
-      InterpolateDynamicItems(scene, now_s);
+      InterpolateDynamicItems(base, scene, now_s);
     }
   }
 
@@ -5324,6 +5548,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
   if (g_sky_have) {
     scene.sky_height = g_sky_height;
+  }
+  if (g_sky_sun_have) {
+    std::memcpy(scene.sky_sun, g_sky_sun, sizeof(g_sky_sun));
+    scene.sky_sun_valid = true;
   }
   const bool blur_active = g_ui_blur_seen || g_ui_blur_hold > 0;
   scene.ui_blur = blur_active ? g_ui_blur : 0.0f;
@@ -6158,6 +6386,33 @@ float4 ps_main(VSOut i) : SV_Target {
     float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
     clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
   }
+  // Exact sky dome (cam_pos.w = -40; sky_defaultPS transcribed from the
+  // Skate 3 ucode in a live capture). The emulated frame's big sun
+  // glow is computed IN the dome shader: a 1D radial gradient (the sky
+  // material's `specular` channel, bound at t4 here) indexed by the sine of
+  // the angle between the dome direction and the sun, its rgb^2 amplified
+  // by 1/sat(a + 0.01), the alpha falloff makes the core HDR-bright, then
+  // added to the squared panorama and run through the standard exposure/
+  // tonemap/sqrt chain (no fog on the sky) and the postfx uber 1.41.
+  // mat_tint.xyz = sun dir, mat_tint.w = the level sky elevation;
+  // overlay.x = sun angular scale, overlay.y = pre-tone multiplier,
+  // misc.y = scene exposure.
+  if (cam_pos.w < -39.5 && cam_pos.w > -40.5) {
+    // The dome mesh is camera-relative: world = mesh + (cam.x, sky_h,
+    // cam.z), so the shader's dome-local direction (sky.fx In.vPos) is
+    // rpos + (0, cam.y - sky_h, 0).
+    float3 dome = normalize(i.rpos + float3(0.0, cam_pos.y - mat_tint.w, 0.0));
+    float3 lin = albedo.rgb * albedo.rgb;
+    float dotPL = saturate(dot(dome, mat_tint.xyz));
+    float sinA = sqrt(saturate(1.0 - dotPL * dotPL));
+    float4 sun = decal_art.Sample(smp_clamp, float2(sinA / overlay.x, 0.5 / 16.0));
+    lin += sun.rgb * sun.rgb / saturate(sun.a + 0.01);
+    float3 xe = lin * overlay.y * misc.y;
+    float3 t1 = saturate(1.0 - xe);
+    float3 tm = max(xe * 0.25 + 0.75, 1.0) - t1 * t1;
+    float3 cc = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
+    return float4(cc, 1.0);
+  }
   // dynamicobject.fx props (cam_pos.w = -(20 + variant): -21 default,
   // -22 alphatest). Rigid movable objects (dispensers, dumpsters, benches,
   // cans). Lit with the game's own dynamicobject model (verified exact):
@@ -6842,14 +7097,19 @@ float4 ps_main(VSOut i) : SV_Target {
 )";
 
 // In-world neon spline shader (waypoint arrows / marker beams). The guest
-// B-spline VS is evaluated on the CPU at publish time, so the VS here is a
-// clip-space passthrough; the two PS variants transcribe the game's own
-// spline.fx (Skate-Shaders repo): "default" = additive glow with the
-// squared-gamma trick, "darken" = straight-alpha backdrop dimming. The
-// gradient texture uses the wrap/aniso sampler like the original i_diffuse
-// (U runs 0..N along the band).
+// B-spline VS is evaluated on the CPU at publish time into WORLD-space
+// vertices; the VS here projects them with the scene's (smoothed) view_proj
+// rows so the signs stay glued to the world under camera re-timing. The two
+// PS variants transcribe the game's own spline.fx (Skate-Shaders repo):
+// "default" = additive glow with the squared-gamma trick, "darken" =
+// straight-alpha backdrop dimming. The gradient texture uses the wrap/aniso
+// sampler like the original i_diffuse (U runs 0..N along the band).
 const char kShaderSplineSource[] = R"(
 cbuffer C : register(b0) {
+  float4 vp0;  // scene view_proj rows (row-vector: clip = x*vp0+y*vp1+z*vp2+w*vp3)
+  float4 vp1;
+  float4 vp2;
+  float4 vp3;
   float4 intensity;  // i_intensity as staged (x = default gain, y = darken gain)
 };
 Texture2D<float4> tex : register(t0);
@@ -6861,7 +7121,7 @@ struct VSOut {
 };
 VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float fade : TEXCOORD1) {
   VSOut o;
-  o.pos = p;
+  o.pos = p.x * vp0 + p.y * vp1 + p.z * vp2 + p.w * vp3;
   o.uv = uv;
   o.fade = fade;
   return o;
@@ -9238,7 +9498,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   if (item.char_family >= 4 && item.char_family <= 5) {
     warm_texture(item.hair_alpha_tex);
   }
-  if (item.env_family != 0 && !item.decal && item.env_family != 10) {
+  if ((item.env_family != 0 && !item.decal && item.env_family != 10) ||
+      item.unlit) {  // unlit = sky: spec_tex is the 1D sun gradient
     warm_texture(item.spec_tex);
   }
   // Environment cube (negative-cached like the draw path).
@@ -9463,7 +9724,8 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   if (item.char_family >= 4 && item.char_family <= 5) {
     stage_texture(item.hair_alpha_tex);
   }
-  if (item.env_family != 0 && !item.decal && item.env_family != 10) {
+  if ((item.env_family != 0 && !item.decal && item.env_family != 10) ||
+      item.unlit) {  // unlit = sky: spec_tex is the 1D sun gradient
     stage_texture(item.spec_tex);
   }
 
@@ -9805,6 +10067,72 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
   if (base == nullptr) {
     return false;
+  }
+  // Photo-mission photo editor (the "Pick a photo" screen with the depth of
+  // field / saturation / brightness / contrast controls; FE screen class
+  // PhotoSelect, challenge/photoselect.swf): the editor's effects ARE the
+  // game's postfx chain, which native rendering suppresses, so natively
+  // the photo showed the raw scene and the controls did nothing. Yield to
+  // the emulated output while the editor is up: the emulated frame there is
+  // complete and exact, and the scene is frozen so emulated-path
+  // performance is fine. Unlike the menus branch above this touches no
+  // caches and no takeover gates; native rendering resumes on the next
+  // frame after the editor closes.
+  //
+  // Detection is a per-frame poll of the game's FE state (stateless, so it
+  // can't get stuck): FrontEndManager singleton ptr global 0x830CFE14
+  // (TU3; from SingletonHolder<FrontEndManager>::Instance = 824AD2F0),
+  // whose NIS FE push-state stack (eastl::vector of 20-byte records at
+  // +0x210) holds a {1, 11} record exactly while the photographer NIS has
+  // the editor pushed. Surveyed across 50 gsnaps spanning gameplay, menus
+  // and other missions: every non-editor record reads {x, -1}; only the
+  // photo-editor capture shows a non-(-1) second field. The
+  // PhotoReplayController heartbeat (sub_825623F0 hook) is kept as a
+  // secondary signal for photo flows that bypass the photographer NIS.
+  if (REXCVAR_GET(skate3_native_render_scene_photo_yield)) {
+    static bool s_in_photo_editor = false;
+    const char* signal = nullptr;
+    {
+      constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
+      uint32_t mgr = 0, beg = 0, end = 0;
+      if (GuestTryLoadU32(base, kFrontEndManagerPtr, &mgr) && mgr != 0 &&
+          GuestTryLoadU32(base, mgr + 0x210, &beg) &&
+          GuestTryLoadU32(base, mgr + 0x214, &end) && beg < end &&
+          end - beg <= 20 * 16) {
+        const uint32_t n = (end - beg) / 20;
+        for (uint32_t i = 0; i < n && signal == nullptr; ++i) {
+          uint32_t f0 = 0, f1 = 0;
+          if (GuestTryLoadU32(base, beg + i * 20, &f0) &&
+              GuestTryLoadU32(base, beg + i * 20 + 4, &f1) && f0 == 1 && f1 == 11) {
+            signal = "FE PhotoSelect push-state";
+          }
+        }
+      }
+    }
+    if (signal == nullptr) {
+      const int64_t last_ns = g_photo_replay_last_ns.load(std::memory_order_relaxed);
+      const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 PerfClock::now().time_since_epoch())
+                                 .count();
+      if (last_ns >= 0 && now_ns - last_ns < 250'000'000) {
+        signal = "PhotoReplayController heartbeat";
+      }
+    }
+    const bool photo_active = signal != nullptr;
+    if (photo_active != s_in_photo_editor) {
+      s_in_photo_editor = photo_active;
+      if (photo_active) {
+        REXLOG_INFO(
+            "native-scene: photo editor - yielding to emulated output ({}; the "
+            "game's postfx applies the photo effects)",
+            signal);
+      } else {
+        REXLOG_INFO("native-scene: photo editor closed - native output resumes");
+      }
+    }
+    if (photo_active) {
+      return false;
+    }
   }
 
   const auto render_t0 = PerfClock::now();
@@ -10695,6 +11023,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         spec_bound = true;
       }
     }
+    // Sky dome: the material's `specular` channel is the 1D radial sun
+    // gradient (512x16), bound in the free decal slot for the exact sky
+    // branch. Until it decodes the dome falls back to the plain fullbright
+    // panorama (sunless for the 1-3 frames in flight).
+    bool sky_sun_bound = false;
+    if (item.unlit && item.spec_tex != 0) {
+      const GuestTexture* sun = resolve_texture(item.spec_tex);
+      if (sun != &g_r.white) {
+        decal_tex = sun;
+        sky_sun_bound = true;
+      }
+    }
     const bool is_decal =
         item.char_family < 4 && item.decal && decal_tex != &g_r.white;
     constants[44] = item.macro_scale;
@@ -10735,6 +11075,23 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[50] = scene.fog_ramp[1];
       constants[51] = scene.fog_ramp[2];
       std::memcpy(constants + 40, scene.fog_color, 4 * sizeof(float));
+    }
+    // cam_pos.w = -40 selects the exact sky branch: the game computes the
+    // sun glow inside the dome shader (see the PS sky branch). Needs the
+    // frame's captured sky sun rows AND the 1D gradient bound above; falls
+    // back to the legacy fullbright dome otherwise. The sky item never uses
+    // mat_tint/overlay/misc, so those root constants carry the sun rows.
+    if (debug_mode == 0 && item.unlit && sky_sun_bound && scene.sky_sun_valid) {
+      constants[39] = -40.0f;
+      constants[40] = scene.sky_sun[0];  // mat_tint.xyz = sun direction
+      constants[41] = scene.sky_sun[1];
+      constants[42] = scene.sky_sun[2];
+      constants[43] = scene.sky_height;  // mat_tint.w = dome viewpos Y
+      constants[44] = scene.sky_sun[3];  // overlay.x = sun angular scale
+      constants[45] = scene.sky_sun[4];  // overlay.y = pre-tone multiplier
+      constants[46] = 0.0f;
+      constants[47] = 0.0f;
+      constants[49] = scene.sky_sun[5];  // misc.y = scene exposure
     }
     list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
 
@@ -10923,8 +11280,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       const uint32_t srv_slot = resolve_2d_texture(s.fetch)->srv_slot;
       list.D3DSetPipelineState(s.pass == 1 ? g_r.pso_spline_darken
                                            : g_r.pso_spline_default);
-      // Root constants: i_intensity as staged (c149).
-      list.D3DSetGraphicsRoot32BitConstants(0, 4, s.consts + 149 * 4, 0);
+      // Root constants: the scene's (smoothed) view_proj rows; the verts
+      // are world-space, then i_intensity as staged (c149).
+      float spline_consts[20];
+      std::memcpy(spline_consts, scene.view_proj, sizeof(float) * 16);
+      std::memcpy(spline_consts + 16, s.consts + 149 * 4, sizeof(float) * 4);
+      list.D3DSetGraphicsRoot32BitConstants(0, 20, spline_consts, 0);
       D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu =
           g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
       srv_gpu.ptr += size_t(srv_slot) * g_r.srv_size;

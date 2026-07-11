@@ -228,6 +228,16 @@ struct FrameScene {
   // skater. Captured per frame from the sky draw's VS bank; the default
   // covers frames before the first capture.
   float sky_height = 165.0f;
+  // Sky sun rows, captured together with sky_height from the sky draw's
+  // PIXEL bank (sky_defaultPS layout): [0..2] = g_vLightDir (unit vector
+  // toward the sun), [3] = sun angular scale (m_params[0].x),
+  // [4] = sky pre-tone multiplier (m_params[0].y), [5] = scene exposure
+  // (g_envattributes[2].x). Consumed by the exact sky scene-PS branch;
+  // the emulated frame's big sun glow is computed IN the sky dome shader
+  // from a 1D radial gradient (the sky material's `specular` channel),
+  // not by a separate draw.
+  bool sky_sun_valid = false;
+  float sky_sun[6] = {};
   // Fullscreen UI background blur: 0 = off; otherwise the kernel scale of
   // the game's blur_hBlur/vBlur + basictex pass chain (PS c0.x, 8 in every
   // capture), detected per frame from the blur_hBlurPS draw. The native
@@ -278,6 +288,13 @@ void OnAddRenderInstance(uint8_t* base, uint32_t instance);
 // device's positional 256-register VS constant shadow bank.
 void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr,
                         uint32_t device);
+
+// Called (per guest frame) from the Sk8::Challenge::PhotoReplayController::
+// Update hook while a photo-mission's photo editor is up. Heartbeat for the
+// photo-editor yield: the editor's depth-of-field / saturation / brightness
+// / contrast effects are the game's own postfx chain, which only the
+// emulated path executes.
+void OnPhotoReplayUpdate();
 
 // 2D/APT phase bracket (the HUD and every other 2D element is a Flash SWF
 // converted to EA APT, rendered through FE::AptRenderingIntegration). Guest

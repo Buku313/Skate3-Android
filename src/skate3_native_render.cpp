@@ -585,6 +585,20 @@ extern "C" REX_FUNC(sub_82963510) {
   }
 }
 
+// Sk8::Challenge::PhotoReplayController::Update(float): runs once per guest
+// frame while a photo-mission's photo editor is up (pick-a-photo +
+// depth-of-field / saturation / brightness / contrast controls). Heartbeat
+// for the native scene's photo-editor yield: the editor's effects are the
+// game's own postfx chain, which only the emulated path executes. Reached
+// via the recomp function table (virtual dispatch), so the override fires
+// like any direct call.
+extern "C" REX_FUNC(sub_825623F0) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnPhotoReplayUpdate();
+  }
+  __imp__sub_825623F0(ctx, base);
+}
+
 // Sk8::WorldPresentation::AddRenderInstance(pegasus::tInstance*): the world
 // registry add, fired per placed instance while a map loads (r4 = tInstance).
 // The prewarm's primary mesh source: the instance's tRModelData mesh table
