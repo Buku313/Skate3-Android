@@ -209,6 +209,17 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_transparents, true, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
                     "Publish world sort-list items (static geometry)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_entity_fade, true, "Skate 3",
+                    "Honor the game's per-entity spawn/distance fade: LivingWorld "
+                    "pres entities (NPCs, traffic vehicles) publish an opacity that "
+                    "every character-family PS writes as output alpha (peds c21.x, "
+                    "defaultcharacter c13.x, cacstamp c22.x, vehicle body c20.x). "
+                    "The game submits their draws at alpha 0 through the whole "
+                    "spawn settle (the physics drop) and ramps alpha up afterwards "
+                    "/ by distance. Off = the old behavior: entities render fully "
+                    "opaque from their first draw (mid-air spawn pop, early "
+                    "distant pop-in).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynamic_items, true, "Skate 3",
                     "Publish dynamic entities (characters, props, cloth)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2683,7 +2694,8 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
 //     tint c10 with power c9.z, exposure c8.z, strand-alpha scale c16.x.
 //   vehicle (fam 6, character.livingworld_vehicles): light c9, key c15
 //     (fresnel power in c15.w), FLAT ambient = c19.w * (0.1, 0.175, 0.3)
-//     (same literal as livingworld), exposure c13.z, phong spec color c16
+//     (same literal as livingworld), exposure c13.z, alpha c20.x (the
+//     per-entity spawn/distance fade), phong spec color c16
 //     with power c16.w (stored in the unused SH row 0), paint recolor
 //     colorize_red c21 / colorize_blue c22 (vehicle.fx: where diffuse green
 //     is below the mask threshold, rgb = r * red_tint + b * blue_tint;
@@ -2813,7 +2825,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
         d[12 * 4 + 3] = 1.0f;
       }
     }
-    d[14 * 4 + 0] = row(fam == 1 ? 13u : 22u, 0);
+    d[14 * 4 + 0] = std::clamp(row(fam == 1 ? 13u : 22u, 0), 0.0f, 1.0f);
   } else if (fam == 3) {
     const float amb = row(19u, 3);
     if (!(amb >= 0.0f && amb < 16.0f)) return;
@@ -2825,7 +2837,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
       d[13 * 4 + c] = std::clamp(row(23u, uint32_t(c)), 0.0f, 4.0f);
     }
     d[12 * 4 + 3] = 1.0f;
-    d[14 * 4 + 0] = row(21u, 0);
+    d[14 * 4 + 0] = std::clamp(row(21u, 0), 0.0f, 1.0f);
   } else if (fam == 6 || fam == 7) {
     // vehicle.fx body / vehicle_glass.fx windows (row map above). The
     // otherwise-unused SH row 0 carries the phong spec color + power.
@@ -2844,7 +2856,11 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
         d[13 * 4 + c] = std::clamp(row(22u, uint32_t(c)), 0.0f, 4.0f);
       }
       d[12 * 4 + 3] = 1.0f;
-      d[14 * 4 + 0] = 1.0f;  // opaque body
+      // Entity opacity: vehicle_defaultPS ends `max oC0.w, c20.x, c20.x`,
+      // the same per-entity constant the glass variant multiplies by its
+      // material alpha. The LivingWorld spawn/distance fade rides here;
+      // 1.0 once the vehicle is fully faded in.
+      d[14 * 4 + 0] = std::clamp(row(20u, 0), 0.0f, 1.0f);
     } else {
       // Glass tint c18.rgb multiplies the ambient/key terms (zero in every
       // capture = reflection-only glass); alpha out = c20.x * c18.w.
@@ -2876,6 +2892,38 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     g_char_rows_cache.clear();
   }
   std::memcpy(g_char_rows_cache[item.mesh].data(), local, sizeof(local));
+}
+
+// The game's per-entity spawn/streaming fade. LivingWorld presentation
+// entities (NPCs, traffic vehicles, spawned props) publish an opacity:
+// 0 through the whole spawn settle (the physics drop after
+// CensusMan::SpawnPedestrian/SpawnVehicle), ramping up afterwards and by
+// distance (cLivingWorldPresEntity::EvaluateOpacityDistance), which every
+// character-family PS writes as its output alpha (the "alpha out" row of
+// CaptureCharLighting: peds c21.x, defaultcharacter c13.x, cacstamp c22.x,
+// vehicle body c20.x, glass c20.x * c18.w, hair strand * scale). Returns
+// that alpha for items whose validated capture carries it, 1.0 otherwise
+// (legacy-shaded items keep the old always-opaque behavior).
+float CharFadeAlpha(const DrawItem& item) {
+  if (item.char_rows[14 * 4 + 1] <= 0.0f) {
+    return 1.0f;
+  }
+  switch (item.char_family) {
+    case 1:
+    case 2:
+    case 3:
+    case 6:
+    case 7:
+      return std::clamp(item.char_rows[14 * 4 + 0], 0.0f, 1.0f);
+    case 4:
+    case 5:
+      // Hair alpha = strand coverage * scale; the scale constant carries the
+      // entity fade, so a near-zero scale means the whole garment is
+      // invisible this frame.
+      return std::clamp(item.char_rows[13 * 4 + 3], 0.0f, 1.0f);
+    default:
+      return 1.0f;
+  }
 }
 
 // Copy the staged bone palette (and, for hair, the tint) out of the shadow
@@ -7922,6 +7970,13 @@ struct RendererState {
   // environment.transparent sub-pass: straight alpha blend, depth test on,
   // z-write OFF; items drawn back-to-front after all opaque items.
   ID3D12PipelineState* pso_transparent = nullptr;
+  // Entity-fade variant of the transparent PSO: same straight alpha blend
+  // but z-write ON. A fading character/vehicle is a solid object at partial
+  // opacity; z-write-off blending composites every overlapping piece (skin
+  // under clothes, far-side doors/wheels through the body shell) into an
+  // x-ray. With depth writes the nearest surface wins and each pixel blends
+  // once, matching the game's main-pass fade.
+  ID3D12PipelineState* pso_fade = nullptr;
   // Hair sub-passes: transparent blend state with cull BACK / cull FRONT
   // (the game's cac_hair/defaulthair two-pass draw order).
   ID3D12PipelineState* pso_hair_a = nullptr;
@@ -8629,6 +8684,10 @@ float4 ps_main(VSOut i) : SV_Target {
                        ? dlin
                        : ch_tintA.rgb * dlin.r + ch_tintB.rgb * dlin.b;
       lin = sel * (ch_key.rgb * ndl * csm + ch_amb.rgb);
+      // livingworld_stamp_defaultPS ends `max oC0.w, c21.x`: the entity's
+      // spawn/distance fade. Only visible when the item is routed to the
+      // blended sub-pass (alpha < 1); the opaque pass ignores it.
+      out_a = ch_misc.x;
     } else {
       // defaultcharacter / CAC pieces: key light + SH irradiance ambient,
       // key gated by the CSM shadow (see the livingworld comment above).
@@ -8643,6 +8702,9 @@ float4 ps_main(VSOut i) : SV_Target {
           (cn.z * cn.z) * ch_sh[7].rgb +
           (cn.x * cn.x - cn.y * cn.y) * ch_sh[8].rgb);
       lin = dlin * (ch_key.rgb * ndl * csm + irr * ch_amb.w);
+      // defaultcharacter/cacstamp PSes end `max oC0.w, c13.x / c22.x`:
+      // the entity's spawn fade (see the livingworld comment above).
+      out_a = ch_misc.x;
     }
     // Exact tone chain: sqrt(0.5 * (max(x*E/4 + 0.75, 1) - sat(1 - x*E)^2)).
     float E = max(ch_key.w, 0.01);
@@ -11080,6 +11142,14 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     pso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
     const HRESULT hr_t =
         device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_transparent));
+    // Entity-fade variant: z-write ON (see RendererState::pso_fade). Drawn
+    // at the head of the blended sub-pass so glass/hair still composite
+    // over the faded body.
+    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_fade)))) {
+      g_r.pso_fade = nullptr;  // fade items fall back to the z-write-off blend
+    }
+    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     // Hair passes: the game draws hair twice with the SAME shader; cull
     // BACK then cull FRONT (cac_hair.xml passes 0/1) so far-side strands
     // never composite over near-side ones (one uncull(ed) blended pass
@@ -12990,6 +13060,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (!skinned && item.dynobj == 0 && !item.ropa && item.char_family == 0) {
         continue;
       }
+      // Entities the game is holding invisible (spawn settle / distance
+      // fade, see CharFadeAlpha) must not paint a shadow either; the
+      // emulated frame shows neither the NPC nor a blob under it.
+      if (item.char_family != 0 && CharFadeAlpha(item) < 0.05f &&
+          REXCVAR_GET(skate3_native_render_scene_entity_fade)) {
+        continue;
+      }
       // NO inline decode here (this block used to re-decode every cloth
       // garment every frame, ~2.9 ms, the 160 fps cap during real play).
       // The dyn decode jobs / worker miss queue keep the cache fresh, one
@@ -13439,8 +13516,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // opaque cull-PSO reset must not fire there.
     const bool refl_trans_pass =
         item.env_family == 13 && debug_mode == 0 && scene.shadow_valid;
+    // Character items mid-fade (spawn settle / distance) draw in the blended
+    // sub-pass too (same gate as the routing below), same exemption.
+    const bool char_fade_pass =
+        (item.char_family == 1 || item.char_family == 2 ||
+         item.char_family == 3 || item.char_family == 6) &&
+        debug_mode == 0 && CharFadeAlpha(item) < 0.999f &&
+        REXCVAR_GET(skate3_native_render_scene_entity_fade);
     if (use_depth && !item.transparent && !item.water && !hair_pass &&
-        !refl_trans_pass && g_r.pso_cullback != nullptr) {
+        !refl_trans_pass && !char_fade_pass && g_r.pso_cullback != nullptr) {
       const float* w = item.world;
       const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
                          w[1] * (w[4] * w[10] - w[6] * w[8]) +
@@ -14089,6 +14173,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     return d2;
   };
   std::vector<const DrawItem*> transparent_items;
+  // Mid-fade entity items (see CharFadeAlpha / pso_fade): blended but with
+  // z-write ON, drawn at the HEAD of the blended sub-pass; they behave like
+  // main-pass objects whose glass/hair still composites over them, and depth
+  // writes stop their own overlapping pieces (skin under clothes, far-side
+  // doors/wheels through the body shell) from double-blending into an x-ray.
+  const auto char_fade_zwrite = [&](const DrawItem& it) {
+    return debug_mode == 0 && it.char_rows[14 * 4 + 1] > 0.0f &&
+           (it.char_family == 1 || it.char_family == 2 ||
+            it.char_family == 3 || it.char_family == 6) &&
+           REXCVAR_GET(skate3_native_render_scene_entity_fade) &&
+           CharFadeAlpha(it) < 0.999f;
+  };
   // Opaque items draw front-to-back (bbox-center distance): early-z rejects
   // occluded pixels before the heavy material PS runs. The game's sort-list
   // order is by render state, not depth; depth-write LESS_EQUAL makes the
@@ -14113,6 +14209,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const bool hair_blend = item.char_family >= 4 && item.char_family <= 5 &&
                             char_capture_ok;
     const bool glass_blend = item.char_family == 7 && char_capture_ok;
+    // Per-entity spawn/distance fade (CharFadeAlpha): the game submits
+    // LivingWorld entity draws at alpha 0 through the whole spawn settle
+    // (NPCs drop ~1 m to the ground before fading in) and ramps alpha with
+    // distance; skip invisible items entirely, blend mid-fade ones.
+    const bool entity_fade = debug_mode == 0 && item.char_family != 0 &&
+                             char_capture_ok &&
+                             REXCVAR_GET(skate3_native_render_scene_entity_fade);
+    const float fade_a = entity_fade ? CharFadeAlpha(item) : 1.0f;
+    if (entity_fade && fade_a <= 0.004f) {
+      continue;
+    }
+    const bool char_fade_blend = char_fade_zwrite(item);
     // environment.reflective_trans (fam 13): blended glass canopies, joins
     // the sorted alpha sub-pass whenever its exact branch is live (same
     // shadow_valid gate as cam_pos.w = -fam; the legacy fallback renders it
@@ -14120,7 +14228,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const bool refl_trans_blend =
         item.env_family == 13 && scene.shadow_valid;
     if ((item.transparent || item.water || hair_blend || glass_blend ||
-         refl_trans_blend) &&
+         refl_trans_blend || char_fade_blend) &&
         debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
@@ -14139,11 +14247,27 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (!transparent_items.empty() && g_r.pso_transparent != nullptr) {
     std::stable_sort(transparent_items.begin(), transparent_items.end(),
                      [&](const DrawItem* a, const DrawItem* b) {
+                       // Fading entities (z-write blend) draw before every
+                       // z-write-off blend so hair/glass composite over them.
+                       const bool fa = char_fade_zwrite(*a);
+                       const bool fb = char_fade_zwrite(*b);
+                       if (fa != fb) {
+                         return fa;
+                       }
                        return view_dist2(*a) > view_dist2(*b);
                      });
     list.D3DSetPipelineState(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
     ID3D12PipelineState* blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
     for (const DrawItem* item : transparent_items) {
+      // Mid-fade entity pieces: alpha blend with z-write ON (see pso_fade).
+      if (use_depth && g_r.pso_fade != nullptr && char_fade_zwrite(*item)) {
+        if (blend_bound != g_r.pso_fade) {
+          list.D3DSetPipelineState(g_r.pso_fade);
+          blend_bound = g_r.pso_fade;
+        }
+        draw_item(*item);
+        continue;
+      }
       const bool hair = item->char_family >= 4 && item->char_family <= 5 &&
                         item->char_rows[14 * 4 + 1] > 0.0f;
       if (hair && use_depth && g_r.pso_hair_a != nullptr && g_r.pso_hair_b != nullptr) {
