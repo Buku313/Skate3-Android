@@ -522,12 +522,21 @@ struct DynDecodeJob {
 };
 std::vector<DynDecodeJob> g_dyn_jobs;  // FIFO; guarded by g_prewarm_mutex
 // Push-side dedupe: clone instances share one tRModelData, so the same mesh
-// registers many times per load. Cleared when the game enters menus/loading
-// (arena addresses are reused across map loads).
-std::unordered_set<uint32_t> g_prewarm_seen;
+// registers many times per load, but a permanent per-address set silently
+// DISABLED the prewarm for re-streamed content (the streamer reuses the
+// same mesh/texture object addresses all session): after a few minutes
+// every re-registered mesh was "seen", its re-decode was skipped, and every
+// streamed texture surfaced as a draw-path first-sight miss instead:
+// 388 white-flash textures in one 45 s traversal = the
+// residual medium-distance pop-in. Now a mesh -> last-queued-frame map:
+// clone bursts still dedupe inside the window, re-streams past it re-queue
+// (registration is the game's own "content changed here" signal, see
+// InvalidateCachedItem above). Cleared when the game enters menus/loading.
+std::unordered_map<uint32_t, uint64_t> g_prewarm_seen;
 // Texture-object dedupe for the workers (they cannot read the render
-// thread's g_r caches); same lifetime as g_prewarm_seen.
-std::unordered_set<uint32_t> g_prewarm_tex_seen;
+// thread's g_r caches): address -> fetch-words key at last staging; a
+// words change at a reused address re-stages, an unchanged one skips.
+std::unordered_map<uint32_t, uint64_t> g_prewarm_tex_seen;
 std::atomic<uint64_t> g_prewarm_done{0};     // entries fully warm-decoded
 std::atomic<uint64_t> g_prewarm_dropped{0};  // entries given up on
 std::atomic<bool> g_prewarm_workers_started{false};
@@ -2453,7 +2462,19 @@ void OnMeshRegistered(uint8_t* base, uint32_t mesh) {
   // workers run before the first gameplay frame would otherwise publish it.
   g_guest_base.store(base, std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-  if (g_prewarm_queue.size() < 65536 && g_prewarm_seen.insert(mesh).second) {
+  const uint64_t now = g_frames_rendered.load(std::memory_order_relaxed);
+  const auto [it, fresh] = g_prewarm_seen.try_emplace(mesh, now);
+  // 300-frame (~2 s) dedup window: activation bursts re-register the same
+  // model once per clone instance: queue it once; a re-registration past
+  // the window is a re-stream (content changed at this address) and must
+  // re-decode BEFORE its first draw or it pops in as a visible miss.
+  if (!fresh) {
+    if (now - it->second < 300) {
+      return;
+    }
+    it->second = now;
+  }
+  if (g_prewarm_queue.size() < 65536) {
     g_prewarm_queue.push_back({mesh, 60});
     g_prewarm_cv.notify_one();
   }
@@ -7798,6 +7819,23 @@ struct GuestTexture {
   // up to the full recheck interval) before settling at the 16-frame
   // steady-state cadence.
   uint8_t recheck_count = 0;
+  // Tiled-aware payload probes: absolute 0xA-mirror addresses of up to 16
+  // of this texture's OWN mip-0 blocks (a 4x4 spread over the block grid,
+  // resolved through the tiled address swizzle). The old contiguous
+  // [payload_addr, payload_size) fingerprint was WRONG for streamed world
+  // textures: they are pitch-packed into shared mip pools and tiled across
+  // padded macro rows, so the range interleaved NEIGHBOR textures' bytes;
+  // pool churn kept the fingerprint flapping, the commit-time stability
+  // verify then rejected every legitimate heal, and freshly promoted mips
+  // stayed stale/low-res for seconds (the medium-distance texture pop-in;
+  // one promote re-logged 8x while its heals were refused).
+  // probe_count == 0 falls back to the range fingerprint (cubes).
+  // 8x8 = 64 probes: the first 4x4 = 16 grid was too sparse; a mid-stream
+  // decode whose 16 probed blocks happened to be final (other regions still
+  // garbage) COMMITTED and never healed, visible as a black/garbage decal
+  // until the next words change replaced it ("decal flash and replace").
+  uint32_t probe_addr[64] = {};
+  uint8_t probe_count = 0;
   // SRV recipe (2D textures) so EXTRA views of this resource can be created
   // into paired descriptor slots (the fam 5/6 masks+normal 2-descriptor
   // table at t4/t5); descriptors can't be copied out of the shader-visible
@@ -7867,6 +7905,81 @@ uint64_t SamplePayloadFingerprint(uint8_t* base, uint32_t addr, uint32_t size) {
     const uint32_t off = uint32_t(uint64_t(size - 8) * k / 63u) & ~7u;
     uint64_t v = 0;
     if (!GuestTryCopy(&v, base + addr + off, sizeof(v))) {
+      return 0;
+    }
+    h = (h ^ v) * 1099511628211ull;
+  }
+  return h;
+}
+
+// Heal-pipeline telemetry (see the 600-frame stats line): verify-fail =
+// commit-time stability rejections, decode-fail = failed re-decodes of a
+// still-serving entry, demote-hold = mip-0 demotes served from the cached
+// full-chain decode without a doomed re-decode.
+std::atomic<uint64_t> g_heal_verify_fail{0};
+std::atomic<uint64_t> g_heal_decode_fail{0};
+std::atomic<uint64_t> g_demote_hold{0};
+// Sticky/skip serving (the anti-white-flash layer): sticky = draws served
+// with the item's previous texture while a fresh object decodes; skipnew =
+// first-sight draws suppressed entirely for the in-flight window.
+std::atomic<uint64_t> g_tex_sticky_served{0};
+std::atomic<uint64_t> g_skip_new{0};
+// Words-keyed (event-ad / streamed-artwork) serving: stale = site served
+// its previous art while a new-words decode is in flight; none = nothing
+// decoded for the site yet (caller shows the baked placeholder).
+std::atomic<uint64_t> g_ad_stale_served{0};
+std::atomic<uint64_t> g_ad_placeholder{0};
+
+// Fill GuestTexture::probe_addr with up to 16 of the texture's own mip-0
+// blocks: a 4x4 spread over the block grid, each resolved through the same
+// tiled/linear addressing the decode uses, clamped to the guarded copy's
+// readable range. Probes crossing into the padded macro-row tail are skipped
+// rather than clamped; the tail belongs to pool neighbors.
+void BuildPayloadProbes(const rex::graphics::TextureInfo& info, uint32_t mip0_addr,
+                        uint32_t ox, uint32_t oy, uint32_t pitch_blocks,
+                        uint32_t copy_size, GuestTexture& out) {
+  out.probe_count = 0;
+  const rex::graphics::FormatInfo* fi = info.format_info();
+  const uint32_t bpb = fi->bytes_per_block();
+  if (mip0_addr == 0 || bpb == 0 || (bpb & (bpb - 1)) != 0) {
+    return;
+  }
+  const uint32_t bpb_log2 = uint32_t(std::countr_zero(bpb));
+  const uint32_t width = info.width + 1u;
+  const uint32_t height = info.height + 1u;
+  const uint32_t cols = (width + fi->block_width - 1) / fi->block_width;
+  const uint32_t rows = (height + fi->block_height - 1) / fi->block_height;
+  for (uint32_t gy = 0; gy < 8; ++gy) {
+    for (uint32_t gx = 0; gx < 8; ++gx) {
+      const uint32_t bx = cols > 1 ? gx * (cols - 1) / 7 : 0;
+      const uint32_t by = rows > 1 ? gy * (rows - 1) / 7 : 0;
+      uint32_t off;
+      if (info.is_tiled) {
+        off = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+            int32_t(bx + ox), int32_t(by + oy), pitch_blocks, bpb_log2));
+      } else {
+        off = ((by + oy) * pitch_blocks + bx + ox) * bpb;
+      }
+      if (off + bpb > copy_size) {
+        continue;
+      }
+      out.probe_addr[out.probe_count++] = (0xA0000000u | mip0_addr) + off;
+    }
+  }
+}
+
+// Probe-based payload fingerprint: hashes one block-leading qword (or the
+// whole block for narrow formats) at each probe address. Returns 0 only when
+// a probe is unreadable: same semantics as the range fingerprint. Falls
+// back to the range hash when no probes were built (cube maps).
+uint64_t SampleProbeFingerprint(uint8_t* base, const GuestTexture& t) {
+  if (t.probe_count == 0) {
+    return SamplePayloadFingerprint(base, t.payload_addr, t.payload_size);
+  }
+  uint64_t h = 1469598103934665603ull;
+  for (uint32_t i = 0; i < t.probe_count; ++i) {
+    uint64_t v = 0;
+    if (!GuestTryCopy(&v, base + t.probe_addr[i], sizeof(v))) {
       return 0;
     }
     h = (h ^ v) * 1099511628211ull;
@@ -8111,6 +8224,18 @@ struct RendererState {
   // parked entries keep their SRV slot until retired. Render thread only.
   std::unordered_map<uint64_t, GuestTexture> tex_lookaside;
   std::unordered_map<uint64_t, uint64_t> tex_lookaside_used;  // key -> frame
+  // Sticky texture serving (see resolve_texture in draw_item): last
+  // successfully-resolved texture OBJECT per (mesh << 3 | slot). Streaming
+  // rotates content onto NEW objects (a mip promote is usually a fresh
+  // object, not a words rebind), so a plain cache miss white-flashed
+  // content that was on screen one frame earlier; the previous object's
+  // decode serves until the new one lands, like the console's own mip
+  // transition. Render thread only.
+  std::unordered_map<uint64_t, uint32_t> tex_sticky;
+  // First frame a texture object resolved white-with-heal-in-flight:
+  // brand-new items (no sticky fallback) skip drawing for a short window
+  // instead of flashing white.
+  std::unordered_map<uint32_t, uint64_t> tex_pending_first;
   bool failed = false;
   bool announced = false;
 };
@@ -8199,8 +8324,7 @@ bool TakeParkedTexture(uint8_t* base, const uint32_t words[6],
   if (it == g_r.tex_lookaside.end()) {
     return false;
   }
-  const uint64_t fp = SamplePayloadFingerprint(base, it->second.payload_addr,
-                                               it->second.payload_size);
+  const uint64_t fp = SampleProbeFingerprint(base, it->second);
   if (fp == 0 || fp != it->second.payload_fp) {
     // The mip pool reused this address range for different content since
     // parking; the parked decode is stale, drop it.
@@ -8305,6 +8429,10 @@ struct StagedTexResult {
   GuestTexture gt;
   StagedTexCommit commit;
   bool valid = false;
+  // The commit-time stability verify rejected this decode (payload moved
+  // between the worker's read and the commit): retry fast, not on the
+  // failed-decode ladder.
+  bool verify_failed = false;
 };
 struct PrewarmResult {
   DrawItem item;
@@ -10182,7 +10310,8 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
   }
   out.payload_addr = 0xA0000000u | info.memory.base_address;
   out.payload_size = size;
-  out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
+  BuildPayloadProbes(info, addr, ox, oy, pitch_blocks, size, out);
+  out.payload_fp = SampleProbeFingerprint(base, out);
   out.recheck_frame = 0;
   out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
   return true;
@@ -10487,7 +10616,9 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   // Payload sample for content revalidation (see GuestTexture).
   out.payload_addr = 0xA0000000u | info.memory.base_address;
   out.payload_size = srcs[0].size;
-  out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
+  BuildPayloadProbes(info, srcs[0].addr, srcs[0].ox, srcs[0].oy,
+                     srcs[0].pitch_blocks, srcs[0].size, out);
+  out.payload_fp = SampleProbeFingerprint(base, out);
   out.recheck_frame = 0;
   out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
   return true;
@@ -12046,8 +12177,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
         return;
       }
       it->second.recheck_frame = frame_number + 16;
-      const uint64_t fp = SamplePayloadFingerprint(base, it->second.payload_addr,
-                                                   it->second.payload_size);
+      const uint64_t fp = SampleProbeFingerprint(base, it->second);
       if (fp == 0 || fp == it->second.payload_fp) {
         return;
       }
@@ -12310,10 +12440,25 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     if (tex_ptr == 0) {
       return;
     }
+    // Words-aware dedupe: a reused object address whose fetch words moved
+    // (the streamer rebinding it to new content) must re-stage; the old
+    // permanent per-address set skipped it and the content surfaced as a
+    // draw-path white flash instead. Unchanged words still skip.
+    uint32_t words[6] = {};
+    for (uint32_t k = 0; k < 6; ++k) {
+      if (!GuestTryLoadU32(base, tex_ptr + (7 + k) * 4, &words[k])) {
+        return;
+      }
+    }
+    const uint64_t wkey = FetchWordsKey(words);
     {
       std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-      if (!g_prewarm_tex_seen.insert(tex_ptr).second) {
-        return;
+      const auto [it, fresh] = g_prewarm_tex_seen.try_emplace(tex_ptr, wkey);
+      if (!fresh) {
+        if (it->second == wkey) {
+          return;
+        }
+        it->second = wkey;
       }
     }
     StagedTexResult tr;
@@ -12569,8 +12714,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       // (static assets; a failed cube negative-caches permanently).
       if (t.valid && !t.cube && verify_base != nullptr &&
           t.gt.payload_addr != 0 &&
-          SamplePayloadFingerprint(verify_base, t.gt.payload_addr,
-                                   t.gt.payload_size) != t.gt.payload_fp) {
+          SampleProbeFingerprint(verify_base, t.gt) != t.gt.payload_fp) {
         if (t.gt.texture) {
           t.gt.texture->Release();
           t.gt.texture = nullptr;
@@ -12580,6 +12724,8 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           t.gt.upload = nullptr;
         }
         t.valid = false;
+        t.verify_failed = true;
+        g_heal_verify_fail.fetch_add(1, std::memory_order_relaxed);
       }
       if (t.cube) {
         // Environment cube: lands in the cube cache. Cubes are static
@@ -12639,14 +12785,23 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         if (same_content || (!t.valid && tit->second.valid)) {
           // The cached decode is as good or better ("keep the old decode
           // when the payload became unreadable": mips stream out at range).
-          // A FAILED fresh decode backs the surviving entry's retry clock
-          // off (+30): the payload usually stays unreadable for a while
-          // (mid-stream upload), and the un-throttled loop re-queued a
-          // doomed decode every 4 frames for its whole duration.
+          // Heals of a STILL-SERVING entry retry fast and flat: the payload
+          // is normally mid-stream and lands within a fraction of a second,
+          // a failed guarded read returns in microseconds, and the old
+          // escalating ladder (8..120 frames) held freshly promoted mips
+          // stale/low-res for visible seconds (the medium-distance texture
+          // pop-in: skate3_1295 re-logged one promote 8x while its heals
+          // starved). After ~30 fast attempts (payload never settling,
+          // permanently churning content) fall back to the ladder.
           if (!t.valid) {
             tit->second.fail_count = BumpFail(tit->second.fail_count);
+            if (!t.verify_failed) {
+              g_heal_decode_fail.fetch_add(1, std::memory_order_relaxed);
+            }
             tit->second.retry_after_frame =
-                frame_number + RetryBackoff(tit->second.fail_count);
+                frame_number + (tit->second.fail_count <= 30
+                                    ? 6
+                                    : RetryBackoff(tit->second.fail_count));
           }
           if (t.gt.texture) t.gt.texture->Release();
           if (t.gt.upload) t.gt.upload->Release();
@@ -12927,6 +13082,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     g_r.tex_lookaside.clear();
     g_r.tex_lookaside_used.clear();
+    g_r.tex_sticky.clear();
+    g_r.tex_pending_first.clear();
     REXLOG_INFO("native-scene: texture cache flushed (debug dialog)");
   }
   if (g_flush_meshes.exchange(false, std::memory_order_relaxed)) {
@@ -13389,8 +13546,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         frame_number >= it->second.recheck_frame &&
         REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
       it->second.recheck_frame = frame_number + 16;
-      const uint64_t fp = SamplePayloadFingerprint(base, it->second.payload_addr,
-                                                   it->second.payload_size);
+      const uint64_t fp = SampleProbeFingerprint(base, it->second);
       if (fp != 0 && fp != it->second.payload_fp) {
         // In-place content rotation (event ads stream the next poster into
         // the same buffer; the words, and so the key, never change): heal
@@ -13430,8 +13586,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (pit != g_r.words_sticky.end() && pit->second != fkey) {
       const auto old = g_r.textures_2d.find(pit->second);
       if (old != g_r.textures_2d.end() && old->second.valid) {
+        g_ad_stale_served.fetch_add(1, std::memory_order_relaxed);
         return &old->second;
       }
+    }
+    // Nothing decoded for this site yet: the caller falls back to the
+    // channel diffuse (the baked placeholder poster). If the "decal flash
+    // and replace" report survives the dense-probe fix, a climbing none=
+    // with a capped log here names this path as the flasher.
+    g_ad_placeholder.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<uint32_t> s_ad_logs{0};
+    if (!retained && s_ad_logs.fetch_add(1) < 24) {
+      REXLOG_INFO(
+          "native-scene: ad/decal words site={:X} fkey={:016X} -> placeholder "
+          "(no decode yet) words=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+          site, fkey, words[0], words[1], words[2], words[3], words[4],
+          words[5]);
     }
     return nullptr;
   };
@@ -13558,7 +13728,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // VirtualQuery here; it takes the process VAD lock, which the guest
     // streaming threads hammer, and ~2 calls per item stalled the whole
     // renderer to 3 fps.
-    const auto resolve_texture = [&](uint32_t tex_ptr) -> const GuestTexture* {
+    // Set by resolve_texture_raw when it returns the white fallback while a
+    // decode is in flight (first-sight miss or a still-failing heal); the
+    // sticky wrapper below then serves the item's last-good texture instead.
+    bool tex_pending = false;
+    const auto resolve_texture_raw = [&](uint32_t tex_ptr) -> const GuestTexture* {
       if (tex_ptr == 0) {
         return &g_r.white;
       }
@@ -13598,8 +13772,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           if (tit->second.recheck_count < 3) {
             ++tit->second.recheck_count;
           }
-          const uint64_t fp = SamplePayloadFingerprint(
-              base, tit->second.payload_addr, tit->second.payload_size);
+          const uint64_t fp = SampleProbeFingerprint(base, tit->second);
           payload_changed = fp != 0 && fp != tit->second.payload_fp;
         }
         // words_changed re-decodes are throttled by retry_after_frame on the
@@ -13612,6 +13785,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         const bool words_changed =
             std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0 &&
             (!tit->second.valid || frame_number >= tit->second.retry_after_frame);
+        if (words_changed && tit->second.valid && (live[1] & 0xFFFFF000u) == 0u) {
+          // Streamer DEMOTED mip 0 out (base address cleared; only the mip
+          // chain stays resident). The cached decode carries the full chain
+          // - strictly better than honoring the demote, so adopt the new
+          // words to stop the mismatch re-detecting, stop payload rechecks
+          // (the old mip-0 pool range is already reused by other content),
+          // and skip the doomed re-decode (base 0 fails instantly; the
+          // retry ladder burned a worker round trip every backoff period
+          // for as long as the demote lasted). A re-promote changes the
+          // words again and heals normally.
+          std::memcpy(tit->second.fetch_words, live, sizeof(live));
+          tit->second.recheck_frame = UINT64_MAX;
+          tit->second.fail_count = 0;
+          g_demote_hold.fetch_add(1, std::memory_order_relaxed);
+          return &tit->second;
+        }
         if (retry_failed || payload_changed || words_changed) {
           if (words_changed) {
             // Streaming mip rebind: when the new words match a parked
@@ -13694,9 +13883,49 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         EnqueueTexMiss(tex_ptr);
         ++tex_decodes;
         g_rr_tex_deferred.fetch_add(1, std::memory_order_relaxed);
+        tex_pending = true;
         return &g_r.white;
       }
-      return tit->second.valid ? &tit->second : &g_r.white;
+      if (!tit->second.valid) {
+        tex_pending = true;  // failed decode with a retry scheduled
+        return &g_r.white;
+      }
+      return &tit->second;
+    };
+    // Sticky serving: streaming rotates content onto NEW texture objects (a
+    // mip promote is usually a fresh object: 287 first-sight objects vs 73
+    // in-place rebinds in one 45 s traversal), so a plain
+    // cache miss white-flashed content that was on screen with the previous
+    // mip one frame earlier. While the new object's decode is in flight,
+    // serve the last texture this item slot successfully resolved, the
+    // same visual as the console's own mip transition. slot: 0 diffuse,
+    // 1 lightmap, 2 macro, 3 normal/ripple, 4 decal art, 5 hair, 6 spec.
+    const auto resolve_texture = [&](uint32_t tex_ptr,
+                                     uint32_t slot) -> const GuestTexture* {
+      tex_pending = false;
+      const GuestTexture* t = resolve_texture_raw(tex_ptr);
+      if (item.retained || tex_ptr == 0) {
+        return t;
+      }
+      const uint64_t skey = (uint64_t(item.mesh) << 3) | slot;
+      if (t != &g_r.white) {
+        g_r.tex_sticky[skey] = tex_ptr;
+        if (!g_r.tex_pending_first.empty()) {
+          g_r.tex_pending_first.erase(tex_ptr);
+        }
+        return t;
+      }
+      if (tex_pending) {
+        const auto sit = g_r.tex_sticky.find(skey);
+        if (sit != g_r.tex_sticky.end() && sit->second != tex_ptr) {
+          const auto old = g_r.textures.find(sit->second);
+          if (old != g_r.textures.end() && old->second.valid) {
+            g_tex_sticky_served.fetch_add(1, std::memory_order_relaxed);
+            return &old->second;
+          }
+        }
+      }
+      return t;
     };
     // Streamed-artwork diffuse override (see DrawItem::diffuse_fetch): the
     // real art exists only as draw-time fetch words; resolve those through
@@ -13708,11 +13937,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                   item.retained)
             : nullptr;
     if (diffuse == nullptr) {
-      diffuse = resolve_texture(item.diffuse_tex);
+      diffuse = resolve_texture(item.diffuse_tex, 0);
+      if (diffuse == &g_r.white && tex_pending && item.diffuse_tex != 0 &&
+          !item.retained) {
+        // Brand-new content, first decode in flight, and no previous mip
+        // cached to serve: draw NOTHING for a short window instead of a
+        // white flash: the emulated pop-in semantics (the game shows
+        // streamed content only once its data is ready). Bounded so a
+        // permanently failing texture still falls back to visible white.
+        const auto [pit, fresh] =
+            g_r.tex_pending_first.try_emplace(item.diffuse_tex, frame_number);
+        if (frame_number - pit->second < 20) {
+          g_skip_new.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+      }
     }
     const GuestTexture* lightmap =
         item.lightmap_tex != 0 && REXCVAR_GET(skate3_native_render_scene_lightmaps)
-            ? resolve_texture(item.lightmap_tex)
+            ? resolve_texture(item.lightmap_tex, 1)
             : nullptr;
     if (lightmap == &g_r.white) {
       lightmap = nullptr;
@@ -13830,7 +14073,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // plaza sections rendered ~1.4x too bright (the ground checkerboard).
     const GuestTexture* macro_tex =
         item.macro_tex != 0 && REXCVAR_GET(skate3_native_render_scene_macro)
-            ? resolve_texture(item.macro_tex)
+            ? resolve_texture(item.macro_tex, 2)
             : &g_r.white;
     if ((item.water || item.char_family >= 6) && item.water_normal != 0) {
       // Water rides its ripple normal map in the macro slot (water never
@@ -13840,7 +14083,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // face away from the sun and shade as a dark ambient-blue patch that
       // stops at the door seams (the exact PS with a FLAT map reproduces
       // that artifact; with the real map it matches the emulated car).
-      macro_tex = resolve_texture(item.water_normal);
+      macro_tex = resolve_texture(item.water_normal, 3);
     }
     // Water / vehicle environment cube (t6, root param 8): decoded once per
     // guest object into the cube cache; the gray fallback cube otherwise.
@@ -13866,7 +14109,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     const GuestTexture* decal_tex = item.decal && item.decal_art != 0 &&
                                             REXCVAR_GET(skate3_native_render_scene_decals)
-                                        ? resolve_texture(item.decal_art)
+                                        ? resolve_texture(item.decal_art, 4)
                                         : &g_r.white;
     // Streamed-artwork decal override (see DrawItem::decal_fetch): ad frames
     // covered by an environment.decal section get the current event-ad art
@@ -13884,7 +14127,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // Hair strand coverage rides the (otherwise unused) decal slot; the
       // PS hair branch samples it at the raw second texcoord. The white
       // fallback keeps failed decodes opaque rather than invisible.
-      decal_tex = resolve_texture(item.hair_alpha_tex);
+      decal_tex = resolve_texture(item.hair_alpha_tex, 5);
     }
     // Exact env families without decal art bind the material's spec/ecc/
     // refmask map (or the animated.tree noise tint) in the free decal slot;
@@ -13892,7 +14135,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     bool spec_bound = false;
     if (item.env_family != 0 && !item.decal && item.env_family != 10 &&
         item.spec_tex != 0) {
-      const GuestTexture* spec = resolve_texture(item.spec_tex);
+      const GuestTexture* spec = resolve_texture(item.spec_tex, 6);
       if (spec != &g_r.white) {
         decal_tex = spec;
         spec_bound = true;
@@ -13904,7 +14147,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // panorama (sunless for the 1-3 frames in flight).
     bool sky_sun_bound = false;
     if (item.unlit && item.spec_tex != 0) {
-      const GuestTexture* sun = resolve_texture(item.spec_tex);
+      const GuestTexture* sun = resolve_texture(item.spec_tex, 6);
       if (sun != &g_r.white) {
         decal_tex = sun;
         sky_sun_bound = true;
@@ -13928,7 +14171,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (item.water_normal == 0) gate |= 2;
       if (spec_bound && (!decal_tex->valid || decal_tex->srv_mips == 0)) gate |= 4;
       if (gate == 0) {
-        const GuestTexture* nrm = resolve_texture(item.water_normal);
+        const GuestTexture* nrm = resolve_texture(item.water_normal, 3);
         if (nrm == &g_r.white) {
           gate |= 8;
         } else {
@@ -14734,6 +14977,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
         "look[hit={} stale={} park={} held={}] "
+        "heal[vfail={} dfail={} demote={}] serve[sticky={} skipnew={} adstale={} adnone={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
         "bones_rescued={}] dynobj[valid={} drawn={}] refl[pair={} flat={} gate={:#x}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
@@ -14753,7 +14997,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
         g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
         g_rr_tex_deferred.load(), g_look_hit.load(), g_look_stale.load(),
-        g_look_park.load(), g_r.tex_lookaside.size(), scene.shadow_valid,
+        g_look_park.load(), g_r.tex_lookaside.size(), g_heal_verify_fail.load(),
+        g_heal_decode_fail.load(), g_demote_hold.load(),
+        g_tex_sticky_served.load(), g_skip_new.load(), g_ad_stale_served.load(),
+        g_ad_placeholder.load(), scene.shadow_valid,
         shadow_ready, shadow_draws,
         g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
         g_char_rows_reused.load(), g_bones_rescued.load(), scene.dynobj_valid,
