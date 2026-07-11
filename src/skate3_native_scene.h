@@ -164,6 +164,19 @@ struct DrawItem {
   // before any draw. Cleared by the post-draw (ib,vb) fixup; items still
   // pending at frame end are dropped (wrong state renders garbage).
   bool pending;
+  // Diagnosis: which path staged this item's palette/world. 0 = none/raw,
+  // 1 = submit-exit capture, 2 = post-draw (ib,vb) fixup, 3 = bones-cache
+  // rescue, 4 = ropa state rescue.
+  uint8_t dbg_src = 0;
+  // The palette was captured from an ORTHOGRAPHIC (CSM caster-cascade)
+  // bank. The game does not reliably re-evaluate fine bone animation for
+  // the shadow passes (vehicle wheel spin measured ~40 ms stale in bursts)
+  // - publishing such a palette as the item's MAIN pose makes the pose
+  // stream jump and resets the motion-smoothing ring (the traffic judder).
+  // Caster-sourced captures lose merge arbitration to perspective-bank
+  // captures and stay registered for a refresh from the mesh's later
+  // main-pass draw.
+  bool caster_bank = false;
   // Cloth patch (non-indexed quad list, CPU-simulated absolute world-space
   // float3 verts): the renderer synthesizes quad->triangle indices instead
   // of reading a guest index buffer.

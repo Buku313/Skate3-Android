@@ -228,6 +228,12 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_synthetic_pan_amp, 0.0, "Skate 
                       "item the game submits, filling in the full surround); > 0 = "
                       "triangle-wave +-amp around the engage heading.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bonesig_auto, 0.0, "Skate 3",
+                      "Auto-arm bone-signal recordings of this many seconds "
+                      "(entity-pose diagnosis, same output as the F12 button): "
+                      "first window ~30 s after the native scene comes up, "
+                      "re-armed every 90 s, 3 windows max. 0 = off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_sort_opaque, true, "Skate 3",
                     "Draw opaque scene items front-to-back (bbox-center camera "
                     "distance). Early-z rejects occluded pixels before the heavy "
@@ -864,6 +870,21 @@ uint32_t BSwap32(uint32_t v) {
 // c4 validates as a plausible world and renders the prop at the origin).
 std::atomic<uint64_t> g_draw_seq{0};
 
+// Provenance of the last completed guest draw: (ib_obj << 32 | vb_obj) for
+// indexed 3D draws, 0 for everything else. The submit-exit capture may only
+// consume the constant bank when the mesh's OWN draw was the last one to
+// flush it; `drew_inside` alone proved only that SOME draw ran during the
+// submit call. When this mesh's draws were deferred but another entity's
+// inline draws ran inside the call, the bank holds that entity's palette,
+// and the sample-projection acceptance gate cannot reliably refuse it: a
+// vehicle right next to the skater, skinned by the skater's foreign
+// palette, still projects on-screen at a plausible spread, and rendered
+// glued to his walking bones (the player-becomes-the-vehicle bug).
+std::atomic<uint64_t> g_last_draw_ibvb{0};
+// drew_inside captures whose bank provably belonged to another mesh's draw
+// (now deferred to the post-draw fixup instead of consumed).
+std::atomic<uint64_t> g_capture_foreign_bank{0};
+
 // Where does this bank keep its bone palette? Pre-pass layout: c4 (bone 0's
 // affine rows right after viewproj). Main-pass layout: camera position at
 // c4, two parameter rows, palette at c7. A camera-position row is easily
@@ -1106,7 +1127,64 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
   if (std_pass) {
     return palette_base;
   }
-  if (gate(palette_base + 1, &s_plus)) {
+  // Fallback homes need their layout's STRUCTURAL signature, not just a
+  // passing projection score. The projection gate alone is fooled by
+  // ONE-BONE-LATE palettes: a vehicle filling the screen at close range
+  // clips half its samples (the correct base FAILS the gate), while a
+  // base+3-register home shifts the vehicle BODY; most of its verts hang
+  // off the LAST real bone, onto the next leftover rows in the bank,
+  // i.e. whatever skinned entity staged before. Standing next to a truck
+  // that is the PLAYER: the shifted palette projects beautifully and was
+  // accepted, gluing the truck body to the walking skater (the
+  // player-becomes-the-vehicle bug; proven in capture:
+  // real palette c4..c18, published capture bone k = real bone k+1, body
+  // bone 4 = the player's stale c19 rows). Signatures, from the verified
+  // layouts:
+  //   +1 homes (cloth/morph/ropa): a PARAMETER row directly in front of
+  //     the palette: (0,0,0,w) (ropa flag) or (1,0,0,0) (NPC morph).
+  //   main-pass homes 7/8: the CAMERA POSITION at c4 (the same key
+  //     BankPaletteBase pins the main-pass layout with).
+  const auto param_like = [&](uint32_t reg) -> bool {
+    float f[4];
+    for (int i = 0; i < 4; ++i) {
+      f[i] = LoadGuestF32(base, bank + (reg * 4 + uint32_t(i)) * 4);
+      if (!(f[i] > -1e7f && f[i] < 1e7f)) {
+        return false;
+      }
+    }
+    if (f[0] * f[0] + f[1] * f[1] + f[2] * f[2] <= 0.0025f) {
+      return true;  // (0,0,0,w): the ropa flag row
+    }
+    // (1,0,0,0): the NPC cloth/morph variant's parameter row. A bone row0
+    // can also be (1,0,0,tx) for an unrotated bone; its w is the world
+    // translation x, so require |w| small too.
+    return std::fabs(f[0] - 1.0f) <= 1e-3f && std::fabs(f[1]) <= 1e-3f &&
+           std::fabs(f[2]) <= 1e-3f && std::fabs(f[3]) <= 1.5f;
+  };
+  const auto cam_at_c4 = [&]() -> bool {
+    if (g_fog_cam[0] == 0.0f && g_fog_cam[1] == 0.0f && g_fog_cam[2] == 0.0f) {
+      return false;
+    }
+    const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
+    const float dy = LoadGuestF32(base, bank + 17 * 4) - g_fog_cam[1];
+    const float dz = LoadGuestF32(base, bank + 18 * 4) - g_fog_cam[2];
+    return dx * dx + dy * dy + dz * dz < 25.0f;
+  };
+  const auto home_ok = [&](uint32_t pb) -> bool {
+    switch (pb) {
+      case 4:
+        return true;
+      case 5:
+        return param_like(4);
+      case 7:
+        return cam_at_c4();
+      case 8:
+        return cam_at_c4() && param_like(7);
+      default:
+        return false;
+    }
+  };
+  if (home_ok(palette_base + 1) && gate(palette_base + 1, &s_plus)) {
     g_palette_base_plus1.fetch_add(1, std::memory_order_relaxed);
     return palette_base + 1;
   }
@@ -1114,7 +1192,7 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     if (pb == palette_base || pb == palette_base + 1) {
       continue;
     }
-    if (gate(pb, nullptr)) {
+    if (home_ok(pb) && gate(pb, nullptr)) {
       return pb;
     }
   }
@@ -1181,6 +1259,19 @@ bool TryColAffine(uint8_t* base, uint32_t bank, uint32_t reg, float* out) {
 bool BankRigidWorld(uint8_t* base, uint32_t bank, float* out) {
   return TryRow4x4(base, bank, 4, out) || TryRow4x4(base, bank, 8, out) ||
          TryColAffine(base, bank, 4, out);
+}
+
+// Orthographic viewproj at c0..c3 (bottom row exactly (0,0,0,1)): the CSM
+// caster-cascade banks, verified in capture (a
+// truck's three caster draws vs its perspective main-pass draw). See
+// DrawItem::caster_bank.
+bool BankIsOrtho(uint8_t* base, uint32_t bank) {
+  const float x = LoadGuestF32(base, bank + (3 * 4 + 0) * 4);
+  const float y = LoadGuestF32(base, bank + (3 * 4 + 1) * 4);
+  const float z = LoadGuestF32(base, bank + (3 * 4 + 2) * 4);
+  const float w = LoadGuestF32(base, bank + (3 * 4 + 3) * 4);
+  return std::fabs(x) < 1e-6f && std::fabs(y) < 1e-6f && std::fabs(z) < 1e-6f &&
+         std::fabs(w - 1.0f) < 1e-3f;
 }
 
 bool GuestReadableApprox(uint8_t* base, uint32_t addr) {
@@ -2733,15 +2824,26 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   if (!BuildItemGeometry(base, ctx, item)) {
     return 0;
   }
-  // Rigid transform: the bank only holds this mesh's constants if its own
-  // draws ran inside the submit call. Deferred (multi-pass) rigid props draw
-  // later; the bank belongs to some earlier mesh, and a leftover identity
-  // matrix at c4 VALIDATES as a plausible world (verified from recorded
-  // draw streams: 4 of 6 vending-machine clones captured exact identity and
-  // rendered invisibly at the origin). Defer those to the post-draw fixup,
-  // like skinned palettes.
+  // The bank only provably holds THIS mesh's constants when the last draw
+  // that flushed it bound this mesh's buffers (see g_last_draw_ibvb);
+  // `drew_inside` alone also accepted banks left by another entity's inline
+  // draws while this mesh's own draws were deferred (the walking-vehicle /
+  // origin-vending-machine captures). Deferring those to the post-draw
+  // (ib,vb) fixup pairs the state with the mesh's own real draw.
+  const bool own_draw_last =
+      drew_inside && g_last_draw_ibvb.load(std::memory_order_relaxed) ==
+                         ((uint64_t(item.ib_obj) << 32) | item.vb_obj);
+  if (drew_inside && !own_draw_last) {
+    g_capture_foreign_bank.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Rigid transform: deferred (multi-pass) rigid props draw later; the
+  // bank belongs to some earlier mesh, and a leftover identity matrix at c4
+  // VALIDATES as a plausible world (verified from recorded draw streams:
+  // 4 of 6 vending-machine clones captured exact identity and rendered
+  // invisibly at the origin). Defer those to the post-draw fixup, like
+  // skinned palettes.
   if (!item.skinned) {
-    if (!drew_inside || !BankRigidWorld(base, bank, item.world)) {
+    if (!own_draw_last || !BankRigidWorld(base, bank, item.world)) {
       item.pending = true;
       g_rigid_pending.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2768,13 +2870,16 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
     const uint32_t palette_base = BankPaletteBase(base, bank);
     // World-path captures come from the sort-list hook BEFORE any of the
     // mesh's draws ran; the bank belongs to some other mesh; always defer
-    // to the post-draw fixup. Same when no draw ran inside the submit call
-    // (deferred mesh): a stale bank can still hold plausible bone rows.
-    item.pending = world_path || !drew_inside || (passes > 1 && passes < 16) ||
+    // to the post-draw fixup. Same when the last draw inside the submit
+    // call was not this mesh's own (deferred mesh, foreign inline draws):
+    // a stale/foreign bank can still hold plausible bone rows.
+    item.pending = world_path || !own_draw_last || (passes > 1 && passes < 16) ||
                    palette_base == 0;
     if (!item.pending) {
       if (CaptureSkinnedState(base, bank, palette_base, item)) {
         g_palette_snapshots.fetch_add(1, std::memory_order_relaxed);
+        item.dbg_src = 1;
+        item.caster_bank = BankIsOrtho(base, bank);
       } else {
         item.pending = true;
       }
@@ -2803,7 +2908,12 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   std::lock_guard<std::mutex> lock(g_palette_mutex);
   g_frame_dynitems.push_back(std::move(item));
   const size_t index = g_frame_dynitems.size() - 1;
-  if (g_frame_dynitems[index].pending) {
+  if (g_frame_dynitems[index].pending ||
+      (g_frame_dynitems[index].skinned && g_frame_dynitems[index].caster_bank &&
+       !g_frame_dynitems[index].ropa)) {
+    // Pending items wait for their first fixup; caster-bank captures stay
+    // registered so the mesh's later main-pass draw REFRESHES the palette
+    // (see DrawItem::caster_bank, stale wheel spin in the shadow banks).
     const DrawItem& d = g_frame_dynitems[index];
     g_frame_pending_by_buffers.emplace((uint64_t(d.ib_obj) << 32) | d.vb_obj, index);
   } else if (g_frame_dynitems[index].char_family != 0 &&
@@ -2961,6 +3071,15 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   if (flags2d != 0) {
     g_draws_2d.fetch_add(1, std::memory_order_relaxed);
   }
+  // Last-draw provenance for the submit-exit capture (see g_last_draw_ibvb):
+  // only an indexed 3D draw leaves a bank the palette/world capture may
+  // trust, keyed by the buffers it bound.
+  g_last_draw_ibvb.store(
+      (func == 0 && flags2d == 0)
+          ? ((uint64_t(g_cur_ib.load(std::memory_order_relaxed)) << 32) |
+             g_cur_vb.load(std::memory_order_relaxed))
+          : 0,
+      std::memory_order_relaxed);
   const uint32_t bank = g_vs_bank.load(std::memory_order_relaxed);
   if (bank == 0) {
     return;
@@ -3648,17 +3767,82 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   if (range.first == range.second) {
     return;
   }
-  // This draw's constants belong to the OLDEST pending item with these
-  // buffers (clones share mesh assets; the deferred list draws in submit
-  // order, so FIFO one-shot pairing keeps clones' palettes apart). This is
-  // the only draw that ever stages a deferred mesh's bones/world.
-  auto oldest = range.first;
+  // This draw's constants belong to the OLDEST still-PENDING item with
+  // these buffers (clones share mesh assets; the deferred list draws in
+  // submit order, so FIFO one-shot pairing keeps clones' palettes apart).
+  // With none pending, the oldest CASTER-sourced item instead gets a
+  // REFRESH from this later draw: palettes captured from the ortho
+  // caster-cascade banks carry stale fine animation (vehicle wheel spin,
+  // ~40 ms behind in bursts); publishing them made the car's pose stream
+  // jump, tripping the smoothing ring's discontinuity reset (the traffic
+  // judder). The refresh entry is only retired by a perspective-bank
+  // (z/main-pass) capture.
+  auto oldest = range.second;
   for (auto it = range.first; it != range.second; ++it) {
-    if (it->second < oldest->second) {
+    if (it->second >= g_frame_dynitems.size() ||
+        !g_frame_dynitems[it->second].pending) {
+      continue;
+    }
+    if (oldest == range.second || it->second < oldest->second) {
       oldest = it;
     }
   }
+  bool caster_refresh = false;
+  if (oldest == range.second) {
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second >= g_frame_dynitems.size()) {
+        continue;
+      }
+      const DrawItem& c = g_frame_dynitems[it->second];
+      if (!c.caster_bank || !c.skinned || c.ropa) {
+        continue;
+      }
+      if (oldest == range.second || it->second < oldest->second) {
+        oldest = it;
+      }
+    }
+    if (oldest == range.second) {
+      return;
+    }
+    caster_refresh = true;
+  }
   DrawItem& d = g_frame_dynitems[oldest->second];
+  if (caster_refresh) {
+    // Refresh of a caster-sourced capture from a later (ideally main-pass)
+    // draw. Re-capture into a PROBE and require the fresher palette to be
+    // THIS entity's pose: same-mesh clones share these buffers, and a far
+    // twin's later draw otherwise refreshes the near car onto the twin's
+    // position (bone-signal recorded 151 m palette teleports; the near
+    // car renders across the map, i.e. invisible where it stands).
+    const uint32_t palette_base = BankPaletteBase(base, bank);
+    if (palette_base == 0) {
+      return;
+    }
+    DrawItem probe = d;
+    if (!CaptureSkinnedState(base, bank, palette_base, probe)) {
+      return;
+    }
+    if (probe.bones.size() < 12 || probe.bones.size() != d.bones.size()) {
+      return;
+    }
+    const float dx = probe.bones[3] - d.bones[3];
+    const float dy = probe.bones[7] - d.bones[7];
+    const float dz = probe.bones[11] - d.bones[11];
+    if (dx * dx + dy * dy + dz * dz > 2.25f) {
+      return;  // > 1.5 m: a twin's draw, not this entity's
+    }
+    probe.caster_bank = BankIsOrtho(base, bank);
+    probe.pending = false;
+    probe.dbg_src = 2;
+    d = std::move(probe);
+    if (d.char_family != 0 && g_frame_char_refresh.size() < 256) {
+      g_frame_char_refresh.emplace(key, oldest->second);
+    }
+    if (!d.caster_bank) {
+      g_frame_pending_by_buffers.erase(oldest);
+    }
+    return;
+  }
   if (d.skinned) {
     // Locate the palette for this draw's layout; a bank without plausible
     // bone rows (parameter blocks, camera rows) must not be consumed; that
@@ -3670,6 +3854,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     if (!CaptureSkinnedState(base, bank, palette_base, d)) {
       return;  // stale bank refused: wait for a later draw with these buffers
     }
+    d.caster_bank = BankIsOrtho(base, bank);
   } else {
     // Deferred rigid prop: the world matrix is wherever this draw's layout
     // keeps it (pre-pass c4..c7, main-pass c8..c11). Not plausible -> wait
@@ -3677,12 +3862,16 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     if (!BankRigidWorld(base, bank, d.world)) {
       return;
     }
+    d.caster_bank = false;
   }
   d.pending = false;
+  d.dbg_src = 2;
   if (d.char_family != 0 && g_frame_char_refresh.size() < 256) {
     g_frame_char_refresh.emplace(key, oldest->second);
   }
-  g_frame_pending_by_buffers.erase(oldest);
+  if (!d.caster_bank) {
+    g_frame_pending_by_buffers.erase(oldest);
+  }
 }
 
 // ---- Camera re-timing (skate3_native_render_scene_smooth_camera) ----------
@@ -4275,6 +4464,12 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     int count = 0;
     int newest = 0;
     uint64_t seen = 0;
+    // EMA of this entity's own pose-change period. Characters/board update
+    // at the 60 Hz sim value cadence (~16.7 ms); traffic vehicles update
+    // SLOWER (their own sim rate); those entities need their evaluation
+    // point delayed by one own-period or the playback clock runs past
+    // their newest sample and they render raw stepped poses (see play_e).
+    double period = 0.0;
     // Per-bone skin-weighted vertex centroids in BIND space (w, x, y, z),
     // lazily computed from the mesh's own vertex buffer the first time a
     // bone of this entity trips the spin-collapse guard. The centroid IS
@@ -4334,9 +4529,187 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       continue;
     }
     const uint32_t k = occurrence[item.mesh]++;
-    const uint64_t key = (uint64_t(item.mesh) << 8) | (k & 0xFF);
-    DynHist& h = s_hist[key];
+    // Skinned pose-to-pose translation distance^2 at a NON-SPINNING
+    // reference. Fast wheel bones sweep multi-meter circles between ~8 ms
+    // samples (the model->world affine's translation carries the axle-
+    // pivot compensation; measured 2.9 m single-sample swings on traffic
+    // at speed), and bone 0 IS a wheel on the vehicle meshes, so keying
+    // the teleport gate on it reset the ring every few samples and
+    // traffic spent most of its time on raw stepped poses ("the whole
+    // vehicle lags then jumps to catch up"; the board's centimeter wheel
+    // offsets never trip it). A genuine teleport/mispair moves EVERY
+    // bone, spin moves only the wheels: with the entity's vertex-weighted
+    // bone set known (the centroid table), take the MINIMUM jump over
+    // real bones; until it exists, bone 0.
+    const auto skinned_dist2 = [&](const std::vector<float>& a,
+                                   const std::vector<float>& b,
+                                   const DynHist& hh) -> float {
+      const auto bone_d2 = [&](size_t bone) -> float {
+        const size_t bi = bone * 12;
+        const float dx = a[bi + 3] - b[bi + 3];
+        const float dy = a[bi + 7] - b[bi + 7];
+        const float dz = a[bi + 11] - b[bi + 11];
+        return dx * dx + dy * dy + dz * dz;
+      };
+      const size_t nbones = a.size() / 12;
+      float best = 1e30f;
+      const size_t ncen = std::min(hh.cen.size(), nbones);
+      for (size_t bone = 0; bone < ncen; ++bone) {
+        if (hh.cen[bone][0] > 0.5f) {
+          best = std::min(best, bone_d2(bone));
+        }
+      }
+      return best < 1e30f ? best : bone_d2(0);
+    };
+    // Distance^2 from this item's new pose to a history's newest pose;
+    // 1e30 when the history is empty, stale, or a different palette size.
+    const auto hist_dist2 = [&](const DynHist& hh) -> float {
+      if (hh.count == 0) {
+        return 1e30f;
+      }
+      const DynPose& lp = hh.ring[hh.newest];
+      if (now - lp.t > 0.1) {
+        return 1e30f;
+      }
+      if (skinned) {
+        if (lp.b.size() != item.bones.size() || lp.b.size() < 12) {
+          return 1e30f;
+        }
+        return skinned_dist2(item.bones, lp.b, hh);
+      }
+      const float dx = item.world[12] - lp.w[12];
+      const float dy = item.world[13] - lp.w[13];
+      const float dz = item.world[14] - lp.w[14];
+      return dx * dx + dy * dy + dz * dz;
+    };
+    // One-time bind-space vertex-centroid table for this entity (see the
+    // pivot-boxcar comment at the collapse guard). Also computed EAGERLY on
+    // an entity's first pose so the teleport gate's non-spinning reference
+    // (skinned_dist2) exists before the first interpolated frame; a car
+    // first seen at full speed otherwise reset its ring off the wheel
+    // swings forever and never reached the collapse path that used to
+    // build this table.
+    const auto ensure_cen = [&](DynHist& hh, size_t nbones) {
+          if ((hh.cen_vb != item.vb_addr || hh.cen_bytes != item.vb_bytes) &&
+              item.stride != 0 && item.bw_offset != 0 && item.bi_offset != 0) {
+            // One-time bind-space centroid pass over this entity's vertex
+            // buffer (guest thread; raw guest reads are safe here, same
+            // as RefinePaletteBase). u8x4 attributes are big-endian per
+            // 32-bit word: component k is byte (24 - 8k) of the host-order
+            // load.
+            hh.cen_vb = item.vb_addr;
+            hh.cen_bytes = item.vb_bytes;
+            hh.cen.assign(nbones, std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
+            const uint32_t vcount =
+                std::min<uint32_t>(item.vb_bytes / item.stride, 200000);
+            for (uint32_t vtx = 0; vtx < vcount; ++vtx) {
+              const uint32_t v = item.vb_addr + vtx * item.stride;
+              float p[3];
+              const uint32_t pa = v + item.pos_offset;
+              bool ok_fmt = true;
+              switch (item.pos_fmt) {
+                case 57:
+                  for (int a = 0; a < 3; ++a) {
+                    const uint32_t u = REX_LOAD_U32(pa + a * 4);
+                    std::memcpy(&p[a], &u, 4);
+                  }
+                  break;
+                case 32:
+                  for (int a = 0; a < 3; ++a) {
+                    p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
+                  }
+                  break;
+                case 26: {
+                  constexpr float kScale = 2.0f / 32767.0f;
+                  for (int a = 0; a < 3; ++a) {
+                    p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale +
+                           (a == 1 ? 0.8f : 0.0f);
+                  }
+                  break;
+                }
+                default:
+                  ok_fmt = false;
+                  break;
+              }
+              if (!ok_fmt) {
+                break;
+              }
+              const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
+              const uint32_t bidx = REX_LOAD_U32(v + item.bi_offset);
+              for (int k = 0; k < 4; ++k) {
+                const uint32_t wgt = (bw >> (24 - 8 * k)) & 0xFF;
+                if (wgt == 0) {
+                  continue;
+                }
+                const uint32_t bone = (bidx >> (24 - 8 * k)) & 0xFF;
+                if (bone >= nbones) {
+                  continue;
+                }
+                auto& cb = hh.cen[bone];
+                const float wf = float(wgt) * (1.0f / 255.0f);
+                cb[0] += wf;
+                cb[1] += wf * p[0];
+                cb[2] += wf * p[1];
+                cb[3] += wf * p[2];
+              }
+            }
+            for (auto& cb : hh.cen) {
+              if (cb[0] > 0.5f) {
+                cb[1] /= cb[0];
+                cb[2] /= cb[0];
+                cb[3] /= cb[0];
+              }
+            }
+          }
+    };
+    uint64_t key = (uint64_t(item.mesh) << 8) | (k & 0xFF);
+    DynHist* hp = &s_hist[key];
+    if (hp->seen == s_frame || hist_dist2(*hp) > 2.25f) {
+      // The k-th slot mispairs: the game's sort lists RESHUFFLE same-mesh
+      // clones as they and the camera move. For static props the
+      // reset-on-jump guard below was enough (a mispair rendered raw for a
+      // few frames), but driving traffic reshuffles CONSTANTLY; the rings
+      // never accumulated 3 poses and every moving car rendered raw
+      // stepped poses (the vehicle judder/catch-up). Re-pair by POSITION
+      // instead: claim the unclaimed history of this mesh whose newest
+      // pose is nearest, within the same 1.5 m one-tick jump gate.
+      float best = 2.25f;
+      DynHist* alt = nullptr;
+      uint64_t alt_key = key;
+      uint32_t fresh_k = 256;  // first index past the dense key range
+      for (uint32_t k2 = 0; k2 < 256; ++k2) {
+        const uint64_t key2 = (uint64_t(item.mesh) << 8) | k2;
+        const auto it2 = s_hist.find(key2);
+        if (it2 == s_hist.end()) {
+          fresh_k = k2;  // occurrence keys are dense per mesh
+          break;
+        }
+        if (k2 == (k & 0xFF) || it2->second.seen == s_frame) {
+          continue;
+        }
+        const float d2 = hist_dist2(it2->second);
+        if (d2 < best) {
+          best = d2;
+          alt = &it2->second;
+          alt_key = key2;
+        }
+      }
+      if (alt != nullptr) {
+        hp = alt;
+        key = alt_key;
+      } else if (hp->seen == s_frame && fresh_k < 256) {
+        // The k-th slot already belongs to another clone this frame and no
+        // history matches: start a fresh ring instead of corrupting the
+        // claimed one with interleaved poses.
+        key = (uint64_t(item.mesh) << 8) | fresh_k;
+        hp = &s_hist[key];
+      }
+    }
+    DynHist& h = *hp;
     h.seen = s_frame;
+    if (skinned) {
+      ensure_cen(h, item.bones.size() / 12);
+    }
     const DynPose& latest = h.ring[h.newest];
     const bool changed =
         h.count == 0 ||
@@ -4356,19 +4729,25 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             now - latest.t > 0.1 ||
             (skinned && latest.b.size() != item.bones.size());
         if (!discontinuity) {
-          // Translation: bone-0 rows carry t in float 3 of each row;
-          // rigid worlds carry it in row 3.
-          const float* nt = skinned ? item.bones.data() : &item.world[12];
-          const float* ot = skinned ? latest.b.data() : &latest.w[12];
-          const float dx = skinned ? nt[3] - ot[3] : nt[0] - ot[0];
-          const float dy = skinned ? nt[7] - ot[7] : nt[1] - ot[1];
-          const float dz = skinned ? nt[11] - ot[11] : nt[2] - ot[2];
-          discontinuity = dx * dx + dy * dy + dz * dz > 2.25f;  // > 1.5 m
+          // Translation jump at the non-spinning reference (see
+          // skinned_dist2; bone 0 is a WHEEL on vehicles); rigid worlds
+          // carry t in row 3.
+          float d2;
+          if (skinned) {
+            d2 = skinned_dist2(item.bones, latest.b, h);
+          } else {
+            const float dx = item.world[12] - latest.w[12];
+            const float dy = item.world[13] - latest.w[13];
+            const float dz = item.world[14] - latest.w[14];
+            d2 = dx * dx + dy * dy + dz * dz;
+          }
+          discontinuity = d2 > 2.25f;  // > 1.5 m
         }
         if (discontinuity) {
           h.count = 0;
         }
       }
+      const double prev_t = h.count > 0 ? h.ring[h.newest].t : 0.0;
       h.newest = h.count == 0 ? 0 : (h.newest + 1) % kRing;
       DynPose& p = h.ring[h.newest];
       // Timestamp with the camera sampler's latest sim tick when fresh:
@@ -4378,6 +4757,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       p.t = (g_latest_cam_tick > 0.0 && now - g_latest_cam_tick < 0.02)
                 ? g_latest_cam_tick
                 : now;
+      if (prev_t > 0.0) {
+        // Track the entity's OWN pose-change period (see DynHist::period).
+        const double dt = p.t - prev_t;
+        if (dt > 0.0005 && dt < 0.1) {
+          h.period = h.period == 0.0 ? dt : h.period * 0.75 + dt * 0.25;
+        }
+      }
       p.b = item.bones;
       std::memcpy(p.w, item.world, sizeof(p.w));
       h.count = std::min(h.count + 1, kRing);
@@ -4435,6 +4821,20 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     const double filter_w = std::clamp(
         REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) *
         1e-3;
+    // Per-entity playback point. Entities whose own pose stream is SLOWER
+    // than the 60 Hz character cadence (traffic vehicles tick on their own
+    // sim rate) pin the shared playback clock past their newest sample;
+    // alpha clamps at 1.0, the whole smoothing machinery degenerates to
+    // raw stepped poses, and every new sample renders as a visible jump
+    // (the vehicle judder/catch-up that survived the entity boxcar).
+    // Evaluating one own-period earlier keeps the eval point BRACKETED by
+    // samples: the staircase renders as continuous piecewise-linear
+    // motion, at the cost of that entity lagging one of ITS sim updates
+    // behind the world, invisible for background traffic, and never
+    // applied to 60 Hz entities (the skater/NPCs keep the shared clock).
+    const double play_e =
+        g_smooth_play -
+        (h.period > 0.020 ? std::min(h.period - 1.0 / 60.0, 0.1) : 0.0);
     static std::vector<float> acc;  // guest render thread only
     float wacc[16] = {};
     bool ok = true;
@@ -4443,13 +4843,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       acc.assign(skinned ? item.bones.size() : 0, 0.0f);
       for (int tap = 0; tap < kTaps && ok; ++tap) {
         const double tt =
-            std::min(g_smooth_play - filter_w * 0.5 + (tap + 0.5) * filter_w / kTaps,
+            std::min(play_e - filter_w * 0.5 + (tap + 0.5) * filter_w / kTaps,
                      h.ring[h.newest].t);
         ok = accum_at(tt, 1.0f / kTaps, acc.data(), wacc);
       }
     } else {
       acc.assign(skinned ? item.bones.size() : 0, 0.0f);
-      ok = accum_at(g_smooth_play, 1.0f, acc.data(), wacc);
+      ok = accum_at(play_e, 1.0f, acc.data(), wacc);
     }
     if (!ok) {
       continue;  // palette-size mismatch in the window: raw pose this frame
@@ -4474,7 +4874,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       int hi2 = h.newest;
       int lo2 = (h.newest + kRing - 1) % kRing;
       for (int step = 1; step < h.count - 1; ++step) {
-        if (h.ring[lo2].t <= g_smooth_play) {
+        if (h.ring[lo2].t <= play_e) {
           break;
         }
         hi2 = lo2;
@@ -4486,7 +4886,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     const DynPose& q0 = h.ring[b_lo];
     const DynPose& q1 = h.ring[b_hi];
     const double bspan = std::max(q1.t - q0.t, 0.0005);
-    const float ba = float(std::clamp((g_smooth_play - q0.t) / bspan, 0.0, 1.0));
+    const float ba = float(std::clamp((play_e - q0.t) / bspan, 0.0, 1.0));
     if (skinned) {
       if (q0.b.size() == item.bones.size() && q1.b.size() == item.bones.size()) {
         // Pass 1: flag collapsed bones (the churning staged-constant rows
@@ -4542,77 +4942,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           // Junk palette rows
           // (unreferenced by vertices) get no centroid weight and keep the
           // lerp.
-          if ((h.cen_vb != item.vb_addr || h.cen_bytes != item.vb_bytes) &&
-              item.stride != 0 && item.bw_offset != 0 && item.bi_offset != 0) {
-            // One-time bind-space centroid pass over this entity's vertex
-            // buffer (guest thread; raw guest reads are safe here, same
-            // as RefinePaletteBase). u8x4 attributes are big-endian per
-            // 32-bit word: component k is byte (24 - 8k) of the host-order
-            // load.
-            h.cen_vb = item.vb_addr;
-            h.cen_bytes = item.vb_bytes;
-            h.cen.assign(nbones, std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
-            const uint32_t vcount =
-                std::min<uint32_t>(item.vb_bytes / item.stride, 200000);
-            for (uint32_t vtx = 0; vtx < vcount; ++vtx) {
-              const uint32_t v = item.vb_addr + vtx * item.stride;
-              float p[3];
-              const uint32_t pa = v + item.pos_offset;
-              bool ok_fmt = true;
-              switch (item.pos_fmt) {
-                case 57:
-                  for (int a = 0; a < 3; ++a) {
-                    const uint32_t u = REX_LOAD_U32(pa + a * 4);
-                    std::memcpy(&p[a], &u, 4);
-                  }
-                  break;
-                case 32:
-                  for (int a = 0; a < 3; ++a) {
-                    p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
-                  }
-                  break;
-                case 26: {
-                  constexpr float kScale = 2.0f / 32767.0f;
-                  for (int a = 0; a < 3; ++a) {
-                    p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale +
-                           (a == 1 ? 0.8f : 0.0f);
-                  }
-                  break;
-                }
-                default:
-                  ok_fmt = false;
-                  break;
-              }
-              if (!ok_fmt) {
-                break;
-              }
-              const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
-              const uint32_t bidx = REX_LOAD_U32(v + item.bi_offset);
-              for (int k = 0; k < 4; ++k) {
-                const uint32_t wgt = (bw >> (24 - 8 * k)) & 0xFF;
-                if (wgt == 0) {
-                  continue;
-                }
-                const uint32_t bone = (bidx >> (24 - 8 * k)) & 0xFF;
-                if (bone >= nbones) {
-                  continue;
-                }
-                auto& cb = h.cen[bone];
-                const float wf = float(wgt) * (1.0f / 255.0f);
-                cb[0] += wf;
-                cb[1] += wf * p[0];
-                cb[2] += wf * p[1];
-                cb[3] += wf * p[2];
-              }
-            }
-            for (auto& cb : h.cen) {
-              if (cb[0] > 0.5f) {
-                cb[1] /= cb[0];
-                cb[2] /= cb[0];
-                cb[3] /= cb[0];
-              }
-            }
-          }
+          ensure_cen(h, nbones);
           uint64_t pivot_upgraded = 0;
           for (size_t b = 0; b < nbones; ++b) {
             if (!s_collapsed[b]) {
@@ -4630,10 +4960,31 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
               }
               const float c[3] = {h.cen[b][1], h.cen[b][2], h.cen[b][3]};
               const float* bar = acc.data() + bi;
-              // Orthonormalize the lerped rotation (rows): recovers the
-              // full-norm midpoint rotation from the shrunk chord.
-              double r0[3] = {lp[0], lp[1], lp[2]};
-              double r1[3] = {lp[4], lp[5], lp[6]};
+              // UNDERSAMPLED spin: traffic wheels at speed turn > 90 deg
+              // between adjacent ~8 ms samples; the pair-lerp rotation is
+              // then meaningless, and with a car wheel's bind centroid
+              // meters from the model origin the (Rbar - Ro)*c pin wobbled
+              // the wheel ~1 m around its well (bone-signal measured; the
+              // board's slow wheels never hit this). When the pair spans
+              // more than ~50 deg (Frobenius dot of the 3x3s: trace(R0^T
+              // R1) = 1 + 2cos(theta) for rotations), render the pair's
+              // NEWEST rotation instead; spin phase snaps once per
+              // sample, invisible at those rev rates, while the centroid
+              // pin still holds the wheel exactly on its smoothed path.
+              double pair_tr = 0.0;
+              for (int i = 0; i < 12; ++i) {
+                if ((i & 3) == 3) {
+                  continue;  // translation column
+                }
+                pair_tr += double(q0.b[bi + i]) * q1.b[bi + i];
+              }
+              const bool snap_spin = pair_tr < 2.28;  // 1 + 2cos(50 deg)
+              const float* rsrc = snap_spin ? q1.b.data() + bi : lp;
+              // Orthonormalize the source rotation (rows): recovers the
+              // full-norm midpoint rotation from the lerp's shrunk chord
+              // (or just cleans up the raw newest sample in snap mode).
+              double r0[3] = {rsrc[0], rsrc[1], rsrc[2]};
+              double r1[3] = {rsrc[4], rsrc[5], rsrc[6]};
               double n0 = std::sqrt(r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2]);
               if (n0 < 1e-4) {
                 return false;
@@ -4703,7 +5054,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       }
     }
     if (bs_rec) {
-      BoneSigAppend(1, key, now, g_smooth_play,
+      BoneSigAppend(1, key, now, play_e,
                     skinned ? item.bones.data() : item.world,
                     skinned ? uint32_t(item.bones.size()) : 16u);
     }
@@ -5103,8 +5454,52 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       auto [slot, inserted] = dyn_slot.try_emplace(r.a, scene.items.size());
       if (inserted) {
         scene.items.push_back(cand);
-      } else if (total_indices(cand) > total_indices(scene.items[slot->second])) {
-        scene.items[slot->second] = cand;
+      } else {
+        // Merge the per-pass captures of one context: PALETTE from the
+        // perspective (z/main-pass) bank; the ortho caster-cascade banks
+        // carry stale fine animation (see DrawItem::caster_bank), but
+        // GEOMETRY from the fullest culled island list. The two must be
+        // decided independently: a shadow list can be missing body parts
+        // the main view needs, and conversely the main view CULLS most of
+        // a vehicle the camera is standing inside/next to (wholesale
+        // "prefer main pass" replacement published that partial list and
+        // near vehicles went invisible).
+        DrawItem& cur = scene.items[slot->second];
+        const bool fresher = !cand.caster_bank && cur.caster_bank;
+        const bool staler = cand.caster_bank && !cur.caster_bank;
+        const bool fuller = total_indices(cand) > total_indices(cur);
+        // State/geometry grafts require the same resolved mode: ropa
+        // garments flip between rigid and skinned per capture, and mixing
+        // one copy's palette with another's interpretation is the
+        // mangled-ribbon bug.
+        const bool graftable = cand.skinned == cur.skinned && !cand.ropa &&
+                               !cur.ropa && cand.mesh == cur.mesh;
+        if (fresher && fuller) {
+          cur = cand;
+        } else if (fresher && graftable) {
+          // Fresher palette, smaller list: adopt the state, keep the
+          // fuller geometry (same mesh and buffers, lists differ only in
+          // which islands each pass kept).
+          cur.bones = cand.bones;
+          std::memcpy(cur.world, cand.world, sizeof(cur.world));
+          std::memcpy(cur.char_rows, cand.char_rows, sizeof(cur.char_rows));
+          std::memcpy(cur.tint, cand.tint, sizeof(cur.tint));
+          cur.caster_bank = false;
+        } else if (staler && fuller && graftable) {
+          // Fuller caster list vs a fresher partial item: keep the fresh
+          // palette, adopt the full geometry.
+          const DrawItem state = cur;
+          cur = cand;
+          cur.bones = state.bones;
+          std::memcpy(cur.world, state.world, sizeof(cur.world));
+          std::memcpy(cur.char_rows, state.char_rows, sizeof(cur.char_rows));
+          std::memcpy(cur.tint, state.tint, sizeof(cur.tint));
+          cur.caster_bank = false;
+        } else if (!fresher && !staler && fuller) {
+          cur = cand;  // same pass class: fullest wins, as before
+        } else if (staler && fuller) {
+          cur = cand;  // ungraftable (ropa): pre-arbitration fullest-wins
+        }
       }
       continue;
     }
@@ -5177,6 +5572,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       DrawItem& rescued = scene.items.back();
       rescued.bones = bit->second;
       rescued.pending = false;
+      rescued.dbg_src = 3;
       g_bones_rescued.fetch_add(1, std::memory_order_relaxed);
     }
     // Refused ropa captures re-publish last frame's resolved state: mode,
@@ -5196,6 +5592,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       rescued.bones = rit->second.bones;
       std::memcpy(rescued.world, rit->second.world, sizeof(rescued.world));
       rescued.pending = false;
+      rescued.dbg_src = 4;
       g_ropa_rescued.fetch_add(1, std::memory_order_relaxed);
     }
   }
@@ -5308,6 +5705,72 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
     const double now_s =
         std::chrono::duration<double>(build_t0.time_since_epoch()).count();
+    // Auto-armed bone-signal recordings (diagnosis, see the cvar): first
+    // window ~30 s after the scene comes up, re-armed every 90 s, 3 max.
+    {
+      const double auto_s = REXCVAR_GET(skate3_native_render_scene_bonesig_auto);
+      if (auto_s > 0.0) {
+        static int s_auto_count = 0;
+        static double s_auto_next = 0.0;
+        if (s_auto_next == 0.0) {
+          s_auto_next = now_s + 30.0;
+        } else if (s_auto_count < 3 && now_s >= s_auto_next) {
+          ++s_auto_count;
+          s_auto_next = now_s + 90.0;
+          REXLOG_INFO("native-scene: auto bone-signal recording {} ({} s)",
+                      s_auto_count, auto_s);
+          RecordBoneSignal(std::min(auto_s, 30.0));
+        }
+      }
+    }
+    // Walking-vehicle detector (diagnosis): a livingworld_vehicles item
+    // whose bone-0 translation sits on top of a character item's bone-0 is
+    // the "player becomes the vehicle" bug. Log the coincidence WITH the
+    // first bone rows of both palettes: identical rows = the same bank was
+    // captured for both (a capture-attribution bug); distinct rows = the
+    // vehicle's own palette tracks the character (a different mechanism).
+    {
+      static double s_last_attach_log = 0.0;
+      if (now_s - s_last_attach_log > 2.0) {
+        bool logged = false;
+        for (const DrawItem& v : scene.items) {
+          if ((v.char_family != 6 && v.char_family != 7) || !v.skinned ||
+              v.bones.size() < 12) {
+            continue;
+          }
+          for (const DrawItem& c : scene.items) {
+            if (&c == &v || !c.skinned || c.bones.size() < 12 ||
+                c.char_family == 0 || c.char_family >= 6) {
+              continue;
+            }
+            const float dx = v.bones[3] - c.bones[3];
+            const float dy = v.bones[7] - c.bones[7];
+            const float dz = v.bones[11] - c.bones[11];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < 4.0f) {
+              const bool same_rows =
+                  std::memcmp(v.bones.data(), c.bones.data(),
+                              12 * sizeof(float)) == 0;
+              REXLOG_INFO(
+                  "native-scene ATTACH: vehicle mesh={:08X} fam={} src={} "
+                  "pend={} d={:.2f} char mesh={:08X} fam={} src={} "
+                  "same_bone0={} v_r0=({:.3f},{:.3f},{:.3f},{:.2f}) "
+                  "c_r0=({:.3f},{:.3f},{:.3f},{:.2f})",
+                  v.mesh, v.char_family, v.dbg_src, v.pending, std::sqrt(d2),
+                  c.mesh, c.char_family, c.dbg_src, same_rows, v.bones[0],
+                  v.bones[1], v.bones[2], v.bones[3], c.bones[0], c.bones[1],
+                  c.bones[2], c.bones[3]);
+              s_last_attach_log = now_s;
+              logged = true;
+              break;
+            }
+          }
+          if (logged) {
+            break;
+          }
+        }
+      }
+    }
     float smooth_vp[16], smooth_cam[3];
     if (SmoothCamera(cam_view, proj, scene.view_proj, scene.cam_pos, now_s, smooth_vp,
                      smooth_cam)) {
@@ -11639,7 +12102,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={}] skinned={} skinned_skipped={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={}] skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
@@ -11652,7 +12115,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
         g_skinned_items.load(),
-        g_skinned_skipped.load(), g_rigid_pending.load(), g_rigid_dropped.load(),
+        g_skinned_skipped.load(), g_capture_foreign_bank.load(),
+        g_rigid_pending.load(), g_rigid_dropped.load(),
         g_world_props.load(),
         g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
         g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
