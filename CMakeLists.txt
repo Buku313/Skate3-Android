@@ -227,6 +227,8 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_demo_path.cpp
     src/skate3_fov.cpp
     src/skate3_iso_installer.cpp
+    src/native/skate3_native_diagnostics.cpp
+    src/native/skate3_native_guest_read.cpp
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
@@ -264,6 +266,29 @@ target_include_directories(skate3 PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/include
     ${REXSDK_DIR}/thirdparty/xxHash
 )
+
+set(SKATE3_NATIVE_SHADER_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/scene.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/shadow_blur.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/resolve.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/blur.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/outline.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/overlay2d.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/spline.hlsl
+)
+set(SKATE3_NATIVE_SHADER_HEADER
+    ${CMAKE_CURRENT_BINARY_DIR}/include/skate3_native_shaders.h)
+add_custom_command(
+    OUTPUT ${SKATE3_NATIVE_SHADER_HEADER}
+    COMMAND ${CMAKE_COMMAND}
+        -DSHADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders
+        -DOUT=${SKATE3_NATIVE_SHADER_HEADER}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake
+    DEPENDS ${SKATE3_NATIVE_SHADER_SOURCES}
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake
+    COMMENT "Embedding native renderer shaders"
+    VERBATIM)
+target_sources(skate3 PRIVATE ${SKATE3_NATIVE_SHADER_HEADER})
 target_compile_definitions(skate3 PRIVATE SKATE3_BUILD_CONFIG="$<CONFIG>")
 if(NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
     target_compile_definitions(skate3 PRIVATE SKATE3_HAS_TITLE_UPDATE=1)

@@ -29,6 +29,9 @@
 #include <rex/graphics/ultrawide_debug.h>
 #include <rex/logging.h>
 
+#include "native/skate3_native_diag.h"
+#include "native/skate3_native_guest_read.h"
+
 #if defined(REX_HAS_D3D12) && REX_HAS_D3D12
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
@@ -378,61 +381,10 @@ std::atomic<bool> g_flush_meshes{false};
 // consumed at the top of BuildFrameScene's retention block (guest thread).
 std::atomic<bool> g_retained_clear{false};
 
-// ---- Camera-signal recorder (judder diagnosis) -----------------------------
-// Records the guest camera SIGNAL during a real stick pan: every distinct
-// pose the ~1 kHz sampler accepts (kind 0, precise host timestamps), the raw
-// per-frame pose at scene build (kind 2) and the smoother's output (kind 1,
-// with its playback time). Written as logs/cam_signal_<ts>.csv when the
-// window closes; offline analysis computes tick-by-tick angular velocity to
-// show whether the game's own pose sequence is irregular at the source
-// (interpolation faithfully reproduces jerky inputs; the synthetic-pan probe
-// already exonerated everything downstream).
-struct CamSigEntry {
-  double t;       // host time (sampler push / frame build)
-  double play_t;  // kind 1 only: the smoother's playback time
-  float yaw;      // heading, degrees
-  uint8_t kind;   // 0 = raw sampler pose, 1 = smoothed frame, 2 = raw frame
-};
-std::mutex g_camsig_mutex;
-std::vector<CamSigEntry> g_camsig;
-std::atomic<double> g_camsig_deadline{0.0};  // record until this host time
-
-// Heading from a row-vector view matrix: camera forward in world space is
-// the view rotation's third column (v[2], v[6], v[10]).
-float YawFromViewRows(const float view[16]) {
-  return std::atan2(view[2], view[10]) * float(180.0 / 3.14159265358979323846);
-}
-
-// ---- Bone-signal recorder (wheel-guard diagnosis) --------------------------
-// Records the raw per-entity pose stream (every ring push: bone palettes /
-// rigid worlds with timestamps, kind 0) plus what the interpolation actually
-// output each frame (kind 1, with the playback time) to
-// logs/bone_signal_<ts>.bin. Offline analysis replays candidate filter/guard
-// strategies against the REAL board data and scores wheel-vs-deck lag/orbit
-// numerically before anything ships (the cam_signal playbook). Binary
-// records after a "BSIG1\n" header: u8 kind, u64 key, f64 t, f64 play,
-// u32 n, float[n]. Guest render thread only (written off-thread at close).
-std::vector<uint8_t> g_bonesig;
-std::atomic<double> g_bonesig_deadline{0.0};
-// Armed from the UI thread (F12 button), consumed on the guest thread; the
-// blob itself is guest-thread-only.
-std::atomic<double> g_bonesig_request{0.0};
-
-void BoneSigAppend(uint8_t kind, uint64_t key, double t, double play, const float* v,
-                   uint32_t n) {
-  if (g_bonesig.size() > (200u << 20)) {
-    return;  // runaway cap
-  }
-  const size_t off = g_bonesig.size();
-  g_bonesig.resize(off + 29 + size_t(n) * 4);
-  uint8_t* p = g_bonesig.data() + off;
-  *p = kind;
-  std::memcpy(p + 1, &key, 8);
-  std::memcpy(p + 9, &t, 8);
-  std::memcpy(p + 17, &play, 8);
-  std::memcpy(p + 25, &n, 4);
-  std::memcpy(p + 29, v, size_t(n) * 4);
-}
+// Camera/bone signal recorders + synthetic-pan probe + offline recording:
+// state and file writers live in native/skate3_native_diagnostics.cpp
+// (native/skate3_native_diag.h); capture call sites below read per-frame
+// locals and stay here.
 std::atomic<uint8_t*> g_guest_base{nullptr};
 std::atomic<uint64_t> g_frames_rendered{0};
 
@@ -854,73 +806,7 @@ std::atomic<uint32_t> g_cur_scissor[4];
 // vertices on a stream other than 0.
 std::atomic<uint32_t> g_cur_streams[4][3];
 
-// Offline-analysis recording (see StartRecording/WriteRecording): the full
-// per-draw constant bank stream is the ground truth for what the game's
-// shaders saw; the per-frame item lists are what our pipeline made of it.
-struct RecordedDraw {
-  uint32_t frame;
-  uint32_t func;  // 0 = DrawIndexedVertices, 1 = DrawVertices, 2 = BeginVertices
-  uint32_t ib;
-  uint32_t vb;
-  uint32_t vb_offset;      // stream-0 OffsetInBytes at bind time
-  uint32_t vb_stride;      // stream-0 stride at bind time
-  uint32_t streams[4][3];  // all streams: {vb, offset, stride}
-  uint32_t vfetch[12];     // fetch-constant shadow groups 0-1 (device+0x480)
-  uint32_t args[4];
-  float bank[1024];  // VS c0..c255
-  float ps[256];     // PS c0..c63 (material colors, e.g. CAS hair tint)
-  // 2D recon fields (SK3DRAW7):
-  uint32_t flags2d;      // bit per active 2D bracket (see On2dPhase)
-  uint32_t ps_obj;       // current guest pixel/vertex shader objects
-  uint32_t vs_obj;
-  uint32_t viewport[6];  // last SetViewport payload (raw guest dwords)
-  uint32_t scissor[4];   // last SetScissorRect payload
-  uint32_t rstates[256];    // render-state shadow snapshot (blend/depth)
-  uint32_t vfetch_all[192];  // full 32-slot texture fetch shadow
-  uint32_t vb_dump;  // index into buffers.bin for this draw's payloads
-  uint32_t ib_dump;  // (~0u = none)
-};
-struct RecordedFrame {
-  uint64_t generation;
-  float view_proj[16];
-  float cam_pos[3];
-  std::vector<DrawItem> dynitems;
-  std::vector<DrawItem> items;
-};
-// Dynamic meshes live in streaming arenas that are recycled DURING a long
-// recording; the end-of-window .gsnap holds garbage for them. Dump each
-// captured buffer payload once per content fingerprint so offline tools
-// decode exactly what the game used.
-struct RecordedBuffer {
-  uint32_t vb_addr;
-  uint32_t ib_addr;
-  uint64_t fingerprint;
-  std::vector<uint8_t> vb;
-  std::vector<uint8_t> ib;
-};
-std::mutex g_record_mutex;
-std::atomic<bool> g_recording{false};
-uint32_t g_record_frame = 0;   // index of the NEXT recorded frame
-uint32_t g_record_stride = 1;  // record every Nth frame
-uint32_t g_frames_seen = 0;    // frames completed since StartRecording
-std::vector<std::unique_ptr<RecordedDraw>> g_recorded_draws;
-std::vector<RecordedFrame> g_recorded_frames;
-std::vector<RecordedBuffer> g_recorded_buffers;
-std::unordered_set<uint64_t> g_recorded_buffer_keys;
-size_t g_recorded_buffer_bytes = 0;
-// BeginVertices (inline ring) payloads are written by the CPU AFTER the
-// call returns; dump them at frame end, when the writes are complete but
-// the ring has not yet wrapped. draw_index links the dump back to its
-// RecordedDraw.
-struct PendingInlineDump {
-  uint32_t addr;
-  uint32_t bytes;
-  size_t draw_index;
-};
-std::vector<PendingInlineDump> g_pending_inline_dumps;
-// One payload dump per (guest address, frame): 2D dynamic buffers hold many
-// draws' vertices; the repeated full-buffer dump would be pure duplication.
-std::unordered_map<uint64_t, uint32_t> g_frame_dump_ids;
+// Offline-analysis recording structs/state: native/skate3_native_diag.h.
 std::atomic<uint64_t> g_vs_uploads{0};
 std::atomic<uint64_t> g_palette_snapshots{0};
 // Palettes captured at base+1 (the cloth/morph VS layout with an extra
@@ -1161,15 +1047,6 @@ uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
   return 0;
 }
 
-float GuestHalfToFloat(uint16_t h) {
-  const uint32_t sign = uint32_t(h & 0x8000u) << 16;
-  const uint32_t exp = (h >> 10) & 0x1F;
-  const uint32_t man = h & 0x3FF;
-  if (exp == 0) return std::bit_cast<float>(sign);  // denorms ~0
-  if (exp == 31) return std::bit_cast<float>(sign | 0x7F800000u);
-  return std::bit_cast<float>(sign | ((exp + 112) << 23) | (man << 13));
-}
-
 // The cloth/morph skinned VS variant (skating-NPC torsos) keeps ONE extra
 // parameter row between the viewproj and the bone palette: observed live,
 // c4 = (1,0,0,0) with the palette at c5 (pre-pass) / c8 (main-pass). A
@@ -1221,6 +1098,14 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     if (!(vp[i] > -1e9f && vp[i] < 1e9f)) return palette_base;
   }
   constexpr uint32_t kSamples = 6;
+  // Sample verts decoded ONCE (native/skate3_native_guest_read.h); only the
+  // candidate palette base varies between score() calls.
+  SkinSampleVert sverts[kSamples];
+  if (!ReadSkinSamplesGuest(base, item, kSamples, sverts)) {
+    // Unsupported position format: every candidate is unscorable (-1); keep
+    // the caller's guess, as the old per-candidate decode did.
+    return palette_base;
+  }
   // score: fraction (0..16) of samples that skin in front of and inside the
   // bank's own clip volume; *out_spread = the skinned samples' bbox diagonal
   // (world units) for the bind-size sanity test below. *out_front_all (when
@@ -1235,59 +1120,10 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     float qmin[3] = {1e9f, 1e9f, 1e9f};
     float qmax[3] = {-1e9f, -1e9f, -1e9f};
     for (uint32_t s = 0; s < kSamples; ++s) {
-      const uint32_t v = item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
-      float p[3];
-      const uint32_t pa = v + item.pos_offset;
-      switch (item.pos_fmt) {
-        case 57:
-          for (int a = 0; a < 3; ++a) p[a] = LoadGuestF32(base, pa + a * 4);
-          break;
-        case 32:
-          for (int a = 0; a < 3; ++a) {
-            p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
-          }
-          break;
-        case 26: {
-          constexpr float kScale = 2.0f / 32767.0f;
-          for (int a = 0; a < 3; ++a) {
-            p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale + (a == 1 ? 0.8f : 0.0f);
-          }
-          break;
-        }
-        default:
-          return -1;
+      float q[3];
+      if (SkinPointBankRows(base, bank, pb, sverts[s], q, &rows_sane) == 0) {
+        continue;
       }
-      // u8x4 attributes are big-endian per 32-bit word: component k is byte
-      // (24 - 8k) of the host-order load.
-      const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
-      const uint32_t bi = REX_LOAD_U32(v + item.bi_offset);
-      uint32_t total = 0;
-      float q[3] = {0.0f, 0.0f, 0.0f};
-      for (int k = 0; k < 4; ++k) {
-        const uint32_t w = (bw >> (24 - 8 * k)) & 0xFF;
-        if (w == 0) continue;
-        const uint32_t bone = (bi >> (24 - 8 * k)) & 0xFF;
-        const uint32_t r0 = pb + 3 * bone;
-        if (r0 + 3 > 256) continue;
-        total += w;
-        for (int a = 0; a < 3; ++a) {
-          float row[4];
-          for (int i = 0; i < 4; ++i) {
-            row[i] = LoadGuestF32(base, bank + ((r0 + a) * 4 + i) * 4);
-          }
-          // A weighted bone's rotation row must be rotation-shaped (norm
-          // near the entity scale). The vehicle-flick captures carried
-          // WORLD POSITIONS in the rotation slots (norm ~140); those can
-          // still project on-screen and pass the geometric gate below.
-          const float rn = row[0] * row[0] + row[1] * row[1] + row[2] * row[2];
-          if (rn < 0.04f || rn > 25.0f) {
-            rows_sane = false;
-          }
-          q[a] += float(w) * (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]);
-        }
-      }
-      if (total == 0) continue;
-      for (int a = 0; a < 3; ++a) q[a] /= float(total);
       float clip[4];
       for (int r = 0; r < 4; ++r) {
         clip[r] = vp[r * 4] * q[0] + vp[r * 4 + 1] * q[1] + vp[r * 4 + 2] * q[2] +
@@ -1331,12 +1167,7 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
   // composes inconsistent transforms and smears the samples several times
   // wider. Generous bound: articulation can stretch a garment's sampled
   // span, junk palettes overshoot by ~10x.
-  float bind_diag = 0.0f;
-  for (int a = 0; a < 3; ++a) {
-    const float d = item.bbox_max[a] - item.bbox_min[a];
-    bind_diag += d * d;
-  }
-  bind_diag = std::sqrt(bind_diag);
+  const float bind_diag = BindDiag(item);
   const float max_spread = std::max(3.0f * bind_diag, bind_diag + 1.0f);
   // Bounded from BELOW too: a palette of non-pose rows can skin every
   // sample to nearly one point that happens to project on-screen (the
@@ -2385,28 +2216,7 @@ int CycleSyntheticPan() {
   return mode;
 }
 
-void RecordBoneSignal(double seconds) {
-  g_bonesig_request.store(seconds, std::memory_order_release);
-  REXLOG_INFO(
-      "native-scene bone-signal: recording {} s; skate past the camera at a steady "
-      "speed NOW",
-      seconds);
-}
-
-void RecordCameraSignal(double seconds) {
-  {
-    std::lock_guard<std::mutex> lock(g_camsig_mutex);
-    g_camsig.clear();
-    g_camsig.reserve(size_t(seconds * 1400.0));
-  }
-  const double now =
-      std::chrono::duration<double>(PerfClock::now().time_since_epoch()).count();
-  g_camsig_deadline.store(now + seconds, std::memory_order_release);
-  REXLOG_INFO(
-      "native-scene cam-signal: recording {} s; pan the camera with the stick at a "
-      "steady rate NOW",
-      seconds);
-}
+// RecordBoneSignal / RecordCameraSignal: native/skate3_native_diagnostics.cpp.
 
 bool ToggleSceneEnabled() {
   if (!REXCVAR_GET(skate3_native_render)) {
@@ -2993,32 +2803,15 @@ int ScoreRigidAffine(uint8_t* base, uint32_t bank, uint32_t m, const DrawItem& i
     rows[i] = LoadGuestF32(base, bank + (m * 4 + i) * 4);
   }
   constexpr uint32_t kSamples = 6;
+  SkinSampleVert sverts[kSamples];
+  if (!ReadSkinSamplesGuest(base, item, kSamples, sverts)) {
+    return -1;
+  }
   int ok = 0;
   int loose = 0;
   int n = 0;
   for (uint32_t s = 0; s < kSamples; ++s) {
-    const uint32_t v = item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
-    const uint32_t pa = v + item.pos_offset;
-    float p[3];
-    switch (item.pos_fmt) {
-      case 57:
-        for (int a = 0; a < 3; ++a) p[a] = LoadGuestF32(base, pa + a * 4);
-        break;
-      case 32:
-        for (int a = 0; a < 3; ++a) {
-          p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
-        }
-        break;
-      case 26: {
-        constexpr float kScale = 2.0f / 32767.0f;
-        for (int a = 0; a < 3; ++a) {
-          p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale + (a == 1 ? 0.8f : 0.0f);
-        }
-        break;
-      }
-      default:
-        return -1;
-    }
+    const float* p = sverts[s].p;
     float q[3];
     for (int a = 0; a < 3; ++a) {
       q[a] = rows[a * 4] * p[0] + rows[a * 4 + 1] * p[1] + rows[a * 4 + 2] * p[2] +
@@ -3062,92 +2855,36 @@ bool RopaPayloadCoherent(const DrawItem& item, const std::vector<uint8_t>& vb) {
       item.bi_offset == 0) {
     return true;
   }
-  const uint32_t count = item.vb_bytes / item.stride;
-  if (count < 2) {
+  const float bind_diag = BindDiag(item);
+  const float max_spread = std::max(3.0f * bind_diag, bind_diag + 1.0f);
+  constexpr uint32_t kSamples = 6;
+  SkinSampleVert sverts[kSamples];
+  const int got = ReadSkinSamplesRaw(vb.data(), vb.size(), item, kSamples, sverts);
+  if (got < 0) {
+    return true;  // unsupported position format: nothing to judge
+  }
+  if (got != int(kSamples)) {
+    // Short copy: garbage in the decoded prefix still fails (the original
+    // checked each sample before its successor's bounds check); otherwise
+    // there is nothing to judge.
+    for (int s = 0; s < got; ++s) {
+      if (!sverts[s].pos_finite) {
+        return false;
+      }
+    }
     return true;
   }
-  float bind_diag = 0.0f;
-  for (int a = 0; a < 3; ++a) {
-    const float d = item.bbox_max[a] - item.bbox_min[a];
-    bind_diag += d * d;
+  float spread = 0.0f;
+  const int r = SkinnedSpreadHostRows(sverts, kSamples, item.bones.data(),
+                                      item.bones.size(), /*min_n=*/2,
+                                      /*garbage_fails=*/true, &spread);
+  if (r < 0) {
+    return false;  // NaN/garbage positions mid-sim-write
   }
-  bind_diag = std::sqrt(bind_diag);
-  const float max_spread = std::max(3.0f * bind_diag, bind_diag + 1.0f);
-  float qmin[3] = {1e9f, 1e9f, 1e9f};
-  float qmax[3] = {-1e9f, -1e9f, -1e9f};
-  int n = 0;
-  constexpr uint32_t kSamples = 6;
-  for (uint32_t s = 0; s < kSamples; ++s) {
-    const uint32_t v = (s * (count - 1) / (kSamples - 1)) * item.stride;
-    if (uint64_t(v) + item.stride > vb.size()) {
-      return true;
-    }
-    const uint8_t* vp = vb.data() + v;
-    // Guest payload copied raw = big-endian attributes.
-    float p[3];
-    switch (item.pos_fmt) {
-      case 57:
-        for (int a = 0; a < 3; ++a) {
-          const uint8_t* b = vp + item.pos_offset + a * 4;
-          const uint32_t w = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 |
-                             uint32_t(b[2]) << 8 | b[3];
-          p[a] = std::bit_cast<float>(w);
-        }
-        break;
-      case 32:
-        for (int a = 0; a < 3; ++a) {
-          const uint8_t* b = vp + item.pos_offset + a * 2;
-          p[a] = GuestHalfToFloat(uint16_t(uint16_t(b[0]) << 8 | b[1]));
-        }
-        break;
-      case 26: {
-        constexpr float kScale = 2.0f / 32767.0f;
-        for (int a = 0; a < 3; ++a) {
-          const uint8_t* b = vp + item.pos_offset + a * 2;
-          p[a] = int16_t(uint16_t(b[0]) << 8 | b[1]) * kScale +
-                 (a == 1 ? 0.8f : 0.0f);
-        }
-        break;
-      }
-      default:
-        return true;
-    }
-    if (!(p[0] > -1e7f && p[0] < 1e7f && p[1] > -1e7f && p[1] < 1e7f &&
-          p[2] > -1e7f && p[2] < 1e7f)) {
-      return false;  // NaN/garbage positions mid-sim-write
-    }
-    // u8x4 weights/indices: component k = guest byte k (matches the
-    // capture path's byte-(24-8k)-of-host-load convention).
-    const uint8_t* bw = vp + item.bw_offset;
-    const uint8_t* bi = vp + item.bi_offset;
-    uint32_t total = 0;
-    float q[3] = {0.0f, 0.0f, 0.0f};
-    for (int k = 0; k < 4; ++k) {
-      const uint32_t w = bw[k];
-      if (w == 0) continue;
-      const uint32_t r0 = 3u * bi[k];
-      if ((r0 + 3) * 4 > item.bones.size()) continue;
-      total += w;
-      for (int a = 0; a < 3; ++a) {
-        const float* row = item.bones.data() + (r0 + uint32_t(a)) * 4;
-        q[a] += float(w) * (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]);
-      }
-    }
-    if (total == 0) continue;
-    ++n;
-    for (int a = 0; a < 3; ++a) {
-      q[a] /= float(total);
-      qmin[a] = std::min(qmin[a], q[a]);
-      qmax[a] = std::max(qmax[a], q[a]);
-    }
-  }
-  if (n < 2) {
+  if (r == 0) {
     return true;  // nothing to judge
   }
-  const float dx = qmax[0] - qmin[0];
-  const float dy = qmax[1] - qmin[1];
-  const float dz = qmax[2] - qmin[2];
-  return std::sqrt(dx * dx + dy * dy + dz * dz) <= max_spread;
+  return spread <= max_spread;
 }
 
 // Dense publish-time coherence gate: skin ~32 samples of the LIVE guest VB
@@ -3168,16 +2905,7 @@ bool PublishedPaletteSane(uint8_t* base, const DrawItem& item,
       item.bi_offset == 0 || item.vb_addr == 0) {
     return true;
   }
-  const uint32_t count = item.vb_bytes / item.stride;
-  if (count < 2) {
-    return true;
-  }
-  float bind_diag = 0.0f;
-  for (int a = 0; a < 3; ++a) {
-    const float d = item.bbox_max[a] - item.bbox_min[a];
-    bind_diag += d * d;
-  }
-  bind_diag = std::sqrt(bind_diag);
+  const float bind_diag = BindDiag(item);
   // 6x, NOT the capture gates' 3x: this judges already-ACCEPTED palettes,
   // where the observed junk measures 183-405 while legit articulation on
   // small meshes (a 0.5 m accessory mid-stride) reached 3.1-3.3x and
@@ -3185,68 +2913,17 @@ bool PublishedPaletteSane(uint8_t* base, const DrawItem& item,
   // 1.56 - real world-space palette, needlessly healed/frozen).
   const float max_spread = std::max(6.0f * bind_diag, bind_diag + 2.0f);
   constexpr uint32_t kSamples = 32;
-  float qmin[3] = {1e9f, 1e9f, 1e9f};
-  float qmax[3] = {-1e9f, -1e9f, -1e9f};
-  int n = 0;
-  for (uint32_t s = 0; s < kSamples; ++s) {
-    const uint32_t v =
-        item.vb_addr + (s * (count - 1) / (kSamples - 1)) * item.stride;
-    const uint32_t pa = v + item.pos_offset;
-    float p[3];
-    switch (item.pos_fmt) {
-      case 57:
-        for (int a = 0; a < 3; ++a) p[a] = LoadGuestF32(base, pa + a * 4);
-        break;
-      case 32:
-        for (int a = 0; a < 3; ++a) {
-          p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
-        }
-        break;
-      case 26: {
-        constexpr float kScale = 2.0f / 32767.0f;
-        for (int a = 0; a < 3; ++a) {
-          p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale + (a == 1 ? 0.8f : 0.0f);
-        }
-        break;
-      }
-      default:
-        return true;
-    }
-    if (!(p[0] > -1e7f && p[0] < 1e7f && p[1] > -1e7f && p[1] < 1e7f &&
-          p[2] > -1e7f && p[2] < 1e7f)) {
-      continue;
-    }
-    const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
-    const uint32_t bi = REX_LOAD_U32(v + item.bi_offset);
-    uint32_t total = 0;
-    float q[3] = {0.0f, 0.0f, 0.0f};
-    for (int k = 0; k < 4; ++k) {
-      const uint32_t w = (bw >> (24 - 8 * k)) & 0xFF;
-      if (w == 0) continue;
-      const uint32_t r0 = 3u * ((bi >> (24 - 8 * k)) & 0xFF);
-      if ((r0 + 3) * 4 > item.bones.size()) continue;
-      total += w;
-      for (int a = 0; a < 3; ++a) {
-        const float* row = item.bones.data() + (r0 + uint32_t(a)) * 4;
-        q[a] += float(w) * (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]);
-      }
-    }
-    if (total == 0) continue;
-    ++n;
-    for (int a = 0; a < 3; ++a) {
-      q[a] /= float(total);
-      qmin[a] = std::min(qmin[a], q[a]);
-      qmax[a] = std::max(qmax[a], q[a]);
-    }
+  SkinSampleVert sverts[kSamples];
+  if (!ReadSkinSamplesGuest(base, item, kSamples, sverts)) {
+    return true;  // unsupported position format: nothing to judge
   }
-  if (n < 4) {
+  float spread = 0.0f;
+  if (SkinnedSpreadHostRows(sverts, kSamples, item.bones.data(), item.bones.size(),
+                            /*min_n=*/4, /*garbage_fails=*/false, &spread) != 1) {
     return true;  // nothing to judge
   }
-  const float dx = qmax[0] - qmin[0];
-  const float dy = qmax[1] - qmin[1];
-  const float dz = qmax[2] - qmin[2];
-  *out_spread = std::sqrt(dx * dx + dy * dy + dz * dz);
-  return *out_spread <= max_spread;
+  *out_spread = spread;
+  return spread <= max_spread;
 }
 
 // Returns false when the bank could not be consumed for this item (ropa
@@ -4596,49 +4273,9 @@ bool g_smooth_active = false;
 // known ideal pose.
 CamPose g_smooth_pose;
 
-// ---- Synthetic camera pan (judder isolation probe) -------------------------
-// See the skate3_native_render_scene_synthetic_pan cvar comment for the mode
-// semantics. Engage state is captured from the RAW guest camera on the guest
-// render thread; the sampler thread reads it for mode 3 under g_synpan_mutex.
-std::atomic<int> g_synpan_active{0};  // engaged mode (0 = off)
-std::mutex g_synpan_mutex;
-float g_synpan_view0[16];  // raw guest view at engage
-float g_synpan_proj0[16];
-float g_synpan_c0[3];   // camera world position at engage (held fixed)
-double g_synpan_t0 = 0.0;
-double g_synpan_step_phase = 0.0;  // mode 2: accumulated phase (degrees)
-double g_synpan_ema_dt = 0.0;      // mode 2: slow EMA of the publish dt
-// Telemetry (guest render thread only).
-uint64_t g_synpan_frames = 0;
-double g_synpan_last_build = 0.0;
-double g_synpan_dt_sum = 0.0, g_synpan_dt_sum2 = 0.0;
-double g_synpan_dt_min = 0.0, g_synpan_dt_max = 0.0;
-double g_synpan_err_sum2 = 0.0, g_synpan_err_max = 0.0;
-uint64_t g_synpan_err_n = 0;
-
-// Full-surround world union for the probe: the game only submits what ITS
-// frustum sees each frame, so a synthetic pan away from the real heading
-// would show an empty world (sky dome only). While the probe is engaged,
-// every static item published is accumulated by identity and appended to
-// each frame's scene; sweep the REAL camera around once with the stick
-// after engaging and the union fills in the whole surround, making a full
-// 360-degree spin (amplitude 0) usable. Guest render thread only.
-std::unordered_map<uint64_t, DrawItem> g_synpan_union;
-
-uint64_t SynPanItemKey(const DrawItem& it) {
-  uint64_t h = 1469598103934665603ull;
-  const auto mix = [&h](uint64_t v) {
-    h ^= v;
-    h *= 1099511628211ull;
-  };
-  mix(it.mesh);
-  mix(it.vb_obj);
-  mix(it.ib_obj);
-  mix(std::bit_cast<uint32_t>(it.world[12]));
-  mix(std::bit_cast<uint32_t>(it.world[13]));
-  mix(std::bit_cast<uint32_t>(it.world[14]));
-  return h;
-}
+// Synthetic-pan probe state/helpers: native/skate3_native_diag.h (the
+// engage/step orchestration stays in BuildFrameScene below; it reads the
+// live camera and scene locals).
 
 // ---- Off-screen retention (edge-of-view teardown fix) ----------------------
 // The game culls its submission stream to ITS camera pose; the native frame
@@ -4742,47 +4379,7 @@ bool BoxOutsideFrustum(const float center[3], float half, const float vp[16],
   return CornersOutsideFrustum(corners, vp, margin);
 }
 
-// Pan phase (degrees of accumulated rotation) -> heading angle in degrees.
-// Triangle wave in [-amp, +amp] starting at 0 heading upward; amp <= 0 =
-// unbounded continuous rotation.
-double SynPanAngleDeg(double phase_deg, double amp) {
-  if (amp <= 0.0) {
-    return phase_deg;
-  }
-  const double period = 4.0 * amp;
-  double m = std::fmod(phase_deg, period);
-  if (m < 0.0) {
-    m += period;
-  }
-  return m < amp ? m : (m < 3.0 * amp ? 2.0 * amp - m : m - period);
-}
-
-// View matrix for the engage pose yawed by `angle_deg` about world up (+Y),
-// camera position held at the engage position. Row-vector convention
-// throughout (p_view = p * V): the 3x3 becomes Ry * R0 (world rotates first,
-// then the engage view, a level pan; direction sign is irrelevant for the
-// probe), translation row rebuilt as -c0 * R'.
-void SynPanView(double angle_deg, float view_out[16]) {
-  const double a = angle_deg * (3.14159265358979323846 / 180.0);
-  const float c = float(std::cos(a)), s = float(std::sin(a));
-  const float ry[3][3] = {{c, 0.0f, -s}, {0.0f, 1.0f, 0.0f}, {s, 0.0f, c}};
-  std::memset(view_out, 0, 16 * sizeof(float));
-  for (int i = 0; i < 3; ++i) {
-    for (int j = 0; j < 3; ++j) {
-      float sum = 0.0f;
-      for (int k = 0; k < 3; ++k) {
-        sum += ry[i][k] * g_synpan_view0[k * 4 + j];
-      }
-      view_out[i * 4 + j] = sum;
-    }
-  }
-  for (int k = 0; k < 3; ++k) {
-    view_out[12 + k] = -(g_synpan_c0[0] * view_out[0 * 4 + k] +
-                         g_synpan_c0[1] * view_out[1 * 4 + k] +
-                         g_synpan_c0[2] * view_out[2 * 4 + k]);
-  }
-  view_out[15] = 1.0f;
-}
+// SynPanAngleDeg / SynPanView: native/skate3_native_diagnostics.cpp.
 
 // ---- High-rate camera sampler ---------------------------------------------
 // Pose samples taken once per RENDERED frame alias as soon as the render
@@ -4887,10 +4484,7 @@ void CamSamplerLoop() {
     // Camera-signal recorder: every DISTINCT pose the guest produced, with
     // the sampler's precise host timestamp (kind 0).
     if (now < g_camsig_deadline.load(std::memory_order_relaxed)) {
-      std::lock_guard<std::mutex> lock(g_camsig_mutex);
-      if (g_camsig.size() < 200000) {
-        g_camsig.push_back({now, 0.0, YawFromViewRows(s.view), 0});
-      }
+      CamSigPush(now, 0.0, YawFromViewRows(s.view), 0);
     }
     std::lock_guard<std::mutex> lock(g_cam_samples_mutex);
     if (g_cam_samples.size() < 256) {
@@ -5224,38 +4818,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
   ++s_frame;
   // Bone-signal recorder window state (see BoneSigAppend). Written on a
   // detached thread once the window closes.
-  bool bs_rec = false;
-  {
-    const double req = g_bonesig_request.exchange(0.0, std::memory_order_acq_rel);
-    if (req > 0.0) {
-      g_bonesig.clear();
-      g_bonesig.reserve(16u << 20);
-      g_bonesig_deadline.store(now + req, std::memory_order_relaxed);
-    }
-    const double dl = g_bonesig_deadline.load(std::memory_order_relaxed);
-    if (dl > 0.0) {
-      if (now < dl) {
-        bs_rec = true;
-      } else {
-        std::vector<uint8_t> blob;
-        blob.swap(g_bonesig);
-        g_bonesig_deadline.store(0.0, std::memory_order_release);
-        std::thread([blob = std::move(blob)]() {
-          std::error_code ec;
-          std::filesystem::create_directories("logs", ec);
-          char path[128];
-          std::snprintf(path, sizeof(path), "logs/bone_signal_%lld.bin",
-                        static_cast<long long>(std::time(nullptr)));
-          std::ofstream f(path, std::ios::binary);
-          f.write("BSIG1\n", 6);
-          f.write(reinterpret_cast<const char*>(blob.data()),
-                  std::streamsize(blob.size()));
-          REXLOG_INFO("native-scene bone-signal: wrote {} bytes -> {}", blob.size() + 6,
-                      path);
-        }).detach();
-      }
-    }
-  }
+  const bool bs_rec = BoneSigTick(now);
   static const float kIdent[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
   std::unordered_map<uint32_t, uint32_t> occurrence;
   for (DrawItem& item : scene.items) {
@@ -5340,54 +4903,25 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             const uint32_t vcount =
                 std::min<uint32_t>(item.vb_bytes / item.stride, 200000);
             for (uint32_t vtx = 0; vtx < vcount; ++vtx) {
-              const uint32_t v = item.vb_addr + vtx * item.stride;
-              float p[3];
-              const uint32_t pa = v + item.pos_offset;
-              bool ok_fmt = true;
-              switch (item.pos_fmt) {
-                case 57:
-                  for (int a = 0; a < 3; ++a) {
-                    const uint32_t u = REX_LOAD_U32(pa + a * 4);
-                    std::memcpy(&p[a], &u, 4);
-                  }
-                  break;
-                case 32:
-                  for (int a = 0; a < 3; ++a) {
-                    p[a] = GuestHalfToFloat(uint16_t(REX_LOAD_U16(pa + a * 2)));
-                  }
-                  break;
-                case 26: {
-                  constexpr float kScale = 2.0f / 32767.0f;
-                  for (int a = 0; a < 3; ++a) {
-                    p[a] = int16_t(REX_LOAD_U16(pa + a * 2)) * kScale +
-                           (a == 1 ? 0.8f : 0.0f);
-                  }
-                  break;
-                }
-                default:
-                  ok_fmt = false;
-                  break;
+              SkinSampleVert sv;
+              if (!ReadSkinVertGuest(base, item, vtx, &sv)) {
+                break;  // unsupported position format
               }
-              if (!ok_fmt) {
-                break;
-              }
-              const uint32_t bw = REX_LOAD_U32(v + item.bw_offset);
-              const uint32_t bidx = REX_LOAD_U32(v + item.bi_offset);
               for (int k = 0; k < 4; ++k) {
-                const uint32_t wgt = (bw >> (24 - 8 * k)) & 0xFF;
+                const uint32_t wgt = sv.w[k];
                 if (wgt == 0) {
                   continue;
                 }
-                const uint32_t bone = (bidx >> (24 - 8 * k)) & 0xFF;
+                const uint32_t bone = sv.bone[k];
                 if (bone >= nbones) {
                   continue;
                 }
                 auto& cb = hh.cen[bone];
                 const float wf = float(wgt) * (1.0f / 255.0f);
                 cb[0] += wf;
-                cb[1] += wf * p[0];
-                cb[2] += wf * p[1];
-                cb[3] += wf * p[2];
+                cb[1] += wf * sv.p[0];
+                cb[2] += wf * sv.p[1];
+                cb[3] += wf * sv.p[2];
               }
             }
             for (auto& cb : hh.cen) {
@@ -6037,6 +5571,234 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
   }
 }
 
+// Publish the frame's 2D overlay draws (BuildFrameScene, before any early
+// return; menu and empty frames still carry 2D). The inline-ring vertex
+// payloads are complete by frame end; convert them to little-endian and
+// expand quad lists into triangle lists so the render side stays trivial.
+void Publish2dDraws(uint8_t* base) {
+  std::vector<Draw2d> frame_2d;
+  {
+    std::lock_guard<std::mutex> lock(g_2d_mutex);
+    frame_2d.swap(g_frame_2d);
+  }
+  static thread_local std::vector<uint8_t> scratch_2d;
+  std::vector<Draw2d> published;
+  published.reserve(frame_2d.size());
+  for (Draw2d& d : frame_2d) {
+    const uint32_t bytes = d.count * d.stride;
+    scratch_2d.resize(bytes);
+    if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
+      continue;
+    }
+    // Guest dwords are big-endian.
+    for (size_t i = 0; i + 4 <= scratch_2d.size(); i += 4) {
+      uint32_t v;
+      std::memcpy(&v, scratch_2d.data() + i, 4);
+      v = BSwap32(v);
+      std::memcpy(scratch_2d.data() + i, &v, 4);
+    }
+    // Verified capture-side vertex layouts, all normalized to one 28-byte
+    // renderer layout {float4 pos, float2 uv, u32 rgba}:
+    //   24-byte {float4 pos, float2 uv}          - APT elements
+    //   20-byte {float3 pos, float2 uv}          - glyph text (bit 4)
+    //   20-byte {float4 pos, u32 color}          - SimpleDraw untextured
+    //   28-byte {float4 pos, u32 color, float2 uv} - SimpleDraw textured
+    //   16-byte {float4 pos}                     - SimpleDraw solid fill
+    //     (color rides in VS c8 = m[8]; the popup panel strips, Rewards
+    //     title bar / teal body / tan footer, are these)
+    // (SimpleDraw = bit 5; its DrawParameters ctor orders colours before
+    // texcoords.)
+    {
+      static thread_local std::vector<uint8_t> norm_2d;
+      norm_2d.resize(size_t(d.count) * 28);
+      const float one = 1.0f;
+      const float zero = 0.0f;
+      const uint32_t white = 0xFFFFFFFFu;
+      const bool font = (d.flags & 0x10u) != 0;
+      const bool simple = (d.flags & 0x20u) != 0;
+      bool ok = true;
+      for (uint32_t v = 0; v < d.count && ok; ++v) {
+        uint8_t* dst = norm_2d.data() + size_t(v) * 28;
+        const uint8_t* src = scratch_2d.data() + size_t(v) * d.stride;
+        if (d.stride == 16 && simple) {  // SimpleDraw: pos4, untextured
+          std::memcpy(dst, src, 16);
+          std::memcpy(dst + 16, &zero, 4);
+          std::memcpy(dst + 20, &zero, 4);
+          std::memcpy(dst + 24, &white, 4);
+        } else if (d.stride == 24) {  // APT: pos4 + uv (with or without the
+          // SimpleDraw bracket; the compass needle/icons are 24-byte
+          // quads issued through SimpleDraw::Draw inside the HUD pass,
+          // same simpledraw_SimpleDrawUVSC shader as plain APT elements;
+          // requiring !simple here dropped them, a regression from adding
+          // bracket bit 5)
+          std::memcpy(dst, src, 24);
+          std::memcpy(dst + 24, &white, 4);
+        } else if (d.stride == 20 && font) {  // glyphs: pos3 + uv
+          std::memcpy(dst, src, 12);
+          std::memcpy(dst + 12, &one, 4);
+          std::memcpy(dst + 16, src + 12, 8);
+          std::memcpy(dst + 24, &white, 4);
+        } else if (d.stride == 20 && simple) {  // SimpleDraw: pos4 + color
+          std::memcpy(dst, src, 16);
+          std::memcpy(dst + 16, &zero, 4);
+          std::memcpy(dst + 20, &zero, 4);
+          // The dword byteswap reversed the color's guest byte order
+          // (r,g,b,a); restore it for R8G8B8A8_UNORM.
+          dst[24] = src[19];
+          dst[25] = src[18];
+          dst[26] = src[17];
+          dst[27] = src[16];
+        } else if (d.stride == 28 && simple) {  // SimpleDraw: pos4+color+uv
+          std::memcpy(dst, src, 16);
+          std::memcpy(dst + 16, src + 20, 8);
+          dst[24] = src[19];
+          dst[25] = src[18];
+          dst[26] = src[17];
+          dst[27] = src[16];
+        } else {
+          ok = false;
+        }
+      }
+      if (!ok) {
+        g_draws_2d_other.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      if (d.stride == 16) {
+        // Untextured fill: the captured fetch words are leftover state from
+        // the previous textured draw; zero them so the replay binds the
+        // white texture instead of tinting the fill with a stale texel.
+        std::memset(d.fetch, 0, sizeof(d.fetch));
+      }
+      scratch_2d = norm_2d;
+      d.stride = 28;
+    }
+    if (d.prim == 13 && d.count % 4 == 0) {
+      // Quad list -> triangle list (v0,v1,v2)(v0,v2,v3).
+      const uint32_t quads = d.count / 4;
+      d.verts.resize(size_t(quads) * 6 * d.stride);
+      static constexpr uint32_t kOrder[6] = {0, 1, 2, 0, 2, 3};
+      for (uint32_t q = 0; q < quads; ++q) {
+        for (uint32_t t = 0; t < 6; ++t) {
+          std::memcpy(d.verts.data() + (size_t(q) * 6 + t) * d.stride,
+                      scratch_2d.data() + (size_t(q) * 4 + kOrder[t]) * d.stride,
+                      d.stride);
+        }
+      }
+      d.prim = 4;
+      d.count = quads * 6;
+    } else if (d.prim == 4 || d.prim == 5) {
+      d.verts.assign(scratch_2d.begin(), scratch_2d.end());
+    } else {
+      continue;
+    }
+    published.push_back(std::move(d));
+  }
+  std::lock_guard<std::mutex> lock(g_2d_mutex);
+  g_scene_2d = std::move(published);
+  ++g_scene_2d_generation;
+}
+
+// Publish the frame's in-world spline draws: evaluate the guest B-spline
+// VS on the CPU (see SplineDraw for the decoded algorithm) into WORLD-space
+// strip vertices; the render side projects them with the scene's (smoothed)
+// view_proj like every other world item, keeping them in phase with the
+// re-timed camera.
+void PublishSplineDraws(uint8_t* base) {
+  std::vector<SplineDraw> frame_spline;
+  {
+    std::lock_guard<std::mutex> lock(g_2d_mutex);
+    frame_spline.swap(g_frame_spline);
+  }
+  std::vector<SplineDraw> published;
+  published.reserve(frame_spline.size());
+  for (SplineDraw& s : frame_spline) {
+    const float* c = s.consts;
+    const auto row = [&](int r) { return c + r * 4; };
+    std::vector<uint8_t> out(size_t(s.count) * 28);
+    float* dst = reinterpret_cast<float*>(out.data());
+    const uint8_t* src = s.verts.data();
+    bool ok = true;
+    for (uint32_t v = 0; v < s.count; ++v, src += 12, dst += 7) {
+      float p[3];
+      for (int k = 0; k < 3; ++k) {
+        uint32_t w;
+        std::memcpy(&w, src + k * 4, 4);
+        w = BSwap32(w);
+        std::memcpy(&p[k], &w, 4);
+      }
+      if (!(p[0] >= 0.0f && p[0] < 142.0f)) {
+        ok = false;
+        break;
+      }
+      const int idx = int(p[0]);
+      const float t = p[0] - float(idx);
+      const int side = p[2] >= 0.5f ? 1 : 0;
+      // Uniform cubic B-spline basis (matches the shader's embedded
+      // coefficients exactly).
+      const float t2 = t * t;
+      const float t3 = t2 * t;
+      const float wgt[4] = {1.0f - 3.0f * t + 3.0f * t2 - t3,
+                            3.0f * t3 - 6.0f * t2 + 4.0f,
+                            -3.0f * t3 + 3.0f * t2 + 3.0f * t + 1.0f, t3};
+      // Blend the world-transformed control points (world columns c4..c6,
+      // translation in .w), /6, plus the world-rotated extrusion offset.
+      float wp[3] = {0.0f, 0.0f, 0.0f};
+      for (int k = 0; k < 4; ++k) {
+        const float* cp = row(7 + idx + k);
+        for (int a = 0; a < 3; ++a) {
+          const float* wr = row(4 + a);
+          wp[a] += wgt[k] *
+                   (wr[0] * cp[0] + wr[1] * cp[1] + wr[2] * cp[2] + wr[3] * cp[3]);
+        }
+      }
+      const float* off = row(151 + side);
+      for (int a = 0; a < 3; ++a) {
+        const float* wr = row(4 + a);
+        wp[a] = wp[a] * (1.0f / 6.0f) +
+                (wr[0] * off[0] + wr[1] * off[1] + wr[2] * off[2] + wr[3] * off[3]);
+      }
+      // Fade still evaluates against the draw's own clip z (the ramps
+      // span hundreds of meters; the ~30 ms offset from the smoothed
+      // camera is invisible), but the PUBLISHED position is WORLD-space:
+      // the render side projects with the scene's (smoothed) view_proj so
+      // the neon signs ride the exact same camera timeline as the world.
+      // Baking the guest VP here was the "waypoint sign judders / lags
+      // and catches up" bug once smooth_camera re-timed everything else.
+      float clip_z;
+      {
+        const float* pr = row(2);
+        clip_z = pr[0] * wp[0] + pr[1] * wp[1] + pr[2] * wp[2] + pr[3];
+      }
+      // Near/far fade against i_clipvalues (clip-space z, pre-divide). A
+      // zero range degenerates to a step, like the shader's rcp(0) = inf.
+      const float* cv = row(150);
+      const auto ramp = [](float z, float start, float range) {
+        if (range > 1e-20f || range < -1e-20f) {
+          const float r = (z - start) / range;
+          return r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+        }
+        return z - start > 0.0f ? 1.0f : 0.0f;
+      };
+      const float fade =
+          std::min(ramp(clip_z, cv[0], cv[1]), 1.0f - ramp(clip_z, cv[2], cv[3]));
+      dst[0] = wp[0];
+      dst[1] = wp[1];
+      dst[2] = wp[2];
+      dst[3] = 1.0f;
+      dst[4] = p[1];
+      dst[5] = p[2];
+      dst[6] = fade;
+    }
+    if (!ok) {
+      continue;
+    }
+    s.verts.swap(out);
+    published.push_back(std::move(s));
+  }
+  std::lock_guard<std::mutex> lock(g_2d_mutex);
+  g_scene_spline = std::move(published);
+}
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
@@ -6084,232 +5846,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
     g_pending_inline_dumps.clear();
   }
-  // Publish this frame's 2D overlay draws (before any early return: menu
-  // and empty frames still carry 2D). The inline-ring vertex payloads are
-  // complete by frame end; convert them to little-endian and expand quad
-  // lists into triangle lists so the render side stays trivial.
-  {
-    std::vector<Draw2d> frame_2d;
-    {
-      std::lock_guard<std::mutex> lock(g_2d_mutex);
-      frame_2d.swap(g_frame_2d);
-    }
-    static thread_local std::vector<uint8_t> scratch_2d;
-    std::vector<Draw2d> published;
-    published.reserve(frame_2d.size());
-    for (Draw2d& d : frame_2d) {
-      const uint32_t bytes = d.count * d.stride;
-      scratch_2d.resize(bytes);
-      if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
-        continue;
-      }
-      // Guest dwords are big-endian.
-      for (size_t i = 0; i + 4 <= scratch_2d.size(); i += 4) {
-        uint32_t v;
-        std::memcpy(&v, scratch_2d.data() + i, 4);
-        v = BSwap32(v);
-        std::memcpy(scratch_2d.data() + i, &v, 4);
-      }
-      // Verified capture-side vertex layouts, all normalized to one 28-byte
-      // renderer layout {float4 pos, float2 uv, u32 rgba}:
-      //   24-byte {float4 pos, float2 uv}          - APT elements
-      //   20-byte {float3 pos, float2 uv}          - glyph text (bit 4)
-      //   20-byte {float4 pos, u32 color}          - SimpleDraw untextured
-      //   28-byte {float4 pos, u32 color, float2 uv} - SimpleDraw textured
-      //   16-byte {float4 pos}                     - SimpleDraw solid fill
-      //     (color rides in VS c8 = m[8]; the popup panel strips, Rewards
-      //     title bar / teal body / tan footer, are these)
-      // (SimpleDraw = bit 5; its DrawParameters ctor orders colours before
-      // texcoords.)
-      {
-        static thread_local std::vector<uint8_t> norm_2d;
-        norm_2d.resize(size_t(d.count) * 28);
-        const float one = 1.0f;
-        const float zero = 0.0f;
-        const uint32_t white = 0xFFFFFFFFu;
-        const bool font = (d.flags & 0x10u) != 0;
-        const bool simple = (d.flags & 0x20u) != 0;
-        bool ok = true;
-        for (uint32_t v = 0; v < d.count && ok; ++v) {
-          uint8_t* dst = norm_2d.data() + size_t(v) * 28;
-          const uint8_t* src = scratch_2d.data() + size_t(v) * d.stride;
-          if (d.stride == 16 && simple) {  // SimpleDraw: pos4, untextured
-            std::memcpy(dst, src, 16);
-            std::memcpy(dst + 16, &zero, 4);
-            std::memcpy(dst + 20, &zero, 4);
-            std::memcpy(dst + 24, &white, 4);
-          } else if (d.stride == 24) {  // APT: pos4 + uv (with or without the
-            // SimpleDraw bracket; the compass needle/icons are 24-byte
-            // quads issued through SimpleDraw::Draw inside the HUD pass,
-            // same simpledraw_SimpleDrawUVSC shader as plain APT elements;
-            // requiring !simple here dropped them, a regression from adding
-            // bracket bit 5)
-            std::memcpy(dst, src, 24);
-            std::memcpy(dst + 24, &white, 4);
-          } else if (d.stride == 20 && font) {  // glyphs: pos3 + uv
-            std::memcpy(dst, src, 12);
-            std::memcpy(dst + 12, &one, 4);
-            std::memcpy(dst + 16, src + 12, 8);
-            std::memcpy(dst + 24, &white, 4);
-          } else if (d.stride == 20 && simple) {  // SimpleDraw: pos4 + color
-            std::memcpy(dst, src, 16);
-            std::memcpy(dst + 16, &zero, 4);
-            std::memcpy(dst + 20, &zero, 4);
-            // The dword byteswap reversed the color's guest byte order
-            // (r,g,b,a); restore it for R8G8B8A8_UNORM.
-            dst[24] = src[19];
-            dst[25] = src[18];
-            dst[26] = src[17];
-            dst[27] = src[16];
-          } else if (d.stride == 28 && simple) {  // SimpleDraw: pos4+color+uv
-            std::memcpy(dst, src, 16);
-            std::memcpy(dst + 16, src + 20, 8);
-            dst[24] = src[19];
-            dst[25] = src[18];
-            dst[26] = src[17];
-            dst[27] = src[16];
-          } else {
-            ok = false;
-          }
-        }
-        if (!ok) {
-          g_draws_2d_other.fetch_add(1, std::memory_order_relaxed);
-          continue;
-        }
-        if (d.stride == 16) {
-          // Untextured fill: the captured fetch words are leftover state from
-          // the previous textured draw; zero them so the replay binds the
-          // white texture instead of tinting the fill with a stale texel.
-          std::memset(d.fetch, 0, sizeof(d.fetch));
-        }
-        scratch_2d = norm_2d;
-        d.stride = 28;
-      }
-      if (d.prim == 13 && d.count % 4 == 0) {
-        // Quad list -> triangle list (v0,v1,v2)(v0,v2,v3).
-        const uint32_t quads = d.count / 4;
-        d.verts.resize(size_t(quads) * 6 * d.stride);
-        static constexpr uint32_t kOrder[6] = {0, 1, 2, 0, 2, 3};
-        for (uint32_t q = 0; q < quads; ++q) {
-          for (uint32_t t = 0; t < 6; ++t) {
-            std::memcpy(d.verts.data() + (size_t(q) * 6 + t) * d.stride,
-                        scratch_2d.data() + (size_t(q) * 4 + kOrder[t]) * d.stride,
-                        d.stride);
-          }
-        }
-        d.prim = 4;
-        d.count = quads * 6;
-      } else if (d.prim == 4 || d.prim == 5) {
-        d.verts.assign(scratch_2d.begin(), scratch_2d.end());
-      } else {
-        continue;
-      }
-      published.push_back(std::move(d));
-    }
-    std::lock_guard<std::mutex> lock(g_2d_mutex);
-    g_scene_2d = std::move(published);
-    ++g_scene_2d_generation;
-  }
-  // Publish this frame's in-world spline draws: evaluate the guest B-spline
-  // VS on the CPU (see SplineDraw for the decoded algorithm) into WORLD-space
-  // strip vertices; the render side projects them with the scene's (smoothed)
-  // view_proj like every other world item, keeping them in phase with the
-  // re-timed camera.
-  {
-    std::vector<SplineDraw> frame_spline;
-    {
-      std::lock_guard<std::mutex> lock(g_2d_mutex);
-      frame_spline.swap(g_frame_spline);
-    }
-    std::vector<SplineDraw> published;
-    published.reserve(frame_spline.size());
-    for (SplineDraw& s : frame_spline) {
-      const float* c = s.consts;
-      const auto row = [&](int r) { return c + r * 4; };
-      std::vector<uint8_t> out(size_t(s.count) * 28);
-      float* dst = reinterpret_cast<float*>(out.data());
-      const uint8_t* src = s.verts.data();
-      bool ok = true;
-      for (uint32_t v = 0; v < s.count; ++v, src += 12, dst += 7) {
-        float p[3];
-        for (int k = 0; k < 3; ++k) {
-          uint32_t w;
-          std::memcpy(&w, src + k * 4, 4);
-          w = BSwap32(w);
-          std::memcpy(&p[k], &w, 4);
-        }
-        if (!(p[0] >= 0.0f && p[0] < 142.0f)) {
-          ok = false;
-          break;
-        }
-        const int idx = int(p[0]);
-        const float t = p[0] - float(idx);
-        const int side = p[2] >= 0.5f ? 1 : 0;
-        // Uniform cubic B-spline basis (matches the shader's embedded
-        // coefficients exactly).
-        const float t2 = t * t;
-        const float t3 = t2 * t;
-        const float wgt[4] = {1.0f - 3.0f * t + 3.0f * t2 - t3,
-                              3.0f * t3 - 6.0f * t2 + 4.0f,
-                              -3.0f * t3 + 3.0f * t2 + 3.0f * t + 1.0f, t3};
-        // Blend the world-transformed control points (world columns c4..c6,
-        // translation in .w), /6, plus the world-rotated extrusion offset.
-        float wp[3] = {0.0f, 0.0f, 0.0f};
-        for (int k = 0; k < 4; ++k) {
-          const float* cp = row(7 + idx + k);
-          for (int a = 0; a < 3; ++a) {
-            const float* wr = row(4 + a);
-            wp[a] += wgt[k] *
-                     (wr[0] * cp[0] + wr[1] * cp[1] + wr[2] * cp[2] + wr[3] * cp[3]);
-          }
-        }
-        const float* off = row(151 + side);
-        for (int a = 0; a < 3; ++a) {
-          const float* wr = row(4 + a);
-          wp[a] = wp[a] * (1.0f / 6.0f) +
-                  (wr[0] * off[0] + wr[1] * off[1] + wr[2] * off[2] + wr[3] * off[3]);
-        }
-        // Fade still evaluates against the draw's own clip z (the ramps
-        // span hundreds of meters; the ~30 ms offset from the smoothed
-        // camera is invisible), but the PUBLISHED position is WORLD-space:
-        // the render side projects with the scene's (smoothed) view_proj so
-        // the neon signs ride the exact same camera timeline as the world.
-        // Baking the guest VP here was the "waypoint sign judders / lags
-        // and catches up" bug once smooth_camera re-timed everything else.
-        float clip_z;
-        {
-          const float* pr = row(2);
-          clip_z = pr[0] * wp[0] + pr[1] * wp[1] + pr[2] * wp[2] + pr[3];
-        }
-        // Near/far fade against i_clipvalues (clip-space z, pre-divide). A
-        // zero range degenerates to a step, like the shader's rcp(0) = inf.
-        const float* cv = row(150);
-        const auto ramp = [](float z, float start, float range) {
-          if (range > 1e-20f || range < -1e-20f) {
-            const float r = (z - start) / range;
-            return r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
-          }
-          return z - start > 0.0f ? 1.0f : 0.0f;
-        };
-        const float fade =
-            std::min(ramp(clip_z, cv[0], cv[1]), 1.0f - ramp(clip_z, cv[2], cv[3]));
-        dst[0] = wp[0];
-        dst[1] = wp[1];
-        dst[2] = wp[2];
-        dst[3] = 1.0f;
-        dst[4] = p[1];
-        dst[5] = p[2];
-        dst[6] = fade;
-      }
-      if (!ok) {
-        continue;
-      }
-      s.verts.swap(out);
-      published.push_back(std::move(s));
-    }
-    std::lock_guard<std::mutex> lock(g_2d_mutex);
-    g_scene_spline = std::move(published);
-  }
+  Publish2dDraws(base);
+  PublishSplineDraws(base);
   // Take this frame's hook-time dynamic items regardless of how we exit,
   // leaving them in place across an early return (no perspective view, empty
   // frame) would desynchronize the indices stored in the records.
@@ -7095,49 +6633,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
 
-  // Camera-signal recorder (see CamSigEntry): per-frame raw + smoothed
-  // heading while the window is open; write + reset when it closes.
-  {
-    const double dl = g_camsig_deadline.load(std::memory_order_relaxed);
-    if (dl > 0.0) {
-      const double rec_now =
-          std::chrono::duration<double>(build_t0.time_since_epoch()).count();
-      if (rec_now < dl) {
-        std::lock_guard<std::mutex> lock(g_camsig_mutex);
-        if (g_camsig.size() < 200000) {
-          g_camsig.push_back({rec_now, 0.0, YawFromViewRows(cam_view), 2});
-          if (g_smooth_active) {
-            float rot[16] = {};
-            ViewRotFromQuat(g_smooth_pose.q, rot);
-            g_camsig.push_back({rec_now, g_smooth_play, YawFromViewRows(rot), 1});
-          }
-        }
-      } else {
-        std::vector<CamSigEntry> entries;
-        {
-          std::lock_guard<std::mutex> lock(g_camsig_mutex);
-          entries.swap(g_camsig);
-        }
-        g_camsig_deadline.store(0.0, std::memory_order_release);
-        std::thread([entries = std::move(entries)]() {
-          std::error_code ec;
-          std::filesystem::create_directories("logs", ec);
-          char path[128];
-          std::snprintf(path, sizeof(path), "logs/cam_signal_%lld.csv",
-                        static_cast<long long>(std::time(nullptr)));
-          std::ofstream f(path);
-          f << "kind,t,play_t,yaw_deg\n";
-          char line[128];
-          for (const CamSigEntry& e : entries) {
-            std::snprintf(line, sizeof(line), "%d,%.6f,%.6f,%.5f\n", int(e.kind), e.t,
-                          e.play_t, double(e.yaw));
-            f << line;
-          }
-          REXLOG_INFO("native-scene cam-signal: wrote {} entries -> {}", entries.size(),
-                      path);
-        }).detach();
-      }
+  // Camera-signal recorder: per-frame raw + smoothed heading while the
+  // window is open; write + reset when it closes (CamSigFrameTick).
+  if (g_camsig_deadline.load(std::memory_order_relaxed) > 0.0) {
+    const double rec_now =
+        std::chrono::duration<double>(build_t0.time_since_epoch()).count();
+    float rot[16] = {};
+    const float* smoothed = nullptr;
+    if (g_smooth_active) {
+      ViewRotFromQuat(g_smooth_pose.q, rot);
+      smoothed = rot;
     }
+    CamSigFrameTick(rec_now, cam_view, smoothed, g_smooth_play);
   }
 
   // Synthetic camera pan probe (see the synthetic_pan cvar comment for the
@@ -7500,51 +7007,32 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         }
         probe = pit->second;
       }
-      float bind_diag = 0.0f;
-      for (int a = 0; a < 3; ++a) {
-        const float d = item.bbox_max[a] - item.bbox_min[a];
-        bind_diag += d * d;
-      }
-      bind_diag = std::sqrt(bind_diag);
+      const float bind_diag = BindDiag(item);
       // 6x like PublishedPaletteSane: judging accepted palettes, where junk
       // measures 100-400x and legit small-mesh articulation reaches ~3.3x.
       const float max_spread = std::max(6.0f * bind_diag, bind_diag + 2.0f);
-      float qmin[3] = {1e9f, 1e9f, 1e9f};
-      float qmax[3] = {-1e9f, -1e9f, -1e9f};
-      int n = 0;
-      for (const SkinProbeSample& ps : probe.s) {
-        uint32_t total = 0;
-        float q[3] = {0.0f, 0.0f, 0.0f};
-        // Decoded-buffer convention: component k = byte k (see DecodeMesh's
-        // SwapU32 + per-byte extraction).
+      // Decoded-buffer convention: component k = byte k (see DecodeMesh's
+      // SwapU32 + per-byte extraction); unpack into the shared sample form.
+      std::vector<SkinSampleVert> sverts(probe.s.size());
+      for (size_t i = 0; i < probe.s.size(); ++i) {
+        const SkinProbeSample& ps = probe.s[i];
+        SkinSampleVert& sv = sverts[i];
+        sv.p[0] = ps.p[0];
+        sv.p[1] = ps.p[1];
+        sv.p[2] = ps.p[2];
+        sv.pos_finite = true;
         for (int k = 0; k < 4; ++k) {
-          const uint32_t w = (ps.bw >> (8 * k)) & 0xFF;
-          if (w == 0) continue;
-          const uint32_t r0 = 3u * ((ps.bi >> (8 * k)) & 0xFF);
-          if ((r0 + 3) * 4 > item.bones.size()) continue;
-          total += w;
-          for (int a = 0; a < 3; ++a) {
-            const float* row = item.bones.data() + (r0 + uint32_t(a)) * 4;
-            q[a] += float(w) *
-                    (row[0] * ps.p[0] + row[1] * ps.p[1] + row[2] * ps.p[2] +
-                     row[3]);
-          }
-        }
-        if (total == 0) continue;
-        ++n;
-        for (int a = 0; a < 3; ++a) {
-          q[a] /= float(total);
-          qmin[a] = std::min(qmin[a], q[a]);
-          qmax[a] = std::max(qmax[a], q[a]);
+          sv.w[k] = uint8_t((ps.bw >> (8 * k)) & 0xFF);
+          sv.bone[k] = uint8_t((ps.bi >> (8 * k)) & 0xFF);
         }
       }
-      if (n < 4) {
+      float spread = 0.0f;
+      int n = 0;
+      if (SkinnedSpreadHostRows(sverts.data(), uint32_t(sverts.size()),
+                                item.bones.data(), item.bones.size(), /*min_n=*/4,
+                                /*garbage_fails=*/false, &spread, &n) != 1) {
         continue;
       }
-      const float dx = qmax[0] - qmin[0];
-      const float dy = qmax[1] - qmin[1];
-      const float dz = qmax[2] - qmin[2];
-      const float spread = std::sqrt(dx * dx + dy * dy + dz * dz);
       if (spread <= max_spread) {
         continue;
       }
@@ -7624,141 +7112,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_scene = std::make_shared<const FrameScene>(std::move(scene));
 }
 
-void StartRecording(uint32_t stride) {
-  std::lock_guard<std::mutex> lock(g_record_mutex);
-  g_recorded_draws.clear();
-  g_recorded_frames.clear();
-  g_recorded_buffers.clear();
-  g_recorded_buffer_keys.clear();
-  g_recorded_buffer_bytes = 0;
-  g_pending_inline_dumps.clear();
-  g_frame_dump_ids.clear();
-  g_record_frame = 0;
-  g_frames_seen = 0;
-  g_record_stride = stride == 0 ? 1 : stride;
-  g_recording.store(true, std::memory_order_relaxed);
-}
-
-void WriteRecording(const char* dir, const char* stem) {
-  g_recording.store(false, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lock(g_record_mutex);
-  const std::filesystem::path base_path = std::filesystem::path(dir) / stem;
-
-  // Binary draw stream: header "SK3DRAW7", fixed records {u32 frame, u32
-  // func, u32 ib, u32 vb, u32 vb_offset, u32 vb_stride, u32 streams[4][3],
-  // u32 vfetch[12], u32 args[4], f32 vs_bank[1024], f32 ps_bank[256],
-  // u32 flags2d, u32 ps_obj, u32 vs_obj, u32 viewport[6], u32 scissor[4],
-  // u32 rstates[256], u32 vfetch_all[192], u32 vb_dump, u32 ib_dump}
-  // (little-endian). func: 0 DrawIndexedVertices, 1 DrawVertices,
-  // 2 BeginVertices. flags2d: bit0 FrontEndManager::Render2D, bit1
-  // AptMovieIntegration::Render, bit2 DrawRenderingUnit. vb_dump/ib_dump
-  // index into buffers.bin records (~0u = none).
-  {
-    std::ofstream out(base_path.string() + ".draws.bin", std::ios::binary);
-    out.write("SK3DRAW7", 8);
-    for (const auto& d : g_recorded_draws) {
-      out.write(reinterpret_cast<const char*>(&d->frame), 4);
-      out.write(reinterpret_cast<const char*>(&d->func), 4);
-      out.write(reinterpret_cast<const char*>(&d->ib), 4);
-      out.write(reinterpret_cast<const char*>(&d->vb), 4);
-      out.write(reinterpret_cast<const char*>(&d->vb_offset), 4);
-      out.write(reinterpret_cast<const char*>(&d->vb_stride), 4);
-      out.write(reinterpret_cast<const char*>(d->streams), 48);
-      out.write(reinterpret_cast<const char*>(d->vfetch), 48);
-      out.write(reinterpret_cast<const char*>(d->args), 16);
-      out.write(reinterpret_cast<const char*>(d->bank), 4096);
-      out.write(reinterpret_cast<const char*>(d->ps), 1024);
-      out.write(reinterpret_cast<const char*>(&d->flags2d), 4);
-      out.write(reinterpret_cast<const char*>(&d->ps_obj), 4);
-      out.write(reinterpret_cast<const char*>(&d->vs_obj), 4);
-      out.write(reinterpret_cast<const char*>(d->viewport), 24);
-      out.write(reinterpret_cast<const char*>(d->scissor), 16);
-      out.write(reinterpret_cast<const char*>(d->rstates), 1024);
-      out.write(reinterpret_cast<const char*>(d->vfetch_all), 768);
-      out.write(reinterpret_cast<const char*>(&d->vb_dump), 4);
-      out.write(reinterpret_cast<const char*>(&d->ib_dump), 4);
-    }
-  }
-
-  // Captured buffer payloads: header "SK3BUFS1", then records {u32 vb_addr,
-  // u32 ib_addr, u64 fingerprint, u32 vb_len, u32 ib_len, raw vb, raw ib}.
-  {
-    std::ofstream out(base_path.string() + ".buffers.bin", std::ios::binary);
-    out.write("SK3BUFS1", 8);
-    for (const RecordedBuffer& b : g_recorded_buffers) {
-      const uint32_t vb_len = uint32_t(b.vb.size());
-      const uint32_t ib_len = uint32_t(b.ib.size());
-      out.write(reinterpret_cast<const char*>(&b.vb_addr), 4);
-      out.write(reinterpret_cast<const char*>(&b.ib_addr), 4);
-      out.write(reinterpret_cast<const char*>(&b.fingerprint), 8);
-      out.write(reinterpret_cast<const char*>(&vb_len), 4);
-      out.write(reinterpret_cast<const char*>(&ib_len), 4);
-      out.write(reinterpret_cast<const char*>(b.vb.data()), vb_len);
-      out.write(reinterpret_cast<const char*>(b.ib.data()), ib_len);
-    }
-  }
-
-  // Per-frame item dump.
-  {
-    std::ofstream out(base_path.string() + ".scene.jsonl");
-    const auto write_item = [&out](const DrawItem& d) {
-      out << "{\"mesh\":\"" << std::hex << d.mesh << "\",\"ib_obj\":\"" << d.ib_obj
-          << "\",\"vb_obj\":\"" << d.vb_obj << "\",\"vb_addr\":\"" << d.vb_addr
-          << "\",\"ib_addr\":\"" << d.ib_addr << "\",\"diffuse\":\"" << d.diffuse_tex
-          << "\",\"diffuse_fetch\":\"" << d.diffuse_fetch[1]
-          << "\",\"lightmap\":\"" << d.lightmap_tex << "\",\"macro\":\"" << d.macro_tex
-          << "\",\"decal_art\":\"" << d.decal_art
-          << "\",\"decal_fetch\":\"" << d.decal_fetch[1]
-          << "\",\"fp\":\"" << d.fingerprint
-          << "\"" << std::dec << ",\"vb_bytes\":" << d.vb_bytes << ",\"ib_count\":"
-          << d.ib_count << ",\"stride\":" << int(d.stride) << ",\"pos_fmt\":"
-          << int(d.pos_fmt) << ",\"pos_off\":" << d.pos_offset << ",\"bw_off\":"
-          << d.bw_offset << ",\"bi_off\":" << d.bi_offset << ",\"skinned\":"
-          << (d.skinned ? 1 : 0) << ",\"pending\":" << (d.pending ? 1 : 0)
-          << ",\"decal\":" << (d.decal ? 1 : 0)
-          << ",\"transparent\":" << (d.transparent ? 1 : 0)
-          << ",\"selected\":" << (d.selected ? 1 : 0) << ",\"world\":[";
-      for (int i = 0; i < 16; ++i) out << (i ? "," : "") << d.world[i];
-      out << "],\"draws\":[";
-      for (size_t i = 0; i < d.draws.size(); ++i) {
-        const DrawEntry& e = d.draws[i];
-        out << (i ? "," : "") << "[" << e.prim << "," << e.base_vertex << ","
-            << e.start_index << "," << e.index_count << "]";
-      }
-      out << "],\"bones\":[";
-      for (size_t i = 0; i < d.bones.size(); ++i) out << (i ? "," : "") << d.bones[i];
-      out << "]}";
-    };
-    for (const RecordedFrame& rf : g_recorded_frames) {
-      out << "{\"generation\":" << rf.generation << ",\"cam\":[" << rf.cam_pos[0] << ","
-          << rf.cam_pos[1] << "," << rf.cam_pos[2] << "],\"view_proj\":[";
-      for (int i = 0; i < 16; ++i) out << (i ? "," : "") << rf.view_proj[i];
-      out << "],\"dynitems\":[";
-      for (size_t i = 0; i < rf.dynitems.size(); ++i) {
-        if (i) out << ",";
-        write_item(rf.dynitems[i]);
-      }
-      out << "],\"items\":[";
-      for (size_t i = 0; i < rf.items.size(); ++i) {
-        if (i) out << ",";
-        write_item(rf.items[i]);
-      }
-      out << "]}\n";
-    }
-  }
-  REXLOG_INFO(
-      "native-scene: recording written ({} draws, {} frames, {} buffers {} MiB) -> "
-      "{}.draws.bin/.scene.jsonl/.buffers.bin",
-      g_recorded_draws.size(), g_recorded_frames.size(), g_recorded_buffers.size(),
-      g_recorded_buffer_bytes >> 20, base_path.string());
-  g_recorded_draws.clear();
-  g_recorded_frames.clear();
-  g_recorded_buffers.clear();
-  g_recorded_buffer_keys.clear();
-  g_recorded_buffer_bytes = 0;
-  g_pending_inline_dumps.clear();
-  g_frame_dump_ids.clear();
-}
+// StartRecording / WriteRecording: native/skate3_native_diagnostics.cpp.
 
 }  // namespace skate3::native_scene
 
@@ -8450,1091 +7804,10 @@ std::vector<PrewarmResult> g_prewarm_out;
 // hot-spinning the workers.
 std::vector<PrewarmEntry> g_prewarm_retry;  // under g_prewarm_out_mutex
 
-// Face-normal shading uses the camera-relative world position: interpolating
-// absolute world coordinates (hundreds of meters) destroys ddx/ddy precision
-// and produces per-pixel noise.
-const char kShaderSource[] = R"(
-cbuffer C : register(b0) {
-  row_major float4x4 world;
-  row_major float4x4 mvp;
-  float4 tint;
-  float4 cam_pos;
-  // Per-material color multiplier (w > 0 enables): CAS hair is a grayscale
-  // texture times the character's hair color.
-  float4 mat_tint;
-  // x = macroOverlayUVScale, y = macroOverlayOpacity, z > 0 = macro overlay
-  // texture bound at t3, w > 0 = environment.decal item with its `decal`
-  // art bound at t4 (composited in-shader over the diffuse, exactly like
-  // the game's decalenvironment PS: lerp by the art's alpha; opaque).
-  // Macro and decal art are INDEPENDENT: decal ground/wall sections carry
-  // the same macrooverlay as their non-decal neighbors, sharing one slot
-  // dropped the macro grime there and rendered alternating plaza sections
-  // ~1.4x too bright (the large-scale ground checkerboard).
-  float4 overlay;
-  // x > 0 = environment.transparent item (alpha-blended sub-pass): shading
-  // follows the game's transparentenvironment.fx; the opaque pass's
-  // alpha-test turned the soft mist gradients into solid white cloud blobs.
-  // yzw = the global distance-fog RAMP (scale/bias/exponent from main-pass
-  // VS c5), and mat_tint doubles as the linear-space fog COLOR (rgb +
-  // transmittance scale in w, VS c6) for transparent items; the root
-  // signature is capped at 64 DWORDs, so fog rides in slots transparent
-  // items never use otherwise. Fog is currently applied to transparent
-  // items only (the km-distant mist sheets; everything else we render is
-  // near enough for fog to be negligible).
-  float4 misc;
-};
-// Per-frame dynamic-shadow (CSM) receiver constants, captured from the
-// game's world-material PIXEL banks.
-cbuffer S : register(b1) {
-  float4 sh_x;      // light-space X row (xyz) + translation (w)   [PS c0]
-  float4 sh_y;      // light-space Y row                           [PS c3]
-  float4 sh_z;      // depth row (height ramp)                     [PS c4]
-  float4 sh_c1;     // cascade 1 scale.xy + offset.zw              [PS c1]
-  float4 sh_c2;     // cascade 2 scale.xy + offset.zw              [PS c2]
-  float4 sh_color;  // shadow color rgb [PS c8] + its luma in w
-  float4 sh_misc;   // x = depth bias [PS c5.x], y = enable
-  // Exact world-shading frame rows (consumed by the env-family branch):
-  float4 sh_sun;    // xyz = sun direction [PS c6], w = scene exposure [c10.x]
-  float4 sh_env;    // x = material multiplier [PS c11.y], yz = tree lightmap
-                    // scale/floor [tree PS c0.xy], w = tree tint mult [c4.y]
-  float4 sh_fogp;   // xyz = global fog ramp scale/bias/exp [VS c5],
-                    // w = proxyworld scale [proxy PS c3.y]
-  float4 sh_fogc;   // fog color rgb + transmittance scale in w [VS c6]
-  // dynamicobject.fx frame-global lighting rows (see FrameScene::dynobj_rows).
-  float4 dyn_sun;   // xyz = sun direction (PS c9), w = scene exposure (c13.x)
-  float4 dyn_amb;   // xyz = flat ambient (c15.rgb), w = bounce scale (c15.w)
-  float4 dyn_misc;  // x = material multiplier (c14.y),
-                    // y = static world-shadow floor (c8.w)
-};
-// Character-family lighting (defaultcharacter.fx and friends): canonical
-// per-draw rows captured from the guest PIXEL constant bank at palette
-// capture (CaptureCharLighting has the per-family register maps; the math
-// below was validated offline by executing the game's own pixel shaders).
-// Enabled per draw via cam_pos.w = family (0 = not a character / capture
-// failed -> the legacy empirical shading below).
-cbuffer CH : register(b2) {
-  float4 ch_light;  // xyz = sun direction, w = hair fresnel power
-  float4 ch_key;    // rgb = key (sun) color, w = exposure
-  float4 ch_amb;    // rgb = flat ambient, w = SH ambient multiplier / hair ambient
-  float4 ch_sh[9];  // SH irradiance rows, pre-scaled (see capture);
-                    // vehicles keep spec color + power in row 0 instead
-  float4 ch_tintA;  // CAC diffuse tint / livingworld red-mask tint (w = apply)
-  float4 ch_tintB;  // livingworld blue-mask tint / hair fresnel tint (w = strand-alpha scale)
-  float4 ch_misc;   // x = alpha out, y = family
-};
-Texture2D<float4> diffuse : register(t0);
-Texture2D<float4> lightmap : register(t1);
-Texture2D<float4> macro : register(t3);
-Texture2D<float4> decal_art : register(t4);
-// Paired second descriptor of the t4 table: the reflective families'
-// (fam 5/6) normal map. Only valid, and only sampled, when overlay.w == 4.
-Texture2D<float4> normal_map : register(t5);
-Texture2D<float2> shadow_atlas : register(t7);
-TextureCube<float4> env_cube : register(t6);
-// Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
-// applied with explicit dots (StructuredBuffer<float4x4> default packing is
-// column-major and would silently transpose the matrices).
-StructuredBuffer<float4> bones : register(t2);
-SamplerState smp : register(s0);
-// s1 = bilinear CLAMP (shared with the 2D pass). Decal art must clamp: the
-// art UV runs far outside [0,1] across big ground sheets and the art's
-// transparent border keeps everything outside the single placement clear;
-// wrap sampling tiled the graffiti across the whole plaza.
-SamplerState smp_clamp : register(s1);
-struct VSOut {
-  float4 pos : SV_Position;
-  float3 rpos : TEXCOORD0;
-  float2 uv : TEXCOORD1;
-  float2 uv2 : TEXCOORD2;
-  float3 nrm : TEXCOORD3;
-  float2 uv3 : TEXCOORD4;
-};
-VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1,
-              float4 bw : BLENDWEIGHT0, uint4 bi : BLENDINDICES0,
-              float3 nrm : NORMAL0, float2 uv3 : TEXCOORD2) {
-  VSOut o;
-  float4 mp = float4(p, 1.0);
-  float3 n = nrm;
-  // tint.g > 0 marks a skinned item: the bone palette (row-vector matrices)
-  // maps model space to world space; mvp is then just view*proj.
-  float wsum = dot(bw, float4(1, 1, 1, 1));
-  if (tint.g > 0.0 && wsum > 0.001) {
-    float3 skinned = float3(0, 0, 0);
-    float3 sn = float3(0, 0, 0);
-    // Guest blend indices are plain bone numbers (verified live: byte
-    // streams like 02 00 03 01); bone k = palette rows 3k..3k+2.
-    [unroll] for (int k = 0; k < 4; ++k) {
-      uint row = bi[k] * 3u;
-      skinned += bw[k] * float3(dot(mp, bones[row]), dot(mp, bones[row + 1]),
-                                dot(mp, bones[row + 2]));
-      sn += bw[k] * float3(dot(n, bones[row].xyz), dot(n, bones[row + 1].xyz),
-                           dot(n, bones[row + 2].xyz));
-    }
-    mp = float4(skinned / wsum, 1.0);
-    n = sn;
-  } else {
-    n = mul(n, (float3x3)world);
-  }
-  o.pos = mul(mp, mvp);
-  o.rpos = mul(mp, world).xyz - cam_pos.xyz;
-  o.uv = uv;
-  o.uv2 = uv2;
-  o.nrm = n;
-  o.uv3 = uv3;
-  return o;
-}
-// Native CSM atlas sample at a world position: finest covering cascade,
-// s = saturate(infront + 1 - coverage). Returns 1 (lit) when uncovered or
-// shadows are off. extra_bias suppresses receiver self-shadow acne on
-// surfaces that are themselves casters (characters, held board). A NEGATIVE
-// extra_bias selects the game's dynamicobject receive bias instead: a
-// per-cascade literal 0.007 (finest) / 0.015 (outer) replacing sh_misc.x
-// (from the dynamicobject_defaultPS ucode). Props
-// are casters themselves, and with only the world bias (c5.x = 0 in every
-// capture) their flat tops compared against their own atlas depth; the
-// lit/dark whole-surface flicker on benches, signs and sails as the
-// camera-following cascades drifted frame to frame.
-float SampleCsmShadow(float3 wp, float extra_bias) {
-  if (sh_misc.y <= 0.0) {
-    return 1.0;
-  }
-  float2 lsv = float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
-  float2 luv = 0.0;
-  float casc = 0.0;
-  float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
-  if (max(abs(l2.x), abs(l2.y)) < 0.99) { luv = l2; casc = 3.0; }
-  float2 l1 = lsv * sh_c1.xy + sh_c1.zw;
-  if (max(abs(l1.x), abs(l1.y)) < 0.99) { luv = l1; casc = 2.0; }
-  if (max(abs(lsv.x), abs(lsv.y)) < 0.99) { luv = lsv; casc = 1.0; }
-  if (casc <= 0.0) {
-    return 1.0;
-  }
-  float bias = extra_bias < 0.0 ? (casc > 1.5 ? 0.015 : 0.007)
-                                : sh_misc.x + extra_bias;
-  float rd = dot(sh_z.xyz, wp) + sh_z.w - bias;
-  float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
-                      luv.y * -0.5 + 0.5);
-  float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
-  return saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
-}
-float4 ps_main(VSOut i) : SV_Target {
-  if (tint.a > 0.0) {
-    return tint;
-  }
-  float4 albedo = diffuse.Sample(smp, i.uv);
-  // Alpha-tested foliage/fences; opaque formats sample alpha = 1. Character
-  // diffuse packs GLOSS in alpha; never clip characters. tint.g > 0 marks
-  // them: set for bones-bound skinned items AND for ropa cloth garments
-  // rendered rigid (sim-active player tees, clipping their gloss alpha
-  // discarded every pixel: the invisible-shirt bug; their decode writes
-  // zero blend weights, so the VS skinning branch stays off).
-  if (tint.g == 0.0 && overlay.w < 0.5 && cam_pos.w > -20.5) {
-    // environment.transparent alpha-tests its SQUARED alpha at ref 16/255
-    // (transparentenvironment.xml: ALPHAREF 16, PS outputs a = diffuse.a^2).
-    // Exact env families (cam_pos.w < 0) use the game's world ALPHAREF 30.
-    // dynamicobject items (cam_pos.w <= -21) are excluded here and clip in
-    // their own branch (only the .alphatest variant tests, at ALPHAREF 30).
-    // Fam 13 (reflective_trans glass, cam_pos.w = -13) never alpha-tests;
-    // it alpha-BLENDS in the sorted sub-pass.
-    if (cam_pos.w > -12.5 || cam_pos.w < -13.5) {
-      float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
-      clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
-    }
-  }
-  // Exact sky dome (cam_pos.w = -40; sky_defaultPS transcribed from the
-  // Skate 3 ucode in a live capture). The emulated frame's big sun
-  // glow is computed IN the dome shader: a 1D radial gradient (the sky
-  // material's `specular` channel, bound at t4 here) indexed by the sine of
-  // the angle between the dome direction and the sun, its rgb^2 amplified
-  // by 1/sat(a + 0.01), the alpha falloff makes the core HDR-bright, then
-  // added to the squared panorama and run through the standard exposure/
-  // tonemap/sqrt chain (no fog on the sky) and the postfx uber 1.41.
-  // mat_tint.xyz = sun dir, mat_tint.w = the level sky elevation;
-  // overlay.x = sun angular scale, overlay.y = pre-tone multiplier,
-  // misc.y = scene exposure.
-  if (cam_pos.w < -39.5 && cam_pos.w > -40.5) {
-    // The dome mesh is camera-relative: world = mesh + (cam.x, sky_h,
-    // cam.z), so the shader's dome-local direction (sky.fx In.vPos) is
-    // rpos + (0, cam.y - sky_h, 0).
-    float3 dome = normalize(i.rpos + float3(0.0, cam_pos.y - mat_tint.w, 0.0));
-    float3 lin = albedo.rgb * albedo.rgb;
-    float dotPL = saturate(dot(dome, mat_tint.xyz));
-    float sinA = sqrt(saturate(1.0 - dotPL * dotPL));
-    float4 sun = decal_art.Sample(smp_clamp, float2(sinA / overlay.x, 0.5 / 16.0));
-    lin += sun.rgb * sun.rgb / saturate(sun.a + 0.01);
-    float3 xe = lin * overlay.y * misc.y;
-    float3 t1 = saturate(1.0 - xe);
-    float3 tm = max(xe * 0.25 + 0.75, 1.0) - t1 * t1;
-    float3 cc = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
-    return float4(cc, 1.0);
-  }
-  // dynamicobject.fx props (cam_pos.w = -(20 + variant): -21 default,
-  // -22 alphatest). Rigid movable objects (dispensers, dumpsters, benches,
-  // cans). Lit with the game's own dynamicobject model (verified exact):
-  // key sun light + bounce + flat ambient, gated by
-  // the CSM shadow (the static world-shadow map is approximated as fully lit
-  // - its floor c8.w bounds it), then fog -> exposure -> tonemap -> sqrt and
-  // the postfx uber 1.41. v1 uses the geometric normal (cross of the mesh
-  // tangent/binormal) with the flat normal-map kd 0.93429; the base/detail/
-  // spec normal maps are v2.
-  if (cam_pos.w < -20.5) {
-    if (cam_pos.w < -21.5) {
-      clip(albedo.a - 0.1176);  // dynamicobject.alphatest: ALPHAREF 30
-    }
-    float3 dlin = albedo.rgb * albedo.rgb;
-    float3 n = dot(i.nrm, i.nrm) > 0.01
-                   ? normalize(i.nrm)
-                   : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
-    float ndl = dot(n, dyn_sun.xyz);
-    float key = saturate(ndl);  // key light gated on N.L >= 0
-    float bounce = saturate(dot(n, float3(-dyn_sun.x, dyn_sun.y, -dyn_sun.z)));
-    // CSM shadow (shared receiver rows at t5); the static world-shadow map is
-    // not rendered natively, so its term is 1 and the min collapses to the
-    // CSM (bounded below by the c8.w floor, dyn_misc.y). extra_bias -1 =
-    // the game's own per-cascade dynamicobject receive bias (props are
-    // casters; without it their flat tops self-shadow and flicker).
-    float s = SampleCsmShadow(i.rpos + cam_pos.xyz, -1.0);
-    float shadow = min(s * (ndl >= 0.0 ? 1.0 : 0.0), max(1.0, dyn_misc.y));
-    float3 lighting = key * shadow + bounce * dyn_amb.w + dyn_amb.rgb;
-    // GetTangentLight with the neutral (flat) normal map: 0.39 * 2.39562.
-    float3 lin = lighting * 0.93429 * dlin;
-    // Fog -> exposure -> tonemap -> sqrt, then the 1.41 uber scene multiplier.
-    float fdist = length(i.rpos);
-    float f1 = saturate(fdist * sh_fogp.x + sh_fogp.y);
-    if (sh_fogp.z != 1.0) {
-      f1 = pow(max(f1, 1e-6), sh_fogp.z);
-    }
-    float3 fog_rgb = sh_fogc.rgb * f1;
-    float fog_a = (1.0 + sh_fogc.a * f1) * dyn_misc.x;  // x material multiplier
-    float3 xe = (lin * fog_a + fog_rgb) * dyn_sun.w;
-    float3 t1 = saturate(1.0 - xe);
-    float3 tm = max(xe * 0.25 + 0.75, 1.0) - t1 * t1;
-    return float4(saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41), 1.0);
-  }
-  // Character families: the game's own lighting in LINEAR space (diffuse is
-  // gamma -> square it), then the exact tone chain from the disassembly and
-  // the postfx uber's 1.41 scene multiplier (which the empirical world
-  // shading already folds into its constants; without it characters sit
-  // ~30% darker than their surroundings, measured on an F11 A/B pair).
-  if (cam_pos.w > 0.5) {
-    float fam = cam_pos.w;
-    float3 dlin = albedo.rgb * albedo.rgb;
-    float3 cn = dot(i.nrm, i.nrm) > 0.01
-                    ? normalize(i.nrm)
-                    : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
-    float ndl = saturate(dot(cn, ch_light.xyz));
-    float3 vd = -normalize(i.rpos);
-    float3 lin;
-    float out_a = 1.0;
-    if (fam > 5.5) {
-      // Traffic vehicles (vehicle.fx fam 6 body / vehicle_glass.fx fam 7
-      // windows, disassembled from vehicle_defaultPS): paint recolor where
-      // the diffuse green channel is below the mask threshold (red-channel
-      // mask * colorize_red + blue-channel mask * colorize_blue, the taxi
-      // yellow), key light + the livingworld flat ambient, phong specular
-      // along the reflected sun, and an environment-cube reflection scaled
-      // by fresnel and the gloss packed in the diffuse alpha. Glass keeps
-      // only the reflection terms (its tint rows are zero) and blends at
-      // the captured alpha. overlay.y > 0 = the material's cube resolved
-      // at t6 (same convention as water).
-      float3 sel;
-      if (fam < 6.5) {
-        sel = dlin.g > 0.001225
-                  ? dlin
-                  : ch_tintA.rgb * dlin.r + ch_tintB.rgb * dlin.b;
-      } else {
-        sel = ch_tintA.rgb;
-      }
-      // DXN panel normal map (the material's `normal` channel, riding the
-      // macro slot; overlay.z > 0 = resolved). The vertex layout carries no
-      // tangent frame, so build a screen-space cotangent frame from the
-      // position/uv derivatives; it reproduces the authored panel shading
-      // including mirrored UV islands. Skipping the map entirely shades the
-      // hinged panels by their vertex normals, which face away from the sun
-      // - the dark ambient-blue "misdrawn shadow" that stopped at the door
-      // seam (verified against the ucode: flat map = the artifact, real
-      // map = the emulated car).
-      float3 vn = cn;
-      if (overlay.z > 0.5) {
-        float2 nm = macro.Sample(smp, i.uv).rg * 2.0 - 1.0;
-        float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
-        float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
-        float3 dp2p = cross(dp2, cn), dp1p = cross(cn, dp1);
-        float3 tt = dp2p * du1.x + dp1p * du2.x;
-        float3 bb = dp2p * du1.y + dp1p * du2.y;
-        float im = rsqrt(max(max(dot(tt, tt), dot(bb, bb)), 1e-12));
-        vn = normalize(nm.x * tt * im + nm.y * bb * im +
-                       cn * sqrt(saturate(1.0 - dot(nm, nm))));
-      }
-      float vndl = saturate(dot(vn, ch_light.xyz));
-      float3 rfl = ch_light.xyz - 2.0 * dot(vn, ch_light.xyz) * vn;
-      // The sun spec is gated on N.L >= 0 (the ucode multiplies the spec
-      // term by an sge result); the cube reflection is not.
-      float spec = pow(saturate(dot(vd, -rfl)), max(ch_sh[0].w, 1.0)) *
-                   (dot(vn, ch_light.xyz) >= 0.0 ? 1.0 : 0.0);
-      float fres = pow(1.0 - saturate(dot(vn, vd)), max(ch_light.w, 1.0));
-      float3 cube = float3(0.0, 0.0, 0.0);
-      if (overlay.y > 0.5) {
-        cube = env_cube.Sample(smp, reflect(-vd, vn)).rgb;
-        cube *= cube;  // the PS consumes the cube squared (linear space)
-      }
-      // Gloss = the diffuse alpha SQUARED: the ucode squares the whole
-      // diffuse fetch (linear-space decode), alpha included; raw alpha
-      // over-specs ~5x and mottles the body panels.
-      float gloss = fam < 6.5 ? albedo.a * albedo.a : 1.0;
-      lin = sel * (ch_key.rgb * vndl + ch_amb.rgb) +
-            (spec * ch_sh[0].rgb + cube) * fres * gloss;
-      out_a = ch_misc.x;
-    } else if (fam > 3.5) {
-      // Hair (cac_hair / defaulthair): key on a wrapped N.L ramp + flat
-      // ambient, fresnel rim tint on a steeper ramp; strand coverage from
-      // the mesh's "alpha" channel at the raw second texcoord (bound at t4)
-      // - alpha-blended in the sorted sub-pass (hair drawn opaque is the
-      // blocky-helmet look).
-      float fres = pow(1.0 - saturate(dot(cn, vd)), max(ch_light.w, 1.0));
-      float3 hl = ch_key.rgb * (saturate(ndl * 0.75 + 0.25) + ch_amb.w) +
-                  ch_tintB.rgb * fres * saturate(ndl * 1.75 + 0.25);
-      lin = dlin * hl;
-      out_a = saturate(decal_art.Sample(smp, i.uv2).r * ch_tintB.w);
-    } else if (fam > 2.5) {
-      // livingworld pedestrians: the diffuse is a stamp-mask atlas: red
-      // regions recolor with tintA, blue with tintB (judged in linear
-      // space; real-color regions have green above the threshold).
-      // The game's character PSes multiply the key light by the CSM shadow
-      // (tap >= ray = lit); characters are casters themselves, so an extra
-      // receiver bias suppresses self-shadow acne while the body-onto-board
-      // / body-onto-NPC shading survives (the sun-axis depth gap there is
-      // tens of cm). Without this the held skateboard, a big flat surface
-      // that is almost always inside the skater's own shadow, renders
-      // fully sunlit (near-white) against the emulated dark deck.
-      float csm = SampleCsmShadow(i.rpos + cam_pos.xyz, 0.012);
-      float3 sel = dlin.g > 0.001225
-                       ? dlin
-                       : ch_tintA.rgb * dlin.r + ch_tintB.rgb * dlin.b;
-      lin = sel * (ch_key.rgb * ndl * csm + ch_amb.rgb);
-      // livingworld_stamp_defaultPS ends `max oC0.w, c21.x`: the entity's
-      // spawn/distance fade. Only visible when the item is routed to the
-      // blended sub-pass (alpha < 1); the opaque pass ignores it.
-      out_a = ch_misc.x;
-    } else {
-      // defaultcharacter / CAC pieces: key light + SH irradiance ambient,
-      // key gated by the CSM shadow (see the livingworld comment above).
-      float csm = SampleCsmShadow(i.rpos + cam_pos.xyz, 0.012);
-      if (ch_tintA.w > 0.0) {
-        dlin *= ch_tintA.rgb;
-      }
-      float3 irr = saturate(
-          ch_sh[0].rgb + cn.x * ch_sh[1].rgb + cn.y * ch_sh[2].rgb +
-          cn.z * ch_sh[3].rgb + (cn.x * cn.z) * ch_sh[4].rgb +
-          (cn.z * cn.y) * ch_sh[5].rgb + (cn.y * cn.x) * ch_sh[6].rgb +
-          (cn.z * cn.z) * ch_sh[7].rgb +
-          (cn.x * cn.x - cn.y * cn.y) * ch_sh[8].rgb);
-      lin = dlin * (ch_key.rgb * ndl * csm + irr * ch_amb.w);
-      // defaultcharacter/cacstamp PSes end `max oC0.w, c13.x / c22.x`:
-      // the entity's spawn fade (see the livingworld comment above).
-      out_a = ch_misc.x;
-    }
-    // Exact tone chain: sqrt(0.5 * (max(x*E/4 + 0.75, 1) - sat(1 - x*E)^2)).
-    float E = max(ch_key.w, 0.01);
-    float3 t1 = saturate(1.0 - lin * E);
-    float3 tm = max(lin * 0.25 * E + 0.75, 1.0) - t1 * t1;
-    float3 cc = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
-    return float4(cc, out_a);
-  }
-  // Exact world-material families (cam_pos.w = -family): hand-ported from
-  // the game's own pixel shaders and verified per-pixel against them with
-  // an offline ucode interpreter. All texture
-  // colors linearize IN-SHADER as x^2 (the fetch signs are unsigned on every
-  // world texture). Families: 1 baseenvironment, 2 defaultenvironment,
-  // 3/4 decalenvironment(_tileable), 5/6 reflective(_simple), 7 alphatest,
-  // 8 environmentdiffuse, 9/10 tree(animate), 11 proxyworld,
-  // 12 incandescent. v1 runs with NEUTRAL normal/detail maps (kd is the
-  // exact flat-map constant 0.39 * 2.39562); spec/reflection masks bind at
-  // t4 (overlay.w == 3) on families without decal art.
-  if (cam_pos.w < -0.5) {
-    float fam = -cam_pos.w;
-    float3 dlin = albedo.rgb * albedo.rgb;
-    // Global distance fog (VS c5/c6, captured per frame): every world PS
-    // ends with col * fog.a + fog.rgb before exposure/tonemap.
-    float fdist = length(i.rpos);
-    float f1 = saturate(fdist * sh_fogp.x + sh_fogp.y);
-    if (sh_fogp.z != 1.0) {
-      f1 = pow(max(f1, 1e-6), sh_fogp.z);
-    }
-    float3 fog_rgb = sh_fogc.rgb * f1;
-    float fog_a = 1.0 + sh_fogc.a * f1;
-    float expo = sh_sun.w;
-    float3 lin;
-    float out_a = 1.0;
-    bool reduced_tone = false;
-    if (fam > 8.5 && fam < 12.5) {
-      // tree/treeanimate: D^2 * max(lm^2, floor) * scale [* tint mult];
-      // proxyworld/incandescent: D^2 * scale. No shadow receive, no kd, no
-      // material multiplier on the fog term.
-      if (fam < 10.5) {
-        float3 lmg = lightmap.Sample(smp, i.uv2).rgb;
-        lin = dlin * max(lmg * lmg, sh_env.z) * sh_env.y;
-        if (fam < 9.5) {
-          lin *= sh_env.w;
-        }
-        out_a = albedo.a;
-      } else {
-        lin = dlin * (fam < 11.5 ? sh_fogp.w : 1.0);
-      }
-    } else {
-      // Environment families: macro overlay (0.5-neutral, fades under decal
-      // art), linear decal composite, lightmap squared and min-clamped
-      // against (CSM s + shadow color), kd, phong spec vs the shader's
-      // fixed literal light, cube reflection on 5/6.
-      float3 ov = float3(1.0, 1.0, 1.0);
-      // Fam 13 (transparentenvironmentreflective) carries no macro term.
-      if (overlay.z > 0.0 && fam < 12.5) {
-        float3 mo = macro.Sample(smp, i.uv * overlay.x).rgb;
-        ov = saturate((mo - 0.5) * overlay.y + 0.5);
-      }
-      if (fam > 2.5 && fam < 4.5 && overlay.w > 0.5) {
-        // overlay.w == 0 = art unresolved (white fallback alpha 1 would
-        // whitewash the whole surface).
-        float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
-                                    : decal_art.Sample(smp_clamp, i.uv3);
-        dlin = lerp(dlin, dk.rgb * dk.rgb, dk.a);
-        ov = lerp(float3(1.0, 1.0, 1.0), ov, 1.0 - dk.a);
-      }
-      float3 dcol = dlin * ov;
-      // CSM shadow term s = sat(infront + 1 - coverage) from the native
-      // atlas (same cascade select as the legacy receive path).
-      float s = 1.0;
-      if (sh_misc.y > 0.0) {
-        float3 wp = i.rpos + cam_pos.xyz;
-        float2 lsv =
-            float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
-        float rd = dot(sh_z.xyz, wp) + sh_z.w - sh_misc.x;
-        float2 luv = 0.0;
-        float casc = 0.0;
-        float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
-        if (max(abs(l2.x), abs(l2.y)) < 0.99) { luv = l2; casc = 3.0; }
-        float2 l1 = lsv * sh_c1.xy + sh_c1.zw;
-        if (max(abs(l1.x), abs(l1.y)) < 0.99) { luv = l1; casc = 2.0; }
-        if (max(abs(lsv.x), abs(lsv.y)) < 0.99) { luv = lsv; casc = 1.0; }
-        if (casc > 0.0) {
-          float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
-                              luv.y * -0.5 + 0.5);
-          float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
-          s = saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
-        }
-      }
-      // Lightmap fetch = the console's semantics: BILINEAR, CLAMPED, mip 0.
-      // The composed atlas pages are single-level on console and the fetch
-      // constants carry clamp_x/clamp_y = 2. Sampling them with the aniso-8
-      // WRAP sampler over our generated mip chain averaged NEIGHBORING
-      // atlas cells together at grazing angles (deep aniso LOD), and at the
-      // page border the wrap pulled in the opposite edge of the page: the
-      // reflective_trans canopy slope (cells at v ~ 0.996, white-cliff
-      // cells wrapping in from v ~ 0) glowed ~2x bright while the right
-      // awning went dark, with the decode, UVs and constants all verified
-      // exact (diagnosed via the mode-7 raw-lightmap isolation view).
-      float3 lmg = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
-      // F12 isolation mode 7: visualize the RAW lightmap sample; mode 8:
-      // visualize the lightmap unwrap coordinate (frac(uv2*16) in rg).
-      // Debug-only taps on fams 5/6/13 (misc.z is 0 on the other fams).
-      if (abs(misc.z - 7.0) < 0.5) {
-        return float4(lmg, 1.0);
-      }
-      if (abs(misc.z - 8.0) < 0.5) {
-        return float4(frac(i.uv2 * 16.0), 0.0, 1.0);
-      }
-      // Mode 9: lightmap-resolve status; RED = a real lightmap is bound
-      // (tint.r set by the C++ resolve), BLUE = white fallback in t1.
-      if (abs(misc.z - 9.0) < 0.5) {
-        return float4(tint.r, 0.0, 1.0 - tint.r, 1.0);
-      }
-      float3 lml = min(lmg * lmg, s + sh_color.rgb);
-      // GetTangentLight with the neutral (flat) normal map:
-      // 0.39 * 2.39562 exactly. Fam 13 has no kd term at all; its body is
-      // D^2 * lml * ALPHA, premultiplied once in the shader on top of the
-      // a^2 blend factor (verified 0.0-error vs the ucode).
-      lin = fam > 12.5 ? lml * dcol * albedo.a : lml * 0.93429 * dcol;
-      if (overlay.w > 2.5) {
-        // spec/ecc/refmask at t4: phong vs the FIXED literal light
-        // (-0.14, 0.5, 0.9), power 10 + 290*ecc, tint (2.1, 1.8, 1.5),
-        // scaled by the clamped lightmap green and the spec mask.
-        float4 masks = decal_art.Sample(smp, i.uv);
-        float3 wn = dot(i.nrm, i.nrm) > 0.01
-                        ? normalize(i.nrm)
-                        : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
-        // misc.z = 3 (F12 reflection isolation): force the flat normal.
-        if (overlay.w > 3.5 && abs(misc.z - 3.0) > 0.5) {
-          // Per-pixel normal map (t5, paired descriptor): the real PS
-          // (baseenvironmentreflective_defaultPS) reflects off the
-          // normal-mapped normal: tangent normal = 2*(n + detail - 1) on
-          // xy, 2*n.z - 1 on z (the material's detail map is a constant
-          // neutral 16x16, folded here as 0.5). With the FLAT vertex normal
-          // every panel of a glass facade reflects the same tiny cube
-          // region: one giant magnified smear of the plaza cube's
-          // lamp-heads/trees (the "streetlight head" artifact, ucode-traced
-          // on a captured pixel; flat N lands on the
-          // face-0 tree/lamp texels, the mapped N tilts onto sky). The
-          // per-panel tilts break the reflection up exactly like the
-          // emulated frame. Screen-space cotangent frame (same shape as
-          // the vehicle DXN branch; the world VS carries no tangent
-          // attributes we decode).
-          // F12 mode 6: the slider drives the normal-map LOD bias live;
-          // the console fetches the nm at its 640p gradient LOD (blurrier,
-          // weaker bump tilts), so the matching bias is the remaining
-          // reflection-rotation candidate. Default stays SHARP (bias 0):
-          // an unconditional misc.y bias visibly degraded the glass;
-          // tune with the
-          // slider first, promote the found value to a default after.
-          float nm_bias = misc.z > 5.5 ? misc.w : 0.0;
-          float3 nmv = normal_map.SampleBias(smp, i.uv, nm_bias).rgb;
-          // Exact composition: xy = 2*normal + 2*detail - 2, z = 2*n.z - 1.
-          // The detail map is a CONSTANT 16x16 (0.514, 0.506), NOT the
-          // formula's 0.5 neutral, so its fold is a constant tangent tilt.
-          // The tilt rides the two F12 trim sliders (packed in misc.x;
-          // defaults = the exact fold) so the residual reflection rotation
-          // can be dialed live against the emulated frame.
-          float trim_yi = floor(misc.x / 1000.0);
-          float2 trim = float2(misc.x - trim_yi * 1000.0 - 500.0, trim_yi - 500.0) *
-                        0.001;
-          float3 nt = float3(nmv.xy * 2.0 - 1.0 + trim, nmv.z * 2.0 - 1.0);
-          float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
-          float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
-          float3 dp2p = cross(dp2, wn), dp1p = cross(wn, dp1);
-          float3 tt = dp2p * du1.x + dp1p * du2.x;
-          float3 bb = dp2p * du1.y + dp1p * du2.y;
-          // Signs/lengths calibrated against the mesh's REAL stored TBN
-          // (10_11_11 tangent @ +24, s16 normal xy @ +20, handedness in the
-          // unwrap sign bits, decoded mesh-wide):
-          // stored T == +dP/dU on 100% of tris (this formula's tt comes out
-          // as -dP/dU -> negate), stored B == this bb direction (dot 0.999),
-          // and the game's rows are UNIT so each axis normalizes SEPARATELY
-          // - the shared max-normalizer both halved and (with the flip)
-          // mirrored the horizontal tilt, which pushed the reflection
-          // DEEPER into the dark cube region instead of off it (first
-          // deploy looked unchanged). With these signs the reconstruction
-          // matches the ucode's mapped normal to 4 decimals at the traced
-          // pixel. An inward geometric wn flips all three terms together;
-          // reflect() is invariant to that.
-          tt *= -rsqrt(max(dot(tt, tt), 1e-12));
-          bb *= rsqrt(max(dot(bb, bb), 1e-12));
-          // The mesh's STORED TBN (what the game's VS interpolates) is the
-          // world-up frame, not the exact UV-gradient frame: B = up
-          // projected into the surface, T = cross(B, N), verified on the
-          // decoded window vertices (B = (0, 0.999, 0), T = horizontal).
-          // The screen-space frame lands ~3 deg off it (authored TBN vs UV
-          // gradients), which rotates reflections by degrees, visible as
-          // parallax against the emulated frame. Use the analytic axes and
-          // keep only the screen-space frame's SIGNS (mirrored UV islands
-          // flip the tangent; derivatives track that, the analytic frame
-          // cannot). Near-horizontal surfaces keep the screen frame.
-          float3 bb2 = float3(0.0, 1.0, 0.0) - wn * wn.y;
-          float lb2 = length(bb2);
-          if (lb2 > 0.05) {
-            bb2 /= lb2;
-            float3 tt2 = cross(bb2, wn);
-            tt = tt2 * (dot(tt2, tt) >= 0.0 ? 1.0 : -1.0);
-            bb = bb2 * (dot(bb2, bb) >= 0.0 ? 1.0 : -1.0);
-          }
-          wn = normalize(nt.x * tt + nt.y * bb + wn * max(nt.z, 0.05));
-        }
-        float3 vd = -normalize(i.rpos);
-        float3 Ls = float3(-0.14, 0.5, 0.9);
-        float3 refl = Ls - 2.0 * wn * dot(wn, Ls);
-        float bp = saturate(dot(vd, -refl));
-        float ks = pow(max(bp, 1e-6), 10.0 + 290.0 * masks.y);
-        // misc.z = 5 (F12 reflection isolation): body only, no spec/cube.
-        if (abs(misc.z - 5.0) > 0.5) {
-          lin += ks * float3(2.1, 1.8, 1.5) * lml.g * masks.x;
-        }
-        if (((fam > 4.5 && fam < 6.5) || fam > 12.5) &&
-            abs(misc.z - 5.0) > 0.5 && abs(misc.z - 1.0) > 0.5) {
-          // Cube reflection: reflect(E, wN) with xy negated (the source's
-          // ref_vec.xy *= -1), luminosity lerped toward 1 by
-          // 0.3 * sat(4*refmask - 2.6), x refmask x reflection_scale 1.5.
-          float3 rv = vd - 2.0 * wn * dot(vd, wn);
-          // misc.y = cube LOD bias log2(render_height / 640): the guest
-          // computes the cube fetch's gradient LOD at its own 1152x640
-          // render; at 4K our per-pixel gradients are ~3.4x smaller, so
-          // without the bias baked cube detail (the plaza streetlight
-          // heads) survives through mips the console's fetch blurs away.
-          // F12 isolation (misc.z): mode 2 samples the ABSOLUTE level in
-          // misc.w; other modes add misc.w as extra bias; mode 4 shows the
-          // raw cube sample in place of the shaded result.
-          float3 dir = float3(-rv.x, -rv.y, rv.z);
-          // Mode 6 gives the slider to the NM fetch; the cube keeps just
-          // the automatic bias there.
-          float cube_extra = misc.z > 5.5 ? 0.0 : misc.w;
-          float3 cube = abs(misc.z - 2.0) < 0.5
-                            ? env_cube.SampleLevel(smp, dir, misc.w).rgb
-                            : env_cube.SampleBias(smp, dir, misc.y + cube_extra).rgb;
-          float rl = 0.3 * saturate(4.0 * masks.z - 2.6);
-          float lum = lml.g + rl * (1.0 - lml.g);
-          lin += cube * lum * masks.z * 1.5;
-          if (abs(misc.z - 4.0) < 0.5) {
-            lin = cube * cube;
-          }
-        }
-      }
-      if (fam > 12.5) {
-        // Fam 13 blend factor: the PS outputs a^2 (straight-alpha blend on
-        // top of the in-shader premultiplied body; wisps thin as ~a^3,
-        // same convention as transparentenvironment).
-        out_a = albedo.a * albedo.a;
-      } else if (fam > 6.5) {
-        out_a = albedo.a;
-        reduced_tone = fam > 7.5;  // environmentdiffuse's cheap tonemap
-      }
-      fog_a *= sh_env.x;  // material multiplier (PS c11.y)
-    }
-    // Fog -> exposure -> tonemap -> sqrt, then the postfx uber's measured
-    // 1.41 scene multiplier (same as the character branch).
-    float3 xe = (lin * fog_a + fog_rgb) * expo;
-    float3 t1e = saturate(1.0 - xe);
-    float3 tme = reduced_tone ? 1.0 - t1e * t1e
-                              : max(xe * 0.25 + 0.75, 1.0) - t1e * t1e;
-    float3 cce = saturate(sqrt(max(tme * 0.5, 0.0)) * 1.41);
-    return float4(cce, out_a);
-  }
-  // Macro overlay: large-scale grime/cracks multiplied over the diffuse at
-  // uv * macroOverlayUVScale, faded by macroOverlayOpacity: the ground and
-  // wall weathering. WHITE is the neutral (materials without weathering
-  // bind a 16x16 "default_white"). The game multiplies it ONCE in its
-  // linear (squared) color space, so the gamma-space equivalent is
-  // sqrt(m); a direct multiply doubles the darkening (harsh black
-  // patchwork vs the emulated subtle weathering).
-  if (overlay.z > 0.0 && misc.x < 1.5) {  // water reuses overlay.z (ripple map flag)
-    float4 m = macro.Sample(smp, i.uv * overlay.x);
-    albedo.rgb *= lerp(float3(1.0, 1.0, 1.0), sqrt(m.rgb), overlay.y * m.a);
-  }
-  // environment.decal surfaces: the paint/graffiti art (t4) is composited
-  // over the base diffuse by ITS alpha, opaque output; these meshes ARE
-  // the wall/ground there. The art maps with uv3, the second half-pair of
-  // the packed half4 first texcoord (validated offline: sampling with the
-  // tiling uv0 repeats it: "Stereo Stereo Stereo"; the fmt-26 second
-  // element is the lightmap unwrap, not the decal's).
-  if (overlay.w > 0.0) {
-    // overlay.w == 2 marks environment.decal_tileable: the art tiles across
-    // the surface (rock/cliff faces) and must WRAP; clamp stretched the
-    // border texels into giant streaks. Single placements clamp (their
-    // transparent border keeps everything outside the placement clear).
-    float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
-                                : decal_art.Sample(smp_clamp, i.uv3);
-    albedo.rgb = lerp(albedo.rgb, dk.rgb, dk.a);
-  }
-  // tint.r > 0 marks items with a lightmap bound (2x baked lighting);
-  // otherwise fall back to derivative face shading. The lighting term stays
-  // separate from the albedo so the CSM receive below can min-clamp IT, the
-  // way the game's GetShadowedLightMap clamps the lightmap lighting.
-  float3 light;
-  if (tint.b > 0.0) {
-    light = float3(1.0, 1.0, 1.0);  // unlit (sky dome)
-  } else if (tint.r > 0.0) {
-    light = lightmap.Sample(smp, i.uv2).rgb * 2.0;
-  } else {
-    // Smooth per-vertex normal when the mesh has one; face normal from
-    // position derivatives otherwise.
-    float3 n = dot(i.nrm, i.nrm) > 0.01 ? normalize(i.nrm)
-                                        : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
-    light = abs(dot(n, normalize(float3(0.4, 0.8, 0.3)))) * 0.35 + 0.75;
-  }
-  // Dynamic CSM shadow receive (world geometry + rigid props; characters
-  // need the game's separate PCF/bias variant; skipping them avoids
-  // self-shadow acne, and the ground shadow is 95% of the visible effect).
-  // Exact receiver math from the baseenvironment PS disassembly: finest
-  // cascade whose |ls| < 0.99 wins; shadow = saturate(infront + 1 -
-  // coverage), then the game min-clamps the LINEAR lighting term:
-  //   light_linear = min(light_linear, s + c8.rgb)
-  // Full shadow clamps to the dim bluish c8 ambient, the penumbra saturates
-  // wherever the clamp exceeds the lit level (which is what keeps the edge
-  // crisp), and surfaces already darker than the clamp, baked shade under
-  // bridges/trees, show NO dynamic shadow at all. Our light term is
-  // gamma-space (light^2 ~ the game's linear term: the lightmap x2 folds
-  // its x4 linear multiplier), so the clamp maps to min(light, sqrt(s+c8))
-  // per channel. A fixed-denominator curve here read pitch-black and
-  // double-darkened baked shade.
-  if (sh_misc.y > 0.0 && tint.g == 0.0 && tint.b == 0.0 && misc.x == 0.0) {
-    float3 wp = i.rpos + cam_pos.xyz;
-    float2 lsv = float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
-    float rd = dot(sh_z.xyz, wp) + sh_z.w - sh_misc.x;
-    float2 luv = 0.0;
-    float casc = 0.0;
-    float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
-    if (max(abs(l2.x), abs(l2.y)) < 0.99) { luv = l2; casc = 3.0; }
-    float2 l1 = lsv * sh_c1.xy + sh_c1.zw;
-    if (max(abs(l1.x), abs(l1.y)) < 0.99) { luv = l1; casc = 2.0; }
-    if (max(abs(lsv.x), abs(lsv.y)) < 0.99) { luv = lsv; casc = 1.0; }
-    if (casc > 0.0) {
-      float2 uv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0, luv.y * -0.5 + 0.5);
-      float2 m = shadow_atlas.Sample(smp_clamp, uv);
-      float s = saturate((m.x >= rd ? 1.0 : 0.0) + (1.0 - m.y));
-      light = min(light, sqrt(s + sh_color.rgb));
-    }
-  }
-  float3 lit = albedo.rgb * light;
-  if (mat_tint.w > 0.0 && misc.x == 0.0) {
-    lit *= mat_tint.rgb;
-  }
-  if (misc.x > 1.5) {
-    // water.* (flowingwater.fx approximation): the real shader is
-    // near-black diffuse + dual time-scrolled ripple-normal taps + an
-    // environment-cube reflection + sun specular. We have no cube map
-    // bound, so the reflection term is the frame fog color (the best
-    // single approximation of the surroundings' haze tone) scaled by a
-    // fresnel curve; the ripple normal perturbs both the fresnel and a sun
-    // sparkle along the captured CSM light axis. The lightmap (x2) keeps
-    // the baked bridge/wall shading on the surface. Calibrated against the
-    // canal capture (emulated mid-canal mean ~(24,28,32)/255).
-    float t = overlay.x;
-    float2 rip;
-    if (overlay.z > 0.0) {
-      // Dual scrolled taps of the material's ripple normal map (macro slot).
-      float2 wuv = i.uv * 6.0;
-      float3 n1 = macro.Sample(smp, wuv + t * float2(0.11, 0.06)).rgb;
-      float3 n2 = macro.Sample(smp, wuv * 1.71 - t * float2(0.07, 0.13)).rgb;
-      rip = (n1.xy + n2.xy) - 1.0;
-    } else {
-      // Normal map unresolved: procedural ripples from world position.
-      // Wavelengths ~0.4-1m (emulated ripples are decimeter-scale); low
-      // frequencies formed meter-wide chevron interference bands that read
-      // as giant arrows on the surface.
-      float3 wp = i.rpos + cam_pos.xyz;
-      rip = 0.35 * float2(sin(wp.x * 9.7 + wp.z * 6.1 + t * 2.3) +
-                              0.6 * sin(wp.x * 17.3 - wp.z * 11.9 + t * 3.4),
-                          cos(wp.x * 7.1 - wp.z * 13.7 + t * 2.7) +
-                              0.6 * cos(wp.x * 12.9 + wp.z * 18.3 + t * 3.1));
-    }
-    float3 wn = normalize(float3(rip.x * 0.4, 2.0, rip.y * 0.4));
-    float3 vd = -normalize(i.rpos);
-    float fres = pow(1.0 - saturate(dot(vd, wn)), 3.0);
-    // The flowing-water lightmap unwrap decodes unreliably (bands across
-    // atlas gutters), so the water term deliberately ignores it: near-black
-    // body + ripple-perturbed cube reflection + sun sparkle.
-    // Deep body: the water "diffuse" is a faint STRIPE MASK (max 24/255,
-    // WaterFallFoamAlpha, a lookup for the real shader, not a color). The
-    // game consumes it in linear space where 0.09^2 vanishes; squaring here
-    // likewise kills the visible blue/black banding. overlay.w > 0 = no
-    // diffuse channel at all (ocean.default); body is zero there, NOT the
-    // white fallback (ocean.fx: diffTerm = (0,0,0), color is all reflection).
-    float3 col = overlay.w > 0.5 ? 0.0 : albedo.rgb * albedo.rgb * 0.6;
-    // Reflection tint: the environment cube when resolved (t6); otherwise a
-    // haze derived from the frame fog color, lifted toward neutral so dark
-    // dusk fog doesn't collapse the water to black (fit: emulated canal
-    // mean ~(24,28,32)/255 with fog color (0.02,0.07,0.13)).
-    float3 renv = overlay.y > 0.0
-                      ? env_cube.Sample(smp, reflect(-vd, wn)).rgb
-                      : mat_tint.rgb * 0.5 + 0.06;
-    col += renv * (0.55 + 0.45 * fres);
-    if (sh_misc.y > 0.0) {
-      float3 h = normalize(vd + normalize(-sh_z.xyz));
-      col += pow(saturate(dot(wn, h)), 90.0) * 0.35;            // sun sparkle
-    }
-    float fade = saturate(length(i.rpos) * misc.y + misc.z);
-    if (misc.w != 1.0) {
-      fade = pow(max(fade, 1e-4), misc.w);
-    }
-    col = sqrt(max(col * col * saturate(1.0 + fade * mat_tint.w) +
-                   fade * mat_tint.rgb, 0.0));
-    // Opaque: the game's murk hides the canal bed entirely (and our bed
-    // shading is untrustworthy under water: striped lightmap unwraps).
-    return float4(col, 1.0);
-  }
-  if (misc.x > 0.0) {
-    // transparentenvironment.fx (Skate 2 source; disassembled Skate 3 PS
-    // matches): outcolor.rgb = diffTerm * diffuse.rgb * diffuse.a; the rgb
-    // is premultiplied by alpha ONCE IN THE SHADER on top of the a^2 blend
-    // factor, so wisps thin out as ~a^3. That cubic falloff is most of the
-    // emulated "sparse clouds" look. Fog is applied in the game's linear
-    // (squared) color space: fade = saturate(dist * ramp.x + ramp.y)^ramp.z
-    // toward the fog color, transmittance = 1 + fade * fogcolor.w.
-    lit *= albedo.a;
-    float fade = saturate(length(i.rpos) * misc.y + misc.z);
-    if (misc.w != 1.0) {
-      fade = pow(max(fade, 1e-4), misc.w);
-    }
-    lit = sqrt(max(lit * lit * saturate(1.0 + fade * mat_tint.w) +
-                   fade * mat_tint.rgb, 0.0));
-    return float4(lit, albedo.a * albedo.a);
-  }
-  return float4(lit, 1.0);
-}
-// Shadow caster pass: vs_main runs with mvp = (world *) lightVP built from
-// the captured receiver rows, so SV_Position.z IS the light-space depth
-// (the height-ramp row; viewport z range 0..1, DepthClip off so casters
-// outside the 12 m depth window clamp like the game accepts). MIN blend on
-// both channels against a (1, 1) clear: R accumulates the min depth, G
-// drops to 0 where any caster drew ("uncoverage"; the blur pass converts
-// to the game's coverage convention).
-float2 ps_shadow_caster(VSOut i) : SV_Target {
-  return float2(i.pos.z, 0.0);
-}
-)";
-
-// Shadow blur: the game's shadow_h/vblur passes, exact semantics from the
-// disassembled Xenos ucode. One fullscreen-triangle draw
-// per tile per direction; taps stay inside the tile (clamped). Coverage is
-// Gaussian-blurred; depth keeps the exact center value where covered and
-// dilates (binary-coverage-weighted neighbour average) into the penumbra
-// otherwise, so depth compares stay valid across the blurred edge.
-// b0 floats: c0 = (dir.x, dir.y, ntaps, src_is_raw), c1 = (w0, w1, w2, 0),
-// c2 = (tile_x0, tile_x1, tile_y1, 0). ntaps 0 = format-convert only
-// (cascade 2 is never blurred).
-const char kShadowBlurSource[] = R"(
-cbuffer C : register(b0) {
-  float4 c0;
-  float4 c1;
-  float4 c2;
-};
-Texture2D<float2> src : register(t0);
-float4 vs_main(uint id : SV_VertexID) : SV_Position {
-  float2 uv = float2((id << 1) & 2, id & 2);
-  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-}
-float2 ps_main(float4 pos : SV_Position) : SV_Target {
-  int2 p = int2(pos.xy);
-  int ntaps = int(c0.z);
-  float w[3] = {c1.x, c1.y, c1.z};
-  float2 center = src.Load(int3(p, 0));
-  float ccen = c0.w > 0.0 ? 1.0 - center.y : center.y;
-  float cov = 0.0;
-  float dsum = 0.0;
-  float dcnt = 0.0;
-  [unroll] for (int k = -2; k <= 2; ++k) {
-    if (abs(k) > ntaps) continue;
-    int2 q = p + int2(c0.xy) * k;
-    q.x = clamp(q.x, int(c2.x), int(c2.y));
-    q.y = clamp(q.y, 0, int(c2.z));
-    float2 t = src.Load(int3(q, 0));
-    float c = c0.w > 0.0 ? 1.0 - t.y : t.y;
-    cov += w[abs(k)] * c;
-    if (k != 0) {
-      float hard = c > 0.001 ? 1.0 : 0.0;
-      dcnt += hard;
-      dsum += hard * t.x;
-    }
-  }
-  float depth = ccen > 0.001 ? center.x : (dcnt > 0.0 ? dsum / dcnt : center.x);
-  return float2(depth, saturate(cov));
-}
-)";
-
-// Fullscreen MSAA resolve: the deferred command list has no
-// ResolveSubresource, so average the samples in a pixel shader (SAMPLES is
-// injected as a compile-time macro).
-const char kResolveShaderSource[] = R"(
-Texture2DMS<float4> src : register(t0);
-float4 vs_main(uint id : SV_VertexID) : SV_Position {
-  float2 uv = float2((id << 1) & 2, id & 2);
-  return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-}
-float4 ps_main(float4 pos : SV_Position) : SV_Target {
-  int2 p = int2(pos.xy);
-  float4 c = 0;
-  [unroll] for (int k = 0; k < SAMPLES; ++k) {
-    c += src.Load(p, k);
-  }
-  return c / SAMPLES;
-}
-)";
-
-// Popup background blur: EXACT port of the game's dedicated pass chain
-// (captured from a live frame with the Rewards popup up):
-//   blur_hBlurPS:  11 gaussian taps along +X over the finished frame,
-//                  offsets k * 0.0003125 * PS c0.x (c0.x = 8 -> 0.0025/tap,
-//                  +/-1.25% of the buffer), literal weights below (sum 1);
-//   blur_vBlurPS:  the same kernel along +Y;
-//   postfx_basictex: plain fullscreen REPLACE of the frame with the result.
-// The game runs it at its fixed 1152x640 internal resolution and the
-// console's bilinear upscale of that buffer is what reads as the "frosted
-// glass" lattice, so the passes here render into 1152x640 intermediates and
-// stretch back, reproducing both the kernel and the lattice.
-const char kBlurShaderSource[] = R"(
-cbuffer C : register(b0) {
-  float4 dir;  // xy = blur axis, z = kernel scale (the game's PS c0.x, 8)
-};
-Texture2D<float4> src : register(t0);
-SamplerState smp_clamp : register(s1);
-struct VSOut {
-  float4 pos : SV_Position;
-  float2 uv : TEXCOORD0;
-};
-VSOut vs_main(uint id : SV_VertexID) {
-  VSOut o;
-  float2 uv = float2((id << 1) & 2, id & 2);
-  o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-  o.uv = uv;
-  return o;
-}
-float4 ps_main(VSOut i) : SV_Target {
-  // Literal kernel from the blur_hBlurPS ucode (c251..c255).
-  const float w[6] = {0.2005654, 0.1769984, 0.1216491, 0.0651141,
-                      0.0271436, 0.0088122};
-  float2 step = dir.xy * (0.0003125 * dir.z);
-  float3 c = src.SampleLevel(smp_clamp, i.uv, 0).rgb * w[0];
-  [unroll] for (int k = 1; k < 6; ++k) {
-    c += src.SampleLevel(smp_clamp, i.uv + step * k, 0).rgb * w[k];
-    c += src.SampleLevel(smp_clamp, i.uv - step * k, 0).rgb * w[k];
-  }
-  return float4(c, 1.0);
-}
-// Prefiltered downsample of the (higher-res) native output into the game's
-// 1152x640 blur space (dir.xy = source texel size). A 4x4 grid of bilinear
-// taps covers reduction ratios up to ~4x (4K -> 1152 is 3.33x); narrower
-// footprints undersampled the scale and the aliased detail crawled as the
-// scene animated: the whole blurred backdrop shimmered, worst around
-// high-contrast edges.
-float4 ps_down(VSOut i) : SV_Target {
-  float3 c = 0.0;
-  [unroll] for (int y = 0; y < 4; ++y) {
-    [unroll] for (int x = 0; x < 4; ++x) {
-      float2 off = float2(float(x) - 1.5, float(y) - 1.5) * dir.xy;
-      c += src.SampleLevel(smp_clamp, i.uv + off, 0).rgb;
-    }
-  }
-  return float4(c / 16.0, 1.0);
-}
-// postfx_basictex: oC0 = tex (verified: `max oC0, r0, r0`).
-float4 ps_blit(VSOut i) : SV_Target {
-  return float4(src.SampleLevel(smp_clamp, i.uv, 0).rgb, 1.0);
-}
-)";
-
-// Selected-object outline composite (park editor / object mover): port of
-// postfx_edgedetectstencilPS. The game stencil-marks the selected object,
-// resolves stencil to a 576x320 texture and adds |threshold crossings| x
-// the outline color (PS c0, the editor blue) onto the frame; our mask pass
-// renders the selected items into a small R8 target instead (see
-// pso_outline_mask) and this pass composites additively over the resolved
-// output. Tap offsets are 1/576 x 1/320 UV fractions like the original, so
-// the contour thickness matches at any output resolution.
-const char kOutlineShaderSource[] = R"(
-cbuffer C : register(b0) {
-  float4 color;  // rgb = outline color (guest edge-detect PS c0)
-};
-Texture2D<float4> src : register(t0);
-SamplerState smp_clamp : register(s1);
-struct VSOut {
-  float4 pos : SV_Position;
-  float2 uv : TEXCOORD0;
-};
-VSOut vs_main(uint id : SV_VertexID) {
-  VSOut o;
-  float2 uv = float2((id << 1) & 2, id & 2);
-  o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-  o.uv = uv;
-  return o;
-}
-float4 ps_main(VSOut i) : SV_Target {
-  // Averaged 5x5 neighborhood of the (binary, full-resolution) mask with a
-  // fixed UV-fraction pitch -> a smooth 0..1 ramp across the silhouette
-  // boundary; the peaked profile 4m(1-m) turns the ramp into an
-  // antialiased line of constant screen-fraction width. The core is
-  // whitened (the emulated line goes through the game's uber grade +
-  // bloom, which lifts its center toward white). A literal port:
-  // binarized crossing counts on the 576x320 grid, stairstepped visibly
-  // at native output resolutions.
-  const float2 t = float2(0.8 / 1152.0, 0.8 / 640.0);
-  float m = 0.0;
-  [unroll] for (int y = -2; y <= 2; ++y) {
-    [unroll] for (int x = -2; x <= 2; ++x) {
-      m += src.SampleLevel(smp_clamp, i.uv + float2(x, y) * t, 0).r;
-    }
-  }
-  m /= 25.0;
-  float band = saturate(6.4 * m * (1.0 - m));
-  float core = band * band * band;
-  // Additive blend (ONE, ONE) onto the frame; alpha untouched (ZERO, ONE).
-  return float4(color.rgb * band + 0.5 * core, 0.0);
-}
-)";
-
-// 2D/APT overlay shader. Verified against a captured HUD draw stream:
-// vertices are {float4 pos, float2 uv} in 1280x720
-// APT movie space; the game's VS constants apply as clip = ortho * (world *
-// pos) with c0..c3 the ortho rows, c4..c7 the element's transform rows and
-// c8 the color multiplier, used exactly as staged.
-const char kShader2dSource[] = R"(
-cbuffer C : register(b0) {
-  float4 m[10];  // m[0..3] proj rows, m[4..7] world rows, m[8] color,
-                 // m[9].x = apply D3D9 half-pixel (2D ortho draws only)
-};
-Texture2D<float4> tex : register(t0);
-SamplerState smp : register(s1);
-struct VSOut {
-  float4 pos : SV_Position;
-  float2 uv : TEXCOORD0;
-  float4 color : COLOR0;
-};
-VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float4 color : COLOR0) {
-  float4 wp = float4(dot(p, m[4]), dot(p, m[5]), dot(p, m[6]), dot(p, m[7]));
-  VSOut o;
-  o.pos = float4(dot(wp, m[0]), dot(wp, m[1]), dot(wp, m[2]), dot(wp, m[3]));
-  // D3D9 half-pixel convention: the art bakes half-texel UVs expecting
-  // pixel centers at integer coordinates; without this the clock-face
-  // quadrant tiles show their wrapped border rows as dark seam lines.
-  // Scaled for the 2D ortho; must not apply to 3D (world-space
-  // SimpleDraw markers), where m[0].x is a projection scale.
-  if (m[9].x > 0.0) {
-    o.pos.x -= 0.5 * m[0].x * o.pos.w;
-    o.pos.y -= 0.5 * m[1].y * o.pos.w;
-  }
-  o.uv = uv;
-  o.color = color;
-  return o;
-}
-float4 ps_main(VSOut i) : SV_Target {
-  return tex.Sample(smp, i.uv) * m[8] * i.color;
-}
-)";
-
-// In-world neon spline shader (waypoint arrows / marker beams). The guest
-// B-spline VS is evaluated on the CPU at publish time into WORLD-space
-// vertices; the VS here projects them with the scene's (smoothed) view_proj
-// rows so the signs stay glued to the world under camera re-timing. The two
-// PS variants transcribe the game's own spline.fx (Skate-Shaders repo):
-// "default" = additive glow with the squared-gamma trick, "darken" =
-// straight-alpha backdrop dimming. The gradient texture uses the wrap/aniso
-// sampler like the original i_diffuse (U runs 0..N along the band).
-const char kShaderSplineSource[] = R"(
-cbuffer C : register(b0) {
-  float4 vp0;  // scene view_proj rows (row-vector: clip = x*vp0+y*vp1+z*vp2+w*vp3)
-  float4 vp1;
-  float4 vp2;
-  float4 vp3;
-  float4 intensity;  // i_intensity as staged (x = default gain, y = darken gain)
-};
-Texture2D<float4> tex : register(t0);
-SamplerState smp : register(s0);
-struct VSOut {
-  float4 pos : SV_Position;
-  float2 uv : TEXCOORD0;
-  float fade : TEXCOORD1;
-};
-VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float fade : TEXCOORD1) {
-  VSOut o;
-  o.pos = p.x * vp0 + p.y * vp1 + p.z * vp2 + p.w * vp3;
-  o.uv = uv;
-  o.fade = fade;
-  return o;
-}
-// Exact transcription of the Skate 3 spline pixel shaders (disassembled
-// ucode, NOT the older Skate 2 spline.fx source: EA added in-shader sqrt
-// gamma compensation). default: oC0.rgb = sqrt(rgb^2 * i.x * fade / a);
-// darken: oC0.rgb = sqrt(rgb^2 * i.y), oC0.a = sqrt(a * i.y * fade).
-// Getting this wrong is visible: a linear 1/a over-brightens the low-alpha
-// glow fringe (fuzzy, blown-out edges) and a linear darken alpha weakens the
-// backdrop dimming that makes the neon read as solid.
-float4 ps_default(VSOut i) : SV_Target {
-  float4 c = tex.Sample(smp, i.uv);
-  float3 sq = c.rgb * c.rgb * (intensity.x * i.fade / max(c.a, 1.0 / 255.0));
-  return float4(sqrt(abs(sq)), 1.0);
-}
-float4 ps_darken(VSOut i) : SV_Target {
-  float4 c = tex.Sample(smp, i.uv);
-  float3 rgb = sqrt(abs(c.rgb * c.rgb * intensity.y));
-  float a = sqrt(abs(c.a * intensity.y * i.fade));
-  return float4(rgb, a);
-}
-)";
+// Shader sources live in src/native/shaders/*.hlsl; the build embeds them
+// into this generated header (cmake/EmbedShaders.cmake) so the exe stays
+// self-contained. Same kFooSource char arrays as before.
+#include "skate3_native_shaders.h"
 
 float HalfToFloat(uint16_t h) {
   const uint32_t sign = (h & 0x8000u) << 16;
@@ -11084,12 +9357,35 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   return true;
 }
 
-bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
-  if (g_r.failed) return false;
-  ID3D12Device* device = context.d3d12.device;
-  g_r.device = device;
+// Scene vertex layout (DecodeMesh's 56-byte output): shared by the scene
+// PSO family and the shadow-caster PSO.
+constexpr D3D12_INPUT_ELEMENT_DESC kSceneInputLayout[7] = {
+    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 20,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"BLENDWEIGHT", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 28,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 32,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 36,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 48,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
 
-  if (!g_r.root_signature) {
+// ---- EnsurePipeline helpers ------------------------------------------------
+// Split from the former ~1,000-line EnsurePipeline: one resource
+// group per function, bodies unchanged. Every helper is idempotent (guarded
+// by its own g_r state) and returns false only on a failure that must abort
+// the native path (g_r.failed set where the original did).
+
+bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
+  if (g_r.root_signature) {
+    return true;
+  }
+  {
     D3D12_ROOT_PARAMETER params[10] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
@@ -11182,519 +9478,547 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       return false;
     }
   }
+  return true;
+}
 
-  if (!g_r.pso || g_r.rtv_format != context.d3d12.guest_output_format) {
-    // MSAA level: the requested count, reduced to what the output format
-    // supports (1 disables and renders directly into the guest output).
-    const int32_t req = REXCVAR_GET(skate3_native_render_scene_msaa);
-    uint32_t msaa = req >= 8 ? 8u : req >= 4 ? 4u : req >= 2 ? 2u : 1u;
-    while (msaa > 1) {
-      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{
-          context.d3d12.guest_output_format, msaa, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
-      if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-                                                &q, sizeof(q))) &&
-          q.NumQualityLevels > 0) {
-        break;
-      }
-      msaa /= 2;
+// MSAA level selection + the main scene PSO and its culling/blend/depth
+// variants (cull-back sheets, transparent, entity fade, hair 2-pass,
+// no-depth, outline mask).
+bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
+  // MSAA level: the requested count, reduced to what the output format
+  // supports (1 disables and renders directly into the guest output).
+  const int32_t req = REXCVAR_GET(skate3_native_render_scene_msaa);
+  uint32_t msaa = req >= 8 ? 8u : req >= 4 ? 4u : req >= 2 ? 2u : 1u;
+  while (msaa > 1) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{
+        context.d3d12.guest_output_format, msaa, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                              &q, sizeof(q))) &&
+        q.NumQualityLevels > 0) {
+      break;
     }
-    g_r.msaa = msaa;
-
-    ID3DBlob* vs = nullptr;
-    ID3DBlob* ps = nullptr;
-    ID3DBlob* errors = nullptr;
-    if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene", nullptr,
-                          nullptr, "vs_main", "vs_5_0", 0, 0, &vs, &errors)) ||
-        FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene", nullptr,
-                          nullptr, "ps_main", "ps_5_0", 0, 0, &ps, &errors))) {
-      REXLOG_ERROR("native-scene: shader compile failed: {}",
-                   errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-      g_r.failed = true;
-      return false;
-    }
-    D3D12_INPUT_ELEMENT_DESC input[7] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 20,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"BLENDWEIGHT", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 28,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 32,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 36,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 48,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
-    pso.pRootSignature = g_r.root_signature;
-    pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-    pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pso.SampleMask = UINT_MAX;
-    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pso.RasterizerState.DepthClipEnable = TRUE;
-    pso.DepthStencilState.DepthEnable = TRUE;
-    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    pso.InputLayout = {input, 7};
-    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.NumRenderTargets = 1;
-    pso.RTVFormats[0] = context.d3d12.guest_output_format;
-    pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    pso.SampleDesc.Count = g_r.msaa;
-    const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso));
-    // Culling variant for double-sided sheet props (banners/flags,
-    // MeshBuffers::two_sided_sheet). The sheet whose winding-derived world
-    // normal faces the camera is the one the game keeps (its lightmap cell
-    // reproduces the emulated banner exactly: albedo x lm x 2 lands within
-    // 3-8% of the F11 emulated reference on capture 1783387480); under our
-    // pipeline those triangles are D3D12 BACK faces, so cull FRONT.
-    // (CULL_BACK was tried first and kept the wrong sheet; banners rendered
-    // the sun-side lightmap cell ~2.4x brighter than emulated.)
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
-    const HRESULT hr_cb =
-        device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_cullback));
-    if (FAILED(hr_cb)) {
-      REXLOG_WARN("native-scene: cull-back PSO creation failed {:08X}", uint32_t(hr_cb));
-      g_r.pso_cullback = nullptr;  // sheets fall back to the uncull(ed) PSO
-    }
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    // Transparent variant: straight alpha blend, depth-tested, no z-write.
-    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    pso.BlendState.RenderTarget[0].BlendEnable = TRUE;
-    pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    pso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-    pso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-    pso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-    pso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-    pso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    const HRESULT hr_t =
-        device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_transparent));
-    // Entity-fade variant: z-write ON (see RendererState::pso_fade). Drawn
-    // at the head of the blended sub-pass so glass/hair still composite
-    // over the faded body.
-    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_fade)))) {
-      g_r.pso_fade = nullptr;  // fade items fall back to the z-write-off blend
-    }
-    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    // Hair passes: the game draws hair twice with the SAME shader; cull
-    // BACK then cull FRONT (cac_hair.xml passes 0/1) so far-side strands
-    // never composite over near-side ones (one uncull(ed) blended pass
-    // interleaves them per triangle order = crunchy noise). Same blend /
-    // z-write-off state as the transparent variant.
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-    if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_a)))) {
-      g_r.pso_hair_a = nullptr;
-    }
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
-    if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_b)))) {
-      g_r.pso_hair_b = nullptr;
-    }
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pso.BlendState.RenderTarget[0].BlendEnable = FALSE;
-    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pso.DepthStencilState.DepthEnable = FALSE;
-    pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
-    const HRESULT hr2 =
-        device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_nodepth));
-    // Selection-outline mask: the same scene VS/PS (the tint.a > 0 solid
-    // path renders flat 1.0) into the small single-sample R8 target. No
-    // depth: the mask is the full silhouette. The guest marking pass is
-    // depth-tested, so a partially occluded selection outlines slightly
-    // differently, acceptable for the editor UI.
-    pso.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
-    pso.SampleDesc.Count = 1;
-    const HRESULT hr_om =
-        device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_outline_mask));
-    if (FAILED(hr_om)) {
-      REXLOG_WARN("native-scene: outline mask PSO creation failed {:08X}",
-                  uint32_t(hr_om));
-      g_r.pso_outline_mask = nullptr;  // outline pass disables itself
-    }
-    pso.RTVFormats[0] = context.d3d12.guest_output_format;
-    pso.SampleDesc.Count = g_r.msaa;
-    vs->Release();
-    ps->Release();
-    if (errors) errors->Release();
-    if (FAILED(hr) || FAILED(hr2) || FAILED(hr_t)) {
-      REXLOG_ERROR("native-scene: PSO creation failed {:08X}/{:08X}/{:08X}", uint32_t(hr),
-                   uint32_t(hr2), uint32_t(hr_t));
-      g_r.failed = true;
-      return false;
-    }
-
-    if (g_r.msaa > 1) {
-      char samples[8];
-      std::snprintf(samples, sizeof(samples), "%u", g_r.msaa);
-      const D3D_SHADER_MACRO macros[] = {{"SAMPLES", samples}, {nullptr, nullptr}};
-      ID3DBlob* rvs = nullptr;
-      ID3DBlob* rps = nullptr;
-      ID3DBlob* rerrors = nullptr;
-      if (FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
-                            "native_resolve", macros, nullptr, "vs_main", "vs_5_0", 0, 0,
-                            &rvs, &rerrors)) ||
-          FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
-                            "native_resolve", macros, nullptr, "ps_main", "ps_5_0", 0, 0,
-                            &rps, &rerrors))) {
-        REXLOG_ERROR(
-            "native-scene: resolve shader compile failed: {}",
-            rerrors ? static_cast<const char*>(rerrors->GetBufferPointer()) : "?");
-        g_r.failed = true;
-        return false;
-      }
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC rp{};
-      rp.pRootSignature = g_r.root_signature;
-      rp.VS = {rvs->GetBufferPointer(), rvs->GetBufferSize()};
-      rp.PS = {rps->GetBufferPointer(), rps->GetBufferSize()};
-      rp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-      rp.SampleMask = UINT_MAX;
-      rp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-      rp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-      rp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-      rp.NumRenderTargets = 1;
-      rp.RTVFormats[0] = context.d3d12.guest_output_format;
-      rp.SampleDesc.Count = 1;
-      const HRESULT hr3 =
-          device->CreateGraphicsPipelineState(&rp, IID_PPV_ARGS(&g_r.resolve_pso));
-      rvs->Release();
-      rps->Release();
-      if (rerrors) rerrors->Release();
-      if (FAILED(hr3)) {
-        REXLOG_ERROR("native-scene: resolve PSO creation failed {:08X}", uint32_t(hr3));
-        g_r.failed = true;
-        return false;
-      }
-    }
-    {
-      // Popup background blur pipelines (blur_hBlur/vBlur port + basictex
-      // replace): fullscreen-triangle passes, no vertex buffer.
-      ID3DBlob* bvs = nullptr;
-      ID3DBlob* bps = nullptr;
-      ID3DBlob* bblit = nullptr;
-      ID3DBlob* bdown = nullptr;
-      ID3DBlob* berr = nullptr;
-      if (FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                            "native_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
-                            &bvs, &berr)) ||
-          FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                            "native_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
-                            &bps, &berr)) ||
-          FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                            "native_blur", nullptr, nullptr, "ps_blit", "ps_5_0", 0, 0,
-                            &bblit, &berr)) ||
-          FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                            "native_blur", nullptr, nullptr, "ps_down", "ps_5_0", 0, 0,
-                            &bdown, &berr))) {
-        REXLOG_ERROR("native-scene: blur shader compile failed: {}",
-                     berr ? static_cast<const char*>(berr->GetBufferPointer()) : "?");
-        g_r.failed = true;
-        return false;
-      }
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
-      bp.pRootSignature = g_r.root_signature;
-      bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
-      bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
-      bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-      bp.SampleMask = UINT_MAX;
-      bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-      bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-      bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-      bp.NumRenderTargets = 1;
-      bp.RTVFormats[0] = context.d3d12.guest_output_format;
-      bp.SampleDesc.Count = 1;
-      if (g_r.pso_blur) g_r.pso_blur->Release();
-      if (g_r.pso_blur_blit) g_r.pso_blur_blit->Release();
-      if (g_r.pso_blur_down) g_r.pso_blur_down->Release();
-      const HRESULT hb1 = device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur));
-      bp.PS = {bblit->GetBufferPointer(), bblit->GetBufferSize()};
-      const HRESULT hb2 =
-          device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_blit));
-      bp.PS = {bdown->GetBufferPointer(), bdown->GetBufferSize()};
-      const HRESULT hb3 =
-          device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_down));
-      bvs->Release();
-      bps->Release();
-      bblit->Release();
-      bdown->Release();
-      if (berr) berr->Release();
-      if (FAILED(hb1) || FAILED(hb2) || FAILED(hb3)) {
-        REXLOG_ERROR("native-scene: blur PSO creation failed {:08X}/{:08X}/{:08X}",
-                     uint32_t(hb1), uint32_t(hb2), uint32_t(hb3));
-        g_r.pso_blur = nullptr;
-        g_r.pso_blur_blit = nullptr;  // blur unavailable; everything else runs
-        g_r.pso_blur_down = nullptr;
-      }
-    }
-    {
-      // Selection-outline edge composite (postfx_edgedetectstencil port):
-      // fullscreen triangle over the resolved output, additive blend.
-      ID3DBlob* ovs = nullptr;
-      ID3DBlob* ops = nullptr;
-      ID3DBlob* oerr = nullptr;
-      if (FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
-                            "native_outline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
-                            &ovs, &oerr)) ||
-          FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
-                            "native_outline", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
-                            &ops, &oerr))) {
-        REXLOG_ERROR("native-scene: outline shader compile failed: {}",
-                     oerr ? static_cast<const char*>(oerr->GetBufferPointer()) : "?");
-        g_r.failed = true;
-        return false;
-      }
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC op{};
-      op.pRootSignature = g_r.root_signature;
-      op.VS = {ovs->GetBufferPointer(), ovs->GetBufferSize()};
-      op.PS = {ops->GetBufferPointer(), ops->GetBufferSize()};
-      op.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-      op.BlendState.RenderTarget[0].BlendEnable = TRUE;
-      op.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
-      op.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
-      op.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-      op.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
-      op.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
-      op.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-      op.SampleMask = UINT_MAX;
-      op.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-      op.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-      op.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-      op.NumRenderTargets = 1;
-      op.RTVFormats[0] = context.d3d12.guest_output_format;
-      op.SampleDesc.Count = 1;
-      if (g_r.pso_outline_edge) g_r.pso_outline_edge->Release();
-      const HRESULT ho = device->CreateGraphicsPipelineState(&op, IID_PPV_ARGS(&g_r.pso_outline_edge));
-      ovs->Release();
-      ops->Release();
-      if (oerr) oerr->Release();
-      if (FAILED(ho)) {
-        REXLOG_WARN("native-scene: outline edge PSO creation failed {:08X}", uint32_t(ho));
-        g_r.pso_outline_edge = nullptr;  // outline unavailable; everything else runs
-      }
-    }
-    {
-      // 2D overlay pipeline: standard alpha blend, no depth, drawn into the
-      // resolved guest output (sample count 1).
-      ID3DBlob* uvs = nullptr;
-      ID3DBlob* ups = nullptr;
-      ID3DBlob* uerrors = nullptr;
-      if (FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
-                            nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &uvs,
-                            &uerrors)) ||
-          FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
-                            nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &ups,
-                            &uerrors))) {
-        REXLOG_ERROR("native-scene: 2D shader compile failed: {}",
-                     uerrors ? static_cast<const char*>(uerrors->GetBufferPointer())
-                             : "?");
-        g_r.failed = true;
-        return false;
-      }
-      D3D12_INPUT_ELEMENT_DESC input2d[3] = {
-          {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
-           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-          {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
-           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-          {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24,
-           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC up{};
-      up.pRootSignature = g_r.root_signature;
-      up.VS = {uvs->GetBufferPointer(), uvs->GetBufferSize()};
-      up.PS = {ups->GetBufferPointer(), ups->GetBufferSize()};
-      auto& rt = up.BlendState.RenderTarget[0];
-      rt.BlendEnable = TRUE;
-      // Straight (non-premultiplied) alpha, verified against the decoded
-      // HUD clock art: the glass-sheen texture is white RGB at low alpha
-      // (premultiplied blending blows it out into an opaque white blob).
-      rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-      rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-      rt.BlendOp = D3D12_BLEND_OP_ADD;
-      rt.SrcBlendAlpha = D3D12_BLEND_ONE;
-      rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-      rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-      rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-      up.SampleMask = UINT_MAX;
-      up.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-      up.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-      up.InputLayout = {input2d, 3};
-      up.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-      up.NumRenderTargets = 1;
-      up.RTVFormats[0] = context.d3d12.guest_output_format;
-      up.SampleDesc.Count = 1;
-      const HRESULT hr4 = device->CreateGraphicsPipelineState(&up, IID_PPV_ARGS(&g_r.pso_2d));
-      uvs->Release();
-      ups->Release();
-      if (uerrors) uerrors->Release();
-      if (FAILED(hr4)) {
-        REXLOG_ERROR("native-scene: 2D PSO creation failed {:08X}", uint32_t(hr4));
-        g_r.failed = true;
-        return false;
-      }
-    }
-    {
-      // In-world spline pipelines: drawn inside the scene pass (MSAA sample
-      // count, depth test LESS_EQUAL, no z-write) with the game's own blend
-      // states (spline.xml): darken = straight alpha, default = additive.
-      ID3DBlob* svs = nullptr;
-      ID3DBlob* spd = nullptr;
-      ID3DBlob* spk = nullptr;
-      ID3DBlob* serrors = nullptr;
-      if (FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
-                            "native_spline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
-                            &svs, &serrors)) ||
-          FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
-                            "native_spline", nullptr, nullptr, "ps_default", "ps_5_0", 0,
-                            0, &spd, &serrors)) ||
-          FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
-                            "native_spline", nullptr, nullptr, "ps_darken", "ps_5_0", 0,
-                            0, &spk, &serrors))) {
-        REXLOG_ERROR("native-scene: spline shader compile failed: {}",
-                     serrors ? static_cast<const char*>(serrors->GetBufferPointer())
-                             : "?");
-        g_r.failed = true;
-        return false;
-      }
-      D3D12_INPUT_ELEMENT_DESC input_spline[3] = {
-          {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
-           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-          {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
-           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-          {"TEXCOORD", 1, DXGI_FORMAT_R32_FLOAT, 0, 24,
-           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC sp{};
-      sp.pRootSignature = g_r.root_signature;
-      sp.VS = {svs->GetBufferPointer(), svs->GetBufferSize()};
-      sp.SampleMask = UINT_MAX;
-      sp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-      sp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-      sp.RasterizerState.DepthClipEnable = TRUE;
-      sp.DepthStencilState.DepthEnable = TRUE;
-      sp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-      sp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-      sp.InputLayout = {input_spline, 3};
-      sp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-      sp.NumRenderTargets = 1;
-      sp.RTVFormats[0] = context.d3d12.guest_output_format;
-      sp.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-      sp.SampleDesc.Count = g_r.msaa;
-      auto& srt = sp.BlendState.RenderTarget[0];
-      srt.BlendEnable = TRUE;
-      srt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-      srt.BlendOp = D3D12_BLEND_OP_ADD;
-      srt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-      // darken pass: straight alpha.
-      sp.PS = {spk->GetBufferPointer(), spk->GetBufferSize()};
-      srt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-      srt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-      srt.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
-      srt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-      const HRESULT hr5 =
-          device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_darken));
-      // default pass: additive glow.
-      sp.PS = {spd->GetBufferPointer(), spd->GetBufferSize()};
-      srt.SrcBlend = D3D12_BLEND_ONE;
-      srt.DestBlend = D3D12_BLEND_ONE;
-      srt.SrcBlendAlpha = D3D12_BLEND_ONE;
-      srt.DestBlendAlpha = D3D12_BLEND_ONE;
-      const HRESULT hr6 =
-          device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_default));
-      svs->Release();
-      spd->Release();
-      spk->Release();
-      if (serrors) serrors->Release();
-      if (FAILED(hr5) || FAILED(hr6)) {
-        REXLOG_ERROR("native-scene: spline PSO creation failed {:08X}/{:08X}",
-                     uint32_t(hr5), uint32_t(hr6));
-        g_r.failed = true;
-        return false;
-      }
-    }
-    {
-      // Dynamic-shadow pipelines: casters (scene VS with a light-space
-      // "view-proj", MIN-blend depth/uncoverage accumulation, no depth
-      // buffer, depth clip OFF so casters outside the 12 m height window
-      // clamp like the game accepts) + the per-tile blur/convert pass.
-      ID3DBlob* cvs = nullptr;
-      ID3DBlob* cps = nullptr;
-      ID3DBlob* bvs = nullptr;
-      ID3DBlob* bps = nullptr;
-      ID3DBlob* werrors = nullptr;
-      if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
-                            nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &cvs, &werrors)) ||
-          FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
-                            nullptr, nullptr, "ps_shadow_caster", "ps_5_0", 0, 0, &cps,
-                            &werrors)) ||
-          FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
-                            "native_shadow_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0,
-                            0, &bvs, &werrors)) ||
-          FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
-                            "native_shadow_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0,
-                            0, &bps, &werrors))) {
-        REXLOG_ERROR("native-scene: shadow shader compile failed: {}",
-                     werrors ? static_cast<const char*>(werrors->GetBufferPointer())
-                             : "?");
-        g_r.failed = true;
-        return false;
-      }
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC cp{};
-      cp.pRootSignature = g_r.root_signature;
-      cp.VS = {cvs->GetBufferPointer(), cvs->GetBufferSize()};
-      cp.PS = {cps->GetBufferPointer(), cps->GetBufferSize()};
-      auto& crt = cp.BlendState.RenderTarget[0];
-      crt.BlendEnable = TRUE;
-      crt.SrcBlend = D3D12_BLEND_ONE;
-      crt.DestBlend = D3D12_BLEND_ONE;
-      crt.BlendOp = D3D12_BLEND_OP_MIN;
-      crt.SrcBlendAlpha = D3D12_BLEND_ONE;
-      crt.DestBlendAlpha = D3D12_BLEND_ONE;
-      crt.BlendOpAlpha = D3D12_BLEND_OP_MIN;
-      crt.RenderTargetWriteMask =
-          D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
-      cp.SampleMask = UINT_MAX;
-      cp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-      cp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-      cp.RasterizerState.DepthClipEnable = FALSE;
-      cp.InputLayout = {input, 7};
-      cp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-      cp.NumRenderTargets = 1;
-      cp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
-      cp.SampleDesc.Count = 1;
-      const HRESULT hr7 =
-          device->CreateGraphicsPipelineState(&cp, IID_PPV_ARGS(&g_r.pso_shadow_caster));
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
-      bp.pRootSignature = g_r.root_signature;
-      bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
-      bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
-      bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-      bp.SampleMask = UINT_MAX;
-      bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-      bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-      bp.RasterizerState.DepthClipEnable = TRUE;
-      bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-      bp.NumRenderTargets = 1;
-      bp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
-      bp.SampleDesc.Count = 1;
-      const HRESULT hr8 =
-          device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_shadow_blur));
-      cvs->Release();
-      cps->Release();
-      bvs->Release();
-      bps->Release();
-      if (werrors) werrors->Release();
-      if (FAILED(hr7) || FAILED(hr8)) {
-        REXLOG_ERROR("native-scene: shadow PSO creation failed {:08X}/{:08X}",
-                     uint32_t(hr7), uint32_t(hr8));
-        g_r.failed = true;
-        return false;
-      }
-    }
-    REXLOG_INFO("native-scene: pipelines created (MSAA x{})", g_r.msaa);
-    g_r.rtv_format = context.d3d12.guest_output_format;
+    msaa /= 2;
   }
+  g_r.msaa = msaa;
 
+  ID3DBlob* vs = nullptr;
+  ID3DBlob* ps = nullptr;
+  ID3DBlob* errors = nullptr;
+  if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene", nullptr,
+                        nullptr, "vs_main", "vs_5_0", 0, 0, &vs, &errors)) ||
+      FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene", nullptr,
+                        nullptr, "ps_main", "ps_5_0", 0, 0, &ps, &errors))) {
+    REXLOG_ERROR("native-scene: shader compile failed: {}",
+                 errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+    g_r.failed = true;
+    return false;
+  }
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+  pso.pRootSignature = g_r.root_signature;
+  pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+  pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+  pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pso.SampleMask = UINT_MAX;
+  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso.RasterizerState.DepthClipEnable = TRUE;
+  pso.DepthStencilState.DepthEnable = TRUE;
+  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+  pso.InputLayout = {kSceneInputLayout, 7};
+  pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso.NumRenderTargets = 1;
+  pso.RTVFormats[0] = context.d3d12.guest_output_format;
+  pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+  pso.SampleDesc.Count = g_r.msaa;
+  const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso));
+  // Culling variant for double-sided sheet props (banners/flags,
+  // MeshBuffers::two_sided_sheet). The sheet whose winding-derived world
+  // normal faces the camera is the one the game keeps (its lightmap cell
+  // reproduces the emulated banner exactly: albedo x lm x 2 lands within
+  // 3-8% of the F11 emulated reference on capture 1783387480); under our
+  // pipeline those triangles are D3D12 BACK faces, so cull FRONT.
+  // (CULL_BACK was tried first and kept the wrong sheet; banners rendered
+  // the sun-side lightmap cell ~2.4x brighter than emulated.)
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+  const HRESULT hr_cb =
+      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_cullback));
+  if (FAILED(hr_cb)) {
+    REXLOG_WARN("native-scene: cull-back PSO creation failed {:08X}", uint32_t(hr_cb));
+    g_r.pso_cullback = nullptr;  // sheets fall back to the uncull(ed) PSO
+  }
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  // Transparent variant: straight alpha blend, depth-tested, no z-write.
+  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+  pso.BlendState.RenderTarget[0].BlendEnable = TRUE;
+  pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+  pso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+  pso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+  pso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+  pso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+  pso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  const HRESULT hr_t =
+      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_transparent));
+  // Entity-fade variant: z-write ON (see RendererState::pso_fade). Drawn
+  // at the head of the blended sub-pass so glass/hair still composite
+  // over the faded body.
+  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_fade)))) {
+    g_r.pso_fade = nullptr;  // fade items fall back to the z-write-off blend
+  }
+  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+  // Hair passes: the game draws hair twice with the SAME shader; cull
+  // BACK then cull FRONT (cac_hair.xml passes 0/1) so far-side strands
+  // never composite over near-side ones (one uncull(ed) blended pass
+  // interleaves them per triangle order = crunchy noise). Same blend /
+  // z-write-off state as the transparent variant.
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+  if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_a)))) {
+    g_r.pso_hair_a = nullptr;
+  }
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+  if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_b)))) {
+    g_r.pso_hair_b = nullptr;
+  }
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso.BlendState.RenderTarget[0].BlendEnable = FALSE;
+  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  pso.DepthStencilState.DepthEnable = FALSE;
+  pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+  const HRESULT hr2 =
+      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_nodepth));
+  // Selection-outline mask: the same scene VS/PS (the tint.a > 0 solid
+  // path renders flat 1.0) into the small single-sample R8 target. No
+  // depth: the mask is the full silhouette. The guest marking pass is
+  // depth-tested, so a partially occluded selection outlines slightly
+  // differently, acceptable for the editor UI.
+  pso.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+  pso.SampleDesc.Count = 1;
+  const HRESULT hr_om =
+      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_outline_mask));
+  if (FAILED(hr_om)) {
+    REXLOG_WARN("native-scene: outline mask PSO creation failed {:08X}",
+                uint32_t(hr_om));
+    g_r.pso_outline_mask = nullptr;  // outline pass disables itself
+  }
+  pso.RTVFormats[0] = context.d3d12.guest_output_format;
+  pso.SampleDesc.Count = g_r.msaa;
+  vs->Release();
+  ps->Release();
+  if (errors) errors->Release();
+  if (FAILED(hr) || FAILED(hr2) || FAILED(hr_t)) {
+    REXLOG_ERROR("native-scene: PSO creation failed {:08X}/{:08X}/{:08X}", uint32_t(hr),
+                 uint32_t(hr2), uint32_t(hr_t));
+    g_r.failed = true;
+    return false;
+  }
+  return true;
+}
+
+// Fullscreen MSAA resolve PSO (no-op below MSAA 2x).
+bool EnsureResolvePso(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
+  if (g_r.msaa > 1) {
+    char samples[8];
+    std::snprintf(samples, sizeof(samples), "%u", g_r.msaa);
+    const D3D_SHADER_MACRO macros[] = {{"SAMPLES", samples}, {nullptr, nullptr}};
+    ID3DBlob* rvs = nullptr;
+    ID3DBlob* rps = nullptr;
+    ID3DBlob* rerrors = nullptr;
+    if (FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
+                          "native_resolve", macros, nullptr, "vs_main", "vs_5_0", 0, 0,
+                          &rvs, &rerrors)) ||
+        FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
+                          "native_resolve", macros, nullptr, "ps_main", "ps_5_0", 0, 0,
+                          &rps, &rerrors))) {
+      REXLOG_ERROR(
+          "native-scene: resolve shader compile failed: {}",
+          rerrors ? static_cast<const char*>(rerrors->GetBufferPointer()) : "?");
+      g_r.failed = true;
+      return false;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC rp{};
+    rp.pRootSignature = g_r.root_signature;
+    rp.VS = {rvs->GetBufferPointer(), rvs->GetBufferSize()};
+    rp.PS = {rps->GetBufferPointer(), rps->GetBufferSize()};
+    rp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    rp.SampleMask = UINT_MAX;
+    rp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    rp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    rp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    rp.NumRenderTargets = 1;
+    rp.RTVFormats[0] = context.d3d12.guest_output_format;
+    rp.SampleDesc.Count = 1;
+    const HRESULT hr3 =
+        device->CreateGraphicsPipelineState(&rp, IID_PPV_ARGS(&g_r.resolve_pso));
+    rvs->Release();
+    rps->Release();
+    if (rerrors) rerrors->Release();
+    if (FAILED(hr3)) {
+      REXLOG_ERROR("native-scene: resolve PSO creation failed {:08X}", uint32_t(hr3));
+      g_r.failed = true;
+      return false;
+    }
+  }
+  return true;
+}
+
+// Popup background blur pipelines; PSO-create failure only disables blur.
+bool EnsureBlurPsos(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
+  {
+    // Popup background blur pipelines (blur_hBlur/vBlur port + basictex
+    // replace): fullscreen-triangle passes, no vertex buffer.
+    ID3DBlob* bvs = nullptr;
+    ID3DBlob* bps = nullptr;
+    ID3DBlob* bblit = nullptr;
+    ID3DBlob* bdown = nullptr;
+    ID3DBlob* berr = nullptr;
+    if (FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                          "native_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
+                          &bvs, &berr)) ||
+        FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                          "native_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
+                          &bps, &berr)) ||
+        FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                          "native_blur", nullptr, nullptr, "ps_blit", "ps_5_0", 0, 0,
+                          &bblit, &berr)) ||
+        FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
+                          "native_blur", nullptr, nullptr, "ps_down", "ps_5_0", 0, 0,
+                          &bdown, &berr))) {
+      REXLOG_ERROR("native-scene: blur shader compile failed: {}",
+                   berr ? static_cast<const char*>(berr->GetBufferPointer()) : "?");
+      g_r.failed = true;
+      return false;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
+    bp.pRootSignature = g_r.root_signature;
+    bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
+    bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
+    bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    bp.SampleMask = UINT_MAX;
+    bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    bp.NumRenderTargets = 1;
+    bp.RTVFormats[0] = context.d3d12.guest_output_format;
+    bp.SampleDesc.Count = 1;
+    if (g_r.pso_blur) g_r.pso_blur->Release();
+    if (g_r.pso_blur_blit) g_r.pso_blur_blit->Release();
+    if (g_r.pso_blur_down) g_r.pso_blur_down->Release();
+    const HRESULT hb1 = device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur));
+    bp.PS = {bblit->GetBufferPointer(), bblit->GetBufferSize()};
+    const HRESULT hb2 =
+        device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_blit));
+    bp.PS = {bdown->GetBufferPointer(), bdown->GetBufferSize()};
+    const HRESULT hb3 =
+        device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_down));
+    bvs->Release();
+    bps->Release();
+    bblit->Release();
+    bdown->Release();
+    if (berr) berr->Release();
+    if (FAILED(hb1) || FAILED(hb2) || FAILED(hb3)) {
+      REXLOG_ERROR("native-scene: blur PSO creation failed {:08X}/{:08X}/{:08X}",
+                   uint32_t(hb1), uint32_t(hb2), uint32_t(hb3));
+      g_r.pso_blur = nullptr;
+      g_r.pso_blur_blit = nullptr;  // blur unavailable; everything else runs
+      g_r.pso_blur_down = nullptr;
+    }
+  }
+  return true;
+}
+
+// Selection-outline edge composite PSO; create failure disables outline.
+bool EnsureOutlineEdgePso(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
+  {
+    // Selection-outline edge composite (postfx_edgedetectstencil port):
+    // fullscreen triangle over the resolved output, additive blend.
+    ID3DBlob* ovs = nullptr;
+    ID3DBlob* ops = nullptr;
+    ID3DBlob* oerr = nullptr;
+    if (FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
+                          "native_outline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
+                          &ovs, &oerr)) ||
+        FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
+                          "native_outline", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
+                          &ops, &oerr))) {
+      REXLOG_ERROR("native-scene: outline shader compile failed: {}",
+                   oerr ? static_cast<const char*>(oerr->GetBufferPointer()) : "?");
+      g_r.failed = true;
+      return false;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC op{};
+    op.pRootSignature = g_r.root_signature;
+    op.VS = {ovs->GetBufferPointer(), ovs->GetBufferSize()};
+    op.PS = {ops->GetBufferPointer(), ops->GetBufferSize()};
+    op.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    op.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    op.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    op.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+    op.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    op.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
+    op.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+    op.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    op.SampleMask = UINT_MAX;
+    op.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    op.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    op.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    op.NumRenderTargets = 1;
+    op.RTVFormats[0] = context.d3d12.guest_output_format;
+    op.SampleDesc.Count = 1;
+    if (g_r.pso_outline_edge) g_r.pso_outline_edge->Release();
+    const HRESULT ho = device->CreateGraphicsPipelineState(&op, IID_PPV_ARGS(&g_r.pso_outline_edge));
+    ovs->Release();
+    ops->Release();
+    if (oerr) oerr->Release();
+    if (FAILED(ho)) {
+      REXLOG_WARN("native-scene: outline edge PSO creation failed {:08X}", uint32_t(ho));
+      g_r.pso_outline_edge = nullptr;  // outline unavailable; everything else runs
+    }
+  }
+  return true;
+}
+
+// 2D overlay pipeline.
+bool Ensure2dPso(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
+  {
+    // 2D overlay pipeline: standard alpha blend, no depth, drawn into the
+    // resolved guest output (sample count 1).
+    ID3DBlob* uvs = nullptr;
+    ID3DBlob* ups = nullptr;
+    ID3DBlob* uerrors = nullptr;
+    if (FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
+                          nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &uvs,
+                          &uerrors)) ||
+        FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
+                          nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &ups,
+                          &uerrors))) {
+      REXLOG_ERROR("native-scene: 2D shader compile failed: {}",
+                   uerrors ? static_cast<const char*>(uerrors->GetBufferPointer())
+                           : "?");
+      g_r.failed = true;
+      return false;
+    }
+    D3D12_INPUT_ELEMENT_DESC input2d[3] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC up{};
+    up.pRootSignature = g_r.root_signature;
+    up.VS = {uvs->GetBufferPointer(), uvs->GetBufferSize()};
+    up.PS = {ups->GetBufferPointer(), ups->GetBufferSize()};
+    auto& rt = up.BlendState.RenderTarget[0];
+    rt.BlendEnable = TRUE;
+    // Straight (non-premultiplied) alpha, verified against the decoded
+    // HUD clock art: the glass-sheen texture is white RGB at low alpha
+    // (premultiplied blending blows it out into an opaque white blob).
+    rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    rt.BlendOp = D3D12_BLEND_OP_ADD;
+    rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+    rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    up.SampleMask = UINT_MAX;
+    up.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    up.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    up.InputLayout = {input2d, 3};
+    up.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    up.NumRenderTargets = 1;
+    up.RTVFormats[0] = context.d3d12.guest_output_format;
+    up.SampleDesc.Count = 1;
+    const HRESULT hr4 = device->CreateGraphicsPipelineState(&up, IID_PPV_ARGS(&g_r.pso_2d));
+    uvs->Release();
+    ups->Release();
+    if (uerrors) uerrors->Release();
+    if (FAILED(hr4)) {
+      REXLOG_ERROR("native-scene: 2D PSO creation failed {:08X}", uint32_t(hr4));
+      g_r.failed = true;
+      return false;
+    }
+  }
+  return true;
+}
+
+// In-world spline pipelines (darken + additive default).
+bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
+  {
+    // In-world spline pipelines: drawn inside the scene pass (MSAA sample
+    // count, depth test LESS_EQUAL, no z-write) with the game's own blend
+    // states (spline.xml): darken = straight alpha, default = additive.
+    ID3DBlob* svs = nullptr;
+    ID3DBlob* spd = nullptr;
+    ID3DBlob* spk = nullptr;
+    ID3DBlob* serrors = nullptr;
+    if (FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
+                          "native_spline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
+                          &svs, &serrors)) ||
+        FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
+                          "native_spline", nullptr, nullptr, "ps_default", "ps_5_0", 0,
+                          0, &spd, &serrors)) ||
+        FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
+                          "native_spline", nullptr, nullptr, "ps_darken", "ps_5_0", 0,
+                          0, &spk, &serrors))) {
+      REXLOG_ERROR("native-scene: spline shader compile failed: {}",
+                   serrors ? static_cast<const char*>(serrors->GetBufferPointer())
+                           : "?");
+      g_r.failed = true;
+      return false;
+    }
+    D3D12_INPUT_ELEMENT_DESC input_spline[3] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 1, DXGI_FORMAT_R32_FLOAT, 0, 24,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC sp{};
+    sp.pRootSignature = g_r.root_signature;
+    sp.VS = {svs->GetBufferPointer(), svs->GetBufferSize()};
+    sp.SampleMask = UINT_MAX;
+    sp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    sp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    sp.RasterizerState.DepthClipEnable = TRUE;
+    sp.DepthStencilState.DepthEnable = TRUE;
+    sp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    sp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    sp.InputLayout = {input_spline, 3};
+    sp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    sp.NumRenderTargets = 1;
+    sp.RTVFormats[0] = context.d3d12.guest_output_format;
+    sp.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    sp.SampleDesc.Count = g_r.msaa;
+    auto& srt = sp.BlendState.RenderTarget[0];
+    srt.BlendEnable = TRUE;
+    srt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    srt.BlendOp = D3D12_BLEND_OP_ADD;
+    srt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    // darken pass: straight alpha.
+    sp.PS = {spk->GetBufferPointer(), spk->GetBufferSize()};
+    srt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    srt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    srt.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
+    srt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    const HRESULT hr5 =
+        device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_darken));
+    // default pass: additive glow.
+    sp.PS = {spd->GetBufferPointer(), spd->GetBufferSize()};
+    srt.SrcBlend = D3D12_BLEND_ONE;
+    srt.DestBlend = D3D12_BLEND_ONE;
+    srt.SrcBlendAlpha = D3D12_BLEND_ONE;
+    srt.DestBlendAlpha = D3D12_BLEND_ONE;
+    const HRESULT hr6 =
+        device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_default));
+    svs->Release();
+    spd->Release();
+    spk->Release();
+    if (serrors) serrors->Release();
+    if (FAILED(hr5) || FAILED(hr6)) {
+      REXLOG_ERROR("native-scene: spline PSO creation failed {:08X}/{:08X}",
+                   uint32_t(hr5), uint32_t(hr6));
+      g_r.failed = true;
+      return false;
+    }
+  }
+  return true;
+}
+
+// Dynamic-shadow caster + per-tile blur/convert PSOs.
+bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
+  {
+    // Dynamic-shadow pipelines: casters (scene VS with a light-space
+    // "view-proj", MIN-blend depth/uncoverage accumulation, no depth
+    // buffer, depth clip OFF so casters outside the 12 m height window
+    // clamp like the game accepts) + the per-tile blur/convert pass.
+    ID3DBlob* cvs = nullptr;
+    ID3DBlob* cps = nullptr;
+    ID3DBlob* bvs = nullptr;
+    ID3DBlob* bps = nullptr;
+    ID3DBlob* werrors = nullptr;
+    if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
+                          nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &cvs, &werrors)) ||
+        FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
+                          nullptr, nullptr, "ps_shadow_caster", "ps_5_0", 0, 0, &cps,
+                          &werrors)) ||
+        FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
+                          "native_shadow_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0,
+                          0, &bvs, &werrors)) ||
+        FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
+                          "native_shadow_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0,
+                          0, &bps, &werrors))) {
+      REXLOG_ERROR("native-scene: shadow shader compile failed: {}",
+                   werrors ? static_cast<const char*>(werrors->GetBufferPointer())
+                           : "?");
+      g_r.failed = true;
+      return false;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC cp{};
+    cp.pRootSignature = g_r.root_signature;
+    cp.VS = {cvs->GetBufferPointer(), cvs->GetBufferSize()};
+    cp.PS = {cps->GetBufferPointer(), cps->GetBufferSize()};
+    auto& crt = cp.BlendState.RenderTarget[0];
+    crt.BlendEnable = TRUE;
+    crt.SrcBlend = D3D12_BLEND_ONE;
+    crt.DestBlend = D3D12_BLEND_ONE;
+    crt.BlendOp = D3D12_BLEND_OP_MIN;
+    crt.SrcBlendAlpha = D3D12_BLEND_ONE;
+    crt.DestBlendAlpha = D3D12_BLEND_ONE;
+    crt.BlendOpAlpha = D3D12_BLEND_OP_MIN;
+    crt.RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+    cp.SampleMask = UINT_MAX;
+    cp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    cp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    cp.RasterizerState.DepthClipEnable = FALSE;
+    cp.InputLayout = {kSceneInputLayout, 7};
+    cp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    cp.NumRenderTargets = 1;
+    cp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
+    cp.SampleDesc.Count = 1;
+    const HRESULT hr7 =
+        device->CreateGraphicsPipelineState(&cp, IID_PPV_ARGS(&g_r.pso_shadow_caster));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
+    bp.pRootSignature = g_r.root_signature;
+    bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
+    bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
+    bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    bp.SampleMask = UINT_MAX;
+    bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    bp.RasterizerState.DepthClipEnable = TRUE;
+    bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    bp.NumRenderTargets = 1;
+    bp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
+    bp.SampleDesc.Count = 1;
+    const HRESULT hr8 =
+        device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_shadow_blur));
+    cvs->Release();
+    cps->Release();
+    bvs->Release();
+    bps->Release();
+    if (werrors) werrors->Release();
+    if (FAILED(hr7) || FAILED(hr8)) {
+      REXLOG_ERROR("native-scene: shadow PSO creation failed {:08X}/{:08X}",
+                   uint32_t(hr7), uint32_t(hr8));
+      g_r.failed = true;
+      return false;
+    }
+  }
+  return true;
+}
+
+// Descriptor heaps (RTV/DSV/SRV) + the bone and 2D-vertex upload rings.
+bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
   if (!g_r.rtv_heap) {
     // Slots 0/1 = guest output / MSAA color; 2+ = APT render-to-texture
     // targets.
@@ -11742,7 +10066,12 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       return false;
     }
   }
+  return true;
+}
 
+// Shadow atlas targets + the always-bound b1 receiver constant buffer.
+bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
   if (!g_r.shadow_raw && REXCVAR_GET(skate3_native_render_scene_shadows)) {
     // Dynamic-shadow atlas chain: raw casters -> hblur intermediate ->
     // blurred final (the texture the scene pass samples). Three fixed-size
@@ -11805,7 +10134,13 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       return false;
     }
   }
+  return true;
+}
 
+// Blur intermediates + the output-sized selection-outline mask. Failures
+// only disable their feature, never abort the native path.
+bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
   if (g_r.blur_tex[0] == nullptr && g_r.pso_blur != nullptr) {
     // Popup background blur intermediates at the game's fixed 1152x640
     // internal resolution (the bilinear stretch back to the output is what
@@ -11907,7 +10242,12 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       device->CreateShaderResourceView(g_r.outline_mask, &srv, slot);
     }
   }
+  return true;
+}
 
+// 1x1 white diffuse fallback + 1x1x6 mid-gray environment-cube fallback.
+bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
   if (!g_r.white.valid) {
     // 1x1 white fallback for items without a resolved diffuse texture.
     D3D12_HEAP_PROPERTIES heap_props{};
@@ -12025,7 +10365,12 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     device->CreateShaderResourceView(g_r.white_cube.texture, &srv, slot);
     g_r.white_cube.valid = true;
   }
+  return true;
+}
 
+// Depth buffer + MSAA color target, rebuilt on output-size change.
+bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
+  ID3D12Device* device = context.d3d12.device;
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
   if (!g_r.depth || g_r.depth_width != width || g_r.depth_height != height) {
@@ -12097,6 +10442,36 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       slot.ptr += size_t(g_r.msaa_srv_slot) * g_r.srv_size;
       device->CreateShaderResourceView(g_r.msaa_color, &srv, slot);
     }
+  }
+  return true;
+}
+
+bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
+  if (g_r.failed) return false;
+  ID3D12Device* device = context.d3d12.device;
+  g_r.device = device;
+
+  if (!EnsureRootSignature(context)) {
+    return false;
+  }
+
+  if (!g_r.pso || g_r.rtv_format != context.d3d12.guest_output_format) {
+    if (!EnsureScenePsoFamily(context) || !EnsureResolvePso(context) ||
+        !EnsureBlurPsos(context) || !EnsureOutlineEdgePso(context) ||
+        !Ensure2dPso(context) || !EnsureSplinePsos(context) ||
+        !EnsureShadowPsos(context)) {
+      return false;
+    }
+    REXLOG_INFO("native-scene: pipelines created (MSAA x{})", g_r.msaa);
+    g_r.rtv_format = context.d3d12.guest_output_format;
+  }
+
+  if (!EnsureHeapsAndRings(context) || !EnsureShadowResources(context)) {
+    return false;
+  }
+  EnsureBlurOutlineTargets(context);
+  if (!EnsureFallbackTextures(context) || !EnsureOutputSizedTargets(context)) {
+    return false;
   }
 
   if (g_r.rtv_resource != context.d3d12.guest_output_resource) {
@@ -12872,84 +11247,77 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           .count()));
 }
 
-bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
-  if (!SceneEnabled() || context.backend != NativeGuestOutputBackend::kD3D12) {
-    return false;
-  }
-  // While the game reports menus / pause / loading (presence context 0x8001
-  // == 0), yield to the emulated output: the native scene neither renders
-  // the 2D UI (the pause menu was invisible) nor the menu's world backdrop
-  // materials (everything drew untextured white). The emulated frame is
-  // complete and correct there; native rendering resumes on unpause.
-  {
-    static bool s_in_menus = false;
-    const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
-    if (in_menus != s_in_menus) {
-      s_in_menus = in_menus;
-      if (in_menus) {
-        REXLOG_INFO(
-            "native-scene: menus/pause/loading - yielding to emulated output "
-            "(presence context)");
-        // Arena addresses are reused across map loads; let the next load's
-        // registrations re-queue meshes (and re-stage textures) at reused
-        // addresses, and drop the cached item cores built from them.
-        ClearItemCache();
-        // Off-screen retention holds guest-address-keyed copies too.
-        g_retained_clear.store(true, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-        g_prewarm_seen.clear();
-        g_prewarm_tex_seen.clear();
-      } else {
-        size_t queued = 0;
-        {
-          std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-          queued = g_prewarm_queue.size();
-        }
-        REXLOG_INFO(
-            "native-scene: gameplay (prewarm: {} meshes decoded, {} dropped, {} still "
-            "queued)",
-            g_prewarm_done.load(std::memory_order_relaxed),
-            g_prewarm_dropped.load(std::memory_order_relaxed), queued);
-      }
-    }
+// Menus / pause / loading yield gate (see the comment at the call site):
+// returns true when RenderScene must yield this frame to the emulated
+// output. Handles the cache clears on entry and the takeover re-arm +
+// loading-screen pipeline build / prewarm commit while yielded.
+bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
+  static bool s_in_menus = false;
+  const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
+  if (in_menus != s_in_menus) {
+    s_in_menus = in_menus;
     if (in_menus) {
-      // Re-arm the takeover gate for the next stretch of gameplay (map
-      // load, unpause).
-      g_warmup_armed.store(true, std::memory_order_relaxed);
+      REXLOG_INFO(
+          "native-scene: menus/pause/loading - yielding to emulated output "
+          "(presence context)");
+      // Arena addresses are reused across map loads: let the next load's
+      // registrations re-queue meshes (and re-stage textures) at reused
+      // addresses, and drop the cached item cores built from them.
+      ClearItemCache();
+      // Off-screen retention holds guest-address-keyed copies too.
+      g_retained_clear.store(true, std::memory_order_relaxed);
+      std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+      g_prewarm_seen.clear();
+      g_prewarm_tex_seen.clear();
+    } else {
+      size_t queued = 0;
       {
-        // Freshness gate: only scenes published AFTER this point qualify;
-        // g_scene still holds the previous map's last scene all through the
-        // loading screen (BuildFrameScene stops publishing without a
-        // perspective view).
-        std::lock_guard<std::mutex> lock(g_scene_mutex);
-        g_warmup_fresh_generation = (g_scene ? g_scene->generation : 0) + 1;
+        std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+        queued = g_prewarm_queue.size();
       }
-      // Build the pipelines / render targets behind the loading screen so
-      // the one-time PSO compilation (~200 ms) never lands on a gameplay
-      // frame.
-      if (!g_r.failed && g_r.pso == nullptr) {
-        EnsurePipeline(context);
-      }
-      // THE loading-screen heavy lifting runs on the prewarm decode WORKER
-      // POOL (a serial render-thread drain both tanked the loading spinner
-      // to ~13 fps and still left 1500 of a map's ~2600 meshes undecoded at
-      // takeover; map-change loads register most of the world in their
-      // final seconds and drop the guest to 10-25 fps while doing it).
-      // Here the render thread only commits finished results: record the
-      // GPU copies, create SRVs, insert into the caches.
-      if (REXCVAR_GET(skate3_native_render_scene_prewarm_budget_ms) > 0 &&
-          !g_r.failed && g_r.pso != nullptr) {
-        EnsurePrewarmWorkers();
-        PrewarmCommit(context, g_frames_rendered.load(std::memory_order_relaxed),
-                      /*loading=*/true);
-      }
-      return false;
+      REXLOG_INFO(
+          "native-scene: gameplay (prewarm: {} meshes decoded, {} dropped, {} still "
+          "queued)",
+          g_prewarm_done.load(std::memory_order_relaxed),
+          g_prewarm_dropped.load(std::memory_order_relaxed), queued);
     }
   }
-  uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
-  if (base == nullptr) {
-    return false;
+  if (in_menus) {
+    // Re-arm the takeover gate for the next stretch of gameplay (map
+    // load, unpause).
+    g_warmup_armed.store(true, std::memory_order_relaxed);
+    {
+      // Freshness gate: only scenes published AFTER this point qualify;
+      // g_scene still holds the previous map's last scene all through the
+      // loading screen (BuildFrameScene stops publishing without a
+      // perspective view).
+      std::lock_guard<std::mutex> lock(g_scene_mutex);
+      g_warmup_fresh_generation = (g_scene ? g_scene->generation : 0) + 1;
+    }
+    // Build the pipelines / render targets behind the loading screen so
+    // the one-time PSO compilation (~200 ms) never lands on a gameplay
+    // frame.
+    if (!g_r.failed && g_r.pso == nullptr) {
+      EnsurePipeline(context);
+    }
+    // THE loading-screen heavy lifting runs on the prewarm decode WORKER
+    // POOL (a serial render-thread drain both tanked the loading spinner
+    // to ~13 fps and still left 1500 of a map's ~2600 meshes undecoded at
+    // takeover; map-change loads register most of the world in their
+    // final seconds and drop the guest to 10-25 fps while doing it).
+    // Here the render thread only commits finished results: record the
+    // GPU copies, create SRVs, insert into the caches.
+    if (REXCVAR_GET(skate3_native_render_scene_prewarm_budget_ms) > 0 &&
+        !g_r.failed && g_r.pso != nullptr) {
+      EnsurePrewarmWorkers();
+      PrewarmCommit(context, g_frames_rendered.load(std::memory_order_relaxed),
+                    /*loading=*/true);
+    }
+    return true;
   }
+  return false;
+}
+
   // Photo-mission photo editor (the "Pick a photo" screen with the depth of
   // field / saturation / brightness / contrast controls; FE screen class
   // PhotoSelect, challenge/photoselect.swf): the editor's effects ARE the
@@ -12971,78 +11339,58 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // photo-editor capture shows a non-(-1) second field. The
   // PhotoReplayController heartbeat (sub_825623F0 hook) is kept as a
   // secondary signal for photo flows that bypass the photographer NIS.
-  if (REXCVAR_GET(skate3_native_render_scene_photo_yield)) {
-    static bool s_in_photo_editor = false;
-    const char* signal = nullptr;
-    {
-      constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
-      uint32_t mgr = 0, beg = 0, end = 0;
-      if (GuestTryLoadU32(base, kFrontEndManagerPtr, &mgr) && mgr != 0 &&
-          GuestTryLoadU32(base, mgr + 0x210, &beg) &&
-          GuestTryLoadU32(base, mgr + 0x214, &end) && beg < end &&
-          end - beg <= 20 * 16) {
-        const uint32_t n = (end - beg) / 20;
-        for (uint32_t i = 0; i < n && signal == nullptr; ++i) {
-          uint32_t f0 = 0, f1 = 0;
-          if (GuestTryLoadU32(base, beg + i * 20, &f0) &&
-              GuestTryLoadU32(base, beg + i * 20 + 4, &f1) && f0 == 1 && f1 == 11) {
-            signal = "FE PhotoSelect push-state";
-          }
+bool YieldForPhotoEditor(uint8_t* base) {
+  if (!REXCVAR_GET(skate3_native_render_scene_photo_yield)) {
+    return false;
+  }
+  static bool s_in_photo_editor = false;
+  const char* signal = nullptr;
+  {
+    constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
+    uint32_t mgr = 0, beg = 0, end = 0;
+    if (GuestTryLoadU32(base, kFrontEndManagerPtr, &mgr) && mgr != 0 &&
+        GuestTryLoadU32(base, mgr + 0x210, &beg) &&
+        GuestTryLoadU32(base, mgr + 0x214, &end) && beg < end &&
+        end - beg <= 20 * 16) {
+      const uint32_t n = (end - beg) / 20;
+      for (uint32_t i = 0; i < n && signal == nullptr; ++i) {
+        uint32_t f0 = 0, f1 = 0;
+        if (GuestTryLoadU32(base, beg + i * 20, &f0) &&
+            GuestTryLoadU32(base, beg + i * 20 + 4, &f1) && f0 == 1 && f1 == 11) {
+          signal = "FE PhotoSelect push-state";
         }
       }
     }
-    if (signal == nullptr) {
-      const int64_t last_ns = g_photo_replay_last_ns.load(std::memory_order_relaxed);
-      const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 PerfClock::now().time_since_epoch())
-                                 .count();
-      if (last_ns >= 0 && now_ns - last_ns < 250'000'000) {
-        signal = "PhotoReplayController heartbeat";
-      }
+  }
+  if (signal == nullptr) {
+    const int64_t last_ns = g_photo_replay_last_ns.load(std::memory_order_relaxed);
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               PerfClock::now().time_since_epoch())
+                               .count();
+    if (last_ns >= 0 && now_ns - last_ns < 250'000'000) {
+      signal = "PhotoReplayController heartbeat";
     }
-    const bool photo_active = signal != nullptr;
-    if (photo_active != s_in_photo_editor) {
-      s_in_photo_editor = photo_active;
-      if (photo_active) {
-        REXLOG_INFO(
-            "native-scene: photo editor - yielding to emulated output ({}; the "
-            "game's postfx applies the photo effects)",
-            signal);
-      } else {
-        REXLOG_INFO("native-scene: photo editor closed - native output resumes");
-      }
-    }
+  }
+  const bool photo_active = signal != nullptr;
+  if (photo_active != s_in_photo_editor) {
+    s_in_photo_editor = photo_active;
     if (photo_active) {
-      return false;
+      REXLOG_INFO(
+          "native-scene: photo editor - yielding to emulated output ({}; the "
+          "game's postfx applies the photo effects)",
+          signal);
+    } else {
+      REXLOG_INFO("native-scene: photo editor closed - native output resumes");
     }
   }
+  return photo_active;
+}
 
-  const auto render_t0 = PerfClock::now();
-  const auto perf_ns_since = [](PerfClock::time_point t0) {
-    return uint64_t(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - t0)
-            .count());
-  };
-
-  std::shared_ptr<const FrameScene> scene_ptr;
-  {
-    std::lock_guard<std::mutex> lock(g_scene_mutex);
-    if (!g_scene || g_scene->items.empty()) {
-      return false;
-    }
-    scene_ptr = g_scene;
-  }
-  const FrameScene& scene = *scene_ptr;
-
-  if (!EnsurePipeline(context)) {
-    return false;
-  }
-  // Flush any barriers pushed by lazy resource creation (white texture).
-  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-
+// Frees retired buffers / recycles retired SRV slots whose last
+// referencing submission completed, and services the debug-dialog
+// texture/mesh cache flushes.
+void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context) {
   auto* command_processor = context.d3d12.command_processor;
-  auto& list = command_processor->GetDeferredCommandList();
-
   // Free retired buffers (and recycle retired SRV slots) whose
   // last-referencing submission has completed.
   if (!g_r.retired.empty() || !g_r.retired_srv_slots.empty()) {
@@ -13096,87 +11444,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     ClearItemCache();  // decode-affecting toggles should re-walk items too
     REXLOG_INFO("native-scene: mesh cache flushed (debug dialog)");
   }
-
-  // Reset this frame's bone ring region (shared by the shadow casters and
-  // the main pass: the shadow pass allocates first, the main pass appends).
-  const uint64_t frame_number = g_frames_rendered.load(std::memory_order_relaxed);
-  const uint32_t bone_region =
-      uint32_t(frame_number % RendererState::kBoneRegions) *
-      RendererState::kBoneRegionSize;
-  g_r.bone_ring_offset = 0;
-
-  // ---- Loading -> gameplay takeover (seamless boot / map-change loads) ----
-  // The loading-screen prewarm (menus branch above) already decoded the
-  // registered world behind the load; the FIRST substantial post-load scene
-  // renders natively right away. Gates kept: staleness (g_scene holds the
-  // PREVIOUS map's scene through the whole load; rendering it shows
-  // old-map garbage) and min items (the capture holds a near-empty scene
-  // for a few frames while the game fades in; taking over there shows a
-  // black/void world; the brief yield shows the game's own fade instead).
-  // The frames after takeover run a budgeted settle pass for whatever
-  // prewarm missed (dynamic entities, late textures), and the draw path's
-  // miss budgets are clamped while settling so leftovers render white/skip
-  // for a frame instead of freezing the takeover frame.
-  const int32_t warmup_ms = REXCVAR_GET(skate3_native_render_scene_warmup_budget_ms);
-  bool settling = false;
-  if (warmup_ms > 0 && REXCVAR_GET(skate3_native_render_scene_debug) == 0) {
-    if (g_warmup_armed.load(std::memory_order_relaxed)) {
-      if (scene.generation < g_warmup_fresh_generation ||
-          scene.items.size() <
-              size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items))) {
-        // Stale or fade-in scene: yield (brief, a few frames). Keep
-        // committing worker results meanwhile; every pre-takeover frame
-        // counts on map changes.
-        PrewarmCommit(context, frame_number);
-        return false;
-      }
-      g_warmup_armed.store(false, std::memory_order_relaxed);
-      g_settle_until_frame = frame_number + 120;
-      size_t queued = 0;
-      {
-        std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-        queued = g_prewarm_queue.size();
-      }
-      REXLOG_INFO(
-          "native-scene: taking over natively ({} items; prewarm {} done / {} dropped "
-          "/ {} queued)",
-          scene.items.size(), g_prewarm_done.load(std::memory_order_relaxed),
-          g_prewarm_dropped.load(std::memory_order_relaxed), queued);
-    }
-    settling = frame_number < g_settle_until_frame;
-    if (settling) {
-      const auto deadline =
-          std::chrono::steady_clock::now() + std::chrono::milliseconds(warmup_ms);
-      WarmCounters wc;
-      for (const DrawItem& item : scene.items) {
-        WarmItemResources(context, base, frame_number, item, deadline, wc);
-      }
-      if (wc.deferred != 0) {
-        // Still behind: keep the settle pass (and the draw-path budget
-        // clamp) alive until a frame clears with budget to spare.
-        g_settle_until_frame =
-            std::max<uint64_t>(g_settle_until_frame, frame_number + 8);
-      }
-      if (wc.decodes > 0) {
-        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-      }
-    }
-  }
-
-  if (!g_r.announced) {
-    g_r.announced = true;
-    REXLOG_INFO("native-scene: rendering natively ({} items, {}x{})", scene.items.size(),
-                context.guest_output_width, context.guest_output_height);
-  }
-
-  // Commit finished worker decodes every frame (streamed arenas decode on
-  // the workers before their first draw instead of hitching the first frame
-  // that sees them). Near-no-op when nothing completed. The workers also
-  // serve the draw path's steady-state misses (EnqueueMeshMiss/EnqueueTexMiss),
-  // so make sure they exist even on a session that never showed a loading
-  // screen with the pipeline up.
-  EnsurePrewarmWorkers();
-  PrewarmCommit(context, frame_number);
+}
 
   // ---- Dynamic-shadow atlas pass ----
   // Renders the frame's dynamic casters (skinned characters + rigid
@@ -13184,11 +11452,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // three cascade tiles with the captured light rows, then applies the
   // game's coverage blur + depth dilation. Runs before the main pass so the
   // scene shader can sample the finished atlas.
+bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
+                       const FrameScene& scene, uint32_t bone_region,
+                       int32_t debug_mode, uint32_t* out_draws) {
+  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+  const float* sh = scene.shadow_rows;
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
-  const auto shadow_t0 = PerfClock::now();
-  const float* sh = scene.shadow_rows;
-  const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
   if (REXCVAR_GET(skate3_native_render_scene_shadows) && scene.shadow_valid &&
       g_r.shadow_raw != nullptr && g_r.pso_shadow_caster != nullptr &&
       g_r.pso_shadow_blur != nullptr && debug_mode == 0) {
@@ -13387,6 +11657,345 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       shadow_ready = shadow_draws > 0;
     }
   }
+  *out_draws = shadow_draws;
+  return shadow_ready;
+}
+
+  // Selection-outline mask (see kOutlineShaderSource): re-render the frame's
+  // selected items into the small R8 target while the scene pass state is
+  // still bound. The edge composite runs after the resolve, on the
+  // single-sample output.
+bool RenderOutlineMask(const NativeGuestOutputRenderContext& context,
+                       const FrameScene& scene, const D3D12_VIEWPORT& viewport,
+                       const D3D12_RECT& scissor, bool msaa_on,
+                       D3D12_CPU_DESCRIPTOR_HANDLE scene_rtv,
+                       D3D12_CPU_DESCRIPTOR_HANDLE dsv, bool use_depth) {
+  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+  bool outline_ready = false;
+  if (REXCVAR_GET(skate3_native_render_scene_selection_outline) &&
+      g_r.pso_outline_mask != nullptr && g_r.pso_outline_edge != nullptr &&
+      g_r.outline_mask != nullptr) {
+    std::vector<const DrawItem*> sel;
+    for (const DrawItem& item : scene.items) {
+      // Skinned items are excluded: the mask VS runs the rigid path (world
+      // matrix), which renders a skinned mesh at bind pose at the origin.
+      if (item.selected && !item.skinned) {
+        sel.push_back(&item);
+      }
+    }
+    if (!sel.empty()) {
+      D3D12_CPU_DESCRIPTOR_HANDLE mask_rtv =
+          g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      mask_rtv.ptr += size_t(7) * g_r.rtv_size;
+      const FLOAT mask_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      list.D3DClearRenderTargetView(mask_rtv, mask_clear, 0, nullptr);
+      list.D3DOMSetRenderTargets(1, &mask_rtv, FALSE, nullptr);
+      D3D12_VIEWPORT mask_vp{0.0f, 0.0f, float(g_r.outline_mask_width),
+                             float(g_r.outline_mask_height), 0.0f, 1.0f};
+      list.RSSetViewport(mask_vp);
+      D3D12_RECT mask_sc{0, 0, LONG(g_r.outline_mask_width),
+                         LONG(g_r.outline_mask_height)};
+      list.RSSetScissorRect(mask_sc);
+      list.D3DSetPipelineState(g_r.pso_outline_mask);
+      for (const DrawItem* item : sel) {
+        auto mit = g_r.meshes.find(item->mesh);
+        if (mit == g_r.meshes.end() || mit->second.fingerprint != item->fingerprint) {
+          continue;  // decoded by the main pass this frame; masks from the next
+        }
+        float constants[52] = {};
+        std::memcpy(constants, item->world, sizeof(item->world));
+        float* mvp = constants + 16;
+        for (int r = 0; r < 4; ++r) {
+          for (int c = 0; c < 4; ++c) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+              sum += constants[r * 4 + k] * scene.view_proj[k * 4 + c];
+            }
+            mvp[r * 4 + c] = sum;
+          }
+        }
+        // tint = (1, 0, 0, 1): the scene PS's solid-color early-out
+        // (tint.a > 0) writes 1.0 into the R8 mask; tint.g = 0 keeps the VS
+        // skinning branch off.
+        constants[32] = 1.0f;
+        constants[35] = 1.0f;
+        list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
+        list.D3DIASetVertexBuffers(0, 1, &mit->second.vb_view);
+        list.D3DIASetIndexBuffer(&mit->second.ib_view);
+        for (const DrawEntry& draw : item->draws) {
+          if (draw.prim == 4) {
+            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          } else if (draw.prim == 6) {
+            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+          } else {
+            continue;
+          }
+          list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index,
+                                       draw.base_vertex, 0);
+          outline_ready = true;
+        }
+      }
+      // Restore the pass state the resolve/2D paths rely on (fullscreen
+      // viewport; the non-MSAA path keeps rendering into the scene target).
+      list.RSSetViewport(viewport);
+      list.RSSetScissorRect(scissor);
+      if (!msaa_on) {
+        list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, use_depth ? &dsv : nullptr);
+      }
+      if (outline_ready) {
+        context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                              g_r.outline_mask,
+                                              D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      }
+    }
+  }
+  return outline_ready;
+}
+
+// Selection-outline composite: additive stencil-edge-detect over the
+// resolved output (before the popup blur, like the game's postfx order).
+void RenderOutlineComposite(const NativeGuestOutputRenderContext& context,
+                            const FrameScene& scene,
+                            D3D12_CPU_DESCRIPTOR_HANDLE output_rtv,
+                            const D3D12_VIEWPORT& viewport,
+                            const D3D12_RECT& scissor) {
+  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+  list.RSSetViewport(viewport);
+  list.RSSetScissorRect(scissor);
+  list.D3DSetPipelineState(g_r.pso_outline_edge);
+  list.D3DSetGraphicsRoot32BitConstants(0, 4, scene.outline_color, 0);
+  D3D12_GPU_DESCRIPTOR_HANDLE mask_srv =
+      g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+  mask_srv.ptr += size_t(g_r.outline_mask_srv) * g_r.srv_size;
+  context.d3d12.set_graphics_root_descriptor_table(
+      context.d3d12.command_processor_user_data, 1, mask_srv);
+  list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  list.D3DDrawInstanced(3, 1, 0, 0);
+  // Back to the mask's steady state for the next frame.
+  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                        g_r.outline_mask,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
+}
+
+// 600-frame perf + telemetry log lines (verbatim from the former tail of
+// RenderScene).
+void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
+                   uint32_t drawn_2d, uint32_t drawn_spline, bool shadow_ready,
+                   uint32_t shadow_draws) {
+  if (frames % 600 == 0) {
+    // CPU-side perf snapshot for this 600-frame window. guest_fps is derived
+    // from the guest frame interval; capture/build run on the guest render
+    // thread (they extend guest frame time directly), render/items/shadow on
+    // the command processor thread, decode inline on the render thread
+    // (count = decodes this window; max = the worst single decode).
+    const double guest_dt_ms = g_pw_guest_dt.AvgMs();
+    REXLOG_INFO(
+        "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
+        "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms | render={:.2f}/{:.2f}ms "
+        "items={:.2f}/{:.2f}ms shadow={:.2f}/{:.2f}ms "
+        "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
+        "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}]",
+        guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
+        g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
+        g_pw_build.MaxMs(), g_pw_render.AvgMs(), g_pw_render.MaxMs(),
+        g_pw_items.AvgMs(), g_pw_items.MaxMs(), g_pw_shadow.AvgMs(),
+        g_pw_shadow.MaxMs(), g_pw_mesh_decode.count.load(std::memory_order_relaxed),
+        g_pw_mesh_decode.AvgMs(), g_pw_mesh_decode.MaxMs(),
+        g_pw_tex_decode.count.load(std::memory_order_relaxed), g_pw_tex_decode.AvgMs(),
+        g_pw_tex_decode.MaxMs(), g_pw_commit.AvgMs(), g_pw_commit.MaxMs(),
+        g_item_cache_hits.exchange(0, std::memory_order_relaxed),
+        g_item_cache_builds.exchange(0, std::memory_order_relaxed),
+        g_cam_changes.exchange(0, std::memory_order_relaxed),
+        g_cam_repeats.exchange(0, std::memory_order_relaxed),
+        g_cam_max_streak.exchange(0, std::memory_order_relaxed));
+    for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_render,
+                          &g_pw_items, &g_pw_shadow, &g_pw_mesh_decode,
+                          &g_pw_tex_decode, &g_pw_commit}) {
+      w->Reset();
+    }
+  }
+  if (frames % 600 == 0) {
+    REXLOG_INFO(
+        "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
+        "splines[{}/{}] "
+        "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
+        "rigid[pending={} dropped={} worldprops={}] "
+        "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
+        "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
+        "look[hit={} stale={} park={} held={}] "
+        "heal[vfail={} dfail={} demote={}] serve[sticky={} skipnew={} adstale={} adnone={}] "
+        "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
+        "bones_rescued={}] dynobj[valid={} drawn={}] refl[pair={} flat={} gate={:#x}]",
+        frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
+        drawn_spline, g_draws_spline.load(),
+        g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
+        g_r.meshes.size(), g_r.textures.size(),
+        g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
+        g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
+        g_ropa_flip.load(), g_ropa_mismatch.load(), g_ropa_relaxed.load(),
+        g_ropa_hold.load(), g_ropa_caster.load(), g_pub_incoherent.load(),
+        g_stretch_veto.load(), g_dyn_gap.load(),
+        g_skinned_items.load(),
+        g_skinned_skipped.load(), g_capture_foreign_bank.load(),
+        g_rigid_pending.load(), g_rigid_dropped.load(),
+        g_world_props.load(),
+        g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
+        g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
+        g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
+        g_rr_tex_deferred.load(), g_look_hit.load(), g_look_stale.load(),
+        g_look_park.load(), g_r.tex_lookaside.size(), g_heal_verify_fail.load(),
+        g_heal_decode_fail.load(), g_demote_hold.load(),
+        g_tex_sticky_served.load(), g_skip_new.load(), g_ad_stale_served.load(),
+        g_ad_placeholder.load(), scene.shadow_valid,
+        shadow_ready, shadow_draws,
+        g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
+        g_char_rows_reused.load(), g_bones_rescued.load(), scene.dynobj_valid,
+        g_dynobj_drawn.load(), g_refl_pair.load(), g_refl_flat.load(),
+        g_refl_gate.load());
+  }
+}
+
+bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
+  if (!SceneEnabled() || context.backend != NativeGuestOutputBackend::kD3D12) {
+    return false;
+  }
+  // While the game reports menus / pause / loading (presence context 0x8001
+  // == 0), yield to the emulated output: the native scene neither renders
+  // the 2D UI (the pause menu was invisible) nor the menu's world backdrop
+  // materials (everything drew untextured white). The emulated frame is
+  // complete and correct there; native rendering resumes on unpause.
+  if (YieldForMenus(context)) {
+    return false;
+  }
+  uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
+  if (base == nullptr) {
+    return false;
+  }
+  if (YieldForPhotoEditor(base)) {
+    return false;
+  }
+
+  const auto render_t0 = PerfClock::now();
+  const auto perf_ns_since = [](PerfClock::time_point t0) {
+    return uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - t0)
+            .count());
+  };
+
+  std::shared_ptr<const FrameScene> scene_ptr;
+  {
+    std::lock_guard<std::mutex> lock(g_scene_mutex);
+    if (!g_scene || g_scene->items.empty()) {
+      return false;
+    }
+    scene_ptr = g_scene;
+  }
+  const FrameScene& scene = *scene_ptr;
+
+  if (!EnsurePipeline(context)) {
+    return false;
+  }
+  // Flush any barriers pushed by lazy resource creation (white texture).
+  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+
+  auto* command_processor = context.d3d12.command_processor;
+  auto& list = command_processor->GetDeferredCommandList();
+
+  ReleaseRetiredAndFlushCaches(context);
+
+  // Reset this frame's bone ring region (shared by the shadow casters and
+  // the main pass: the shadow pass allocates first, the main pass appends).
+  const uint64_t frame_number = g_frames_rendered.load(std::memory_order_relaxed);
+  const uint32_t bone_region =
+      uint32_t(frame_number % RendererState::kBoneRegions) *
+      RendererState::kBoneRegionSize;
+  g_r.bone_ring_offset = 0;
+
+  // ---- Loading -> gameplay takeover (seamless boot / map-change loads) ----
+  // The loading-screen prewarm (menus branch above) already decoded the
+  // registered world behind the load; the FIRST substantial post-load scene
+  // renders natively right away. Gates kept: staleness (g_scene holds the
+  // PREVIOUS map's scene through the whole load; rendering it shows
+  // old-map garbage) and min items (the capture holds a near-empty scene
+  // for a few frames while the game fades in; taking over there shows a
+  // black/void world; the brief yield shows the game's own fade instead).
+  // The frames after takeover run a budgeted settle pass for whatever
+  // prewarm missed (dynamic entities, late textures), and the draw path's
+  // miss budgets are clamped while settling so leftovers render white/skip
+  // for a frame instead of freezing the takeover frame.
+  const int32_t warmup_ms = REXCVAR_GET(skate3_native_render_scene_warmup_budget_ms);
+  bool settling = false;
+  if (warmup_ms > 0 && REXCVAR_GET(skate3_native_render_scene_debug) == 0) {
+    if (g_warmup_armed.load(std::memory_order_relaxed)) {
+      if (scene.generation < g_warmup_fresh_generation ||
+          scene.items.size() <
+              size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items))) {
+        // Stale or fade-in scene: yield (brief, a few frames). Keep
+        // committing worker results meanwhile; every pre-takeover frame
+        // counts on map changes.
+        PrewarmCommit(context, frame_number);
+        return false;
+      }
+      g_warmup_armed.store(false, std::memory_order_relaxed);
+      g_settle_until_frame = frame_number + 120;
+      size_t queued = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+        queued = g_prewarm_queue.size();
+      }
+      REXLOG_INFO(
+          "native-scene: taking over natively ({} items; prewarm {} done / {} dropped "
+          "/ {} queued)",
+          scene.items.size(), g_prewarm_done.load(std::memory_order_relaxed),
+          g_prewarm_dropped.load(std::memory_order_relaxed), queued);
+    }
+    settling = frame_number < g_settle_until_frame;
+    if (settling) {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(warmup_ms);
+      WarmCounters wc;
+      for (const DrawItem& item : scene.items) {
+        WarmItemResources(context, base, frame_number, item, deadline, wc);
+      }
+      if (wc.deferred != 0) {
+        // Still behind: keep the settle pass (and the draw-path budget
+        // clamp) alive until a frame clears with budget to spare.
+        g_settle_until_frame =
+            std::max<uint64_t>(g_settle_until_frame, frame_number + 8);
+      }
+      if (wc.decodes > 0) {
+        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      }
+    }
+  }
+
+  if (!g_r.announced) {
+    g_r.announced = true;
+    REXLOG_INFO("native-scene: rendering natively ({} items, {}x{})", scene.items.size(),
+                context.guest_output_width, context.guest_output_height);
+  }
+
+  // Commit finished worker decodes every frame (streamed arenas decode on
+  // the workers before their first draw instead of hitching the first frame
+  // that sees them). Near-no-op when nothing completed. The workers also
+  // serve the draw path's steady-state misses (EnqueueMeshMiss/EnqueueTexMiss),
+  // so make sure they exist even on a session that never showed a loading
+  // screen with the pipeline up.
+  EnsurePrewarmWorkers();
+  PrewarmCommit(context, frame_number);
+
+  bool shadow_ready = false;
+  uint32_t shadow_draws = 0;
+  const auto shadow_t0 = PerfClock::now();
+  const float* sh = scene.shadow_rows;
+  const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
+  shadow_ready =
+      RenderShadowAtlas(context, scene, bone_region, debug_mode, &shadow_draws);
   g_pw_shadow.Add(perf_ns_since(shadow_t0));
 
   // The scene draws into the MSAA target when enabled (resolved into the
@@ -14634,89 +13243,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
-  // Selection-outline mask (see kOutlineShaderSource): re-render the frame's
-  // selected items into the small R8 target while the scene pass state is
-  // still bound. The edge composite runs after the resolve, on the
-  // single-sample output.
-  bool outline_ready = false;
-  if (REXCVAR_GET(skate3_native_render_scene_selection_outline) &&
-      g_r.pso_outline_mask != nullptr && g_r.pso_outline_edge != nullptr &&
-      g_r.outline_mask != nullptr) {
-    std::vector<const DrawItem*> sel;
-    for (const DrawItem& item : scene.items) {
-      // Skinned items are excluded: the mask VS runs the rigid path (world
-      // matrix), which renders a skinned mesh at bind pose at the origin.
-      if (item.selected && !item.skinned) {
-        sel.push_back(&item);
-      }
-    }
-    if (!sel.empty()) {
-      D3D12_CPU_DESCRIPTOR_HANDLE mask_rtv =
-          g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      mask_rtv.ptr += size_t(7) * g_r.rtv_size;
-      const FLOAT mask_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-      list.D3DClearRenderTargetView(mask_rtv, mask_clear, 0, nullptr);
-      list.D3DOMSetRenderTargets(1, &mask_rtv, FALSE, nullptr);
-      D3D12_VIEWPORT mask_vp{0.0f, 0.0f, float(g_r.outline_mask_width),
-                             float(g_r.outline_mask_height), 0.0f, 1.0f};
-      list.RSSetViewport(mask_vp);
-      D3D12_RECT mask_sc{0, 0, LONG(g_r.outline_mask_width),
-                         LONG(g_r.outline_mask_height)};
-      list.RSSetScissorRect(mask_sc);
-      list.D3DSetPipelineState(g_r.pso_outline_mask);
-      for (const DrawItem* item : sel) {
-        auto mit = g_r.meshes.find(item->mesh);
-        if (mit == g_r.meshes.end() || mit->second.fingerprint != item->fingerprint) {
-          continue;  // decoded by the main pass this frame; masks from the next
-        }
-        float constants[52] = {};
-        std::memcpy(constants, item->world, sizeof(item->world));
-        float* mvp = constants + 16;
-        for (int r = 0; r < 4; ++r) {
-          for (int c = 0; c < 4; ++c) {
-            float sum = 0.0f;
-            for (int k = 0; k < 4; ++k) {
-              sum += constants[r * 4 + k] * scene.view_proj[k * 4 + c];
-            }
-            mvp[r * 4 + c] = sum;
-          }
-        }
-        // tint = (1, 0, 0, 1): the scene PS's solid-color early-out
-        // (tint.a > 0) writes 1.0 into the R8 mask; tint.g = 0 keeps the VS
-        // skinning branch off.
-        constants[32] = 1.0f;
-        constants[35] = 1.0f;
-        list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
-        list.D3DIASetVertexBuffers(0, 1, &mit->second.vb_view);
-        list.D3DIASetIndexBuffer(&mit->second.ib_view);
-        for (const DrawEntry& draw : item->draws) {
-          if (draw.prim == 4) {
-            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-          } else if (draw.prim == 6) {
-            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-          } else {
-            continue;
-          }
-          list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index,
-                                       draw.base_vertex, 0);
-          outline_ready = true;
-        }
-      }
-      // Restore the pass state the resolve/2D paths rely on (fullscreen
-      // viewport; the non-MSAA path keeps rendering into the scene target).
-      list.RSSetViewport(viewport);
-      list.RSSetScissorRect(scissor);
-      if (!msaa_on) {
-        list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, use_depth ? &dsv : nullptr);
-      }
-      if (outline_ready) {
-        context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                              g_r.outline_mask,
-                                              D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-      }
-    }
-  }
+  const bool outline_ready =
+      RenderOutlineMask(context, scene, viewport, scissor, msaa_on, scene_rtv,
+                        dsv, use_depth);
 
   if (msaa_on) {
     // Resolve: average the MSAA samples into the guest output with a
@@ -14745,26 +13274,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   }
 
   if (outline_ready) {
-    // Selection-outline composite: additive stencil-edge-detect over the
-    // resolved output (before the popup blur, like the game's postfx order).
-    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-    list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-    list.RSSetViewport(viewport);
-    list.RSSetScissorRect(scissor);
-    list.D3DSetPipelineState(g_r.pso_outline_edge);
-    list.D3DSetGraphicsRoot32BitConstants(0, 4, scene.outline_color, 0);
-    D3D12_GPU_DESCRIPTOR_HANDLE mask_srv =
-        g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-    mask_srv.ptr += size_t(g_r.outline_mask_srv) * g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 1, mask_srv);
-    list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list.D3DDrawInstanced(3, 1, 0, 0);
-    // Back to the mask's steady state for the next frame.
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          g_r.outline_mask,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+    RenderOutlineComposite(context, scene, output_rtv, viewport, scissor);
   }
 
   // Popup background blur: exact port of the game's blur_hBlur/vBlur +
@@ -14935,78 +13445,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
   g_pw_render.Add(perf_ns_since(render_t0));
   const uint64_t frames = g_frames_rendered.fetch_add(1) + 1;
-  if (frames % 600 == 0) {
-    // CPU-side perf snapshot for this 600-frame window. guest_fps is derived
-    // from the guest frame interval; capture/build run on the guest render
-    // thread (they extend guest frame time directly), render/items/shadow on
-    // the command processor thread, decode inline on the render thread
-    // (count = decodes this window; max = the worst single decode).
-    const double guest_dt_ms = g_pw_guest_dt.AvgMs();
-    REXLOG_INFO(
-        "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
-        "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms | render={:.2f}/{:.2f}ms "
-        "items={:.2f}/{:.2f}ms shadow={:.2f}/{:.2f}ms "
-        "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
-        "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}]",
-        guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
-        g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
-        g_pw_build.MaxMs(), g_pw_render.AvgMs(), g_pw_render.MaxMs(),
-        g_pw_items.AvgMs(), g_pw_items.MaxMs(), g_pw_shadow.AvgMs(),
-        g_pw_shadow.MaxMs(), g_pw_mesh_decode.count.load(std::memory_order_relaxed),
-        g_pw_mesh_decode.AvgMs(), g_pw_mesh_decode.MaxMs(),
-        g_pw_tex_decode.count.load(std::memory_order_relaxed), g_pw_tex_decode.AvgMs(),
-        g_pw_tex_decode.MaxMs(), g_pw_commit.AvgMs(), g_pw_commit.MaxMs(),
-        g_item_cache_hits.exchange(0, std::memory_order_relaxed),
-        g_item_cache_builds.exchange(0, std::memory_order_relaxed),
-        g_cam_changes.exchange(0, std::memory_order_relaxed),
-        g_cam_repeats.exchange(0, std::memory_order_relaxed),
-        g_cam_max_streak.exchange(0, std::memory_order_relaxed));
-    for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_render,
-                          &g_pw_items, &g_pw_shadow, &g_pw_mesh_decode,
-                          &g_pw_tex_decode, &g_pw_commit}) {
-      w->Reset();
-    }
-  }
-  if (frames % 600 == 0) {
-    REXLOG_INFO(
-        "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
-        "splines[{}/{}] "
-        "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
-        "rigid[pending={} dropped={} worldprops={}] "
-        "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
-        "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
-        "look[hit={} stale={} park={} held={}] "
-        "heal[vfail={} dfail={} demote={}] serve[sticky={} skipnew={} adstale={} adnone={}] "
-        "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
-        "bones_rescued={}] dynobj[valid={} drawn={}] refl[pair={} flat={} gate={:#x}]",
-        frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
-        drawn_spline, g_draws_spline.load(),
-        g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
-        g_r.meshes.size(), g_r.textures.size(),
-        g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
-        g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
-        g_ropa_flip.load(), g_ropa_mismatch.load(), g_ropa_relaxed.load(),
-        g_ropa_hold.load(), g_ropa_caster.load(), g_pub_incoherent.load(),
-        g_stretch_veto.load(), g_dyn_gap.load(),
-        g_skinned_items.load(),
-        g_skinned_skipped.load(), g_capture_foreign_bank.load(),
-        g_rigid_pending.load(), g_rigid_dropped.load(),
-        g_world_props.load(),
-        g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
-        g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
-        g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
-        g_rr_tex_deferred.load(), g_look_hit.load(), g_look_stale.load(),
-        g_look_park.load(), g_r.tex_lookaside.size(), g_heal_verify_fail.load(),
-        g_heal_decode_fail.load(), g_demote_hold.load(),
-        g_tex_sticky_served.load(), g_skip_new.load(), g_ad_stale_served.load(),
-        g_ad_placeholder.load(), scene.shadow_valid,
-        shadow_ready, shadow_draws,
-        g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
-        g_char_rows_reused.load(), g_bones_rescued.load(), scene.dynobj_valid,
-        g_dynobj_drawn.load(), g_refl_pair.load(), g_refl_flat.load(),
-        g_refl_gate.load());
-  }
+  LogFrameStats(scene, frames, drawn, drawn_2d, drawn_spline, shadow_ready,
+                shadow_draws);
   return true;
 }
 

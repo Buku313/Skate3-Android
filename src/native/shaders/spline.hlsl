@@ -1,0 +1,47 @@
+// In-world neon spline shader (waypoint arrows / marker beams). The guest
+// B-spline VS is evaluated on the CPU at publish time into WORLD-space
+// vertices; the VS here projects them with the scene's (smoothed) view_proj
+// rows so the signs stay glued to the world under camera re-timing. The two
+// PS variants transcribe the game's own spline.fx (Skate-Shaders repo):
+// "default" = additive glow with the squared-gamma trick, "darken" =
+// straight-alpha backdrop dimming. The gradient texture uses the wrap/aniso
+// sampler like the original i_diffuse (U runs 0..N along the band).
+cbuffer C : register(b0) {
+  float4 vp0;  // scene view_proj rows (row-vector: clip = x*vp0+y*vp1+z*vp2+w*vp3)
+  float4 vp1;
+  float4 vp2;
+  float4 vp3;
+  float4 intensity;  // i_intensity as staged (x = default gain, y = darken gain)
+};
+Texture2D<float4> tex : register(t0);
+SamplerState smp : register(s0);
+struct VSOut {
+  float4 pos : SV_Position;
+  float2 uv : TEXCOORD0;
+  float fade : TEXCOORD1;
+};
+VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float fade : TEXCOORD1) {
+  VSOut o;
+  o.pos = p.x * vp0 + p.y * vp1 + p.z * vp2 + p.w * vp3;
+  o.uv = uv;
+  o.fade = fade;
+  return o;
+}
+// Exact transcription of the Skate 3 spline pixel shaders (disassembled
+// ucode, NOT the older Skate 2 spline.fx source: EA added in-shader sqrt
+// gamma compensation). default: oC0.rgb = sqrt(rgb^2 * i.x * fade / a);
+// darken: oC0.rgb = sqrt(rgb^2 * i.y), oC0.a = sqrt(a * i.y * fade).
+// Getting this wrong is visible: a linear 1/a over-brightens the low-alpha
+// glow fringe (fuzzy, blown-out edges) and a linear darken alpha weakens the
+// backdrop dimming that makes the neon read as solid.
+float4 ps_default(VSOut i) : SV_Target {
+  float4 c = tex.Sample(smp, i.uv);
+  float3 sq = c.rgb * c.rgb * (intensity.x * i.fade / max(c.a, 1.0 / 255.0));
+  return float4(sqrt(abs(sq)), 1.0);
+}
+float4 ps_darken(VSOut i) : SV_Target {
+  float4 c = tex.Sample(smp, i.uv);
+  float3 rgb = sqrt(abs(c.rgb * c.rgb * intensity.y));
+  float a = sqrt(abs(c.a * intensity.y * i.fade));
+  return float4(rgb, a);
+}
