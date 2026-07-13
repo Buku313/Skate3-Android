@@ -32,6 +32,7 @@
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_guest_read.h"
+#include "native/skate3_native_lw.h"
 #include "native/skate3_native_v3_shadow.h"
 #include "native/skate3_native_v3_shadow_mat.h"
 #include "native/skate3_hud_tile.h"
@@ -229,6 +230,30 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_entity_fade, true, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynamic_items, true, "Skate 3",
                     "Publish dynamic entities (characters, props, cloth)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_lw_fade, true, "Skate 3",
+    "Serve LivingWorld NPC/vehicle fade alpha from the entity itself "
+    "(entity+528 via the LW entity store, mapped per MeshContext) instead "
+    "of the per-draw captured constant row. The captured row is a per-draw "
+    "inference: capture races serve alpha=1 (opaque mid-air spawns, no "
+    "fade-in) or a clone's foreign row (one-frame invisibility blinks). "
+    "Off = the pre-store captured-row behavior.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_lw_gap_fill, true, "Skate 3",
+    "Republish a LivingWorld NPC for up to 2 frames when its MeshContext "
+    "drops out of the submit records while the entity is still alive (the "
+    "1-3 frame publish GAPs: an in-view NPC vanishing for a frame reads as "
+    "a blink/teleport). Off = gaps render as-is.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_lw_identity, true, "Skate 3",
+    "Key LivingWorld entities' pose-smoothing rings by their MeshContext "
+    "(the game's own per-instance identity) instead of (mesh, occurrence) "
+    "pairing. Same-mesh clone reshuffles in the sort lists can then never "
+    "mispair a ring (the NPC/prop teleport-slide class). Off = the "
+    "positional re-pair heuristics alone.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ropa_inline, false, "Skate 3",
                     "Decode CPU-cloth (ROPA) garment VBs inline on the render thread "
@@ -435,6 +460,8 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_mips, true, "Skate 3",
 // toggle refuses to flip the scene on without it: the hooks that feed the
 // scene are only installed when it was set at boot.
 REXCVAR_DECLARE(bool, skate3_native_render);
+// Defined in native/skate3_native_lw.cpp (the LW entity store module).
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_palette);
 
 namespace skate3::native_scene {
 namespace {
@@ -748,6 +775,50 @@ struct CachedBones {
 };
 std::unordered_map<uint32_t, CachedBones> g_bones_cache;
 std::atomic<uint64_t> g_bones_rescued{0};
+// ctx -> last published palette for skinned character-family items (the
+// per-INSTANCE sibling of g_bones_cache): clones share meshes, so the
+// mesh-keyed rescue is gated to pub_count==1 and a refused clone capture
+// next to a published twin got NOTHING: a one-frame invisibility blink.
+// The MeshContext is the game's own per-instance identity,
+// so this cache rescues each instance
+// with ITS OWN last palette regardless of how many clones are alive.
+std::unordered_map<uint32_t, CachedBones> g_bones_cache_ctx;
+std::atomic<uint64_t> g_lw_ctx_rescued{0};
+// LW entity store consumption counters (stats line lw[...]).
+std::atomic<uint64_t> g_lw_stamped{0};
+std::atomic<uint64_t> g_lw_fade0{0};
+std::atomic<uint64_t> g_lw_gap_filled{0};
+// Authoritative caster-palette substitutions + per-ctx lighting-rows serves
+// (edge-of-view vehicles; see the stamp pass).
+std::atomic<uint64_t> g_lw_pal_sub{0};
+std::atomic<uint64_t> g_lw_rows_served{0};
+// ctx -> last VALIDATED lighting/paint rows, entity-checked (a recycled
+// instance must not inherit the previous occupant's paint). The mesh-keyed
+// g_char_rows_cache fallback is gated to single-instance meshes; cloned
+// traffic never qualified, so a caster-only stretch (main view culls the
+// vehicle at the screen edge before it leaves the screen) dropped to
+// legacy flat shading: the "vehicle loses its texture/color at the edge"
+// sighting.
+struct CharRowsCtx {
+  std::array<float, 60> rows;
+  uint32_t entity = 0;
+};
+std::unordered_map<uint32_t, CharRowsCtx> g_char_rows_cache_ctx;
+// ctx -> last PUBLISHED item of a live LW entity (skinned character
+// families, non-ropa): when a ctx drops out of the submit records for a
+// frame or two while its entity is still alive in the store (observed as
+// "dyn publish GAP" incidents on fam-3/5 ped meshes, 1-3
+// frames each: an in-view NPC vanishing for a frame reads as a blink or,
+// moving, a small teleport), the whole item republishes. Console behavior:
+// a live entity never skips a frame. Self-limiting: entries expire after 2
+// unpublished frames and refresh only from LIVE publishes (never from a
+// fill, dbg_src 9), so a real despawn shows at most 2 filled frames, at
+// the entity's own served alpha.
+struct LwRetained {
+  DrawItem item;
+  uint64_t frame = 0;
+};
+std::unordered_map<uint32_t, LwRetained> g_lw_last_items;
 // mesh -> last RESOLVED ropa garment state (rigid world OR skinned palette).
 // Ropa items must NOT ride the g_bones_cache rescue above: a ropa capture is
 // refused exactly when the bank is stale (g_ropa_stale), and while the cloth
@@ -2914,6 +2985,33 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
 // that alpha for items whose validated capture carries it, 1.0 otherwise
 // (legacy-shaded items keep the old always-opaque behavior).
 float CharFadeAlpha(const DrawItem& item) {
+  // LW-mapped items: the entity's own
+  // opacity is authoritative; it is the exact value the game serves this
+  // ctx's shader as output alpha, independent of whether the per-draw row
+  // capture validated (or captured a clone's foreign row). Families whose
+  // shader COMPOSES the entity fade with another factor (hair strand-scale,
+  // vehicle-glass tint alpha) keep their captured value bounded by it.
+  if (item.lw_alpha >= 0.0f) {
+    const float a = std::clamp(item.lw_alpha, 0.0f, 1.0f);
+    switch (item.char_family) {
+      case 1:
+      case 2:
+      case 3:
+      case 6:
+        return a;
+      case 4:
+      case 5:
+        return item.char_rows[14 * 4 + 1] > 0.0f
+                   ? std::min(a, std::clamp(item.char_rows[13 * 4 + 3], 0.0f, 1.0f))
+                   : a;
+      case 7:
+        return item.char_rows[14 * 4 + 1] > 0.0f
+                   ? std::min(a, std::clamp(item.char_rows[14 * 4 + 0], 0.0f, 1.0f))
+                   : a;
+      default:
+        break;
+    }
+  }
   if (item.char_rows[14 * 4 + 1] <= 0.0f) {
     return 1.0f;
   }
@@ -5174,10 +5272,29 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             }
           }
     };
-    uint64_t key = (uint64_t(item.mesh) << 8) | (k & 0xFF);
+    // LW-mapped items key their ring by the game's own per-instance
+    // identity (the MeshContext); sort-
+    // list clone reshuffles cannot mispair an identity key, so the whole
+    // positional claim search below is skipped for them. Mesh stays in the
+    // key so a model/LOD swap on the same instance starts a fresh ring
+    // (pose sizes differ). Legacy (mesh, occurrence) pairing continues to
+    // serve everything without a store entry (player, CAC, non-LW).
+    bool lw_keyed = item.lw_entity != 0 && item.ctx != 0 &&
+                    REXCVAR_GET(skate3_native_render_scene_lw_identity);
+    uint64_t key = lw_keyed ? ((1ull << 63) | (uint64_t(item.ctx) << 32) |
+                               uint64_t(item.mesh))
+                            : ((uint64_t(item.mesh) << 8) | (k & 0xFF));
     DynHist* hp = &s_hist[key];
+    if (lw_keyed && hp->seen == s_frame) {
+      // One ctx published twice in a frame (should not happen; dyn_slot
+      // dedups per ctx): fall back to the legacy pairing for this copy
+      // rather than double-ingesting the identity ring.
+      lw_keyed = false;
+      key = (uint64_t(item.mesh) << 8) | (k & 0xFF);
+      hp = &s_hist[key];
+    }
     const float own_d2 = hp->seen == s_frame ? 1e30f : hist_dist2(*hp);
-    if (own_d2 > 1e-4f) {
+    if (!lw_keyed && own_d2 > 1e-4f) {
       // The k-th slot mispairs: the game's sort lists RESHUFFLE same-mesh
       // clones as they and the camera move. For static props the
       // reset-on-jump guard below was enough (a mispair rendered raw for a
@@ -5413,7 +5530,11 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       const float d2 = skinned_dist2(item.bones, latest.b, h);
       return d2 > 9.0f && d2 < 900.0f;
     }();
+    // dbg_src 10 = LW-authoritative palette substitution: the pose IS the
+    // entity's current sim tick; holding the ring's (older) pose over it
+    // would re-stale exactly what the substitution fixed.
     if (skinned && h.count > 0 && latest.b.size() == item.bones.size() &&
+        item.dbg_src != 10 &&
         ((item.caster_bank && now - h.last_persp_t <= 0.05) || item.retained ||
          caster_stale_jump)) {
       if (caster_stale_jump) {
@@ -6254,6 +6375,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // (rigid vs skinned), never blindly re-skin (see g_ropa_state_cache).
   std::unordered_map<uint32_t, const DrawItem*> pending_skinned_by_mesh;
   std::unordered_map<uint32_t, const DrawItem*> pending_ropa_by_mesh;
+  // Per-INSTANCE candidates (ctx-keyed, character families): the mesh-keyed
+  // rescue above is pub_count==1-gated, so a refused CLONE capture next to
+  // a published twin dropped for the frame: the NPC visible/invisible
+  // flicker (see g_bones_cache_ctx).
+  std::unordered_map<uint32_t, const DrawItem*> pending_skinned_by_ctx;
   const auto total_indices = [](const DrawItem& d) {
     uint64_t n = 0;
     for (const DrawEntry& e : d.draws) n += e.index_count;
@@ -6296,6 +6422,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           pending_ropa_by_mesh.try_emplace(cand.mesh, &cand);
         } else if (cand.skinned) {
           pending_skinned_by_mesh.try_emplace(cand.mesh, &cand);
+          if (cand.ctx != 0 && cand.char_family != 0) {
+            pending_skinned_by_ctx.try_emplace(cand.ctx, &cand);
+          }
         }
         (cand.skinned ? g_skinned_skipped : g_rigid_dropped)
             .fetch_add(1, std::memory_order_relaxed);
@@ -6454,13 +6583,25 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           healed = true;
         }
       } else {
-        const auto bit = g_bones_cache.find(item.mesh);
-        if (bit != g_bones_cache.end() &&
-            bit->second.bones.size() == item.bones.size() &&
-            g_guest_frame - bit->second.frame <= 10) {
-          item.bones = bit->second.bones;
+        // Prefer the per-instance cache (clone-exact) over the mesh-keyed
+        // one; healing a clone with its TWIN's palette is a teleport.
+        const auto cit = item.ctx != 0 ? g_bones_cache_ctx.find(item.ctx)
+                                       : g_bones_cache_ctx.end();
+        if (cit != g_bones_cache_ctx.end() &&
+            cit->second.bones.size() == item.bones.size() &&
+            g_guest_frame - cit->second.frame <= 10) {
+          item.bones = cit->second.bones;
           item.dbg_src = 6;
           healed = true;
+        } else {
+          const auto bit = g_bones_cache.find(item.mesh);
+          if (bit != g_bones_cache.end() &&
+              bit->second.bones.size() == item.bones.size() &&
+              g_guest_frame - bit->second.frame <= 10) {
+            item.bones = bit->second.bones;
+            item.dbg_src = 6;
+            healed = true;
+          }
         }
       }
       if (!healed) {
@@ -6520,6 +6661,53 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         cb.frame = g_guest_frame;
       }
     }
+    // Per-instance palette cache refresh (see g_bones_cache_ctx): every
+    // published skinned character-family item keeps its OWN last palette
+    // keyed by ctx: no pub_count gate needed, the key IS the instance.
+    for (const DrawItem& item : scene.items) {
+      if (!item.skinned || item.bones.empty() || item.caster_bank ||
+          item.ctx == 0 || item.char_family == 0 || item.ropa ||
+          item.draws.empty()) {
+        continue;
+      }
+      if (g_bones_cache_ctx.size() > 2048) {
+        for (auto it = g_bones_cache_ctx.begin();
+             it != g_bones_cache_ctx.end();) {
+          it = g_guest_frame - it->second.frame > 60
+                   ? g_bones_cache_ctx.erase(it)
+                   : std::next(it);
+        }
+      }
+      CachedBones& cb = g_bones_cache_ctx[item.ctx];
+      cb.bones = item.bones;
+      cb.frame = g_guest_frame;
+    }
+    // Per-instance rescue, BEFORE the mesh-keyed one: a refused/pending
+    // skinned character capture whose ctx did not publish this frame
+    // re-publishes with ITS OWN last palette (<= 10 frames fresh, same
+    // bound as the mesh rescue), regardless of how many clones of the mesh
+    // are alive. Rescued items bump pub_count so the mesh-keyed loop below
+    // cannot double-publish the same candidate.
+    for (const auto& [ctxk, cand] : pending_skinned_by_ctx) {
+      if (dyn_slot.find(ctxk) != dyn_slot.end()) {
+        continue;  // this instance published live
+      }
+      const auto bit = g_bones_cache_ctx.find(ctxk);
+      if (bit == g_bones_cache_ctx.end() ||
+          g_guest_frame - bit->second.frame > 10) {
+        continue;  // stale = an old pose; one missing frame beats a teleport
+      }
+      scene.items.push_back(*cand);
+      DrawItem& rescued = scene.items.back();
+      rescued.bones = bit->second.bones;
+      rescued.pending = false;
+      rescued.dbg_src = 3;
+      ++pub_count[rescued.mesh];
+      // Mark the ctx published so the LW gap fill below cannot double-
+      // publish the same instance this frame.
+      dyn_slot.try_emplace(ctxk, scene.items.size() - 1);
+      g_lw_ctx_rescued.fetch_add(1, std::memory_order_relaxed);
+    }
     for (const auto& [mesh, cand] : pending_skinned_by_mesh) {
       if (pub_count.find(mesh) != pub_count.end()) {
         continue;  // a live copy published; nothing to rescue
@@ -6537,6 +6725,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       rescued.bones = bit->second.bones;
       rescued.pending = false;
       rescued.dbg_src = 3;
+      if (rescued.ctx != 0) {
+        dyn_slot.try_emplace(rescued.ctx, scene.items.size() - 1);
+      }
       g_bones_rescued.fetch_add(1, std::memory_order_relaxed);
     }
     // Refused ropa captures re-publish last frame's resolved state: mode,
@@ -6557,7 +6748,62 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       std::memcpy(rescued.world, rit->second.world, sizeof(rescued.world));
       rescued.pending = false;
       rescued.dbg_src = 4;
+      if (rescued.ctx != 0) {
+        dyn_slot.try_emplace(rescued.ctx, scene.items.size() - 1);
+      }
       g_ropa_rescued.fetch_add(1, std::memory_order_relaxed);
+    }
+    // LW gap fill (see g_lw_last_items): republish live entities' items
+    // whose ctx skipped this frame's records entirely, the class the
+    // pending rescues cannot see (no capture happened at all).
+    if (REXCVAR_GET(skate3_native_render_scene_lw_gap_fill)) {
+      const uint64_t now = g_guest_frame;
+      for (auto it = g_lw_last_items.begin(); it != g_lw_last_items.end();) {
+        if (dyn_slot.find(it->first) != dyn_slot.end()) {
+          ++it;  // published live this frame; refreshed below
+          continue;
+        }
+        LwRetained& r = it->second;
+        float alpha = 1.0f;
+        uint32_t entity = 0;
+        if (now - r.frame > 2 ||
+            !skate3::native_lw::LookupLwCtx(it->first, &alpha, &entity)) {
+          it = g_lw_last_items.erase(it);
+          continue;
+        }
+        scene.items.push_back(r.item);
+        scene.items.back().dbg_src = 9;  // gap fill (refresh below skips it)
+        g_lw_gap_filled.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_fill_logged{0};
+        const uint32_t ln = s_fill_logged.fetch_add(1, std::memory_order_relaxed);
+        if (ln < 16 || (ln & 255u) == 0) {
+          REXLOG_INFO(
+              "native-scene: LW gap fill ctx={:08X} mesh={:08X} fam={} "
+              "age={} alpha={:.2f} (n={})",
+              it->first, r.item.mesh, r.item.char_family, now - r.frame,
+              alpha, ln);
+        }
+        ++it;
+      }
+      for (const DrawItem& item : scene.items) {
+        // NOTE: lw_entity is not stamped yet here (the stamp pass runs just
+        // before the smoothing block); LW membership is enforced at FILL
+        // time by the store lookup; non-LW entries simply expire unused.
+        if (item.char_family == 0 || item.ctx == 0 || item.ropa ||
+            item.pending || item.caster_bank || item.dbg_src == 9 ||
+            !item.skinned || item.bones.empty() || item.draws.empty()) {
+          continue;
+        }
+        if (g_lw_last_items.size() > 512 &&
+            g_lw_last_items.find(item.ctx) == g_lw_last_items.end()) {
+          continue;  // growth backstop
+        }
+        LwRetained& r = g_lw_last_items[item.ctx];
+        r.item = item;
+        r.frame = now;
+      }
+    } else if (!g_lw_last_items.empty()) {
+      g_lw_last_items.clear();
     }
   }
   // Cross-frame character-lighting fallback (see g_char_rows_cache): items
@@ -6960,6 +7206,110 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         g_dyn_jobs.push_back(std::move(j));
       }
       g_prewarm_cv.notify_all();
+    }
+  }
+
+  // LivingWorld entity store stamp: map
+  // each character-family item's MeshContext to its owning LW entity and
+  // stamp the entity's authoritative opacity + per-instance identity. Runs
+  // after every dyn publish path (captures, merges, rescues, vehicle
+  // retention) and before the smoothing block so the pose rings can key by
+  // identity. Items with no fresh store entry (player skater - a different
+  // fade system, CAC entities, despawned/retained leftovers) keep the
+  // captured-row behavior untouched.
+  if (REXCVAR_GET(skate3_native_render_scene_lw_fade) ||
+      REXCVAR_GET(skate3_native_render_scene_lw_identity)) {
+    // Fade serving also honors the master entity-fade switch: with it off
+    // the routing ignores fades entirely, so the alpha row must keep its
+    // captured value (the shader still reads it on some paths).
+    const bool serve_fade =
+        REXCVAR_GET(skate3_native_render_scene_lw_fade) &&
+        REXCVAR_GET(skate3_native_render_scene_entity_fade);
+    const bool serve_id = REXCVAR_GET(skate3_native_render_scene_lw_identity);
+    for (DrawItem& item : scene.items) {
+      if (item.char_family == 0 || item.ctx == 0) {
+        continue;
+      }
+      float alpha = 1.0f;
+      uint32_t entity = 0;
+      if (!skate3::native_lw::LookupLwCtx(item.ctx, &alpha, &entity)) {
+        continue;
+      }
+      g_lw_stamped.fetch_add(1, std::memory_order_relaxed);
+      if (serve_id) {
+        item.lw_entity = entity;
+      }
+      // Per-ctx lighting/paint rows (see g_char_rows_cache_ctx): refresh
+      // from validated captures, serve on capture-failed frames, entity-
+      // checked so a recycled instance never inherits foreign paint. This
+      // keeps edge-of-view vehicles (caster-only capture stretches, every
+      // read rejected) on their own shading instead of legacy flat.
+      if (item.char_rows[14 * 4 + 1] > 0.0f) {
+        if (g_char_rows_cache_ctx.size() > 4096) {
+          g_char_rows_cache_ctx.clear();
+        }
+        CharRowsCtx& cr = g_char_rows_cache_ctx[item.ctx];
+        std::memcpy(cr.rows.data(), item.char_rows, sizeof(item.char_rows));
+        cr.entity = entity;
+      } else {
+        const auto rit = g_char_rows_cache_ctx.find(item.ctx);
+        if (rit != g_char_rows_cache_ctx.end() &&
+            rit->second.entity == entity) {
+          std::memcpy(item.char_rows, rit->second.rows.data(),
+                      sizeof(item.char_rows));
+          g_lw_rows_served.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      // Authoritative palette for every vehicle pose that did NOT come
+      // from a fresh perspective capture: caster-only frames (ortho banks
+      // = GUESSED palette base + ~40 ms-stale animation, the edge-of-view
+      // mangle class), retention re-publishes (last capture aging up to 10
+      // frames; at driving speed a stale republish renders a GHOST
+      // meters BEHIND the live position right after the vehicle exits the
+      // view; a garbage last capture makes the ghost sideways), rescues
+      // and gap fills. The entity's OWN packed palette (m_matrices,
+      // written by the pack writer this sim tick) is its true current
+      // pose: a genuinely-exited vehicle lands off-screen (no ghost), a
+      // pan-trailing retention case lands exactly right.
+      if (item.skinned && !item.ropa &&
+          (item.char_family == 6 || item.char_family == 7) &&
+          (item.caster_bank || item.retained || item.dbg_src == 3 ||
+           item.dbg_src == 6 || item.dbg_src == 9) &&
+          !item.bones.empty() &&
+          REXCVAR_GET(skate3_native_render_scene_lw_palette)) {
+        float rows[96 * 12];
+        const uint32_t n =
+            skate3::native_lw::LookupLwPalette(item.ctx, rows, 96 * 12);
+        if (n != 0 && size_t(n) * 12 <= item.bones.size()) {
+          std::memcpy(item.bones.data(), rows, size_t(n) * 12 * sizeof(float));
+          item.caster_bank = false;
+          item.dbg_src = 10;  // lw palette substitution
+          g_lw_pal_sub.fetch_add(1, std::memory_order_relaxed);
+          static std::atomic<uint32_t> s_sub_logged{0};
+          const uint32_t ln =
+              s_sub_logged.fetch_add(1, std::memory_order_relaxed);
+          if (ln < 16 || (ln & 511u) == 0) {
+            REXLOG_INFO(
+                "native-scene: LW palette substituted ctx={:08X} mesh={:08X} "
+                "fam={} rows={} (n={})",
+                item.ctx, item.mesh, item.char_family, n, ln);
+          }
+        }
+      }
+      if (serve_fade) {
+        item.lw_alpha = alpha;
+        // The exact shading path reads the alpha ROW (cbuffer CH row 14.x)
+        // - overwrite it with the entity value for the families where that
+        // row IS the raw entity fade on console (c13.x / c21.x / c22.x /
+        // c20.x). Hair (strand-scale composed) and vehicle glass
+        // (tint-composed) keep their captured rows; CharFadeAlpha bounds
+        // them by the entity alpha instead.
+        if (item.char_rows[14 * 4 + 1] > 0.0f &&
+            (item.char_family == 1 || item.char_family == 2 ||
+             item.char_family == 3 || item.char_family == 6)) {
+          item.char_rows[14 * 4 + 0] = std::clamp(alpha, 0.0f, 1.0f);
+        }
+      }
     }
   }
 
@@ -13107,6 +13457,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     }
   }
   if (frames % 600 == 0) {
+    uint32_t lw_ctxs = 0, lw_ents = 0;
+    skate3::native_lw::QueryLwStats(&lw_ctxs, &lw_ents);
     REXLOG_INFO(
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
@@ -13118,7 +13470,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "store[n={} routes={} evict={}] "
         "heal[vfail={} dfail={} demote={}] serve[sticky={} skipnew={} adstale={} adnone={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
-        "bones_rescued={}] dynobj[valid={} drawn={}] refl[pair={} flat={} gate={:#x}]",
+        "bones_rescued={}] dynobj[valid={} drawn={}] "
+        "lw[ctxs={} ents={} stamp={} fade0={} resc={} fill={} pal={} rows={}] "
+        "refl[pair={} flat={} gate={:#x}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.tex_store.size(),
@@ -13144,8 +13498,10 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         shadow_ready, shadow_draws,
         g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
         g_char_rows_reused.load(), g_bones_rescued.load(), scene.dynobj_valid,
-        g_dynobj_drawn.load(), g_refl_pair.load(), g_refl_flat.load(),
-        g_refl_gate.load());
+        g_dynobj_drawn.load(), lw_ctxs, lw_ents, g_lw_stamped.load(),
+        g_lw_fade0.load(), g_lw_ctx_rescued.load(), g_lw_gap_filled.load(),
+        g_lw_pal_sub.load(), g_lw_rows_served.load(),
+        g_refl_pair.load(), g_refl_flat.load(), g_refl_gate.load());
   }
 }
 
@@ -14692,8 +15048,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // LivingWorld entity draws at alpha 0 through the whole spawn settle
     // (NPCs drop ~1 m to the ground before fading in) and ramps alpha with
     // distance; skip invisible items entirely, blend mid-fade ones.
+    // LW-mapped items (lw_alpha >= 0) do not need a validated lighting
+    // capture to honor the fade: the entity alpha is authoritative even
+    // when the capture chain failed; a spawn-settling NPC is invisible
+    // regardless of whether its rows validated this frame.
     const bool entity_fade = debug_mode == 0 && item.char_family != 0 &&
-                             char_capture_ok &&
+                             (char_capture_ok || item.lw_alpha >= 0.0f) &&
                              REXCVAR_GET(skate3_native_render_scene_entity_fade);
     const float fade_a = entity_fade ? CharFadeAlpha(item) : 1.0f;
     // One-frame fade-blink guard: a mesh that rendered ~opaque last frame
@@ -14705,8 +15065,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // skip + the mid-fade blend routing) and log it. The last-alpha map
     // updates from the RAW value, so a persisting alpha 0 (real despawn /
     // spawn settle) only gets one repaired frame and then skips normally.
+    // LW-mapped items bypass the blink repair entirely (read AND write):
+    // the entity alpha cannot blink; the repair exists for garbage/foreign
+    // CAPTURED rows, and its mesh key is clone-shared, which force-drew
+    // spawn-settling clones OPAQUE every frame their twin was visible (the
+    // "NPC drops out of the sky with no fade" sighting).
     bool fade_blink = false;
-    if (item.char_family != 0 && debug_mode == 0) {
+    if (item.char_family != 0 && debug_mode == 0 && item.lw_alpha < 0.0f) {
       static std::unordered_map<uint32_t, uint8_t> s_fade_opaque;  // render thread
       uint8_t& was_opaque = s_fade_opaque[item.mesh];
       if (entity_fade && fade_a <= 0.004f && was_opaque) {
@@ -14730,6 +15095,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     if (entity_fade && fade_a <= 0.004f && !fade_blink) {
+      if (item.lw_alpha >= 0.0f) {
+        g_lw_fade0.fetch_add(1, std::memory_order_relaxed);
+      }
       continue;
     }
     const bool char_fade_blend = char_fade_zwrite(item) && !fade_blink;

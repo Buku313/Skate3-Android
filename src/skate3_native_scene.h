@@ -25,6 +25,15 @@ struct DrawItem {
   // and the entity store: the owning cModelInstance is resolved backward by
   // m_arrMeshContext containment (there is no forward mesh->owner pointer).
   uint32_t ctx = 0;
+  // LivingWorld entity store mapping,
+  // stamped at scene build when this ctx belongs to a live LW entity:
+  // lw_alpha = the entity's authoritative opacity (entity+528.x: exactly
+  // the value BindConstants serves this ctx as the shader's output alpha;
+  // -1 = unmapped), lw_entity = the owning entity address (the game's own
+  // per-instance identity, used to key the pose rings so same-mesh clone
+  // reshuffles can never mispair).
+  float lw_alpha = -1.0f;
+  uint32_t lw_entity = 0;
   uint32_t mesh;      // guest mesh object address (resource cache key)
   uint32_t vb_obj;    // guest renderengine::VertexBuffer object (draw matching)
   uint32_t ib_obj;    // guest renderengine::IndexBuffer object (draw matching)

@@ -21,6 +21,10 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_splines);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_quadlists);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_world_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynamic_items);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_fade);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_identity);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_gap_fill);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_palette);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_retain_offscreen);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
@@ -217,6 +221,37 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                            REXCVAR_GET(skate3_native_render_scene_dynamic_items),
                            "Characters, movable props, cloth (RenderMesh/world-path "
                            "captures)"));
+  REXCVAR_SET(
+      skate3_native_render_scene_lw_fade,
+      CvarCheckbox("LW entity fade (store)",
+                   REXCVAR_GET(skate3_native_render_scene_lw_fade),
+                   "Serve NPC/traffic fade alpha from the LivingWorld entity "
+                   "itself (per-instance store) instead of the per-draw "
+                   "captured constant row; fixes opaque mid-air spawns, "
+                   "missing fade-ins and clone alpha blinks"));
+  REXCVAR_SET(
+      skate3_native_render_scene_lw_identity,
+      CvarCheckbox("LW entity identity (pose rings)",
+                   REXCVAR_GET(skate3_native_render_scene_lw_identity),
+                   "Key NPC/traffic pose-smoothing rings by the game's own "
+                   "per-instance MeshContext instead of (mesh, occurrence) "
+                   "pairing; clone reshuffles can no longer mispair "
+                   "(teleport/slide class)"));
+  REXCVAR_SET(
+      skate3_native_render_scene_lw_gap_fill,
+      CvarCheckbox("LW gap fill (1-2 frame republish)",
+                   REXCVAR_GET(skate3_native_render_scene_lw_gap_fill),
+                   "Republish a live NPC whose MeshContext skipped this "
+                   "frame's submit records (the 1-3 frame publish GAPs that "
+                   "read as blinks/small teleports)"));
+  REXCVAR_SET(
+      skate3_native_render_scene_lw_palette,
+      CvarCheckbox("LW authoritative caster palettes",
+                   REXCVAR_GET(skate3_native_render_scene_lw_palette),
+                   "Replace GUESSED ortho caster-bank palettes on "
+                   "edge-of-view vehicles with the entity's own packed "
+                   "palette from the pack writer (the mangle/transform "
+                   "class)"));
   REXCVAR_SET(skate3_native_render_scene_quadlists,
               CvarCheckbox("Quad-list particles",
                            REXCVAR_GET(skate3_native_render_scene_quadlists),

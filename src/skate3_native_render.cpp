@@ -1,5 +1,6 @@
 #include "skate3_native_render.h"
 
+#include "native/skate3_native_lw.h"
 #include "native/skate3_native_v3_shadow.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
@@ -667,11 +668,13 @@ extern "C" REX_FUNC(sub_827A52C8) {
 
 // Sk8::cLivingWorldPresEntity::Update: post-call, this+528 holds the
 // entity's evaluated spawn/distance fade opacity (x = alpha), this+16 the
-// current LOD index.
+// current LOD index. Feeds BOTH the v3 shadow fade comparison and the
+// LW entity store (per-instance ctx -> alpha/identity, the serving path).
 extern "C" REX_FUNC(sub_827C1188) {
   const uint32_t entity = ctx.r3.u32;
   __imp__sub_827C1188(ctx, base);
   if (skate3::native_render::Enabled()) {
+    skate3::native_lw::OnLwEntityTick(base, entity);
     skate3::native_v3::OnLivingWorldUpdate(base, entity);
   }
 }
