@@ -232,7 +232,6 @@ set(SKATE3_COMMON_SOURCES
     src/native/skate3_native_lw.cpp
     src/native/skate3_native_v3_shadow.cpp
     src/native/skate3_native_v3_shadow_mat.cpp
-    src/native/skate3_hud_tile.cpp
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp

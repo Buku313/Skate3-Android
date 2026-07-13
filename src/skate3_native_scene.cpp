@@ -35,7 +35,6 @@
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_v3_shadow.h"
 #include "native/skate3_native_v3_shadow_mat.h"
-#include "native/skate3_hud_tile.h"
 
 #if defined(REX_HAS_D3D12) && REX_HAS_D3D12
 #include <rex/graphics/d3d12/command_processor.h>
@@ -361,33 +360,21 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ropa_blend, true, "Skate 3",
                     "jelly/clip-through, worse at LOWER fps. OFF = newest decode "
                     "(old behavior).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_2d_tile_regen, 4, "Skate 3",
-                     "Regenerate small 2D/HUD cached-bitmap tiles at Nx resolution "
-                     "when they fit the radial (concentric-circle) model: the score "
-                     "ring quadrants / meter arcs the APT UI rasterizes at 720p "
-                     "display size and every faithful renderer shows soft. The tile's "
-                     "radius->color profile is measured, validated (fit err <=3/255; "
-                     "ring quadrants measure ~1, non-radial art ~30 and falls back) "
-                     "and re-rendered as exact circle art with authored AA ramps "
-                     "tightened to output-pixel width. 0 = off, 2-4 = factor. Hot "
-                     "(affects NEW decodes; cached tiles keep their resolution until "
-                     "content churn).")
-    .range(0, 4)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(
-    skate3_native_render_scene_2d_async_px, 131072, "Skate 3",
+    skate3_native_render_scene_2d_async_px, 1, "Skate 3",
     "Pixel-count threshold above which 2D/HUD texture decodes route to the "
     "words-miss decode workers instead of running inline on the render "
-    "thread. Fullscreen menu/loading art decodes 10-35 ms inline (136 ms "
-    "max observed) and every screen change brings a burst of "
-    "it; the stall blocks the swap, freezes the guest (guest_dt_max "
-    "100-256 ms in menu windows) and reads as sluggish menus + hard-cut "
-    "screen transitions (the game's captured fade fills advance only a "
-    "frame or two mid-stall). Async: a first sighting skips the quad for "
-    "the 1-3 frames the worker needs (imperceptible pop-in), a content "
+    "thread. Inline 2D decodes stall the frame AND the guest (swap blocks; "
+    "guest_dt_max 100-256 ms in menu windows), and the cost "
+    "is NOT proportional to texel count: 8888 APT tiles pay a per-PIXEL "
+    "tiled-offset computation plus two CreateCommittedResource calls, so "
+    "even 64x64 tiles measured 3-19 ms. Default 1 = "
+    "everything async: a first sighting skips the quad for the 1-3 frames "
+    "the worker needs (imperceptible pop-in at render rate), a content "
     "change keeps serving the stale decode until the commit swaps it. "
-    "Small tiles stay inline: sub-ms, and the radial tile regen "
-    "(2d_tile_regen) is render-thread-only. 0 = all inline (old behavior).")
+    "0 = all inline (old "
+    "behavior); larger values gate by pixel count (the original big-art "
+    "threshold was 131072).")
     .range(0, 1 << 24)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_2d_sharp, 0.0, "Skate 3",
@@ -1087,10 +1074,6 @@ struct Draw2d {
   uint32_t fetch[18];
   float consts[36];   // VS c0..c8
   std::vector<uint8_t> verts;  // filled at frame end (little-endian dwords)
-  // Set by ApplyGaugeComposites on the render thread's frame-local copy:
-  // >= 0 redirects this draw to a per-GAUGE composite texture (the quad's
-  // uvs are rewritten to sample its slice of the joint regeneration).
-  int composite_srv = -1;
 };
 std::mutex g_2d_mutex;
 std::vector<Draw2d> g_frame_2d;  // capture in submission order
@@ -3028,23 +3011,25 @@ bool IsCasEditorPs(uint8_t* base, uint32_t obj) {
 
 void OnSetShader(bool pixel, uint32_t obj) {
   (pixel ? g_cur_ps_obj : g_cur_vs_obj).store(obj, std::memory_order_relaxed);
-  if (pixel) {
-    uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
-    if (base != nullptr && IsCasEditorPs(base, obj)) {
-      g_cas_ps_last_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 std::chrono::steady_clock::now().time_since_epoch())
-                                 .count(),
-                             std::memory_order_relaxed);
-    }
+  // Classify BOTH labels: the hook's pixel/vertex flags are SWAPPED
+  // relative to the real shader types (see ClassifySplineShader, which
+  // checks both trackers for the same reason); gating on `pixel` alone
+  // left the heartbeat dead (the *_nisPS debug paths arrive on the other
+  // label), which blackholed the startup-flow editor.
+  uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
+  if (base != nullptr && IsCasEditorPs(base, obj)) {
+    g_cas_ps_last_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count(),
+                           std::memory_order_relaxed);
   }
 }
 
 // The CAS editor is ON SCREEN now: its own "_nis" pixel shaders were set
 // within the last 0.5 s (see IsCasEditorPs). Consumed by the portrait-pass
 // publish gate and the takeover gates; the STARTUP-flow editor's scene is
-// skater-only (the garage geometry only exists in-world, so pre-gameplay the
-// scene is ~10 all-character items at cam (-3.8,200.9,-7.6)), which both looks exactly like a portrait pass and sits below
-// warmup_min_items.
+// small (below warmup_min_items) and can look like a portrait pass, so the
+// gates need to know the editor is up.
 bool CasEditorHeartbeatFresh() {
   const int64_t last_ns = g_cas_ps_last_ns.load(std::memory_order_relaxed);
   if (last_ns < 0) {
@@ -3054,6 +3039,31 @@ bool CasEditorHeartbeatFresh() {
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
   return now_ns - last_ns < 500'000'000;
+}
+
+// Full CAS-editor detection: FE push-state screen id 15 (present in BOTH
+// flows, pause: [0,56,63,15], startup new-game: [0,67,15], verified in
+// capture) OR the _nis shader heartbeat as backup. Cheap
+// (a handful of guarded u32 reads); stateless per frame.
+bool CasEditorActive(uint8_t* base) {
+  if (CasEditorHeartbeatFresh()) {
+    return true;
+  }
+  constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
+  uint32_t mgr = 0, beg = 0, end = 0;
+  if (GuestTryLoadU32(base, kFrontEndManagerPtr, &mgr) && mgr != 0 &&
+      GuestTryLoadU32(base, mgr + 0x210, &beg) &&
+      GuestTryLoadU32(base, mgr + 0x214, &end) && beg < end &&
+      end - beg <= 20 * 16) {
+    const uint32_t n = (end - beg) / 20;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint32_t f0 = 0;
+      if (GuestTryLoadU32(base, beg + i * 20, &f0) && f0 == 15) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 void OnRenderStateUpload(uint64_t mask, uint32_t bank, uint32_t ptr) {
@@ -8493,7 +8503,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // _default compiles and never do.
   if (rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0 &&
       !scene.items.empty() && scene.items.size() <= 48 &&
-      !CasEditorHeartbeatFresh()) {
+      !CasEditorActive(base)) {
     bool all_char = true;
     for (const DrawItem& it : scene.items) {
       if (it.char_family == 0) {
@@ -8638,6 +8648,14 @@ struct GuestTexture {
   // Unbounded forcing re-decoded permanently-uniform textures every poll
   // forever, each a discarded worker round trip.
   uint8_t nb_redecodes = 0;
+  // Frame of the last decode that landed CHANGED content for this key
+  // (stamped by the words-key commit and the inline 2D decode). Classifies
+  // video-plane content changes as mid-playback (recent change -> serve the
+  // stale frame while the worker re-decodes, keeps 30 fps cadence) vs a
+  // playback-START edge (quiet for seconds -> the entry holds the PREVIOUS
+  // video's last frame; serving it flashed old content at every video
+  // boundary; hold the quad black until fresh content commits).
+  uint64_t last_change_frame = 0;
 };
 
 // THE texture identity key: FNV-1a
@@ -8647,7 +8665,14 @@ struct GuestTexture {
 inline uint64_t FetchWordsKey(const uint32_t words[6]) {
   uint64_t key = 1469598103934665603ull;
   for (int k = 0; k < 6; ++k) {
-    key ^= words[k];
+    // Clamp modes (dword_0 bits 10-18, clamp_x/y/z) are SAMPLER state, not
+    // content identity; the same texture object binds with different clamp
+    // bits per draw (observed: one texture decoded twice under 01004802 vs
+    // 01024802, bit 17), and keying on them decodes/stores every variant
+    // separately. The store holds textures + SRVs only; samplers are
+    // static in the replay pipelines, so clamp-variant entries are exact
+    // duplicates. Sign bits stay: they select the host SRV format.
+    key ^= k == 0 ? (words[k] & ~0x0007FC00u) : words[k];
     key *= 1099511628211ull;
   }
   return key;
@@ -9061,19 +9086,6 @@ struct RendererState {
   static constexpr uint32_t kUiRegions = 4;
   ID3D12Resource* ui_ring = nullptr;
   uint8_t* ui_ring_cpu = nullptr;
-  // Decoded 1x RGBA of the small HUD tiles (filled by EnsureHudTileRegen
-  // before its radial gate); the per-GAUGE composite path reads these to
-  // rebuild whole gauges (ApplyGaugeComposites).
-  struct Tile1x {
-    uint32_t w = 0, h = 0;
-    uint32_t swizzle = 0;  // fetch dword3 swizzle (SRV composition)
-    std::vector<uint32_t> px;
-  };
-  std::unordered_map<uint64_t, Tile1x> tiles_rgba;
-  // Per-gauge composite regenerations, keyed by the member tiles' words +
-  // layout (content changes reallocate the tiles -> new words -> new key).
-  // valid=false entries are negative caches (joint fit rejected).
-  std::unordered_map<uint64_t, GuestTexture> gauge_composites;
   // Last successfully resolved words-key per streamed-art site
   // (mesh << 1 | slot; slot 0 = diffuse override, 1 = decal override).
   // Serves the site's previous art while a new-mip-words decode is in
@@ -10517,667 +10529,6 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   out.recheck_frame = 0;
   out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
   return true;
-}
-
-// ---- APT cached-bitmap tile regeneration (skate3_hud_tile.h) -------------
-// The 2D/HUD path's small runtime-rasterized tiles (score ring quadrants,
-// meter arcs) carry exactly one texel per 720p display pixel: the one HUD
-// class that stays soft at any render scale on every faithful renderer
-// (the content is CPU-written by the APT filter rasterizer; Xenia cannot
-// scale it either). Where a tile fits the radial model, re-render it at
-// factor-x as exact circle art before upload. Only the inline words-keyed
-// 2D resolve uses this; everything else keeps the plain decode.
-
-// BC1 color endpoints expand with BIT-REPLICATION, not integer scaling;
-// the low bits matter (the glass-streetlight lesson, commit 72287a9).
-void DecodeBc1ColorBlock(const uint8_t* blk, bool always_four,
-                         uint32_t texels[16]) {
-  const uint16_t c0 = uint16_t(blk[0] | (blk[1] << 8));
-  const uint16_t c1 = uint16_t(blk[2] | (blk[3] << 8));
-  uint8_t pal[4][4];  // rgba
-  const auto expand = [](uint16_t c, uint8_t* o) {
-    const uint32_t r5 = (c >> 11) & 31u, g6 = (c >> 5) & 63u, b5 = c & 31u;
-    o[0] = uint8_t((r5 << 3) | (r5 >> 2));
-    o[1] = uint8_t((g6 << 2) | (g6 >> 4));
-    o[2] = uint8_t((b5 << 3) | (b5 >> 2));
-    o[3] = 255;
-  };
-  expand(c0, pal[0]);
-  expand(c1, pal[1]);
-  if (always_four || c0 > c1) {
-    for (int k = 0; k < 3; ++k) {
-      pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k] + 1) / 3);
-      pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k] + 1) / 3);
-    }
-    pal[2][3] = pal[3][3] = 255;
-  } else {
-    for (int k = 0; k < 3; ++k) {
-      pal[2][k] = uint8_t((pal[0][k] + pal[1][k]) / 2);
-      pal[3][k] = 0;
-    }
-    pal[2][3] = 255;
-    pal[3][3] = 0;  // 3-color mode: index 3 = transparent black
-  }
-  uint32_t idx;
-  std::memcpy(&idx, blk + 4, 4);
-  for (int t = 0; t < 16; ++t) {
-    const uint8_t* p = pal[(idx >> (2 * t)) & 3u];
-    texels[t] = uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
-                (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
-  }
-}
-
-void DecodeBc3Block(const uint8_t* blk, uint32_t texels[16]) {
-  DecodeBc1ColorBlock(blk + 8, /*always_four=*/true, texels);
-  const uint8_t a0 = blk[0], a1 = blk[1];
-  uint64_t bits = 0;
-  for (int i = 0; i < 6; ++i) {
-    bits |= uint64_t(blk[2 + i]) << (8 * i);
-  }
-  for (int t = 0; t < 16; ++t) {
-    const uint32_t k = uint32_t(bits >> (3 * t)) & 7u;
-    uint32_t a;
-    if (k == 0) {
-      a = a0;
-    } else if (k == 1) {
-      a = a1;
-    } else if (a0 > a1) {
-      a = ((8 - k) * a0 + (k - 1) * a1) / 7;
-    } else if (k == 6) {
-      a = 0;
-    } else if (k == 7) {
-      a = 255;
-    } else {
-      a = ((6 - k) * a0 + (k - 1) * a1) / 5;
-    }
-    texels[t] = (texels[t] & 0x00FFFFFFu) | (a << 24);
-  }
-}
-
-// Decode a small 2D fetch (mip 0) to RGBA, regenerate radially at
-// `factor`x, and serve it as an R8G8B8A8 texture. Returns false (leaving
-// `out` untouched apart from scratch fields) whenever anything disqualifies
-// the tile; the caller then takes the plain EnsureGuestTextureFromWords
-// path. Inline render-thread paths only (never the staged worker split).
-bool EnsureHudTileRegen(const NativeGuestOutputRenderContext& context,
-                        uint8_t* base, const uint32_t words[6], int factor,
-                        GuestTexture& out) {
-  if (g_tex_stage_out != nullptr) {
-    return false;
-  }
-  xenos::xe_gpu_texture_fetch_t fetch = {};
-  fetch.dword_0 = words[0];
-  fetch.dword_1 = words[1];
-  fetch.dword_2 = words[2];
-  fetch.dword_3 = words[3];
-  fetch.dword_4 = words[4];
-  fetch.dword_5 = words[5];
-  if (fetch.type != xenos::FetchConstantType::kTexture || fetch.base_address == 0) {
-    return false;
-  }
-  const rex::graphics::FormatInfo* pre_fi =
-      rex::graphics::FormatInfo::Get(uint32_t(fetch.format));
-  if (pre_fi == nullptr || pre_fi->block_width == 0 || pre_fi->block_height == 0 ||
-      pre_fi->bytes_per_block() == 0) {
-    return false;
-  }
-  rex::graphics::TextureInfo info;
-  if (!rex::graphics::TextureInfo::Prepare(fetch, &info)) {
-    return false;
-  }
-  if (info.dimension != xenos::DataDimension::k2DOrStacked || info.is_stacked ||
-      info.memory.base_address == 0 || info.memory.base_size == 0) {
-    return false;
-  }
-  const auto base_fmt = rex::graphics::GetBaseFormat(info.format);
-  if (base_fmt != xenos::TextureFormat::k_DXT1 &&
-      base_fmt != xenos::TextureFormat::k_DXT4_5 &&
-      base_fmt != xenos::TextureFormat::k_8_8_8_8) {
-    return false;
-  }
-  const uint32_t width = info.width + 1u;
-  const uint32_t height = info.height + 1u;
-  if (width < 16 || height < 16 || width > 128 || height > 128) {
-    return false;
-  }
-  HostTextureFormat host;
-  if (!GetHostTextureFormat(info.format, host)) {
-    return false;
-  }
-  const rex::graphics::FormatInfo* format_info = info.format_info();
-  const uint32_t bytes_per_block = format_info->bytes_per_block();
-  if (bytes_per_block == 0 || (bytes_per_block & (bytes_per_block - 1)) != 0) {
-    return false;
-  }
-  const uint32_t bytes_per_block_log2 = uint32_t(std::countr_zero(bytes_per_block));
-  const uint32_t block_w = format_info->block_width;
-  const uint32_t block_h = format_info->block_height;
-
-  // Guest copy of mip 0 (same swizzle-aware sizing as the plain decode; a
-  // truncated copy simply falls back; never regenerate partial content).
-  uint32_t ox = 0, oy = 0;
-  const uint32_t mip_addr = info.GetMipLocation(0, &ox, &oy, true);
-  const uint32_t pitch_blocks = info.extent.block_pitch_h;
-  uint32_t src_size = info.memory.base_size;
-  if (info.is_tiled) {
-    const uint32_t right = (width + block_w - 1) / block_w + ox;
-    const uint32_t bottom = (height + block_h - 1) / block_h + oy;
-    src_size = std::max(
-        src_size, rex::graphics::texture_util::GetTiledAddressUpperBound2D(
-                      right, bottom, pitch_blocks, bytes_per_block_log2));
-  }
-  static thread_local std::vector<uint8_t> guest_scratch;
-  guest_scratch.resize(src_size);
-  if (!GuestTryCopy(guest_scratch.data(), base + (0xA0000000u | mip_addr), src_size)) {
-    return false;
-  }
-
-  // De-tile + endian-swap into linear block rows.
-  const uint32_t cols = (width + block_w - 1) / block_w;
-  const uint32_t rows = (height + block_h - 1) / block_h;
-  static thread_local std::vector<uint8_t> block_scratch;
-  block_scratch.resize(size_t(cols) * rows * bytes_per_block);
-  for (uint32_t by = 0; by < rows; ++by) {
-    for (uint32_t bx = 0; bx < cols; ++bx) {
-      uint32_t source_offset;
-      if (info.is_tiled) {
-        source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
-            int32_t(bx + ox), int32_t(by + oy), pitch_blocks, bytes_per_block_log2));
-      } else {
-        source_offset = ((by + oy) * pitch_blocks + bx + ox) * bytes_per_block;
-      }
-      if (source_offset + bytes_per_block > src_size) {
-        return false;  // out-of-range block: fall back, don't fabricate
-      }
-      std::memcpy(block_scratch.data() + (size_t(by) * cols + bx) * bytes_per_block,
-                  guest_scratch.data() + source_offset, bytes_per_block);
-    }
-  }
-  SwapGuestEndian(block_scratch.data(), uint32_t(block_scratch.size()),
-                  info.endianness);
-
-  // Decode to RGBA (canonical channel order; the SRV swizzle below applies
-  // the fetch swizzle exactly like the plain path would).
-  std::vector<uint32_t> rgba(size_t(width) * height);
-  if (base_fmt == xenos::TextureFormat::k_8_8_8_8) {
-    for (uint32_t y = 0; y < height; ++y) {
-      std::memcpy(rgba.data() + size_t(y) * width,
-                  block_scratch.data() + size_t(y) * cols * bytes_per_block,
-                  size_t(width) * 4);
-    }
-  } else {
-    for (uint32_t by = 0; by < rows; ++by) {
-      for (uint32_t bx = 0; bx < cols; ++bx) {
-        uint32_t texels[16];
-        const uint8_t* blk =
-            block_scratch.data() + (size_t(by) * cols + bx) * bytes_per_block;
-        if (base_fmt == xenos::TextureFormat::k_DXT1) {
-          DecodeBc1ColorBlock(blk, /*always_four=*/false, texels);
-        } else {
-          DecodeBc3Block(blk, texels);
-        }
-        for (uint32_t ty = 0; ty < 4; ++ty) {
-          const uint32_t y = by * 4 + ty;
-          if (y >= height) {
-            break;
-          }
-          for (uint32_t tx = 0; tx < 4; ++tx) {
-            const uint32_t x = bx * 4 + tx;
-            if (x < width) {
-              rgba[size_t(y) * width + x] = texels[ty * 4 + tx];
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Retain the decoded 1x pixels for the per-GAUGE composite path (before
-  // the gate on purpose: composites also need tiles whose own fit fails).
-  {
-    if (g_r.tiles_rgba.size() > 256) {
-      g_r.tiles_rgba.clear();
-    }
-    RendererState::Tile1x& t1 = g_r.tiles_rgba[FetchWordsKey(words)];
-    t1.w = width;
-    t1.h = height;
-    t1.swizzle = fetch.swizzle;
-    t1.px = rgba;
-  }
-
-  // Radial fit + regeneration (the actual gate: non-radial art rejects).
-  float fit_err = 0.0f;
-  std::vector<uint32_t> up;
-  if (!skate3::hud_tile::RegenerateRadial(rgba.data(), int(width), int(height),
-                                          factor, up, &fit_err)) {
-    return false;
-  }
-  const uint32_t uw = width * uint32_t(factor);
-  const uint32_t uh = height * uint32_t(factor);
-  {
-    static std::atomic<uint32_t> s_regen_logs{0};
-    const uint32_t n = s_regen_logs.fetch_add(1, std::memory_order_relaxed);
-    if (n < 16 || (n & 63u) == 0) {
-      REXLOG_INFO(
-          "native-scene: HUD tile radial-regen {}x{} -> {}x{} fit_err={:.2f} "
-          "fmt={} w1={:08X} (n={})",
-          width, height, uw, uh, fit_err, uint32_t(info.format), words[1], n);
-    }
-  }
-
-  // Upload as a single-mip R8G8B8A8 texture; SRV swizzle = the fetch
-  // swizzle over canonical RGBA (identical to the plain path's composition
-  // for the DXT/8888 host formats, whose host swizzle is RGBA).
-  ID3D12Device* device = context.d3d12.device;
-  D3D12_HEAP_PROPERTIES heap{};
-  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC desc{};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = uw;
-  desc.Height = uh;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 1;
-  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  desc.SampleDesc.Count = 1;
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&out.texture)))) {
-    return false;
-  }
-  const uint32_t pitch = (uw * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-                         ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-  out.upload = CreateUploadBuffer(device, size_t(pitch) * uh);
-  if (!out.upload) {
-    out.texture->Release();
-    out.texture = nullptr;
-    return false;
-  }
-  uint8_t* mapping = nullptr;
-  out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
-  for (uint32_t y = 0; y < uh; ++y) {
-    std::memcpy(mapping + size_t(y) * pitch, up.data() + size_t(y) * uw,
-                size_t(uw) * 4);
-  }
-  out.upload->Unmap(0, nullptr);
-  auto* command_processor = context.d3d12.command_processor;
-  auto& list = command_processor->GetDeferredCommandList();
-  D3D12_TEXTURE_COPY_LOCATION dst{};
-  dst.pResource = out.texture;
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  D3D12_TEXTURE_COPY_LOCATION src{};
-  src.pResource = out.upload;
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  src.PlacedFootprint.Footprint.Width = uw;
-  src.PlacedFootprint.Footprint.Height = uh;
-  src.PlacedFootprint.Footprint.Depth = 1;
-  src.PlacedFootprint.Footprint.RowPitch = pitch;
-  list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  if (!AllocGuestSrvSlot(out.srv_slot)) {
-    out.texture->Release();
-    out.texture = nullptr;
-    return false;
-  }
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-  srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
-  srv.Texture2D.MipLevels = 1;
-  out.srv_format = srv.Format;
-  out.srv_mapping = srv.Shader4ComponentMapping;
-  out.srv_mips = 1;
-  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-  slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
-  device->CreateShaderResourceView(out.texture, &srv, slot);
-
-  std::memcpy(out.fetch_words, words, 6 * sizeof(uint32_t));
-  out.payload_addr = 0xA0000000u | info.memory.base_address;
-  out.payload_size = src_size;
-  BuildPayloadProbes(info, mip_addr, ox, oy, pitch_blocks, src_size, out);
-  out.payload_fp = SampleProbeFingerprint(base, out);
-  out.near_black = SampleProbeNearBlack(base, out);
-  out.recheck_frame = 0;
-  out.incomplete = false;
-  out.valid = true;
-  return true;
-}
-
-// ---- Per-GAUGE composite reconstruction ----------------------------------
-// The radial gauges compose 2x2 quadrant quads around a shared corner, and
-// the quadrant pairs come from DIFFERENT source rasterizations of the same
-// band (arcs up to ~half a texel apart in radius, band weights visibly
-// different: the 180-degree pairs match, the mirrored
-// pairs differ). Any PER-TILE regeneration renders each quadrant faithful
-// to its own art, so the authored mismatch shows as seams/style steps at
-// every cardinal point. The fix operates per GAUGE: group the quadrant
-// draws that share a corner (same element transform), rebuild the whole
-// gauge as ONE 1x composite laid out exactly as the game samples it, fit
-// ONE radial model across all quadrants jointly, regenerate ONE continuous
-// factor-x texture, and rewrite the quads' uvs to sample their slice of
-// it. One model + one texture: no seams, no style split, and no clamp-band
-// cross (the composite has real content across the seam lines). The
-// per-quadrant deviations from the joint model ride the fit residual,
-// soft, exactly like the source art blends them.
-void ApplyGaugeComposites(const NativeGuestOutputRenderContext& context,
-                          std::vector<Draw2d>& scene_2d) {
-  const int factor =
-      std::clamp<int>(REXCVAR_GET(skate3_native_render_scene_2d_tile_regen), 0, 4);
-  if (factor < 2 || g_r.srv_heap == nullptr) {
-    return;
-  }
-  struct Quad {
-    int draw;
-    float x0, y0, x1, y1;         // local rect
-    float ux0, ux1, vy0, vy1;      // u at x0/x1, v at y0/y1 (orientation)
-    uint64_t wkey;
-    uint32_t thash;                // transform hash (consts)
-  };
-  std::vector<Quad> quads;
-  for (int i = 0; i < int(scene_2d.size()); ++i) {
-    const Draw2d& d = scene_2d[i];
-    if (d.prim != 4 || d.count != 6 || d.stride != 28 ||
-        (d.fetch[0] & 0x3u) != 2 || d.fetch[1] == 0 ||
-        d.verts.size() != size_t(6) * 28) {
-      continue;
-    }
-    float xs[6], ys[6], us[6], vs[6];
-    for (int v = 0; v < 6; ++v) {
-      const uint8_t* p = d.verts.data() + size_t(v) * 28;
-      std::memcpy(&xs[v], p + 0, 4);
-      std::memcpy(&ys[v], p + 4, 4);
-      std::memcpy(&us[v], p + 16, 4);
-      std::memcpy(&vs[v], p + 20, 4);
-    }
-    Quad q{};
-    q.x0 = *std::min_element(xs, xs + 6);
-    q.x1 = *std::max_element(xs, xs + 6);
-    q.y0 = *std::min_element(ys, ys + 6);
-    q.y1 = *std::max_element(ys, ys + 6);
-    const float sx = q.x1 - q.x0, sy = q.y1 - q.y0;
-    if (sx < 24.0f || sx > 129.0f || std::fabs(sx - sy) > 0.6f) {
-      continue;
-    }
-    // Every vertex on a rect corner; collect the uv orientation.
-    bool corners = true;
-    bool got_ux0 = false, got_ux1 = false, got_vy0 = false, got_vy1 = false;
-    for (int v = 0; v < 6 && corners; ++v) {
-      const bool at_x0 = std::fabs(xs[v] - q.x0) < 0.05f;
-      const bool at_x1 = std::fabs(xs[v] - q.x1) < 0.05f;
-      const bool at_y0 = std::fabs(ys[v] - q.y0) < 0.05f;
-      const bool at_y1 = std::fabs(ys[v] - q.y1) < 0.05f;
-      corners = (at_x0 || at_x1) && (at_y0 || at_y1);
-      if (at_x0) { q.ux0 = us[v]; got_ux0 = true; }
-      if (at_x1) { q.ux1 = us[v]; got_ux1 = true; }
-      if (at_y0) { q.vy0 = vs[v]; got_vy0 = true; }
-      if (at_y1) { q.vy1 = vs[v]; got_vy1 = true; }
-    }
-    if (!corners || !got_ux0 || !got_ux1 || !got_vy0 || !got_vy1) {
-      continue;
-    }
-    // Full-tile quads only (uv spans ~1 in both axes, either direction).
-    if (std::fabs(std::fabs(q.ux1 - q.ux0) - 1.0f) > 0.1f ||
-        std::fabs(std::fabs(q.vy1 - q.vy0) - 1.0f) > 0.1f) {
-      continue;
-    }
-    uint64_t th = 1469598103934665603ull;
-    for (int c = 0; c < 36; ++c) {
-      uint32_t bits;
-      std::memcpy(&bits, &d.consts[c], 4);
-      th ^= bits;
-      th *= 1099511628211ull;
-    }
-    q.thash = uint32_t(th ^ (th >> 32));
-    q.wkey = FetchWordsKey(d.fetch);
-    q.draw = i;
-    quads.push_back(q);
-  }
-  if (quads.size() < 4) {
-    return;
-  }
-  // Group by (transform, shared corner). Each quad registers its 4 corners;
-  // a gauge = one corner point with all four rect positions present.
-  struct Corner {
-    std::vector<int> qidx;
-  };
-  std::unordered_map<uint64_t, Corner> corners;
-  const auto ckey = [](uint32_t th, float x, float y) {
-    const int64_t qx = llround(double(x) * 4.0);
-    const int64_t qy = llround(double(y) * 4.0);
-    uint64_t k = th;
-    k = k * 1099511628211ull ^ uint64_t(qx + (int64_t(1) << 30));
-    k = k * 1099511628211ull ^ uint64_t(qy + (int64_t(1) << 30));
-    return k;
-  };
-  for (int qi = 0; qi < int(quads.size()); ++qi) {
-    const Quad& q = quads[qi];
-    corners[ckey(q.thash, q.x0, q.y0)].qidx.push_back(qi);
-    corners[ckey(q.thash, q.x1, q.y0)].qidx.push_back(qi);
-    corners[ckey(q.thash, q.x0, q.y1)].qidx.push_back(qi);
-    corners[ckey(q.thash, q.x1, q.y1)].qidx.push_back(qi);
-  }
-  std::vector<char> claimed(scene_2d.size(), 0);
-  for (auto& [key, corner] : corners) {
-    if (corner.qidx.size() < 4) {
-      continue;
-    }
-    // Positions around the shared point: bit0 = rect right of it, bit1 =
-    // rect below it. All four must be present with equal sizes.
-    int rep[4] = {-1, -1, -1, -1};
-    std::vector<int> members[4];
-    float s = 0.0f;
-    float cx = 0.0f, cy = 0.0f;
-    bool ok = true;
-    for (const int qi : corner.qidx) {
-      const Quad& q = quads[qi];
-      if (claimed[q.draw]) {
-        ok = false;
-        break;
-      }
-      // Which of this quad's corners is the shared point?
-      float px, py;
-      int pos = -1;
-      for (int cxi = 0; cxi < 2 && pos < 0; ++cxi) {
-        for (int cyi = 0; cyi < 2 && pos < 0; ++cyi) {
-          px = cxi ? q.x1 : q.x0;
-          py = cyi ? q.y1 : q.y0;
-          if (ckey(q.thash, px, py) == key) {
-            pos = (cxi ? 0 : 1) | (cyi ? 0 : 2);  // rect right/below of point
-          }
-        }
-      }
-      if (pos < 0) {
-        ok = false;
-        break;
-      }
-      const float qs = q.x1 - q.x0;
-      if (s == 0.0f) {
-        s = qs;
-        cx = pos & 1 ? q.x0 : q.x1;
-        cy = pos & 2 ? q.y0 : q.y1;
-      } else if (std::fabs(qs - s) > 0.3f) {
-        ok = false;
-        break;
-      }
-      if (rep[pos] < 0) {
-        rep[pos] = qi;
-      } else if (quads[rep[pos]].wkey != q.wkey) {
-        ok = false;  // two DIFFERENT tiles at one position: not a gauge
-        break;
-      }
-      members[pos].push_back(qi);
-    }
-    if (!ok || rep[0] < 0 || rep[1] < 0 || rep[2] < 0 || rep[3] < 0) {
-      continue;
-    }
-    const int S = int(std::lround(s));
-    if (S < 24 || S > 128) {
-      continue;
-    }
-    // Group content hash: member tiles (position order) + layout + factor.
-    uint64_t ghash = 1469598103934665603ull;
-    bool tiles_ok = true;
-    const RendererState::Tile1x* tiles[4] = {};
-    for (int pos = 0; pos < 4 && tiles_ok; ++pos) {
-      const Quad& q = quads[rep[pos]];
-      const auto it = g_r.tiles_rgba.find(q.wkey);
-      if (it == g_r.tiles_rgba.end() || int(it->second.w) != S ||
-          int(it->second.h) != S) {
-        tiles_ok = false;  // density != 1 or tile not decoded yet
-        break;
-      }
-      tiles[pos] = &it->second;
-      ghash = ghash * 1099511628211ull ^ q.wkey;
-      ghash = ghash * 1099511628211ull ^
-              uint64_t((q.ux1 < q.ux0 ? 1 : 0) | (q.vy1 < q.vy0 ? 2 : 0) |
-                       (uint64_t(pos) << 2));
-    }
-    if (!tiles_ok) {
-      continue;
-    }
-    ghash = ghash * 1099511628211ull ^ uint64_t(S);
-    ghash = ghash * 1099511628211ull ^ uint64_t(factor);
-    auto git = g_r.gauge_composites.find(ghash);
-    if (git == g_r.gauge_composites.end()) {
-      // Build the 1x composite exactly as the game samples the quads:
-      // composite texel (I,J) = the art at local point (cx - S + I,
-      // cy - S + J) through the containing quad's own uv mapping.
-      std::vector<uint32_t> comp(size_t(2 * S) * (2 * S));
-      for (int J = 0; J < 2 * S; ++J) {
-        for (int I = 0; I < 2 * S; ++I) {
-          const int pos = (I >= S ? 1 : 0) | (J >= S ? 2 : 0);
-          const Quad& q = quads[rep[pos]];
-          const RendererState::Tile1x& t = *tiles[pos];
-          const float px = cx - float(S) + float(I);
-          const float py = cy - float(S) + float(J);
-          const float u =
-              q.ux0 + (px - q.x0) * (q.ux1 - q.ux0) / (q.x1 - q.x0);
-          const float v =
-              q.vy0 + (py - q.y0) * (q.vy1 - q.vy0) / (q.y1 - q.y0);
-          const int col = std::clamp(int(std::lround(u * float(S) - 0.5f)), 0, S - 1);
-          const int row = std::clamp(int(std::lround(v * float(S) - 0.5f)), 0, S - 1);
-          comp[size_t(J) * (2 * S) + I] = t.px[size_t(row) * S + col];
-        }
-      }
-      GuestTexture gt{};
-      float fit_err = 0.0f;
-      std::vector<uint32_t> up;
-      if (skate3::hud_tile::RegenerateRadial(comp.data(), 2 * S, 2 * S, factor,
-                                             up, &fit_err,
-                                             /*max_fit_err=*/6.0f)) {
-        // Upload (single-mip R8G8B8A8; SRV composes the fetch swizzle).
-        const uint32_t uw = uint32_t(2 * S * factor);
-        ID3D12Device* device = context.d3d12.device;
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = uw;
-        desc.Height = uw;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        const uint32_t pitch =
-            (uw * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-            ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-        uint8_t* mapping = nullptr;
-        if (SUCCEEDED(device->CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr, IID_PPV_ARGS(&gt.texture))) &&
-            (gt.upload = CreateUploadBuffer(device, size_t(pitch) * uw)) != nullptr &&
-            SUCCEEDED(gt.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping))) &&
-            AllocGuestSrvSlot(gt.srv_slot)) {
-          for (uint32_t y = 0; y < uw; ++y) {
-            std::memcpy(mapping + size_t(y) * pitch, up.data() + size_t(y) * uw,
-                        size_t(uw) * 4);
-          }
-          gt.upload->Unmap(0, nullptr);
-          auto* command_processor = context.d3d12.command_processor;
-          auto& list = command_processor->GetDeferredCommandList();
-          D3D12_TEXTURE_COPY_LOCATION dst{};
-          dst.pResource = gt.texture;
-          dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-          D3D12_TEXTURE_COPY_LOCATION src{};
-          src.pResource = gt.upload;
-          src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-          src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-          src.PlacedFootprint.Footprint.Width = uw;
-          src.PlacedFootprint.Footprint.Height = uw;
-          src.PlacedFootprint.Footprint.Depth = 1;
-          src.PlacedFootprint.Footprint.RowPitch = pitch;
-          list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-          context.d3d12.push_transition_barrier(
-              context.d3d12.command_processor_user_data, gt.texture,
-              D3D12_RESOURCE_STATE_COPY_DEST,
-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-          D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-          srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-          srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-          srv.Shader4ComponentMapping = ComposeSrvSwizzle(
-              tiles[0]->swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
-          srv.Texture2D.MipLevels = 1;
-          D3D12_CPU_DESCRIPTOR_HANDLE slot =
-              g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-          slot.ptr += size_t(gt.srv_slot) * g_r.srv_size;
-          device->CreateShaderResourceView(gt.texture, &srv, slot);
-          gt.valid = true;
-          static std::atomic<uint32_t> s_gauge_logs{0};
-          const uint32_t n = s_gauge_logs.fetch_add(1, std::memory_order_relaxed);
-          if (n < 16 || (n & 63u) == 0) {
-            REXLOG_INFO(
-                "native-scene: GAUGE composite {}x{} -> {}x{} fit_err={:.2f} "
-                "(4 quadrants joint) (n={})",
-                2 * S, 2 * S, uw, uw, fit_err, n);
-          }
-        }
-      }
-      if (!gt.valid) {
-        if (gt.texture) {
-          gt.texture->Release();
-          gt.texture = nullptr;
-        }
-        if (gt.upload) {
-          gt.upload->Release();
-          gt.upload = nullptr;
-        }
-      }
-      if (g_r.gauge_composites.size() > 64) {
-        for (auto& [k2, old] : g_r.gauge_composites) {
-          if (old.texture) old.texture->Release();
-          if (old.upload) old.upload->Release();
-          if (old.valid) g_r.srv_free.push_back(old.srv_slot);
-        }
-        g_r.gauge_composites.clear();
-      }
-      git = g_r.gauge_composites.emplace(ghash, gt).first;
-    }
-    if (!git->second.valid) {
-      continue;  // negative cache: joint fit rejected
-    }
-    // Redirect every member draw (incl. glow multipass duplicates) to its
-    // slice of the composite: uv = art texel coords of the joint layout.
-    for (int pos = 0; pos < 4; ++pos) {
-      for (const int qi : members[pos]) {
-        const Quad& q = quads[qi];
-        Draw2d& d = scene_2d[q.draw];
-        claimed[q.draw] = 1;
-        d.composite_srv = int(git->second.srv_slot);
-        for (int v = 0; v < 6; ++v) {
-          uint8_t* p = d.verts.data() + size_t(v) * 28;
-          float x, y;
-          std::memcpy(&x, p + 0, 4);
-          std::memcpy(&y, p + 4, 4);
-          const float u = (x - cx + float(S) + 0.5f) / float(2 * S);
-          const float w = (y - cy + float(S) + 0.5f) / float(2 * S);
-          std::memcpy(p + 16, &u, 4);
-          std::memcpy(p + 20, &w, 4);
-        }
-      }
-    }
-  }
 }
 
 // (The object-keyed EnsureGuestTexture wrapper is gone: everything decodes
@@ -12903,10 +12254,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     }
     ++wc.decodes;
     GuestTexture gt;
-    const int32_t regen = REXCVAR_GET(skate3_native_render_scene_2d_tile_regen);
-    if (regen < 2 || !EnsureHudTileRegen(context, base, words, regen, gt)) {
-      EnsureGuestTextureFromWords(context, base, words, gt);
-    }
+    EnsureGuestTextureFromWords(context, base, words, gt);
     gt.last_used_frame = frame_number;
     g_r.tex_store.emplace(fkey, gt);
   };
@@ -13506,6 +12854,9 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         if (t.valid) {
           CommitStagedGuestTexture(context, t.gt, t.commit);
           committed_tex = true;
+          // Content landed this frame; the video-start cold/hot classifier
+          // (GuestTexture::last_change_frame) keys off commit times.
+          t.gt.last_change_frame = frame_number;
         } else {
           t.gt.fail_count = BumpFail(t.gt.fail_count);
           t.gt.retry_after_frame = frame_number + RetryBackoff(t.gt.fail_count);
@@ -14536,7 +13887,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const bool ready =
         fresh && (g_scene->items.size() >=
                       size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items)) ||
-                  (!g_scene->items.empty() && CasEditorHeartbeatFresh()));
+                  (!g_scene->items.empty() && CasEditorActive(base)));
     loading_native = !ready;
   }
   g_loading_hold = loading_native;
@@ -14585,6 +13936,23 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   bool movie_fresh = false;
   for (const MoviePlanes& m : movies) {
     movie_fresh |= m.ns >= 0 && movie_now_ns - m.ns < 500'000'000;
+  }
+  // Movie SESSION start (publish-freshness OFF->ON edge = a video began):
+  // the triple substitution only serves plane content DECODED DURING THIS
+  // SESSION (GuestTexture::last_change_frame >= this stamp). The APT plane
+  // copies keep their addresses across videos, so at video N+1's start
+  // both the store AND guest memory can still hold video N's last frame;
+  // serving either flashed the previous video for a few frames at every
+  // boundary. Until the new video's first frame lands (content change ->
+  // inline re-decode), the quad holds black, which is what a starting
+  // video looks like.
+  static uint64_t s_movie_session_frame = 0;
+  {
+    static bool s_movie_fresh_prev = false;
+    if (movie_fresh && !s_movie_fresh_prev) {
+      s_movie_session_frame = g_frames_rendered.load(std::memory_order_relaxed);
+    }
+    s_movie_fresh_prev = movie_fresh;
   }
   const bool movie_sub = movie_fresh &&
                          REXCVAR_GET(skate3_native_render_scene_fmv_native) &&
@@ -14649,7 +14017,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // as the gameplay takeover; the gate stays armed for the real load
       // that follows the editor.
       const bool editor_scene = scene.generation >= g_warmup_fresh_generation &&
-                                !scene.items.empty() && CasEditorHeartbeatFresh();
+                                !scene.items.empty() && CasEditorActive(base);
       if (small_or_stale && !editor_scene) {
         // Stale or fade-in scene: yield (brief, a few frames). Keep
         // committing worker results meanwhile; every pre-takeover frame
@@ -14915,7 +14283,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (it != g_r.tex_store.end() && it->second.valid &&
         frame_number >= it->second.recheck_frame &&
         REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
-      it->second.recheck_frame = frame_number + 16;
+      // 2-frame cadence in menu/editor contexts, like the item-draw poll
+      // (in-place CAS composite rewrites during edits).
+      it->second.recheck_frame =
+          frame_number +
+          (g_in_menus_frame.load(std::memory_order_relaxed) ? 2 : 16);
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
       const bool fp_new = fp != 0 && fp != it->second.payload_fp;
       if (it->second.recheck_count < 3) {
@@ -15241,9 +14613,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (!item.retained && !route.demoted &&
           frame_number >= e.recheck_frame &&
           REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
+        // Menu/editor contexts poll STEADY entries on a 2-frame cadence
+        // (mirrors the 2D resolver): the CAS editor recomposes the skater's
+        // skin/garment textures IN PLACE progressively over ~a second on
+        // every edit, and the 16-frame steady cadence made each composite
+        // step land ~100+ ms late, desynchronized across the pieces, the
+        // "broken for 1-2 s after changing skin color" state. Gameplay
+        // keeps the cheap steady cadence.
         e.recheck_frame =
             frame_number +
-            (e.recheck_count < 3 ? (2ull << e.recheck_count) : 16ull);
+            (e.recheck_count < 3
+                 ? (2ull << e.recheck_count)
+                 : (g_in_menus_frame.load(std::memory_order_relaxed) ? 2ull
+                                                                     : 16ull));
         const uint64_t fp = SampleProbeFingerprint(base, e);
         const bool fp_new = fp != 0 && fp != e.payload_fp;
         if (trm) {
@@ -16270,57 +15652,73 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // Guest-texture resolver shared by the spline pass (pre-resolve, in the
   // scene pass) and the HUD pass (post-resolve); both allocate strip/quad
   // vertices from the same per-frame ui_ring region.
-  // force_inline: the FMV plane resolves stay on the inline decode; video
-  // pacing is tuned around frame-exact per-frame re-decodes
-  // and the planes are small.
+  // Per-frame inline budget for HOT content re-decodes (actively-animating
+  // elements + video planes): inline keeps their content latency at ONE
+  // frame; overflow degrades to the async heal for the rest of the frame.
+  int64_t hot_inline_budget_ns = 4'000'000;
+  // force_inline: the dormant FMV bracket-fallback resolve stays on the
+  // inline decode (fires at most once per plane set).
+  // video: the FMV triple resolves; content changes always decode inline
+  // (frame-exact playback), and the caller additionally gates serving on
+  // last_change_frame >= the movie session start (see the triple loop).
   const auto resolve_2d_texture = [&](const uint32_t fetch[6],
-                                      bool force_inline =
-                                          false) -> const GuestTexture* {
+                                      bool force_inline = false,
+                                      bool video = false) -> const GuestTexture* {
     if ((fetch[0] & 0x3u) != 2 || fetch[1] == 0) {
       return &g_r.white;
     }
-    uint64_t key = 1469598103934665603ull;
-    for (int k = 0; k < 6; ++k) {
-      key ^= fetch[k];
-      key *= 1099511628211ull;
-    }
-    // Large-art async routing (see the 2d_async_px cvar): fullscreen
-    // menu/loading art decodes 10-35 ms inline (136 ms max)
-    // and screen changes bring bursts of it; the render-thread stall
-    // blocked the swap and froze the guest 100-256 ms (the sluggish-menus
-    // / hard-cut-transitions report). Anything over the pixel threshold
-    // decodes on the words-miss workers instead; small tiles keep the
-    // inline path (sub-ms, and the radial regen is render-thread-only).
+    const uint64_t key = FetchWordsKey(fetch);
+    // Routing (see the 2d_async_px cvar): inline 2D decodes stall the frame
+    // AND the guest, and the cost is NOT proportional to texel count (8888
+    // APT tiles pay a per-PIXEL tiled-offset loop + 2 CreateCommittedResource
+    // calls; 64x64 tiles measured 3-19 ms with the regen attempt on top)
+    // - so FIRST SIGHTINGS and COLD content changes decode on
+    // the words-miss workers. HOT content (changed within the last ~60
+    // frames: video planes, actively-animating menu/HUD elements) re-decodes
+    // INLINE under a small per-frame budget instead; the async round trip
+    // (probe cadence + worker + commit ~ 4-5 frames) capped animating UI at
+    // a ~30 Hz content rate, which read as "menus feel like 15-30 fps while
+    // the counter says 140".
     const int32_t async_px = REXCVAR_GET(skate3_native_render_scene_2d_async_px);
     const uint32_t px_w = (fetch[2] & 0x1FFFu) + 1;
     const uint32_t px_h = ((fetch[2] >> 13) & 0x1FFFu) + 1;
     const bool async_ui = !force_inline && async_px > 0 &&
                           uint64_t(px_w) * px_h > uint64_t(async_px);
-    auto it = find_words_texture(key);
+    // PLAIN store lookup on purpose: find_words_texture is the 3D poster
+    // revalidator; it probes, RE-ARMS recheck_frame and enqueues its own
+    // ui=false heal, which made this resolver's liveness block dead code
+    // (recheck always freshly re-armed before it ran; astale=0 across whole
+    // sessions) and put every 2D content update on that 4-5
+    // frame async round trip.
+    auto it = g_r.tex_store.find(key);
+    bool inline_redecode = false;
+    if (it != g_r.tex_store.end()) {
+      it->second.last_used_frame = frame_number;
+    }
     if (it != g_r.tex_store.end() && it->second.valid && !it->second.incomplete &&
         frame_number >= it->second.recheck_frame &&
         REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
-      // Content liveness for CPU-rewritten UI art: intro/menu VIDEO frames
-      // (rw::movie software decode) rewrite the same payload every tick with
-      // the fetch words unchanged; the words-keyed cache would freeze
-      // playback on its first decoded frame. Probe the payload; on change,
-      // retire + re-decode inline (the fresh entry's recheck_frame of 0
-      // keeps a playing video on a per-frame cadence). Static art settles at
-      // the same 16-frame cadence as the world store's revalidation.
+      // Content liveness for CPU-rewritten UI art: video frames and APT
+      // re-rasterized tiles rewrite the same payload with the fetch words
+      // unchanged; without the probe the words-keyed cache would freeze
+      // them on their first decoded content.
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
       if (fp != 0 && fp != it->second.payload_fp) {
-        if (async_ui) {
-          // Serve the stale decode while a worker re-decodes; the words-key
-          // commit swaps the store entry in place. Short recheck keeps
-          // watching; the in-flight set dedupes re-enqueues.
-          EnqueueWordsMiss(key, fetch, /*ui=*/true);
-          it->second.recheck_frame = frame_number + 2;
-          g_2d_async_stale.fetch_add(1, std::memory_order_relaxed);
-        } else {
+        const bool hot =
+            frame_number - it->second.last_change_frame <= 60;
+        inline_redecode =
+            video || !async_ui || (hot && hot_inline_budget_ns > 0);
+        if (inline_redecode) {
           RetireGuestTexture(it->second,
                              command_processor->GetCurrentSubmission());
           g_r.tex_store.erase(it);
-          it = g_r.tex_store.end();
+          it = g_r.tex_store.end();  // falls into the inline decode below
+        } else {
+          // Cold change (poster rotation class): heal on the workers,
+          // serve the stale decode meanwhile.
+          EnqueueWordsMiss(key, fetch, /*ui=*/true);
+          it->second.recheck_frame = frame_number + 2;
+          g_2d_async_stale.fetch_add(1, std::memory_order_relaxed);
         }
       } else {
         // Menu screens probe on a 2-frame cadence: the skater-portrait
@@ -16333,25 +15731,21 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     if (it == g_r.tex_store.end()) {
-      if (async_ui) {
-        // First sighting of big art: decode on the workers and skip the
-        // quad for the 1-3 frames that takes (imperceptible pop-in at the
-        // render rate, vs a whole-frame render+guest stall inline).
+      if (async_ui && !video && !inline_redecode) {
+        // First sighting: decode on the workers and skip the quad for the
+        // 1-3 frames that takes (imperceptible pop-in at the render rate,
+        // vs a whole-frame render+guest stall inline).
         EnqueueWordsMiss(key, fetch, /*ui=*/true);
         g_2d_async_skip.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
       }
-      // Small HUD/spline art decodes inline (sub-ms; async would pop gauge
-      // elements for no gain). Small radial tiles (score ring quadrants /
-      // meter arcs) regenerate at Nx first, see EnsureHudTileRegen;
-      // everything else keeps the plain decode.
+      // Small HUD/spline art decodes inline (sub-ms; async would pop
+      // HUD elements for no gain).
       const auto hud_t0 = PerfClock::now();
       GuestTexture gt;
-      const int32_t regen = REXCVAR_GET(skate3_native_render_scene_2d_tile_regen);
-      if (regen < 2 || !EnsureHudTileRegen(context, base, fetch, regen, gt)) {
-        EnsureGuestTextureFromWords(context, base, fetch, gt);
-      }
+      EnsureGuestTextureFromWords(context, base, fetch, gt);
       const uint64_t decode_ns = perf_ns_since(hud_t0);
+      hot_inline_budget_ns -= int64_t(decode_ns);
       g_pw_tex_decode.Add(decode_ns);
       // Attribution for residual render-thread stalls: anything still
       // decoding inline for >3 ms should either move over the async
@@ -16378,6 +15772,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
       gt.last_used_frame = frame_number;
+      gt.last_change_frame = frame_number;
       it = g_r.tex_store.emplace(key, gt).first;
     }
     return it->second.valid ? &it->second : &g_r.white;
@@ -16589,9 +15984,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       scene_2d = g_scene_2d;
     }
     if (!scene_2d.empty()) {
-      // Per-GAUGE composite reconstruction (frame-local rewrite: redirects
-      // grouped quadrant quads to joint regenerated textures).
-      ApplyGaugeComposites(context, scene_2d);
       list.D3DSetPipelineState(g_r.pso_2d);
       // One shared draw routine for both the RTT passes and the screen pass.
       // ui_region/ui_offset continue after the spline pass's allocations.
@@ -16611,8 +16003,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         uint32_t srv_slot;
         if (yuv != nullptr) {
           srv_slot = yuv[0];
-        } else if (d.composite_srv >= 0) {
-          srv_slot = uint32_t(d.composite_srv);
         } else {
           const GuestTexture* t = resolve_2d_texture(d.fetch);
           if (t == nullptr) {
@@ -16634,8 +16024,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // (see the cvar; the shader gates on actual fetch magnification).
         constants[37] = float(std::clamp(
             REXCVAR_GET(skate3_native_render_scene_2d_sharp), 0.0, 2.0));
-        constants[38] = 0.0f;
-        constants[39] = 0.0f;
+        // m[9].zw: the D3D9 half-pixel shift in NDC, in OUTPUT-pixel units
+        // (half a 720p pixel shifted fullscreen art 1-2 native px up-left
+        // at 2x+ scales), and deliberately 7/16 px instead of exactly
+        // 1/2: an exact half puts the bottom/right edge of an
+        // edge-to-edge quad precisely THROUGH the last row/column's pixel
+        // centers, and the top-left fill rule then drops that row/column
+        // - the residual 1px see-through sliver on loading screens. The
+        // 1/16 px underhang is far below visible sampling misalignment.
+        constants[38] = viewport.Width > 0.0f ? 0.875f / viewport.Width : 0.0f;
+        constants[39] = viewport.Height > 0.0f ? 0.875f / viewport.Height : 0.0f;
         list.D3DSetGraphicsRoot32BitConstants(0, 40, constants, 0);
         const auto srv_table_at = [&](uint32_t param, uint32_t slot) {
           D3D12_GPU_DESCRIPTOR_HANDLE h =
@@ -16724,7 +16122,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           if (best != nullptr) {
             bool ok = true;
             for (int p = 0; p < 3 && ok; ++p) {
-              auto hot = find_words_texture(FetchWordsKey(best->words[p]));
+              auto hot = g_r.tex_store.find(FetchWordsKey(best->words[p]));
               if (hot != g_r.tex_store.end()) {
                 hot->second.recheck_frame = 0;
               }
@@ -16751,7 +16149,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // (async decode in flight, substitution off) the quad is SKIPPED;
         // black under a starting video is what the real thing looks like.
         bool video_quad = false;
-        if (d.composite_srv < 0 && yuv_triple(d)) {
+        if (yuv_triple(d)) {
           video_quad = true;
           if (movie_sub) {
             TripleCacheEntry* e = nullptr;
@@ -16767,17 +16165,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               bool decode_failed = false;
               for (int p = 0; p < 3 && e->ok; ++p) {
                 const uint32_t* w = d.fetch + p * 6;
-                auto hot = find_words_texture(FetchWordsKey(w));
+                // Plain find (find_words_texture would probe + enqueue its
+                // own ui=false heal first): force the per-frame probe, the
+                // resolve inline-decodes any content change (video=true).
+                auto hot = g_r.tex_store.find(FetchWordsKey(w));
                 if (hot != g_r.tex_store.end()) {
                   hot->second.recheck_frame = 0;  // content-hot: per-frame probe
                 }
-                // Async-capable resolve: a content change serves the stale
-                // plane while the worker re-decodes (the per-frame inline
-                // re-decode of a 720p plane set cost ~3x4 ms on the render
-                // thread every content change: video judder + boot
-                // sluggishness); nullptr = first decode still in flight.
-                const GuestTexture* t = resolve_2d_texture(w);
-                e->ok = t != nullptr && t != &g_r.white && t->texture != nullptr;
+                const GuestTexture* t =
+                    resolve_2d_texture(w, /*force_inline=*/false, /*video=*/true);
+                // Session gate: only content decoded during THIS movie
+                // session serves; at a video boundary both the store and
+                // guest memory can still hold the PREVIOUS video's last
+                // frame (the plane copies keep their addresses); the quad
+                // holds black until the new video's first frame lands.
+                e->ok = t != nullptr && t != &g_r.white && t->texture != nullptr &&
+                        t->last_change_frame >= s_movie_session_frame;
                 decode_failed |= t == &g_r.white;
                 e->slots[p] = e->ok ? t->srv_slot : 0;
               }
@@ -16796,8 +16199,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             }
           }
         }
-        if (yuv == nullptr && movie_sub && d.composite_srv < 0 &&
-            (d.flags & 0x2u) != 0 && d.src_stride == 24) {
+        if (yuv == nullptr && movie_sub && (d.flags & 0x2u) != 0 &&
+            d.src_stride == 24) {
           // Bracketed movie quad without a readable triple: through ps_main
           // it draws its c8 opaque-black cover, also a video quad.
           video_quad = true;

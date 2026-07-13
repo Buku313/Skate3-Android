@@ -6,7 +6,11 @@
 cbuffer C : register(b0) {
   float4 m[10];  // m[0..3] proj rows, m[4..7] world rows, m[8] color,
                  // m[9].x = apply D3D9 half-pixel (2D ortho draws only),
-                 // m[9].y = sharp-magnification amount (0 = plain bilinear)
+                 // m[9].y = sharp-magnification amount (0 = plain bilinear),
+                 // m[9].zw = the D3D9 half-pixel shift in NDC (7/16 of an
+                 // OUTPUT pixel; exactly 1/2 puts edge-to-edge quads'
+                 // last row/col centers ON the bottom/right edge and the
+                 // top-left rule drops them: the 1px sliver)
 };
 Texture2D<float4> tex : register(t0);
 SamplerState smp : register(s1);
@@ -22,11 +26,15 @@ VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float4 color : COLOR0)
   // D3D9 half-pixel convention: the art bakes half-texel UVs expecting
   // pixel centers at integer coordinates; without this the clock-face
   // quadrant tiles show their wrapped border rows as dark seam lines.
-  // Scaled for the 2D ortho; must not apply to 3D (world-space
-  // SimpleDraw markers), where m[0].x is a projection scale.
+  // The rasterization-convention delta is half a pixel OF THE RENDER
+  // TARGET: half a NATIVE pixel, not half a 720p pixel (0.5 * m[0].x =
+  // half a 720p pixel shifted fullscreen art 1-2 native px up-left at 2x+
+  // output scales: the see-through sliver along the bottom/right of
+  // loading screens). Must not apply to 3D (world-space SimpleDraw
+  // markers), where the projection is perspective.
   if (m[9].x > 0.0) {
-    o.pos.x -= 0.5 * m[0].x * o.pos.w;
-    o.pos.y -= 0.5 * m[1].y * o.pos.w;
+    o.pos.x -= m[9].z * o.pos.w;
+    o.pos.y += m[9].w * o.pos.w;
   }
   o.uv = uv;
   o.color = color;
