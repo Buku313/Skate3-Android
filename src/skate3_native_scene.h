@@ -300,6 +300,11 @@ struct FrameScene {
   // capture), detected per frame from the blur_hBlurPS draw. The native
   // replica runs after the MSAA resolve, before the 2D overlay draws.
   float ui_blur = 0.0f;
+  // Blur modulate color (the blur passes' PS c1; both blur ucodes end in
+  // `mul oC0, r0, c1`, so it applies per pass): (1,1,1) under gameplay
+  // popups, the dark menu fade in the pause menu; its square is the
+  // darkened pause backdrop.
+  float ui_blur_color[3] = {1.0f, 1.0f, 1.0f};
   // Selection-outline color (postfx_edgedetectstencilPS c0; the park-editor
   // blue in every capture), refreshed from the guest edge-detect draw when
   // it runs. Consumed by the outline composite when any item is selected.

@@ -702,7 +702,10 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
 }
 
 void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
-  (void)drawer;
+  // Always-on native/emulated corner readout (top right; cvar
+  // skate3_native_render_mode_indicator hides it live). Input-transparent,
+  // so it never affects cursor or focus handling.
+  render_mode_indicator_ = std::make_unique<skate3::RenderModeIndicator>(drawer);
   rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings", [this] {
     ToggleSimpleSettings();
   });
@@ -802,6 +805,7 @@ void Skate3BaseApp::OnShutdown() {
   simple_settings_dialog_.reset();
   ultrawide_targets_dialog_.reset();
   native_debug_dialog_.reset();
+  render_mode_indicator_.reset();
 }
 
 void Skate3BaseApp::ToggleSimpleSettings() {

@@ -10,7 +10,13 @@
 // glass" lattice, so the passes here render into 1152x640 intermediates and
 // stretch back, reproducing both the kernel and the lattice.
 cbuffer C : register(b0) {
-  float4 dir;  // xy = blur axis, z = kernel scale (the game's PS c0.x, 8)
+  float4 dir;   // xy = blur axis, z = kernel scale (the game's PS c0.x, 8)
+  float4 tint;  // rgb = the game's PS c1 of the blur pass: the menu fade
+                // modulate. Both blur ucodes end in `mul oC0, r0, c1`, so it
+                // applies PER PASS (squared overall). Gameplay popups stage
+                // (1,1,1), why the original port had no multiply, the
+                // pause menu stages ~(0.35,0.33,0.32) = the darkened
+                // backdrop (measured in a live pause-menu capture).
 };
 Texture2D<float4> src : register(t0);
 SamplerState smp_clamp : register(s1);
@@ -35,7 +41,7 @@ float4 ps_main(VSOut i) : SV_Target {
     c += src.SampleLevel(smp_clamp, i.uv + step * k, 0).rgb * w[k];
     c += src.SampleLevel(smp_clamp, i.uv - step * k, 0).rgb * w[k];
   }
-  return float4(c, 1.0);
+  return float4(c * tint.rgb, 1.0);
 }
 // Prefiltered downsample of the (higher-res) native output into the game's
 // 1152x640 blur space (dir.xy = source texel size). A 4x4 grid of bilinear

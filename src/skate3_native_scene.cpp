@@ -141,6 +141,16 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_photo_yield, true, "Skate 3",
                     "is fine. Detected by polling the FrontEndManager NIS push-state "
                     "stack (plus the PhotoReplayController heartbeat as a backup).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_pause_native, true, "Skate 3",
+                    "Keep the NATIVE renderer active through the in-game pause menu "
+                    "instead of yielding to the emulated output. Pause is told apart "
+                    "from loading screens / the boot frontend by the world still "
+                    "submitting perspective scenes while the presence context reads 0 "
+                    "(loads and the frontend stop publishing within ~300 ms, which "
+                    "falls back to the yield path and its cache clears). Native pause "
+                    "also skips the pause-entry cache clears, so unpausing costs "
+                    "nothing.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
                     "60 (large .draws.bin; for targeted investigations)")
@@ -488,6 +498,12 @@ std::mutex g_scene_mutex;
 // vectors) every frame.
 std::shared_ptr<const FrameScene> g_scene;
 uint64_t g_generation = 0;
+// Steady-clock stamp of the last scene publish (BuildFrameScene only
+// publishes when a perspective view submitted this frame). YieldForMenus
+// uses its freshness to tell the in-game pause menu (the world keeps
+// resubmitting behind the menu) apart from loading screens and the boot
+// frontend (publishes stop), for skate3_native_render_scene_pause_native.
+std::atomic<int64_t> g_last_publish_ns{-1};
 // Debug-dialog cache flushes: consumed at the top of RenderScene so texture/
 // mesh-affecting toggles (mip chains, 565 fixes, ...) take effect immediately
 // instead of only for newly streamed content.
@@ -666,6 +682,15 @@ bool g_sky_sun_have = false;
 // popup is actually up, so this can never stick on.
 float g_ui_blur = 8.0f;
 bool g_ui_blur_seen = false;
+// Blur modulate color (the blur passes' PS c1): both blur ucodes end in
+// `mul oC0, r0, c1`: the game's menu fade. Gameplay popups stage (1,1,1)
+// (why the exact port originally had no multiply); the pause menu stages
+// ~(0.35,0.33,0.32), squared across the H+V passes = the darkened pause
+// backdrop. Read live on the blur_hBlurPS draw, accepted only when the
+// bank's c0 kernel row reads exactly (8,8); a stale mid-stage bank fails
+// that gate (the staleness class that pulsed the blur radius when c0.x was
+// fed live, see g_ui_blur above).
+float g_ui_blur_color[3] = {1.0f, 1.0f, 1.0f};
 // Hold the blur across publishes that carry no blur draw: the game does not
 // issue the pass chain on every swap while the popup is up, and publishing
 // the raw per-swap flag alternated blur on/off: a visible brightness
@@ -4031,6 +4056,23 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       // pulsed the blur radius; the popup backdrop shimmered.
       g_ui_blur = 8.0f;
       g_ui_blur_seen = true;
+      // Fade modulate (PS c1, see g_ui_blur_color): genuinely dynamic (the
+      // pause fade ramps in over a few frames), so it must be read live,
+      // gated on the c0 kernel row reading exactly its known (8,8) staging,
+      // which a stale mid-update bank fails. NaN also fails the comparisons.
+      const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+      if (ps_bank != 0) {
+        const float k0 = LoadGuestF32(base, ps_bank + 0);
+        const float k1 = LoadGuestF32(base, ps_bank + 4);
+        float c1[3];
+        for (int a = 0; a < 3; ++a) {
+          c1[a] = LoadGuestF32(base, ps_bank + 16 + a * 4);
+        }
+        if (k0 == 8.0f && k1 == 8.0f && c1[0] >= 0.0f && c1[0] <= 1.0f &&
+            c1[1] >= 0.0f && c1[1] <= 1.0f && c1[2] >= 0.0f && c1[2] <= 1.0f) {
+          std::memcpy(g_ui_blur_color, c1, sizeof(g_ui_blur_color));
+        }
+      }
     }
   }
   // Selected-object outline capture (see g_frame_selected): the sky draw
@@ -7678,6 +7720,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
   const bool blur_active = g_ui_blur_seen || g_ui_blur_hold > 0;
   scene.ui_blur = blur_active ? g_ui_blur : 0.0f;
+  std::memcpy(scene.ui_blur_color, g_ui_blur_color, sizeof(scene.ui_blur_color));
   if (g_ui_blur_seen) {
     g_ui_blur_hold = 2;
   } else if (g_ui_blur_hold > 0) {
@@ -7686,9 +7729,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   {
     static bool s_blur_was_active = false;
     if (blur_active != s_blur_was_active) {
-      REXLOG_INFO("native-scene: popup background blur {} (kernel scale {:.1f})",
-                  blur_active ? "ON" : "off", g_ui_blur);
+      REXLOG_INFO(
+          "native-scene: popup background blur {} (kernel scale {:.1f}, fade "
+          "{:.2f}/{:.2f}/{:.2f})",
+          blur_active ? "ON" : "off", g_ui_blur, g_ui_blur_color[0],
+          g_ui_blur_color[1], g_ui_blur_color[2]);
       s_blur_was_active = blur_active;
+      if (!blur_active) {
+        // Don't carry one popup's fade into the next popup's first frame
+        // if its own c1 read misses the coherence gate.
+        g_ui_blur_color[0] = g_ui_blur_color[1] = g_ui_blur_color[2] = 1.0f;
+      }
     }
   }
   g_ui_blur_seen = false;
@@ -7884,6 +7935,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                              .count()));
   }
 
+  g_last_publish_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count(),
+                          std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;
   g_scene = std::make_shared<const FrameScene>(std::move(scene));
@@ -12897,13 +12952,56 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
 // output. Handles the cache clears on entry and the takeover re-arm +
 // loading-screen pipeline build / prewarm commit while yielded.
 bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
-  static bool s_in_menus = false;
+  static bool s_yielding = false;
+  static bool s_seen_gameplay = false;
+  static bool s_pause_native = false;
   const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
-  if (in_menus != s_in_menus) {
-    s_in_menus = in_menus;
-    if (in_menus) {
+  if (!in_menus) {
+    s_seen_gameplay = true;
+  }
+  // In-game pause menu: the presence context reads 0, but the world keeps
+  // resubmitting perspective scenes behind the menu (loading screens and the
+  // boot frontend stop publishing): stay native there so the pause backdrop
+  // renders natively and the caches survive the pause. The 2D pause UI rides
+  // the same captured-APT overlay replay as the gameplay HUD. If publishes
+  // go stale (a load was picked from the pause menu, or the game stops
+  // redrawing the world), this degrades to the yield path below within
+  // ~300 ms, cache clears and all.
+  bool pause_native = false;
+  if (in_menus && s_seen_gameplay &&
+      REXCVAR_GET(skate3_native_render_scene_pause_native)) {
+    const int64_t last_ns = g_last_publish_ns.load(std::memory_order_relaxed);
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    pause_native = last_ns >= 0 && now_ns - last_ns < 300'000'000;
+  }
+  if (pause_native != s_pause_native) {
+    s_pause_native = pause_native;
+    if (pause_native) {
       REXLOG_INFO(
-          "native-scene: menus/pause/loading - yielding to emulated output "
+          "native-scene: pause menu over live world - staying NATIVE "
+          "(2d stats at entry: draws_2d={} other={} dropped={})",
+          g_draws_2d.load(std::memory_order_relaxed),
+          g_draws_2d_other.load(std::memory_order_relaxed),
+          g_draws_2d_dropped.load(std::memory_order_relaxed));
+    } else {
+      REXLOG_INFO(
+          "native-scene: leaving native pause ({}; 2d stats at exit: "
+          "draws_2d={} other={} dropped={})",
+          in_menus ? "scene publishes went stale - loading/frontend"
+                   : "gameplay resumed",
+          g_draws_2d.load(std::memory_order_relaxed),
+          g_draws_2d_other.load(std::memory_order_relaxed),
+          g_draws_2d_dropped.load(std::memory_order_relaxed));
+    }
+  }
+  const bool yield = in_menus && !pause_native;
+  if (yield != s_yielding) {
+    s_yielding = yield;
+    if (yield) {
+      REXLOG_INFO(
+          "native-scene: menus/loading - yielding to emulated output "
           "(presence context)");
       // Arena addresses are reused across map loads: let the next load's
       // registrations re-queue meshes (and re-stage textures) at reused
@@ -12927,7 +13025,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
           g_prewarm_dropped.load(std::memory_order_relaxed), queued);
     }
   }
-  if (in_menus) {
+  if (yield) {
     // Re-arm the takeover gate for the next stretch of gameplay (map
     // load, unpause).
     g_warmup_armed.store(true, std::memory_order_relaxed);
@@ -13509,11 +13607,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (!SceneEnabled() || context.backend != NativeGuestOutputBackend::kD3D12) {
     return false;
   }
-  // While the game reports menus / pause / loading (presence context 0x8001
-  // == 0), yield to the emulated output: the native scene neither renders
-  // the 2D UI (the pause menu was invisible) nor the menu's world backdrop
-  // materials (everything drew untextured white). The emulated frame is
-  // complete and correct there; native rendering resumes on unpause.
+  // While the game reports menus / loading (presence context 0x8001 == 0),
+  // yield to the emulated output, EXCEPT the in-game pause menu (world
+  // still publishing perspective scenes), which stays native when
+  // skate3_native_render_scene_pause_native is on: the pause UI rides the
+  // same captured-APT 2D replay as the gameplay HUD, and the backdrop is the
+  // ordinary native world. Loading screens and the boot frontend still
+  // render emulated (complete and correct there).
   if (YieldForMenus(context)) {
     return false;
   }
@@ -15389,8 +15489,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     flush();
     list.D3DOMSetRenderTargets(1, &blur_rtv1, FALSE, nullptr);
     list.D3DSetPipelineState(g_r.pso_blur);
-    const float h_consts[4] = {1.0f, 0.0f, scene.ui_blur, 0.0f};
-    list.D3DSetGraphicsRoot32BitConstants(0, 4, h_consts, 0);
+    const float h_consts[8] = {1.0f,
+                               0.0f,
+                               scene.ui_blur,
+                               0.0f,
+                               scene.ui_blur_color[0],
+                               scene.ui_blur_color[1],
+                               scene.ui_blur_color[2],
+                               1.0f};
+    list.D3DSetGraphicsRoot32BitConstants(0, 8, h_consts, 0);
     srv_table(g_r.blur_srv[0]);
     list.D3DDrawInstanced(3, 1, 0, 0);
     // V: blur_tex[1] -> blur_tex[0].
@@ -15398,8 +15505,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     to_rt(g_r.blur_tex[0]);
     flush();
     list.D3DOMSetRenderTargets(1, &blur_rtv0, FALSE, nullptr);
-    const float v_consts[4] = {0.0f, 1.0f, scene.ui_blur, 0.0f};
-    list.D3DSetGraphicsRoot32BitConstants(0, 4, v_consts, 0);
+    const float v_consts[8] = {0.0f,
+                               1.0f,
+                               scene.ui_blur,
+                               0.0f,
+                               scene.ui_blur_color[0],
+                               scene.ui_blur_color[1],
+                               scene.ui_blur_color[2],
+                               1.0f};
+    list.D3DSetGraphicsRoot32BitConstants(0, 8, v_consts, 0);
     srv_table(g_r.blur_srv[1]);
     list.D3DDrawInstanced(3, 1, 0, 0);
     // Replace: blur_tex[0] stretched over the full output (basictex).

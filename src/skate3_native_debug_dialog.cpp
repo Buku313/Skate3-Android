@@ -3,8 +3,15 @@
 #include <imgui.h>
 
 #include <rex/cvar.h>
+#include <rex/graphics/native_guest_renderer.h>
 
 #include "skate3_native_scene.h"
+
+REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, true, "Skate 3",
+                    "Small top-right corner readout of which renderer produced the "
+                    "last presented frame: NATIVE (native scene renderer) or "
+                    "EMULATED (Xenos GPU emulation: menus/loading yields, F5 off).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Hook-layer master (boot-time), shown read-only.
 REXCVAR_DECLARE(bool, skate3_native_render);
@@ -398,6 +405,25 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
   if (!open) {
     Hide();
   }
+}
+
+void RenderModeIndicator::OnDraw(ImGuiIO& io) {
+  if (!REXCVAR_GET(skate3_native_render_mode_indicator)) {
+    return;
+  }
+  const bool native = rex::graphics::IsNativeGuestOutputActive();
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.0f, 10.0f), ImGuiCond_Always,
+                          ImVec2(1.0f, 0.0f));
+  ImGui::SetNextWindowBgAlpha(0.35f);
+  ImGui::Begin("##render_mode_indicator", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                   ImGuiWindowFlags_AlwaysAutoResize |
+                   ImGuiWindowFlags_NoSavedSettings |
+                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+  ImGui::TextColored(native ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
+                            : ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
+                     "%s", native ? "NATIVE" : "EMULATED");
+  ImGui::End();
 }
 
 }  // namespace skate3

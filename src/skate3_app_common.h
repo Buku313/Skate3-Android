@@ -62,6 +62,7 @@ class Skate3BaseApp : public rex::ReXApp {
   std::unique_ptr<rex::ui::SimpleSettingsDialog> simple_settings_dialog_;
   std::unique_ptr<rex::ui::UltrawideTargetsDialog> ultrawide_targets_dialog_;
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
+  std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
   bool recipe_overlay_installed_ = false;
   bool big_device_aliases_installed_ = false;
   std::atomic<uint32_t> debug_marker_count_{0};
