@@ -151,6 +151,22 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_pause_native, true, "Skate 3",
                     "also skips the pause-entry cache clears, so unpausing costs "
                     "nothing.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_loading_native, true, "Skate 3",
+                    "Render post-startup loading screens natively, black backdrop "
+                    "plus the game's own captured 2D loading UI, instead of "
+                    "yielding to the emulated output. The loading-screen "
+                    "housekeeping (cache clears, registration prewarm, takeover "
+                    "arming) is unchanged; only the presented pixels switch source. "
+                    "The boot flow before the first gameplay stays emulated.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_boot_native, true, "Skate 3",
+                    "Extend native rendering to the game startup flow (intro videos, "
+                    "boot frontend, the first load); i.e. drop the first-gameplay "
+                    "prerequisite from the native menu/loading modes, and render the "
+                    "pre-takeover boot frames as native 2D-over-black instead of "
+                    "yielding. With this and the pause/loading modes on, the emulated "
+                    "GPU output is never presented.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
                     "60 (large .draws.bin; for targeted investigations)")
@@ -6311,6 +6327,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
   }
+  // Published every frame (not just on world submissions): boot/menu frames
+  // carry only 2D, and the render thread's 2D texture decodes need the
+  // guest base from the very first natively rendered boot frame.
+  g_guest_base.store(base, std::memory_order_relaxed);
   ++g_guest_frame;  // paces the world-item cache revalidation
   // Perf telemetry: guest frame interval + this frame's capture-hook cost.
   static PerfClock::time_point s_last_frame_tp{};
@@ -6376,7 +6396,6 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (count == 0) {
     return;
   }
-  g_guest_base.store(base, std::memory_order_relaxed);
 
   // Multiple SceneRenderViews can submit per frame (main, shadow cascades,
   // reflections). Pick the perspective one (proj[2][3] == 1 in row-vector
@@ -12947,12 +12966,25 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           .count()));
 }
 
+// Set by YieldForMenus, consumed by RenderScene in the same call (render
+// thread only): this frame is a NATIVE loading-screen frame; no world scene
+// exists (or it is the previous map's stale one), so RenderScene renders a
+// black backdrop + the captured 2D loading UI instead of the world.
+bool g_loading_native_frame = false;
+// Render thread only: the previous rendered frame was a native loading
+// frame. Used to HOLD the loading visuals through the post-load takeover
+// gate window; the emulated output was suppressed all through the native
+// loading screen, so yielding there would flash the stale pre-load frame.
+bool g_loading_hold = false;
+
 // Menus / pause / loading yield gate (see the comment at the call site):
 // returns true when RenderScene must yield this frame to the emulated
 // output. Handles the cache clears on entry and the takeover re-arm +
-// loading-screen pipeline build / prewarm commit while yielded.
+// loading-screen pipeline build / prewarm commit while in a load, whether
+// the loading pixels themselves render emulated (yield) or natively
+// (g_loading_native_frame).
 bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
-  static bool s_yielding = false;
+  static bool s_in_loading = false;
   static bool s_seen_gameplay = false;
   static bool s_pause_native = false;
   const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
@@ -12967,8 +12999,12 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   // go stale (a load was picked from the pause menu, or the game stops
   // redrawing the world), this degrades to the yield path below within
   // ~300 ms, cache clears and all.
+  // boot_native lifts the first-gameplay prerequisite from both native menu
+  // modes: a boot-frontend 3D backdrop renders like a pause backdrop, and
+  // everything else (videos, menus, the first load) renders as 2D-over-black.
+  const bool boot_native = REXCVAR_GET(skate3_native_render_scene_boot_native);
   bool pause_native = false;
-  if (in_menus && s_seen_gameplay &&
+  if (in_menus && (s_seen_gameplay || boot_native) &&
       REXCVAR_GET(skate3_native_render_scene_pause_native)) {
     const int64_t last_ns = g_last_publish_ns.load(std::memory_order_relaxed);
     const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -12996,13 +13032,22 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
           g_draws_2d_dropped.load(std::memory_order_relaxed));
     }
   }
-  const bool yield = in_menus && !pause_native;
-  if (yield != s_yielding) {
-    s_yielding = yield;
-    if (yield) {
+  const bool in_loading = in_menus && !pause_native;
+  // Loading screens themselves render natively too (black + the captured 2D
+  // loading UI) when enabled, everything after the first gameplay. The
+  // housekeeping below runs for the loading STATE either way; only the
+  // yield decision changes.
+  const bool loading_native =
+      in_loading && (s_seen_gameplay || boot_native) &&
+      REXCVAR_GET(skate3_native_render_scene_loading_native);
+  g_loading_native_frame = loading_native;
+  if (in_loading != s_in_loading) {
+    s_in_loading = in_loading;
+    if (in_loading) {
       REXLOG_INFO(
-          "native-scene: menus/loading - yielding to emulated output "
-          "(presence context)");
+          "native-scene: menus/loading - {} (presence context)",
+          loading_native ? "rendering the loading screen NATIVELY"
+                         : "yielding to emulated output");
       // Arena addresses are reused across map loads: let the next load's
       // registrations re-queue meshes (and re-stage textures) at reused
       // addresses, and drop the cached item cores built from them.
@@ -13025,7 +13070,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
           g_prewarm_dropped.load(std::memory_order_relaxed), queued);
     }
   }
-  if (yield) {
+  if (in_loading) {
     // Re-arm the takeover gate for the next stretch of gameplay (map
     // load, unpause).
     g_warmup_armed.store(true, std::memory_order_relaxed);
@@ -13042,6 +13087,11 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
     // frame.
     if (!g_r.failed && g_r.pso == nullptr) {
       EnsurePipeline(context);
+    }
+    if (loading_native) {
+      // RenderScene renders this frame (black + 2D loading UI) and runs
+      // the prewarm commit itself with the loading budget.
+      return false;
     }
     // THE loading-screen heavy lifting runs on the prewarm decode WORKER
     // POOL (a serial render-thread drain both tanked the loading spinner
@@ -13632,8 +13682,39 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             .count());
   };
 
+  bool loading_native = g_loading_native_frame;
+  // Render the takeover-gate window (warmup armed, no fresh substantial
+  // scene yet) as a native loading frame instead of yielding, in two cases:
+  // (a) g_loading_hold: the frames right after a native loading screen
+  //     (the presence context flips to gameplay before the first fresh
+  //     scene, and the emulated output was suppressed all through the load,
+  //     so yielding would flash its stale pre-load content);
+  // (b) boot_native: the whole startup flow (intro videos, boot frontend)
+  //     runs with the gate armed and no scene published, and should render
+  //     natively as 2D-over-black rather than fall back to emulated.
+  if (!loading_native &&
+      (g_loading_hold || REXCVAR_GET(skate3_native_render_scene_boot_native)) &&
+      REXCVAR_GET(skate3_native_render_scene_warmup_budget_ms) > 0 &&
+      g_warmup_armed.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(g_scene_mutex);
+    const bool ready =
+        g_scene && g_scene->generation >= g_warmup_fresh_generation &&
+        g_scene->items.size() >=
+            size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items));
+    loading_native = !ready;
+  }
+  g_loading_hold = loading_native;
   std::shared_ptr<const FrameScene> scene_ptr;
-  {
+  if (loading_native) {
+    // Native loading screen: there is no current world scene (g_scene holds
+    // the PREVIOUS map's stale one); render an empty scene, i.e. a black
+    // backdrop, and let the 2D overlay tail replay the game's live loading
+    // UI (Publish2dDraws publishes every guest frame, loads included).
+    // Value-initialized: zero items, no shadow/blur/outline, generation 0.
+    static const std::shared_ptr<const FrameScene> s_loading_scene =
+        std::make_shared<const FrameScene>();
+    scene_ptr = s_loading_scene;
+  } else {
     std::lock_guard<std::mutex> lock(g_scene_mutex);
     if (!g_scene || g_scene->items.empty()) {
       return false;
@@ -13689,7 +13770,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // for a frame instead of freezing the takeover frame.
   const int32_t warmup_ms = REXCVAR_GET(skate3_native_render_scene_warmup_budget_ms);
   bool settling = false;
-  if (warmup_ms > 0 && REXCVAR_GET(skate3_native_render_scene_debug) == 0) {
+  // The takeover gates judge REAL scenes only; a native loading frame
+  // renders its empty scene deliberately (the gates re-run as usual once
+  // the presence context flips back to gameplay).
+  if (warmup_ms > 0 && !loading_native &&
+      REXCVAR_GET(skate3_native_render_scene_debug) == 0) {
     if (g_warmup_armed.load(std::memory_order_relaxed)) {
       if (scene.generation < g_warmup_fresh_generation ||
           scene.items.size() <
@@ -13746,7 +13831,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // EnqueueWordsMiss), so make sure they exist even on a session that never
   // showed a loading screen with the pipeline up.
   EnsurePrewarmWorkers();
-  PrewarmCommit(context, frame_number);
+  // Native loading frames take the loading-screen commit budget; the heavy
+  // decode lifting behind the load is unchanged from the yielded path.
+  PrewarmCommit(context, frame_number, /*loading=*/loading_native);
   // Content-store LRU: superseded words states (old mip levels, pre-demote
   // detail sets, one-shot UI art) age out once nothing routes to them.
   EvictTexStore(frame_number, command_processor->GetCurrentSubmission());
@@ -13778,7 +13865,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
   const bool use_depth = debug_mode != 4;
   const D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_r.dsv_heap->GetCPUDescriptorHandleForHeapStart();
-  const FLOAT clear_color[4] = {0.25f, 0.35f, 0.55f, 1.0f};
+  // Loading frames clear to black (the game's loading UI composes over
+  // black); real scenes keep the sky-ish debug clear that shows through
+  // undecoded holes.
+  const FLOAT clear_color[4] = {loading_native ? 0.0f : 0.25f,
+                                loading_native ? 0.0f : 0.35f,
+                                loading_native ? 0.0f : 0.55f, 1.0f};
   list.D3DClearRenderTargetView(scene_rtv, clear_color, 0, nullptr);
   if (use_depth) {
     list.D3DClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -15314,6 +15406,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       key *= 1099511628211ull;
     }
     auto it = find_words_texture(key);
+    if (it != g_r.tex_store.end() && it->second.valid && !it->second.incomplete &&
+        frame_number >= it->second.recheck_frame &&
+        REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
+      // Content liveness for CPU-rewritten UI art: intro/menu VIDEO frames
+      // (rw::movie software decode) rewrite the same payload every tick with
+      // the fetch words unchanged; the words-keyed cache would freeze
+      // playback on its first decoded frame. Probe the payload; on change,
+      // retire + re-decode inline (the fresh entry's recheck_frame of 0
+      // keeps a playing video on a per-frame cadence). Static art settles at
+      // the same 16-frame cadence as the world store's revalidation.
+      const uint64_t fp = SampleProbeFingerprint(base, it->second);
+      if (fp != 0 && fp != it->second.payload_fp) {
+        RetireGuestTexture(it->second, command_processor->GetCurrentSubmission());
+        g_r.tex_store.erase(it);
+        it = g_r.tex_store.end();
+      } else {
+        it->second.recheck_frame = frame_number + 16;
+      }
+    }
     if (it == g_r.tex_store.end()) {
       // HUD/spline art decodes inline (small; async would flash UI elements
       // white on first sight). The big streamed posters go through
