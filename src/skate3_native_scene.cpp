@@ -3039,6 +3039,23 @@ void OnSetShader(bool pixel, uint32_t obj) {
   }
 }
 
+// The CAS editor is ON SCREEN now: its own "_nis" pixel shaders were set
+// within the last 0.5 s (see IsCasEditorPs). Consumed by the portrait-pass
+// publish gate and the takeover gates; the STARTUP-flow editor's scene is
+// skater-only (the garage geometry only exists in-world, so pre-gameplay the
+// scene is ~10 all-character items at cam (-3.8,200.9,-7.6)), which both looks exactly like a portrait pass and sits below
+// warmup_min_items.
+bool CasEditorHeartbeatFresh() {
+  const int64_t last_ns = g_cas_ps_last_ns.load(std::memory_order_relaxed);
+  if (last_ns < 0) {
+    return false;
+  }
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  return now_ns - last_ns < 500'000'000;
+}
+
 void OnRenderStateUpload(uint64_t mask, uint32_t bank, uint32_t ptr) {
   (void)mask;
   if (ptr == 0) {
@@ -8468,8 +8485,15 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // backdrops always carry world geometry (the pause plaza ~700 items, the
   // CAS editor room has env-family walls). Skipped publishes also skip the
   // freshness stamp, so the mode never flips.
+  // CAS-editor exemption: the STARTUP-flow editor's scene is skater-only
+  // (no garage world pre-gameplay: 10 all-char items, exactly a portrait
+  // pass's shape; without the exemption this gate ate it, 3D black
+  // behind a live menu). The editor's _nis shader heartbeat separates the
+  // two: editor draws stamp it every frame, portrait passes use the
+  // _default compiles and never do.
   if (rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0 &&
-      !scene.items.empty() && scene.items.size() <= 48) {
+      !scene.items.empty() && scene.items.size() <= 48 &&
+      !CasEditorHeartbeatFresh()) {
     bool all_char = true;
     for (const DrawItem& it : scene.items) {
       if (it.char_family == 0) {
@@ -14502,10 +14526,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       REXCVAR_GET(skate3_native_render_scene_warmup_budget_ms) > 0 &&
       g_warmup_armed.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lock(g_scene_mutex);
+    // A fresh CAS-editor scene qualifies at ANY size: the startup-flow
+    // editor is skater-only (~10 items, below warmup_min_items) but is a
+    // complete, deliberate scene; holding it rendered the 3D view black
+    // behind the live editor menu. It renders WITHOUT disarming the gate
+    // (see the takeover gate below); real gameplay still needs min_items.
+    const bool fresh =
+        g_scene && g_scene->generation >= g_warmup_fresh_generation;
     const bool ready =
-        g_scene && g_scene->generation >= g_warmup_fresh_generation &&
-        g_scene->items.size() >=
-            size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items));
+        fresh && (g_scene->items.size() >=
+                      size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items)) ||
+                  (!g_scene->items.empty() && CasEditorHeartbeatFresh()));
     loading_native = !ready;
   }
   g_loading_hold = loading_native;
@@ -14609,27 +14640,37 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (warmup_ms > 0 && !loading_native &&
       REXCVAR_GET(skate3_native_render_scene_debug) == 0) {
     if (g_warmup_armed.load(std::memory_order_relaxed)) {
-      if (scene.generation < g_warmup_fresh_generation ||
+      const bool small_or_stale =
+          scene.generation < g_warmup_fresh_generation ||
           scene.items.size() <
-              size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items))) {
+              size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items));
+      // A fresh CAS-editor scene renders despite being under min_items (the
+      // startup-flow editor is skater-only, ~10 items), but does NOT count
+      // as the gameplay takeover; the gate stays armed for the real load
+      // that follows the editor.
+      const bool editor_scene = scene.generation >= g_warmup_fresh_generation &&
+                                !scene.items.empty() && CasEditorHeartbeatFresh();
+      if (small_or_stale && !editor_scene) {
         // Stale or fade-in scene: yield (brief, a few frames). Keep
         // committing worker results meanwhile; every pre-takeover frame
         // counts on map changes.
         PrewarmCommit(context, frame_number);
         return false;
       }
-      g_warmup_armed.store(false, std::memory_order_relaxed);
-      g_settle_until_frame = frame_number + 120;
-      size_t queued = 0;
-      {
-        std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-        queued = g_prewarm_queue.size();
+      if (!small_or_stale) {
+        g_warmup_armed.store(false, std::memory_order_relaxed);
+        g_settle_until_frame = frame_number + 120;
+        size_t queued = 0;
+        {
+          std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+          queued = g_prewarm_queue.size();
+        }
+        REXLOG_INFO(
+            "native-scene: taking over natively ({} items; prewarm {} done / {} dropped "
+            "/ {} queued)",
+            scene.items.size(), g_prewarm_done.load(std::memory_order_relaxed),
+            g_prewarm_dropped.load(std::memory_order_relaxed), queued);
       }
-      REXLOG_INFO(
-          "native-scene: taking over natively ({} items; prewarm {} done / {} dropped "
-          "/ {} queued)",
-          scene.items.size(), g_prewarm_done.load(std::memory_order_relaxed),
-          g_prewarm_dropped.load(std::memory_order_relaxed), queued);
     }
     settling = frame_number < g_settle_until_frame;
     if (settling) {
