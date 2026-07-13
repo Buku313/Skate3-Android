@@ -2866,6 +2866,12 @@ void OnPhotoReplayUpdate() {
 // logos, any full-motion video). Same contract as the photo-replay
 // heartbeat above.
 static std::atomic<int64_t> g_movie_decode_last_ns{-1};
+// Last frame the 2D replay actually SUBSTITUTED a movie quad (ps_yuv2d).
+// Consulted by YieldForMovie: while the native substitution is serving the
+// video, the emulated yield must never engage; the emulated framebuffer
+// is STALE under draw suppression, and presenting it flashed the previous
+// video's last frame at every video boundary.
+static std::atomic<int64_t> g_movie_native_last_ns{-1};
 
 void OnMovieDecode() {
   g_movie_decode_last_ns.store(
@@ -13817,18 +13823,37 @@ bool YieldForMovie() {
                              PerfClock::now().time_since_epoch())
                              .count();
   const bool active = now_ns - last_ns < 500'000'000;
+  // LAST-RESORT gating: yielding INSTANTLY at video start presented the
+  // emulated framebuffer, which under draw suppression still holds a stale
+  // frame: the flash of the PREVIOUS video at every video boundary
+  // (measured: yield, planes published +16 ms, substitution
+  // native +38 ms, a ~5-frame stale-frame window). The substitution path
+  // gets 400 ms from the first heartbeat to engage, and once it has drawn
+  // recently the yield stays off entirely (covers the video-END race the
+  // same way). Genuine native-FMV failure (fmv_native off, pso missing,
+  // plane decode failure) still reaches the emulated yield after the
+  // grace window.
+  static int64_t s_fresh_since = -1;
+  if (!active) {
+    s_fresh_since = -1;
+  } else if (s_fresh_since < 0) {
+    s_fresh_since = now_ns;
+  }
+  const int64_t native_ns = g_movie_native_last_ns.load(std::memory_order_relaxed);
+  const bool yield = active && now_ns - s_fresh_since >= 400'000'000 &&
+                     (native_ns < 0 || now_ns - native_ns > 1'000'000'000);
   static bool s_active = false;
-  if (active != s_active) {
-    s_active = active;
-    if (active) {
+  if (yield != s_active) {
+    s_active = yield;
+    if (yield) {
       REXLOG_INFO(
           "native-scene: FMV playing - yielding to emulated output "
-          "(MovieDecoder heartbeat)");
+          "(MovieDecoder heartbeat; substitution did not engage)");
     } else {
       REXLOG_INFO("native-scene: FMV ended - native output resumes");
     }
   }
-  return active;
+  return yield;
 }
 
 bool YieldForPhotoEditor(uint8_t* base) {
@@ -16285,7 +16310,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (regen < 2 || !EnsureHudTileRegen(context, base, fetch, regen, gt)) {
         EnsureGuestTextureFromWords(context, base, fetch, gt);
       }
-      g_pw_tex_decode.Add(perf_ns_since(hud_t0));
+      const uint64_t decode_ns = perf_ns_since(hud_t0);
+      g_pw_tex_decode.Add(decode_ns);
+      // Attribution for residual render-thread stalls: anything still
+      // decoding inline for >3 ms should either move over the async
+      // threshold or explain itself here.
+      if (decode_ns > 3'000'000) {
+        static std::atomic<uint32_t> s_slow{0};
+        const uint32_t n = s_slow.fetch_add(1, std::memory_order_relaxed);
+        if (n < 24 || (n & 255u) == 0) {
+          REXLOG_INFO(
+              "native-scene: SLOW inline 2D decode {:.1f}ms {}x{} "
+              "fetch=[{:08X} {:08X} {:08X}] forced={} (n={})",
+              double(decode_ns) / 1e6, px_w, px_h, fetch[0], fetch[1],
+              fetch[2], force_inline ? 1 : 0, n);
+        }
+      }
       if (!gt.valid) {
         static std::unordered_set<uint64_t> logged;
         if (logged.size() < 32 && logged.insert(key).second) {
@@ -16662,8 +16702,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       bool movie_drawn = false;
       for (const Draw2d& d : scene_2d) {
         const uint32_t* yuv = nullptr;
-        if (movie_sub && d.composite_srv < 0) {
-          if (yuv_triple(d)) {
+        // Video-quad detection runs regardless of movie_sub: a quad whose
+        // own fetch slots form a YUV triple must NEVER draw through ps_main
+        // - that renders the raw Y plane (greyscale luma, or the PREVIOUS
+        // video's frame while the plane copies are still stale), the
+        // video-boundary flash class. If the planes can't resolve yet
+        // (async decode in flight, substitution off) the quad is SKIPPED;
+        // black under a starting video is what the real thing looks like.
+        bool video_quad = false;
+        if (d.composite_srv < 0 && yuv_triple(d)) {
+          video_quad = true;
+          if (movie_sub) {
             TripleCacheEntry* e = nullptr;
             for (int t = 0; t < triple_count && e == nullptr; ++t) {
               if (triple_cache[t].y_addr == d.fetch[1]) {
@@ -16674,18 +16723,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               e = &triple_cache[triple_count++];
               e->y_addr = d.fetch[1];
               e->ok = true;
+              bool decode_failed = false;
               for (int p = 0; p < 3 && e->ok; ++p) {
                 const uint32_t* w = d.fetch + p * 6;
                 auto hot = find_words_texture(FetchWordsKey(w));
                 if (hot != g_r.tex_store.end()) {
                   hot->second.recheck_frame = 0;  // content-hot: per-frame probe
                 }
-                const GuestTexture* t =
-                    resolve_2d_texture(w, /*force_inline=*/true);
-                e->ok = t != &g_r.white && t->texture != nullptr;
-                e->slots[p] = t->srv_slot;
+                // Async-capable resolve: a content change serves the stale
+                // plane while the worker re-decodes (the per-frame inline
+                // re-decode of a 720p plane set cost ~3x4 ms on the render
+                // thread every content change: video judder + boot
+                // sluggishness); nullptr = first decode still in flight.
+                const GuestTexture* t = resolve_2d_texture(w);
+                e->ok = t != nullptr && t != &g_r.white && t->texture != nullptr;
+                decode_failed |= t == &g_r.white;
+                e->slots[p] = e->ok ? t->srv_slot : 0;
               }
-              if (!e->ok) {
+              if (decode_failed) {
                 static std::atomic<uint32_t> s_triple_failed{0};
                 if (s_triple_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
                   REXLOG_INFO(
@@ -16699,20 +16754,38 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               yuv = e->slots;
             }
           }
-          if (yuv == nullptr && (d.flags & 0x2u) != 0 && d.src_stride == 24) {
-            yuv = fallback_yuv();
-            if (yuv != nullptr) {
-              static std::atomic<uint32_t> s_fb_logged{0};
-              if (s_fb_logged.fetch_add(1, std::memory_order_relaxed) < 4) {
-                REXLOG_INFO(
-                    "native-scene: FMV bracket fallback served a quad (no "
-                    "readable YUV triple on it)");
-              }
+        }
+        if (yuv == nullptr && movie_sub && d.composite_srv < 0 &&
+            (d.flags & 0x2u) != 0 && d.src_stride == 24) {
+          // Bracketed movie quad without a readable triple: through ps_main
+          // it draws its c8 opaque-black cover, also a video quad.
+          video_quad = true;
+          yuv = fallback_yuv();
+          if (yuv != nullptr) {
+            static std::atomic<uint32_t> s_fb_logged{0};
+            if (s_fb_logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+              REXLOG_INFO(
+                  "native-scene: FMV bracket fallback served a quad (no "
+                  "readable YUV triple on it)");
             }
           }
         }
+        if (video_quad && yuv == nullptr) {
+          static std::atomic<uint32_t> s_vskip{0};
+          const uint32_t n = s_vskip.fetch_add(1, std::memory_order_relaxed);
+          if (n < 8 || (n & 511u) == 0) {
+            REXLOG_INFO(
+                "native-scene: video quad skipped (planes not ready, "
+                "y={:08X}, movie_sub={}) (n={})",
+                d.fetch[1], movie_sub ? 1 : 0, n);
+          }
+          continue;
+        }
         emit_draw(d, yuv);
         movie_drawn |= yuv != nullptr;
+      }
+      if (movie_drawn) {
+        g_movie_native_last_ns.store(movie_now_ns, std::memory_order_relaxed);
       }
       if (movie_drawn) {
         static std::atomic<bool> s_movie_logged{false};
