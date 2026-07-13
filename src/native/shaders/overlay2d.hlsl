@@ -61,6 +61,23 @@ float4 SampleCR(float2 uv, float2 ts) {
   c += tex.Sample(smp, float2(t3.x, t3.y)) * (w3.x * w3.y);
   return c;
 }
+// Native FMV: the movie quad (AptMovieIntegration bracket, stride-24
+// textured) samples three CPU-filled YUV planes: Y at t0, U at t1, V at
+// t4 (the root signature's existing single-SRV tables). BT.601 studio
+// range. c8 / vertex color are deliberately ignored: the game stages c8 =
+// opaque BLACK on the movie quad (its own movie shader never reads it),
+// which is exactly what rendered the video as a black cover through
+// ps_main.
+Texture2D<float4> tex_u : register(t1);
+Texture2D<float4> tex_v : register(t4);
+float4 ps_yuv2d(VSOut i) : SV_Target {
+  float y = tex.Sample(smp, i.uv).r;
+  float u = tex_u.Sample(smp, i.uv).r - 0.5;
+  float v = tex_v.Sample(smp, i.uv).r - 0.5;
+  y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+  float3 c = float3(y + 1.596 * v, y - 0.813 * v - 0.391 * u, y + 2.018 * u);
+  return float4(saturate(c), 1.0);
+}
 float4 ps_main(VSOut i) : SV_Target {
   float4 c = tex.Sample(smp, i.uv);
   // Sharp magnification (m[9].y = skate3_native_render_scene_2d_sharp):

@@ -751,6 +751,31 @@ extern "C" REX_FUNC(sub_825623F0) {
   __imp__sub_825623F0(ctx, base);
 }
 
+// rw::movie::MovieDecoder::Decode(int, VideoRenderable**,
+// SubtitleRenderable*): fires per decoded FMV frame while any movie plays
+// (boot intro logos and all other rw::movie playback). Heartbeat for the
+// native scene's FMV yield: the video frame is CPU-decoded into a texture
+// and reaches the screen through the game's postfx chain + swap without a
+// capturable 2D draw, so only the emulated path can show it.
+extern "C" REX_FUNC(sub_82A92DC8) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnMovieDecode();
+  }
+  __imp__sub_82A92DC8(ctx, base);
+}
+
+// VideoRenderer_RwTexture::Render(VideoRenderable*, int): fills the three
+// YUV plane textures (members this+12/+124/+68) with the decoded FMV frame
+// via Texture::Lock/FillTextureData/Unlock. Post-call, the planes hold the
+// finished frame: publish their fetch words for the native FMV blit.
+extern "C" REX_FUNC(sub_8263C498) {
+  const uint32_t self = ctx.r3.u32;
+  __imp__sub_8263C498(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnMovieFrame(base, self);
+  }
+}
+
 // Sk8::WorldPresentation::AddRenderInstance(pegasus::tInstance*): the world
 // registry add, fired per placed instance while a map loads (r4 = tInstance).
 // The prewarm's primary mesh source: the instance's tRModelData mesh table

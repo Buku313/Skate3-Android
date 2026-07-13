@@ -167,6 +167,67 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_boot_native, true, "Skate 3",
                     "yielding. With this and the pause/loading modes on, the emulated "
                     "GPU output is never presented.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_native, true, "Skate 3",
+                    "Render FMVs natively: the movie player CPU-decodes VP6 into "
+                    "three YUV plane textures (VideoRenderer_RwTexture members, "
+                    "published per frame by the Render hook), and the captured "
+                    "movie quad (the AptMovieIntegration stride-24 draw; through "
+                    "the plain 2D shader it rendered as an opaque black cover, its "
+                    "c8 is black) is substituted with the ps_yuv2d combine inside "
+                    "the 2D replay, order-faithful and at the quad's own geometry "
+                    "(windowed movies place exactly). When off (or the planes fail "
+                    "to publish), FMVs fall back to the emulated yield "
+                    "(skate3_native_render_scene_fmv_yield).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_yield, true, "Skate 3",
+                    "Yield to the emulated output while an FMV is playing (intro "
+                    "logos, any rw::movie playback). The video frame is CPU-decoded "
+                    "into a texture and reaches the screen through the game's postfx "
+                    "chain + swap without any capturable 2D draw (F11-proven on the "
+                    "boot intro: 15 draws, all postfx passes + fade fills, none "
+                    "sampling the video), so the native path has nothing to replay; "
+                    "the emulated frame is complete and correct there, same class as "
+                    "the photo editor. Detected via the MovieDecoder::Decode "
+                    "heartbeat; native rendering resumes within 0.5 s of the last "
+                    "decoded frame.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cas_yield, true, "Skate 3",
+                    "Yield to the emulated output while the create-a-skater editor "
+                    "(the CAS 'Edit Skater' screen) is up. The editor is a special FE "
+                    "renderer: its own CAC shader variants (cac*_nisPS, different "
+                    "constant layouts than gameplay, so the char-lighting capture "
+                    "rejects every bank), per-frame texture-space composite passes "
+                    "(cac*_unwrapPS render the edited garment/skin art into textures) "
+                    "and its own DOF postfx chain, none of which the native scene "
+                    "models. Natively it showed wrong clothing tints/skin tone and "
+                    "broken live-edit previews. The emulated "
+                    "frame is complete and exact there (photo-editor class). Detected "
+                    "by polling the FrontEndManager push-state stack for screen id 15 "
+                    "(surveyed unique to the CAS editor across 40 gsnaps).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_menu_unsuppress, true, "Skate 3",
+    "While a menu/pause/loading context (presence context 0) renders "
+    "natively, temporarily clear native_render_suppress_emulated_draws so "
+    "the game's off-screen one-shot renders keep executing; the team-menu "
+    "skater portrait boxes are a render-to-texture the game produces once "
+    "when the screen opens (and again after an edit); with emulated draws "
+    "suppressed that pass never ran and the boxes stayed empty in every "
+    "native menu session (even the F11 emulated pair-shot inherited the "
+    "never-filled texture). Costs the emulated pipeline's GPU time during "
+    "menus only; gameplay suppression is untouched. Restored to the user's "
+    "configured value on the first gameplay frame.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_2d_unbracketed, true, "Skate 3",
+                    "During native loading/boot frames, also capture full-screen "
+                    "inline 2D draws issued OUTSIDE the FE/APT brackets: the boot "
+                    "intro video's to-screen quad draws before the FrontEndManager "
+                    "render path exists (VideoRenderer_RwTexture fills a CPU-locked "
+                    "texture; something below the FE draws it), which left the video "
+                    "black with audio. Gated on a >=960-wide viewport so small "
+                    "render-to-texture helper quads never leak into the overlay. "
+                    "No effect during gameplay/pause frames.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
                     "60 (large .draws.bin; for targeted investigations)")
@@ -936,6 +997,12 @@ std::atomic<uint32_t> g_device{0};
 // Flash SWFs converted to APT; draws issued inside these brackets are the 2D
 // draw stream.
 std::atomic<uint32_t> g_phase2d_depth[6];
+// Set by the render thread while rendering native loading/boot frames
+// (no world scene): the guest-side 2D capture also accepts full-screen
+// inline draws OUTSIDE the brackets there (the boot movie player's video
+// quad draws below every FE hook). See the capture site + the
+// skate3_native_render_scene_2d_unbracketed cvar.
+std::atomic<bool> g_capture_2d_unbracketed{false};
 std::atomic<uint64_t> g_draws_2d{0};
 // 2D draws seen through paths the overlay does not replay yet
 // (DrawIndexedVertices / DrawVertices in the 2D phase; gameplay HUD uses
@@ -961,6 +1028,11 @@ struct Draw2d {
   uint32_t prim;    // xenos primitive: 4 trilist, 5 tristrip, 13 quadlist
   uint32_t count;   // vertex count
   uint32_t stride;  // bytes per vertex at capture (see publish normalization)
+  // Capture-time stride, preserved across the publish normalization (which
+  // rewrites stride to the renderer's 28). The FMV substitution keys on it:
+  // the movie quad is the stride-24 textured layout inside the
+  // AptMovieIntegration bracket (bit 1).
+  uint32_t src_stride = 0;
   uint32_t addr;    // guest inline-ring write pointer
   uint32_t flags;   // bracket bits at capture (layout disambiguation)
   uint32_t fetch[6];  // texture fetch constant (shadow slot 0)
@@ -2705,6 +2777,76 @@ void OnPhotoReplayUpdate() {
       std::memory_order_relaxed);
 }
 
+// Last rw::movie::MovieDecoder::Decode heartbeat (FMV playback: intro
+// logos, any full-motion video). Same contract as the photo-replay
+// heartbeat above.
+static std::atomic<int64_t> g_movie_decode_last_ns{-1};
+
+void OnMovieDecode() {
+  g_movie_decode_last_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          PerfClock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+}
+
+// YUV plane fetch words of the last FMV frame handed to
+// VideoRenderer_RwTexture::Render (Y full res, U/V half res, CPU-filled via
+// Texture::Lock: the game's postfx uber composites these into the frame;
+// natively the ps_yuv fullscreen pass does). Guest thread publishes under
+// the mutex; RenderScene copies per frame.
+struct MovieFrame {
+  uint32_t words[3][6];  // Y, U, V fetch constants
+  int64_t ns = -1;
+};
+std::mutex g_movie_mutex;
+MovieFrame g_movie_frame;
+
+void OnMovieFrame(uint8_t* base, uint32_t renderer) {
+  // Plane texture members of VideoRenderer_RwTexture, from the recompiled
+  // Render body (Lock/FillTextureData/Unlock trios): [this+12] = Y,
+  // [this+124] = U, [this+68] = V; the fill sources are the renderable's
+  // y/u/v buffers at +8/+12/+16 (TransferYUVBuffer order).
+  static constexpr uint32_t kPlaneOfs[3] = {12, 124, 68};
+  MovieFrame mf;
+  for (int p = 0; p < 3; ++p) {
+    uint32_t obj = 0;
+    if (!GuestTryLoadU32(base, renderer + kPlaneOfs[p], &obj) || obj < 0x10000) {
+      return;
+    }
+    // Stable fetch-words read at tex+0x1C (the D3D12 section's
+    // ReadStableTexWords, inlined to keep this compiled guest-side).
+    uint32_t raw[6], raw2[6];
+    if (!GuestTryCopy(raw, base + obj + 0x1C, sizeof(raw)) ||
+        !GuestTryCopy(raw2, base + obj + 0x1C, sizeof(raw2)) ||
+        std::memcmp(raw, raw2, sizeof(raw)) != 0) {
+      return;
+    }
+    for (int i = 0; i < 6; ++i) {
+      mf.words[p][i] = BSwap32(raw[i]);
+    }
+    if ((mf.words[p][0] & 3u) != 2 || mf.words[p][1] == 0) {
+      return;  // not a live texture fetch constant
+    }
+  }
+  mf.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              PerfClock::now().time_since_epoch())
+              .count();
+  {
+    std::lock_guard<std::mutex> lock(g_movie_mutex);
+    g_movie_frame = mf;
+  }
+  OnMovieDecode();  // shared FMV heartbeat (the emulated-yield fallback)
+  static std::atomic<bool> s_logged{false};
+  if (!s_logged.exchange(true, std::memory_order_relaxed)) {
+    REXLOG_INFO(
+        "native-scene: FMV planes published (y=[{:08X} {:08X}] u=[{:08X} "
+        "{:08X}] v=[{:08X} {:08X}])",
+        mf.words[0][0], mf.words[0][1], mf.words[1][0], mf.words[1][1],
+        mf.words[2][0], mf.words[2][1]);
+  }
+}
+
 void On2dPhase(uint32_t bit, bool enter) {
   if (bit >= 6) {
     return;
@@ -3672,6 +3814,41 @@ uint32_t ClassifySplineShader(uint8_t* base, uint32_t obj) {
   return kind;
 }
 
+// Cached shader debug-path leaf (obj+0x54, e.g. "postfx_basictex.updb" ->
+// "postfx_basictex") for the unbracketed-2D capture diagnosis log. Guest
+// render thread only, like ClassifySplineShader above.
+const char* ShaderDebugLeaf(uint8_t* base, uint32_t obj) {
+  static std::unordered_map<uint32_t, std::string> cache;
+  if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
+    return "?";
+  }
+  auto it = cache.find(obj);
+  if (it == cache.end()) {
+    char text[97] = {};
+    if (!GuestTryCopy(text, base + obj + 0x54, 96)) {
+      return "?";
+    }
+    text[96] = '\0';
+    std::string name;
+    const char* leaf = std::strrchr(text, '\\');
+    for (const char* p = leaf ? leaf + 1 : text; *p != '\0'; ++p) {
+      if (*p < 0x20 || *p > 0x7E) {
+        name.clear();
+        break;
+      }
+      name += *p;
+    }
+    if (name.empty()) {
+      name = "?";
+    }
+    if (cache.size() > 4096) {
+      cache.clear();
+    }
+    it = cache.emplace(obj, std::move(name)).first;
+  }
+  return it->second.c_str();
+}
+
 }  // namespace
 
 void OnSetIndices(uint32_t ib_obj) { g_cur_ib.store(ib_obj, std::memory_order_relaxed); }
@@ -4192,7 +4369,35 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // Live 2D overlay capture: the HUD renders exclusively through the
   // BeginVertices inline path (func 2). Vertex payloads are read at frame
   // end; everything else (transform constants, texture fetch) is staged now.
-  if (flags2d != 0 && SceneEnabled() && REXCVAR_GET(skate3_native_render_scene_2d)) {
+  //
+  // During native loading/boot frames (no world scene) full-screen inline
+  // draws OUTSIDE the brackets are accepted too: the boot intro video's
+  // to-screen quad draws below every FE hook (the movie plays before the
+  // FrontEndManager render path exists), which left the video black with
+  // audio. The >=960-wide viewport gate keeps small render-to-texture
+  // helper quads out; the capped log names every candidate (func 1 =
+  // DrawVertices video blits would need their own capture; the log is the
+  // evidence trail if that path exists).
+  bool unbracketed_2d = false;
+  if (flags2d == 0 && (func == 1 || func == 2) && SceneEnabled() &&
+      g_capture_2d_unbracketed.load(std::memory_order_relaxed) &&
+      REXCVAR_GET(skate3_native_render_scene_2d_unbracketed) &&
+      g_cur_viewport[2].load(std::memory_order_relaxed) >= 960) {
+    unbracketed_2d = func == 2;
+    static std::atomic<uint32_t> s_unbr_logged{0};
+    if (s_unbr_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+      REXLOG_INFO(
+          "native-scene: unbracketed 2D draw func={} r4={} r5={} r6={} "
+          "r7={:08X} ps={} vs={} vp={}x{}",
+          func, r4, r5, r6, r7,
+          ShaderDebugLeaf(base, g_cur_ps_obj.load(std::memory_order_relaxed)),
+          ShaderDebugLeaf(base, g_cur_vs_obj.load(std::memory_order_relaxed)),
+          g_cur_viewport[2].load(std::memory_order_relaxed),
+          g_cur_viewport[3].load(std::memory_order_relaxed));
+    }
+  }
+  if ((flags2d != 0 || unbracketed_2d) && SceneEnabled() &&
+      REXCVAR_GET(skate3_native_render_scene_2d)) {
     if (func == 2) {
       const uint32_t device = g_device.load(std::memory_order_relaxed);
       if (device != 0 && r7 >= 0x10000 && r5 != 0 && r5 <= 65536 && r6 >= 8 &&
@@ -6144,7 +6349,10 @@ void Publish2dDraws(uint8_t* base) {
       for (uint32_t v = 0; v < d.count && ok; ++v) {
         uint8_t* dst = norm_2d.data() + size_t(v) * 28;
         const uint8_t* src = scratch_2d.data() + size_t(v) * d.stride;
-        if (d.stride == 16 && simple) {  // SimpleDraw: pos4, untextured
+        // Unbracketed captures (d.flags == 0, native loading/boot frames)
+        // take the SimpleDraw layout readings for 16/28: EA's inline-quad
+        // helpers order color before texcoords everywhere.
+        if (d.stride == 16 && (simple || d.flags == 0)) {  // pos4, untextured
           std::memcpy(dst, src, 16);
           std::memcpy(dst + 16, &zero, 4);
           std::memcpy(dst + 20, &zero, 4);
@@ -6172,7 +6380,7 @@ void Publish2dDraws(uint8_t* base) {
           dst[25] = src[18];
           dst[26] = src[17];
           dst[27] = src[16];
-        } else if (d.stride == 28 && simple) {  // SimpleDraw: pos4+color+uv
+        } else if (d.stride == 28 && (simple || d.flags == 0)) {  // pos4+color+uv
           std::memcpy(dst, src, 16);
           std::memcpy(dst + 16, src + 20, 8);
           dst[24] = src[19];
@@ -6194,6 +6402,7 @@ void Publish2dDraws(uint8_t* base) {
         std::memset(d.fetch, 0, sizeof(d.fetch));
       }
       scratch_2d = norm_2d;
+      d.src_stride = d.stride;
       d.stride = 28;
     }
     if (d.prim == 13 && d.count % 4 == 0) {
@@ -8403,6 +8612,10 @@ struct RendererState {
   ID3D12PipelineState* pso_blur = nullptr;
   ID3D12PipelineState* pso_blur_blit = nullptr;
   ID3D12PipelineState* pso_blur_down = nullptr;
+  // Native FMV: overlay-2D pipeline variant whose PS combines the movie
+  // player's three CPU-filled YUV plane textures (ps_yuv2d; substituted for
+  // the captured movie quad in the 2D replay, see OnMovieFrame).
+  ID3D12PipelineState* pso_yuv2d = nullptr;
   // Selection outline (see DrawItem::selected): selected items re-render
   // into a single-sample R8 mask at OUTPUT resolution (RTV slot 7: a
   // low-res mask stairstepped the contour centerline at 4K) and a
@@ -11546,6 +11759,23 @@ bool Ensure2dPso(const NativeGuestOutputRenderContext& context) {
     up.RTVFormats[0] = context.d3d12.guest_output_format;
     up.SampleDesc.Count = 1;
     const HRESULT hr4 = device->CreateGraphicsPipelineState(&up, IID_PPV_ARGS(&g_r.pso_2d));
+    // FMV variant: identical pipeline, ps_yuv2d combine (see the movie-quad
+    // substitution in the 2D replay). Failure only loses native FMV; the
+    // emulated yield fallback covers it.
+    ID3DBlob* uyuv = nullptr;
+    if (SUCCEEDED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
+                             nullptr, nullptr, "ps_yuv2d", "ps_5_0", 0, 0, &uyuv,
+                             nullptr))) {
+      up.PS = {uyuv->GetBufferPointer(), uyuv->GetBufferSize()};
+      if (g_r.pso_yuv2d) g_r.pso_yuv2d->Release();
+      if (FAILED(device->CreateGraphicsPipelineState(&up, IID_PPV_ARGS(&g_r.pso_yuv2d)))) {
+        REXLOG_WARN("native-scene: FMV 2D PSO creation failed - movies yield");
+        g_r.pso_yuv2d = nullptr;
+      }
+      uyuv->Release();
+    } else {
+      REXLOG_WARN("native-scene: ps_yuv2d compile failed - movies yield");
+    }
     uvs->Release();
     ups->Release();
     if (uerrors) uerrors->Release();
@@ -13041,6 +13271,9 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
       in_loading && (s_seen_gameplay || boot_native) &&
       REXCVAR_GET(skate3_native_render_scene_loading_native);
   g_loading_native_frame = loading_native;
+  // Guest-side mirror for the unbracketed-2D capture; RenderScene re-stores
+  // the final verdict after the takeover-gate hold below.
+  g_capture_2d_unbracketed.store(loading_native, std::memory_order_relaxed);
   if (in_loading != s_in_loading) {
     s_in_loading = in_loading;
     if (in_loading) {
@@ -13132,6 +13365,41 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   // photo-editor capture shows a non-(-1) second field. The
   // PhotoReplayController heartbeat (sub_825623F0 hook) is kept as a
   // secondary signal for photo flows that bypass the photographer NIS.
+// FMV playback (intro logos, any full-motion video): the frame is
+// CPU-decoded into a texture (VideoRenderer_RwTexture Lock/Fill/Unlock) and
+// reaches the screen through the game's postfx chain + swap; no capturable
+// 2D draw exists (captured FMV frames show ~15 draws, all postfx
+// passes + fade fills), so the native path has nothing to replay. Yield
+// while the MovieDecoder::Decode heartbeat is fresh; the emulated frame is
+// complete and correct there (photo-editor class). Touches no caches or
+// takeover gates; native rendering resumes on the next frame after the
+// movie ends.
+bool YieldForMovie() {
+  if (!REXCVAR_GET(skate3_native_render_scene_fmv_yield)) {
+    return false;
+  }
+  const int64_t last_ns = g_movie_decode_last_ns.load(std::memory_order_relaxed);
+  if (last_ns < 0) {
+    return false;
+  }
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             PerfClock::now().time_since_epoch())
+                             .count();
+  const bool active = now_ns - last_ns < 500'000'000;
+  static bool s_active = false;
+  if (active != s_active) {
+    s_active = active;
+    if (active) {
+      REXLOG_INFO(
+          "native-scene: FMV playing - yielding to emulated output "
+          "(MovieDecoder heartbeat)");
+    } else {
+      REXLOG_INFO("native-scene: FMV ended - native output resumes");
+    }
+  }
+  return active;
+}
+
 bool YieldForPhotoEditor(uint8_t* base) {
   if (!REXCVAR_GET(skate3_native_render_scene_photo_yield)) {
     return false;
@@ -13704,6 +13972,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     loading_native = !ready;
   }
   g_loading_hold = loading_native;
+  g_capture_2d_unbracketed.store(loading_native, std::memory_order_relaxed);
   std::shared_ptr<const FrameScene> scene_ptr;
   if (loading_native) {
     // Native loading screen: there is no current world scene (g_scene holds
@@ -13728,6 +13997,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   }
   // Flush any barriers pushed by lazy resource creation (white texture).
   context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+
+  // FMV routing: prefer the native path, the captured movie quad (the
+  // AptMovieIntegration stride-24 draw, which the game's own shader paints
+  // with the YUV planes; through ps_main it rendered as an opaque BLACK
+  // cover, c8 = black) is SUBSTITUTED with the ps_yuv2d combine inside the
+  // 2D replay, order-faithful (the black backdrop fills land under it,
+  // like the emulated frame). Only when that path is unavailable does a
+  // live movie heartbeat yield to the emulated output.
+  MovieFrame movie;
+  {
+    std::lock_guard<std::mutex> lock(g_movie_mutex);
+    movie = g_movie_frame;
+  }
+  const bool movie_fresh =
+      movie.ns >= 0 &&
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          PerfClock::now().time_since_epoch())
+              .count() -
+              movie.ns <
+          500'000'000;
+  const bool movie_sub = movie_fresh &&
+                         REXCVAR_GET(skate3_native_render_scene_fmv_native) &&
+                         g_r.pso_yuv2d != nullptr;
+  if (!movie_sub && YieldForMovie()) {
+    return false;
+  }
 
   auto* command_processor = context.d3d12.command_processor;
   auto& list = command_processor->GetDeferredCommandList();
@@ -15662,7 +15957,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       list.D3DSetPipelineState(g_r.pso_2d);
       // One shared draw routine for both the RTT passes and the screen pass.
       // ui_region/ui_offset continue after the spline pass's allocations.
-      const auto emit_draw = [&](const Draw2d& d) {
+      // yuv != nullptr redirects this draw to the FMV combine: pso_yuv2d
+      // with the three movie plane slots on tables 1/2/5 (t0/t1/t4), the
+      // quad's own geometry/transform (so windowed movies place exactly).
+      const auto emit_draw = [&](const Draw2d& d, const uint32_t* yuv = nullptr) {
         const uint32_t bytes = uint32_t(d.verts.size());
         if (bytes == 0 || d.stride != 28) {
           return;
@@ -15672,9 +15970,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           return;
         }
         std::memcpy(g_r.ui_ring_cpu + ui_region + ui_offset, d.verts.data(), bytes);
-        const uint32_t srv_slot = d.composite_srv >= 0
-                                      ? uint32_t(d.composite_srv)
-                                      : resolve_2d_texture(d.fetch)->srv_slot;
+        const uint32_t srv_slot =
+            yuv != nullptr ? yuv[0]
+            : d.composite_srv >= 0 ? uint32_t(d.composite_srv)
+                                   : resolve_2d_texture(d.fetch)->srv_slot;
         float constants[40];
         std::memcpy(constants, d.consts, sizeof(d.consts));
         // 2D ortho draws have no translation row in the projection (c3 ==
@@ -15690,17 +15989,28 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         constants[38] = 0.0f;
         constants[39] = 0.0f;
         list.D3DSetGraphicsRoot32BitConstants(0, 40, constants, 0);
-        D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu =
-            g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-        srv_gpu.ptr += size_t(srv_slot) * g_r.srv_size;
-        context.d3d12.set_graphics_root_descriptor_table(
-            context.d3d12.command_processor_user_data, 1, srv_gpu);
+        const auto srv_table_at = [&](uint32_t param, uint32_t slot) {
+          D3D12_GPU_DESCRIPTOR_HANDLE h =
+              g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+          h.ptr += size_t(slot) * g_r.srv_size;
+          context.d3d12.set_graphics_root_descriptor_table(
+              context.d3d12.command_processor_user_data, param, h);
+        };
+        srv_table_at(1, srv_slot);
+        if (yuv != nullptr) {
+          list.D3DSetPipelineState(g_r.pso_yuv2d);
+          srv_table_at(2, yuv[1]);
+          srv_table_at(5, yuv[2]);
+        }
         D3D12_VERTEX_BUFFER_VIEW vbv{
             g_r.ui_ring->GetGPUVirtualAddress() + ui_region + ui_offset, bytes, d.stride};
         list.D3DIASetVertexBuffers(0, 1, &vbv);
         list.D3DIASetPrimitiveTopology(d.prim == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
                                                    : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list.D3DDrawInstanced(d.count, 1, 0, 0);
+        if (yuv != nullptr) {
+          list.D3DSetPipelineState(g_r.pso_2d);
+        }
         ui_offset += bytes;
         ++drawn_2d;
       };
@@ -15708,8 +16018,50 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
       list.RSSetViewport(viewport);
       list.RSSetScissorRect(scissor);
+      // Native FMV: resolve the three movie plane textures once (the
+      // content-liveness probe re-decodes them every frame while the video
+      // plays) and substitute the combine for every movie quad this frame.
+      uint32_t yuv_slots[3] = {};
+      bool yuv_ready = false;
+      if (movie_sub) {
+        yuv_ready = true;
+        for (int p = 0; p < 3 && yuv_ready; ++p) {
+          // A playing video rewrites its planes every few RENDERED frames
+          // (30 fps content vs 140 fps render); the liveness probe's
+          // 16-frame settle cadence after an unchanged sample would show
+          // one video frame in ~17 (the "sluggish video" report). Movie
+          // planes are known content-hot: force the probe every frame;
+          // the re-decode itself still only fires when the fingerprint
+          // actually changed (the video's own rate).
+          auto hot = find_words_texture(FetchWordsKey(movie.words[p]));
+          if (hot != g_r.tex_store.end()) {
+            hot->second.recheck_frame = 0;
+          }
+          const GuestTexture* t = resolve_2d_texture(movie.words[p]);
+          yuv_ready = t != &g_r.white && t->texture != nullptr;
+          yuv_slots[p] = t->srv_slot;
+        }
+        if (!yuv_ready) {
+          static std::atomic<uint32_t> s_yuv_failed{0};
+          if (s_yuv_failed.fetch_add(1, std::memory_order_relaxed) < 8) {
+            REXLOG_INFO("native-scene: FMV plane resolve FAILED this frame");
+          }
+        }
+      }
+      bool movie_drawn = false;
       for (const Draw2d& d : scene_2d) {
-        emit_draw(d);
+        const bool movie_quad =
+            yuv_ready && (d.flags & 0x2u) != 0 && d.src_stride == 24;
+        emit_draw(d, movie_quad ? yuv_slots : nullptr);
+        movie_drawn |= movie_quad;
+      }
+      if (movie_drawn) {
+        static std::atomic<bool> s_movie_logged{false};
+        if (!s_movie_logged.exchange(true, std::memory_order_relaxed)) {
+          REXLOG_INFO(
+              "native-scene: FMV rendering NATIVELY (movie-quad YUV "
+              "substitution)");
+        }
       }
     }
   }

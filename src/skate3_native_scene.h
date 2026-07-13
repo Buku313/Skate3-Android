@@ -364,6 +364,8 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
 // / contrast effects are the game's own postfx chain, which only the
 // emulated path executes.
 void OnPhotoReplayUpdate();
+void OnMovieDecode();
+void OnMovieFrame(uint8_t* base, uint32_t renderer);
 
 // 2D/APT phase bracket (the HUD and every other 2D element is a Flash SWF
 // converted to EA APT, rendered through FE::AptRenderingIntegration). Guest
