@@ -6633,6 +6633,42 @@ void Publish2dDraws(uint8_t* base) {
         }
       }
     }
+    // TRANSITION-FADE TRACER: the game's screen-to-screen fades are
+    // fullscreen SimpleDraw fills (RenderMan::FinalQuadFade ->
+    // Draw_QuadListColoured, stride 16, color+ramping alpha in VS c8; the
+    // fade color/alpha global sits at [0x83083C38]+31376+848/864, enable
+    // byte +880). A mid-ramp alpha logged here proves the fade is captured
+    // and replaying natively; if transitions still look like hard cuts
+    // with these lines present, the problem is render pacing, not capture.
+    // Rolling-capped: 6 lines per 2 s window.
+    if (d.src_stride == 16 && d.count >= 4) {
+      float alpha = d.consts[35];
+      if (alpha > 0.02f && alpha < 0.98f) {
+        float x0, y0, x1, y1;
+        std::memcpy(&x0, d.verts.data(), 4);
+        std::memcpy(&y0, d.verts.data() + 4, 4);
+        std::memcpy(&x1, d.verts.data() + size_t(2) * d.stride, 4);
+        std::memcpy(&y1, d.verts.data() + size_t(2) * d.stride + 4, 4);
+        if (std::fabs(x1 - x0) >= 1200.0f && std::fabs(y1 - y0) >= 680.0f) {
+          static std::atomic<uint32_t> s_fade_logs{0};
+          static std::atomic<int64_t> s_fade_win{0};
+          const int64_t now_s =
+              std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+          int64_t win = s_fade_win.load(std::memory_order_relaxed);
+          if (now_s - win >= 2 && s_fade_win.compare_exchange_strong(win, now_s)) {
+            s_fade_logs.store(0, std::memory_order_relaxed);
+          }
+          if (s_fade_logs.fetch_add(1, std::memory_order_relaxed) < 6) {
+            REXLOG_INFO(
+                "native-scene: transition fade fill alpha={:.2f} "
+                "rgb=({:.2f},{:.2f},{:.2f}) flags={:02x}",
+                alpha, d.consts[32], d.consts[33], d.consts[34], d.flags);
+          }
+        }
+      }
+    }
     published.push_back(std::move(d));
   }
   std::lock_guard<std::mutex> lock(g_2d_mutex);
@@ -14331,7 +14367,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     REXLOG_INFO(
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
-        "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
+        "2d[other={} dropped={} askip={} astale={} textures={}] cached_meshes={} textures={} "
         "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={} blend={} blendmiss={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
@@ -14344,7 +14380,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "refl[pair={} flat={} gate={:#x}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
-        g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.tex_store.size(),
+        g_draws_2d_other.load(), g_draws_2d_dropped.load(),
+        g_2d_async_skip.load(), g_2d_async_stale.load(), g_r.tex_store.size(),
         g_r.meshes.size(), g_r.tex_store.size(),
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
@@ -16187,9 +16224,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // the same 16-frame cadence as the world store's revalidation.
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
       if (fp != 0 && fp != it->second.payload_fp) {
-        RetireGuestTexture(it->second, command_processor->GetCurrentSubmission());
-        g_r.tex_store.erase(it);
-        it = g_r.tex_store.end();
+        if (async_ui) {
+          // Serve the stale decode while a worker re-decodes; the words-key
+          // commit swaps the store entry in place. Short recheck keeps
+          // watching; the in-flight set dedupes re-enqueues.
+          EnqueueWordsMiss(key, fetch, /*ui=*/true);
+          it->second.recheck_frame = frame_number + 2;
+          g_2d_async_stale.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          RetireGuestTexture(it->second,
+                             command_processor->GetCurrentSubmission());
+          g_r.tex_store.erase(it);
+          it = g_r.tex_store.end();
+        }
       } else {
         // Menu screens probe on a 2-frame cadence: the skater-portrait
         // boxes are resolved IN PLACE (words unchanged) up to hundreds of
@@ -16201,11 +16248,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     if (it == g_r.tex_store.end()) {
-      // HUD/spline art decodes inline (small; async would flash UI elements
-      // white on first sight). The big streamed posters go through
-      // resolve_fetch_words -> the worker queue instead. Small radial tiles
-      // (score ring quadrants / meter arcs) regenerate at Nx first, see
-      // EnsureHudTileRegen; everything else keeps the plain decode.
+      if (async_ui) {
+        // First sighting of big art: decode on the workers and skip the
+        // quad for the 1-3 frames that takes (imperceptible pop-in at the
+        // render rate, vs a whole-frame render+guest stall inline).
+        EnqueueWordsMiss(key, fetch, /*ui=*/true);
+        g_2d_async_skip.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+      }
+      // Small HUD/spline art decodes inline (sub-ms; async would pop gauge
+      // elements for no gain). Small radial tiles (score ring quadrants /
+      // meter arcs) regenerate at Nx first, see EnsureHudTileRegen;
+      // everything else keeps the plain decode.
       const auto hud_t0 = PerfClock::now();
       GuestTexture gt;
       const int32_t regen = REXCVAR_GET(skate3_native_render_scene_2d_tile_regen);
@@ -16249,7 +16303,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         continue;
       }
       std::memcpy(g_r.ui_ring_cpu + ui_region + ui_offset, s.verts.data(), bytes);
-      const uint32_t srv_slot = resolve_2d_texture(s.fetch)->srv_slot;
+      const GuestTexture* spline_tex = resolve_2d_texture(s.fetch);
+      if (spline_tex == nullptr) {
+        continue;  // big-art decode in flight on the workers; skip a frame
+      }
+      const uint32_t srv_slot = spline_tex->srv_slot;
       list.D3DSetPipelineState(s.pass == 1 ? g_r.pso_spline_darken
                                            : g_r.pso_spline_default);
       // Root constants: the scene's (smoothed) view_proj rows; the verts
@@ -16450,10 +16508,20 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           return;
         }
         std::memcpy(g_r.ui_ring_cpu + ui_region + ui_offset, d.verts.data(), bytes);
-        const uint32_t srv_slot =
-            yuv != nullptr ? yuv[0]
-            : d.composite_srv >= 0 ? uint32_t(d.composite_srv)
-                                   : resolve_2d_texture(d.fetch)->srv_slot;
+        uint32_t srv_slot;
+        if (yuv != nullptr) {
+          srv_slot = yuv[0];
+        } else if (d.composite_srv >= 0) {
+          srv_slot = uint32_t(d.composite_srv);
+        } else {
+          const GuestTexture* t = resolve_2d_texture(d.fetch);
+          if (t == nullptr) {
+            // Big-art decode in flight on the workers (large-art async
+            // routing); skip the quad; it lands 1-3 frames later.
+            return;
+          }
+          srv_slot = t->srv_slot;
+        }
         float constants[40];
         std::memcpy(constants, d.consts, sizeof(d.consts));
         // 2D ortho draws have no translation row in the projection (c3 ==
@@ -16560,7 +16628,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               if (hot != g_r.tex_store.end()) {
                 hot->second.recheck_frame = 0;
               }
-              const GuestTexture* t = resolve_2d_texture(best->words[p]);
+              const GuestTexture* t =
+                  resolve_2d_texture(best->words[p], /*force_inline=*/true);
               ok = t != &g_r.white && t->texture != nullptr;
               fallback_slots[p] = t->srv_slot;
             }
@@ -16592,7 +16661,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                 if (hot != g_r.tex_store.end()) {
                   hot->second.recheck_frame = 0;  // content-hot: per-frame probe
                 }
-                const GuestTexture* t = resolve_2d_texture(w);
+                const GuestTexture* t =
+                    resolve_2d_texture(w, /*force_inline=*/true);
                 e->ok = t != &g_r.white && t->texture != nullptr;
                 e->slots[p] = t->srv_slot;
               }
