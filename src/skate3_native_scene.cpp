@@ -206,6 +206,21 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cas_yield, true, "Skate 3",
                     "(surveyed unique to the CAS editor across 40 gsnaps).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_menu_rtt_passes, true, "Skate 3",
+    "While a menu/pause/loading context (presence context 0) renders "
+    "natively, drop native_render_suppress_mode to 0 (suppress "
+    "framebuffer-sized passes ONLY) so the game's sub-framebuffer "
+    "render-to-texture passes execute; the team-menu/Import-Skater skater "
+    "portrait boxes are one-shot RTT passes at a surface pitch inside the "
+    "mode-2 suppressed band (> 512, != 1024): under mode 2 they never ran "
+    "and the boxes stayed empty. The visible frame stays fully native "
+    "(framebuffer passes remain suppressed); this is the same "
+    "execute-the-composition-passes-emulated class as lightmap pages and "
+    "CAS outfit composition. Restored to the configured mode on the first "
+    "gameplay frame. Menu-only cost: the midsize postfx-chain passes also "
+    "execute there (mode 0 was the long-lived default before mode 2).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_menu_unsuppress, false, "Skate 3",
     "ESCAPE HATCH, normally unnecessary: while a menu/pause/loading context "
     "(presence context 0) renders natively, temporarily clear "
@@ -359,6 +374,22 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_2d_tile_regen, 4, "Skate 3",
                      "(affects NEW decodes; cached tiles keep their resolution until "
                      "content churn).")
     .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_2d_async_px, 131072, "Skate 3",
+    "Pixel-count threshold above which 2D/HUD texture decodes route to the "
+    "words-miss decode workers instead of running inline on the render "
+    "thread. Fullscreen menu/loading art decodes 10-35 ms inline (136 ms "
+    "max observed) and every screen change brings a burst of "
+    "it; the stall blocks the swap, freezes the guest (guest_dt_max "
+    "100-256 ms in menu windows) and reads as sluggish menus + hard-cut "
+    "screen transitions (the game's captured fade fills advance only a "
+    "frame or two mid-stall). Async: a first sighting skips the quad for "
+    "the 1-3 frames the worker needs (imperceptible pop-in), a content "
+    "change keeps serving the stale decode until the commit swaps it. "
+    "Small tiles stay inline: sub-ms, and the radial tile regen "
+    "(2d_tile_regen) is render-thread-only. 0 = all inline (old behavior).")
+    .range(0, 1 << 24)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_2d_sharp, 0.0, "Skate 3",
                       "Sharp-magnification amount for the 2D/HUD overlay (0 = plain "
@@ -544,6 +575,18 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_palette);
 // output is active. Temporarily overridden to false during menu contexts by
 // YieldForMenus (see skate3_native_render_scene_menu_unsuppress).
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
+// SDK-level suppression PASS FILTER (d3d12 command_processor.cpp): 0 =
+// suppress framebuffer-sized passes only (pitch >= 1280), 2 = suppress all
+// except lightmap pages (1024) and small composites (<= 512). YieldForMenus
+// drops it to 0 during menu contexts so the skater-portrait RTT passes
+// (pitch > 512, in the mode-2 suppressed band) execute; see
+// skate3_native_render_scene_menu_rtt_passes.
+REXCVAR_DECLARE(int32_t, native_render_suppress_mode);
+// SDK-level async pipeline compilation (rexglue command_processor.cpp): the
+// d3d12 backend SKIPS draws whose pipeline is still compiling. Forced
+// synchronous during menu contexts by YieldForMenus so one-shot portrait
+// renders can't lose still-compiling pieces (first-run armless skaters).
+REXCVAR_DECLARE(bool, async_shader_compilation);
 
 namespace skate3::native_scene {
 namespace {
@@ -643,6 +686,15 @@ struct PrewarmEntry {
   // visible RIGHT NOW, so the commit takes it this frame regardless of the
   // gameplay per-frame commit cap.
   bool miss = false;
+  // 2D/HUD overlay miss (large-art async routing, see
+  // skate3_native_render_scene_2d_async_px): the commit skips the
+  // payload-stability verify for these; APT re-rasterizes animating UI
+  // art every guest frame, so "payload moved between decode and commit" is
+  // the NORMAL state mid-animation and the verify would reject every
+  // commit, freezing the element (spinners, ramping fades). The per-frame
+  // content probe in the 2D resolve is the heal path for torn reads, the
+  // same exposure the old inline decode had.
+  bool ui = false;
 };
 std::mutex g_prewarm_mutex;
 std::condition_variable g_prewarm_cv;  // wakes the decode workers
@@ -998,6 +1050,11 @@ std::atomic<uint64_t> g_draws_2d{0};
 // only the BeginVertices inline path, verified by capture).
 std::atomic<uint64_t> g_draws_2d_other{0};
 std::atomic<uint64_t> g_draws_2d_dropped{0};
+// Large-art async decode routing (see skate3_native_render_scene_2d_async_px):
+// quads skipped while their first decode is in flight on the workers, and
+// stale decodes served while a content-change re-decode is in flight.
+std::atomic<uint64_t> g_2d_async_skip{0};
+std::atomic<uint64_t> g_2d_async_stale{0};
 
 // One captured 2D draw (verified layout): BeginVertices
 // inline vertices, stride 24 = {float x, y, z, w; float u, v} in 1280x720
@@ -6392,6 +6449,32 @@ void Publish2dDraws(uint8_t* base) {
   std::vector<Draw2d> published;
   published.reserve(frame_2d.size());
   for (Draw2d& d : frame_2d) {
+    // OFFSCREEN COMPOSITION draws: bracket bits carrying ONLY SimpleDraw
+    // (0x20) / font (0x10) with none of the screen-pass brackets (bit 0
+    // FrontEndManager::Render2D, bit 1 AptMovieIntegration, bit 2
+    // DrawRenderingUnit, bit 3 the HUD render-to-texture pass) are the
+    // game's internal render-target helpers, not screen UI; the
+    // skater-portrait generator composes the card through bare SimpleDraw
+    // quads in the TARGET's coordinate space (traced:
+    // flags=20 fullscreen 1152x640 postfx blit + centered
+    // 324x640 portrait compose quads on textures 03f47054/03f3f054,
+    // replayed on screen they were the centered "poster" flash on every
+    // menu entry / skater switch, sampling whatever the resolve arena
+    // still held). Every real UI draw in gameplay, pause and the frontend
+    // carries at least one screen bracket (observed flags 0d/19/29/2b/2d).
+    // flags == 0 (unbracketed boot/loading capture) keeps its own gate.
+    if (d.flags != 0 && (d.flags & 0x0Fu) == 0) {
+      static std::atomic<uint32_t> s_offscreen_2d{0};
+      const uint32_t n = s_offscreen_2d.fetch_add(1, std::memory_order_relaxed);
+      if (n < 8 || (n & 2047u) == 0) {
+        REXLOG_INFO(
+            "native-scene: offscreen 2D compose draw dropped (flags={:02x} "
+            "tex={:08x} count={}) (n={})",
+            d.flags, d.fetch[1], d.count, n);
+      }
+      g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
     const uint32_t bytes = d.count * d.stride;
     scratch_2d.resize(bytes);
     if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
@@ -6501,6 +6584,54 @@ void Publish2dDraws(uint8_t* base) {
       d.verts.assign(scratch_2d.begin(), scratch_2d.end());
     } else {
       continue;
+    }
+    // BIG-QUAD TRACER (reported symptom: an unrelated "mongo poster" texture
+    // flashes portrait-shaped at screen center on team/import entry and
+    // skater switches; idle F11s never catch it). Edge-triggered: log each
+    // TEXTURED replayed 2D draw whose transformed extent covers >= 8% of
+    // the 1280x720 APT space (the portrait box itself is ~8%), once per
+    // texture base per 5 s window. Names the quad's texture / bracket /
+    // geometry / timing for the fix.
+    if (d.fetch[0] != 0) {
+      float mn[2] = {1e9f, 1e9f};
+      float mx[2] = {-1e9f, -1e9f};
+      const float* m = d.consts;  // c0..c8; c4..c7 = 2D transform rows
+      const uint32_t nv = d.count;
+      for (uint32_t v = 0; v < nv; ++v) {
+        const uint8_t* p = d.verts.data() + size_t(v) * d.stride;
+        float pos[4];
+        std::memcpy(pos, p, 16);
+        for (int c = 0; c < 2; ++c) {
+          const float t = pos[0] * m[16 + c] + pos[1] * m[20 + c] +
+                          pos[2] * m[24 + c] + pos[3] * m[28 + c];
+          mn[c] = std::min(mn[c], t);
+          mx[c] = std::max(mx[c], t);
+        }
+      }
+      const float w = mx[0] - mn[0];
+      const float h = mx[1] - mn[1];
+      if (w > 0.0f && h > 0.0f && w * h >= 0.08f * 1280.0f * 720.0f &&
+          w * h < 1e8f) {
+        static std::unordered_set<uint32_t> s_seen;
+        static int64_t s_window_s = 0;
+        static std::atomic<uint32_t> s_big{0};
+        const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        if (now_s - s_window_s >= 5) {
+          s_window_s = now_s;
+          s_seen.clear();
+        }
+        if (s_seen.size() < 24 && s_seen.insert(d.fetch[1]).second) {
+          REXLOG_INFO(
+              "native-scene: BIG 2D quad tex=({:08x},{:08x},{:08x}) flags={:02x} "
+              "src_stride={} count={} bbox=({:.0f},{:.0f})-({:.0f},{:.0f}) "
+              "c8=({:.2f},{:.2f},{:.2f},{:.2f}) (n={})",
+              d.fetch[0], d.fetch[1], d.fetch[2], d.flags, d.src_stride, d.count,
+              mn[0], mn[1], mx[0], mx[1], m[32], m[33], m[34], m[35],
+              s_big.fetch_add(1, std::memory_order_relaxed));
+        }
+      }
     }
     published.push_back(std::move(d));
   }
@@ -8263,6 +8394,43 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                              .count()));
   }
 
+  // AUX-publish gate: the skater-portrait render-to-texture passes submit a
+  // real perspective SceneRenderView, and on the frontend menu screens
+  // (team boxes, Import Skater) it is the ONLY publisher; publishing it
+  // rendered the portrait FULL SCREEN behind the menu for the whole
+  // pause-freshness window on every entry/scroll (flapping
+  // pause-native <-> loading in 300 ms cycles). Its projection is
+  // screen-shaped (the aspect gate at view selection above never fired), so
+  // identify it by CONTENT: a menu-context (presence 0) scene consisting of
+  // nothing but character-family pieces (skater + board, every material
+  // "character.*") is a portrait pass, never the visible frame. Real menu
+  // backdrops always carry world geometry (the pause plaza ~700 items, the
+  // CAS editor room has env-family walls). Skipped publishes also skip the
+  // freshness stamp, so the mode never flips.
+  if (rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0 &&
+      !scene.items.empty() && scene.items.size() <= 48) {
+    bool all_char = true;
+    for (const DrawItem& it : scene.items) {
+      if (it.char_family == 0) {
+        all_char = false;
+        break;
+      }
+    }
+    if (all_char) {
+      static std::atomic<uint32_t> s_aux_pub{0};
+      const uint32_t n = s_aux_pub.fetch_add(1, std::memory_order_relaxed);
+      if (n < 8 || (n & 255u) == 0) {
+        const float m00 = LoadGuestF32(base, viewcam + 0x60 + 0 * 4);
+        const float m11 = LoadGuestF32(base, viewcam + 0x60 + (1 * 4 + 1) * 4);
+        REXLOG_INFO(
+            "native-scene: portrait-pass publish skipped ({} char items, cam "
+            "({:.1f},{:.1f},{:.1f}), proj m00={:.3f} m11={:.3f}) (n={})",
+            scene.items.size(), scene.cam_pos[0], scene.cam_pos[1],
+            scene.cam_pos[2], m00, m11, n);
+      }
+      return;
+    }
+  }
   g_last_publish_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now().time_since_epoch())
                               .count(),
@@ -9069,6 +9237,8 @@ struct StagedTexResult {
   // between the worker's read and the commit): retry fast, not on the
   // failed-decode ladder.
   bool verify_failed = false;
+  // 2D/HUD overlay origin: skip the stability verify (see PrewarmEntry::ui).
+  bool ui = false;
 };
 struct PrewarmResult {
   DrawItem item;
@@ -12723,12 +12893,13 @@ void EnqueueMeshMiss(uint32_t mesh) {
 // a traversal hitch (a poster decode costs the same ~10 ms as any texture);
 // while a decode is in flight the item falls back to its channel diffuse
 // (the placeholder poster), not white.
-void EnqueueWordsMiss(uint64_t key, const uint32_t words[6]) {
+void EnqueueWordsMiss(uint64_t key, const uint32_t words[6], bool ui = false) {
   std::lock_guard<std::mutex> lock(g_prewarm_mutex);
   if (g_miss_queue.size() < 65536 && g_miss_inflight_words.insert(key).second) {
     PrewarmEntry e{0, 0, 0, key};
     std::memcpy(e.words, words, sizeof(e.words));
     e.miss = true;
+    e.ui = ui;
     g_miss_queue.push_back(e);
     g_prewarm_cv.notify_one();
   }
@@ -12759,6 +12930,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     // the decode from the captured fetch words.
     StagedTexResult tr;
     tr.words_key = e.wkey;
+    tr.ui = e.ui;
     NativeGuestOutputRenderContext stage_ctx{};
     stage_ctx.backend = NativeGuestOutputBackend::kD3D12;
     stage_ctx.d3d12.device = g_r.device;
@@ -13130,7 +13302,11 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       // results, so the cache keeps the previous good decode and the retry
       // clock re-runs the heal once the payload settles. Cubes are exempt
       // (static assets; a failed cube negative-caches permanently).
-      if (t.valid && !t.cube && verify_base != nullptr &&
+      // UI-origin results skip the verify (see PrewarmEntry::ui): animating
+      // APT art legitimately rewrites its payload every guest frame, so the
+      // re-sample below would reject every mid-animation commit and freeze
+      // the element; the 2D resolve's content probe is the heal path there.
+      if (t.valid && !t.cube && !t.ui && verify_base != nullptr &&
           t.gt.payload_addr != 0 &&
           SampleProbeFingerprint(verify_base, t.gt) != t.gt.payload_fp) {
         if (t.gt.texture) {
@@ -13296,6 +13472,11 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           .count()));
 }
 
+// Render-thread mirror of the presence-context check (set in YieldForMenus):
+// menu screens shorten the 2D texture liveness recheck cadence so in-place
+// UI-texture rewrites (portrait resolves) heal fast.
+std::atomic<bool> g_in_menus_frame{false};
+
 // Set by YieldForMenus, consumed by RenderScene in the same call (render
 // thread only): this frame is a NATIVE loading-screen frame; no world scene
 // exists (or it is the previous map's stale one), so RenderScene renders a
@@ -13318,6 +13499,11 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   static bool s_seen_gameplay = false;
   static bool s_pause_native = false;
   const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
+  // Render-thread mirror for the 2D texture resolver: menu screens shorten
+  // the content-liveness recheck cadence (see resolve_2d_texture) so
+  // in-place rewrites of UI textures (the one-shot skater-portrait resolves)
+  // heal within a couple of frames instead of up to 16.
+  g_in_menus_frame.store(in_menus, std::memory_order_relaxed);
   if (!in_menus) {
     s_seen_gameplay = true;
   }
@@ -13397,6 +13583,62 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
             "restored");
       }
       s_unsup_forced = false;
+    }
+  }
+  // Menu-context suppression FILTER relaxation (the near-native sibling of
+  // the full lift above): mode 0 keeps the framebuffer passes suppressed,
+  // the screen stays natively composed, but lets the sub-framebuffer RTT
+  // passes execute, which is where the one-shot skater-portrait renders
+  // live (their pitch sits inside the mode-2 suppressed band; with mode 2
+  // active in menus the boxes stayed empty).
+  {
+    static bool s_mode_forced = false;
+    static int32_t s_mode_saved = 0;
+    const bool want =
+        in_menus && REXCVAR_GET(skate3_native_render_scene_menu_rtt_passes);
+    if (want && !s_mode_forced) {
+      s_mode_saved = REXCVAR_GET(native_render_suppress_mode);
+      if (s_mode_saved != 0) {
+        REXCVAR_SET(native_render_suppress_mode, 0);
+        REXLOG_INFO(
+            "native-scene: menu context - suppress mode {} -> 0 (portrait "
+            "RTT passes execute; restored on gameplay)",
+            s_mode_saved);
+      }
+      s_mode_forced = true;
+    } else if (!want && s_mode_forced) {
+      if (s_mode_saved != 0) {
+        REXCVAR_SET(native_render_suppress_mode, s_mode_saved);
+        REXLOG_INFO("native-scene: leaving menu context - suppress mode {} restored",
+                    s_mode_saved);
+      }
+      s_mode_forced = false;
+    }
+    // Same menu window: shader compilation goes SYNCHRONOUS. With
+    // async_shader_compilation on, the d3d12 command processor SKIPS any
+    // draw whose pipeline is still compiling (command_processor.cpp
+    // ConfigurePipeline tail): fine mid-gameplay, but the skater-portrait
+    // boxes are ONE-SHOT renders: pieces skipped during a first-run compile
+    // are baked into the portrait forever (the armless/torso-less
+    // skaters; later runs are fine because the
+    // shader/pipeline disk storage is warm). Menus tolerate the one-time
+    // compile stalls invisibly.
+    static bool s_async_forced = false;
+    static bool s_async_saved = false;
+    if (want && !s_async_forced) {
+      s_async_saved = REXCVAR_GET(async_shader_compilation);
+      if (s_async_saved) {
+        REXCVAR_SET(async_shader_compilation, false);
+        REXLOG_INFO(
+            "native-scene: menu context - shader compilation synchronous "
+            "(one-shot portrait renders can't skip still-compiling pieces)");
+      }
+      s_async_forced = true;
+    } else if (!want && s_async_forced) {
+      if (s_async_saved) {
+        REXCVAR_SET(async_shader_compilation, true);
+      }
+      s_async_forced = false;
     }
   }
   const bool in_loading = in_menus && !pause_native;
@@ -15906,7 +16148,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // Guest-texture resolver shared by the spline pass (pre-resolve, in the
   // scene pass) and the HUD pass (post-resolve); both allocate strip/quad
   // vertices from the same per-frame ui_ring region.
-  const auto resolve_2d_texture = [&](const uint32_t fetch[6]) -> const GuestTexture* {
+  // force_inline: the FMV plane resolves stay on the inline decode; video
+  // pacing is tuned around frame-exact per-frame re-decodes
+  // and the planes are small.
+  const auto resolve_2d_texture = [&](const uint32_t fetch[6],
+                                      bool force_inline =
+                                          false) -> const GuestTexture* {
     if ((fetch[0] & 0x3u) != 2 || fetch[1] == 0) {
       return &g_r.white;
     }
@@ -15915,6 +16162,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       key ^= fetch[k];
       key *= 1099511628211ull;
     }
+    // Large-art async routing (see the 2d_async_px cvar): fullscreen
+    // menu/loading art decodes 10-35 ms inline (136 ms max)
+    // and screen changes bring bursts of it; the render-thread stall
+    // blocked the swap and froze the guest 100-256 ms (the sluggish-menus
+    // / hard-cut-transitions report). Anything over the pixel threshold
+    // decodes on the words-miss workers instead; small tiles keep the
+    // inline path (sub-ms, and the radial regen is render-thread-only).
+    const int32_t async_px = REXCVAR_GET(skate3_native_render_scene_2d_async_px);
+    const uint32_t px_w = (fetch[2] & 0x1FFFu) + 1;
+    const uint32_t px_h = ((fetch[2] >> 13) & 0x1FFFu) + 1;
+    const bool async_ui = !force_inline && async_px > 0 &&
+                          uint64_t(px_w) * px_h > uint64_t(async_px);
     auto it = find_words_texture(key);
     if (it != g_r.tex_store.end() && it->second.valid && !it->second.incomplete &&
         frame_number >= it->second.recheck_frame &&
@@ -15932,7 +16191,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_r.tex_store.erase(it);
         it = g_r.tex_store.end();
       } else {
-        it->second.recheck_frame = frame_number + 16;
+        // Menu screens probe on a 2-frame cadence: the skater-portrait
+        // boxes are resolved IN PLACE (words unchanged) up to hundreds of
+        // ms after the quad first draws (asset streaming first), and a
+        // 16-frame recheck left the pre-resolve memory content, the
+        // loading-poster flash, on screen for its full window.
+        it->second.recheck_frame =
+            frame_number + (g_in_menus_frame.load(std::memory_order_relaxed) ? 2 : 16);
       }
     }
     if (it == g_r.tex_store.end()) {
