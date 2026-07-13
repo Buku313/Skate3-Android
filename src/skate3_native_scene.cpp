@@ -301,12 +301,27 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_ropa_delay, 0, "Skate 3",
                      "phase model was backwards. Kept for experiments.")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_lookaside, true, "Skate 3",
-                    "Park texture decodes displaced by streaming mip rebinds in a "
-                    "words-keyed lookaside and swap them back in instantly when the "
-                    "words return (mip flap A<->B) or a fresh object binds already-"
-                    "decoded content. Off = every rebind costs a worker re-decode "
-                    "round trip (stale/white art for the duration).")
+REXCVAR_DEFINE_STRING(skate3_native_render_scene_trace_mesh, "", "Skate 3",
+                      "Hex guest mesh address to trace end-to-end through the "
+                      "texture pipeline ('tex-trace:' log lines): per-frame "
+                      "served objects + content fingerprints (on change), "
+                      "every slot resolve decision (direct/sticky/hold/near-"
+                      "black/white), every payload/words poll verdict, and "
+                      "every worker commit touching the mesh's objects. "
+                      "Empty = off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_detail_hold, 240, "Skate 3",
+                     "Frames an item slot keeps serving its previous HIGHER-"
+                     "resolution texture after the game's material-detail "
+                     "system rebinds a strictly smaller one (streaming "
+                     "pressure flaps a nearby mesh's DT material to its UN "
+                     "variant for ~0.5 s and back, the visible 'different "
+                     "texture set' flash; the detailed decode is still "
+                     "cached host-side, so the flap can be invisible). A "
+                     "downgrade that persists past the hold is adopted (a "
+                     "real demote as you leave the area). 0 = serve the "
+                     "guest binding verbatim (the console's own detail pop).")
+    .range(0, 2000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_retain_offscreen, true, "Skate 3",
                     "Keep recently seen static items in the scene while the game "
@@ -497,12 +512,12 @@ uint64_t g_settle_until_frame = 0;
 struct PrewarmEntry {
   uint32_t mesh;
   uint16_t retries;
-  // Texture-only entry (mesh == 0): a steady-state draw-path texture miss
-  // routed to the workers (see EnqueueTexMiss).
+  // Environment-cube entry (mesh == 0, tex != 0): the one object-keyed
+  // texture path left (see EnqueueCubeMiss).
   uint32_t tex = 0;
-  // Fetch-words entry (mesh == 0, tex == 0, wkey != 0): a words-keyed
-  // texture miss (streamed-artwork posters/event ads: no guest texture
-  // object to key on; see EnqueueWordsMiss).
+  // Fetch-words entry (mesh == 0, tex == 0, wkey != 0): a content-store
+  // miss decoded from the captured stable words snapshot (see
+  // EnqueueWordsMiss): every 2D/3D texture miss and heal.
   uint64_t wkey = 0;
   uint32_t words[6] = {};
   // Environment-cube entry (tex != 0 && cube): a cube-cache miss: a single
@@ -517,8 +532,8 @@ struct PrewarmEntry {
 std::mutex g_prewarm_mutex;
 std::condition_variable g_prewarm_cv;  // wakes the decode workers
 std::vector<PrewarmEntry> g_prewarm_queue;
-// Draw-path misses (EnqueueMeshMiss/EnqueueTexMiss/EnqueueWordsMiss/
-// EnqueueCubeMiss): content that is visible RIGHT NOW (white / skipped),
+// Draw-path misses (EnqueueMeshMiss/EnqueueWordsMiss/EnqueueCubeMiss):
+// content that is visible RIGHT NOW (white / skipped),
 // served FIFO with strict priority over the speculative registration
 // backlog in g_prewarm_queue. Guarded by g_prewarm_mutex.
 std::vector<PrewarmEntry> g_miss_queue;
@@ -7613,6 +7628,10 @@ struct GuestTexture {
   UINT srv_mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   uint32_t srv_mips = 0;
   bool valid = false;
+  // Store LRU clock: last frame this entry was served/touched. Superseded
+  // words states (old mip levels, pre-demote detail sets) age out once
+  // nothing routes to them.
+  uint64_t last_used_frame = 0;
   // A tiled mip's padded macro-row copy faulted and fell back to the
   // reported size; blocks beyond it uploaded as ZERO (the half-black
   // banner mip: tiled addressing puts the image's bottom rows past
@@ -7625,12 +7644,20 @@ struct GuestTexture {
   // the unshadowed-bright window, 59810af semantics) until a heal lands
   // real content; other slots ignore it (black diffuse content is legal).
   bool near_black = false;
+  // Same-content confirmations of a near-black verdict (commit dedups of
+  // forced re-decodes). The forcing covers ONE race, a decode reading a
+  // page mid-compose while the fingerprint sampled the composed result,
+  // so a few confirmations prove the content is genuinely uniform and the
+  // forcing stops (the plain fp poll still heals a later in-place compose).
+  // Unbounded forcing re-decoded permanently-uniform textures every poll
+  // forever, each a discarded worker round trip.
+  uint8_t nb_redecodes = 0;
 };
 
-// Cache key for draw-time fetch-word texture bindings (streamed artwork /
-// decal ad overrides, no guest texture object to key on): FNV-1a over the
-// six raw fetch-constant words. Shared by the draw path and the warmup
-// pre-decode so both hit the same g_r.textures_2d entries.
+// THE texture identity key: FNV-1a
+// over the six fetch-constant words, console identity semantics for the
+// content store. Object resolves, draw-time word bindings, 2D/HUD art, and
+// the decode workers all key the same g_r.tex_store entries with it.
 inline uint64_t FetchWordsKey(const uint32_t words[6]) {
   uint64_t key = 1469598103934665603ull;
   for (int k = 0; k < 6; ++k) {
@@ -7638,6 +7665,13 @@ inline uint64_t FetchWordsKey(const uint32_t words[6]) {
     key *= 1099511628211ull;
   }
   return key;
+}
+
+// Base-level pixel area from stored fetch words (word 2 packs width-1 /
+// height-1 in 13-bit fields), the material-detail downgrade compare key.
+inline uint64_t FetchWordsArea(const uint32_t words[6]) {
+  return uint64_t((words[2] & 0x1FFFu) + 1u) *
+         uint64_t(((words[2] >> 13) & 0x1FFFu) + 1u);
 }
 
 // Escalating retry backoff (native frames) for failed texture decodes: the
@@ -7705,6 +7739,13 @@ std::atomic<uint64_t> g_demote_hold{0};
 // first-sight draws suppressed entirely for the in-flight window.
 std::atomic<uint64_t> g_tex_sticky_served{0};
 std::atomic<uint64_t> g_skip_new{0};
+// Per-mesh pipeline trace (skate3_native_render_scene_trace_mesh). Render
+// thread only: the traced mesh address (parsed once per frame), the traced
+// mesh's current store keys (so worker-commit events can be matched), and
+// the last logged per-ctx state signature (summaries log on change).
+uint32_t g_trace_mesh_addr = 0;
+std::unordered_set<uint64_t> g_trace_keys;
+std::unordered_map<uint32_t, uint64_t> g_trace_sig;
 // Words-keyed (event-ad / streamed-artwork) serving: stale = site served
 // its previous art while a new-words decode is in flight; none = nothing
 // decoded for the site yet (caller shows the baked placeholder).
@@ -7969,7 +8010,6 @@ struct RendererState {
   // the frame is in flight).
   std::vector<uint32_t> srv_free;
   std::vector<std::pair<uint32_t, uint64_t>> retired_srv_slots;
-  std::unordered_map<uint32_t, GuestTexture> textures;
   GuestTexture white;
   // Water environment CUBE maps (t6): separate cache; same guest object
   // addresses decode differently (6 faces, TextureCube SRV).
@@ -8031,10 +8071,6 @@ struct RendererState {
   static constexpr uint32_t kUiRegions = 4;
   ID3D12Resource* ui_ring = nullptr;
   uint8_t* ui_ring_cpu = nullptr;
-  // Textures resolved from raw fetch-constant words: the 2D path binds its
-  // textures through the device fetch shadow, not renderengine objects.
-  // Keyed by an FNV hash of the 6 fetch words.
-  std::unordered_map<uint64_t, GuestTexture> textures_2d;
   // Decoded 1x RGBA of the small HUD tiles (filled by EnsureHudTileRegen
   // before its radial gate); the per-GAUGE composite path reads these to
   // rebuild whole gauges (ApplyGaugeComposites).
@@ -8061,22 +8097,47 @@ struct RendererState {
   // stale descriptor. Slots come from the monotonic allocator and are never
   // retired (bounded by the distinct reflective materials seen).
   std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> mat_pairs;
-  // Words-keyed LOOKASIDE of decodes displaced from `textures` by a
-  // streaming mip rebind (see ParkGuestTexture): both states of a words
-  // flap A<->B stay resident, so the flap swaps decodes instantly instead
-  // of costing a worker re-decode round trip per flip (the "decal goes
-  // black/white then reloads on approach" churn). Bounded (LRU-evicted);
-  // parked entries keep their SRV slot until retired. Render thread only.
-  std::unordered_map<uint64_t, GuestTexture> tex_lookaside;
-  std::unordered_map<uint64_t, uint64_t> tex_lookaside_used;  // key -> frame
-  // Sticky texture serving (see resolve_texture in draw_item): last
-  // successfully-resolved texture OBJECT per (mesh << 3 | slot). Streaming
-  // rotates content onto NEW objects (a mip promote is usually a fresh
-  // object, not a words rebind), so a plain cache miss white-flashed
-  // content that was on screen one frame earlier; the previous object's
-  // decode serves until the new one lands, like the console's own mip
-  // transition. Render thread only.
-  std::unordered_map<uint64_t, uint32_t> tex_sticky;
+  // THE texture content store (console identity
+  // semantics): fetch-words key -> decode. One
+  // words state = one entry; both states of a streaming flap A<->B simply
+  // stay resident under their own keys (what the old lookaside simulated
+  // with park/take), and superseded states age out via the LRU. Shared by
+  // the 3D draw path (through the object routes below), the 2D/HUD pass,
+  // and the draw-time fetch-word overrides (posters/ads). Render thread
+  // only.
+  std::unordered_map<uint64_t, GuestTexture> tex_store;
+  // Texture object -> its last STABLE fetch-words state (seqlock
+  // double-read at resolve). A route is a lookup aid, never an owner: the
+  // game freely retargets objects (mip promote/demote, detail demote,
+  // object reuse) and every retarget is just a different store key; a
+  // reused object can never serve another binding's art. Render thread
+  // only.
+  struct TexRoute {
+    uint32_t words[6] = {};
+    uint64_t key = 0;
+    // Live words carry no mip-0 base (streamer demoted the top level; the
+    // old pool range is already reused). The route holds the pre-demote
+    // state, its cached decode carries the full chain, strictly better,
+    // and payload polls are suspended while held (the probes would read
+    // the reused pool). A re-promote publishes fresh words and re-routes.
+    bool demoted = false;
+  };
+  std::unordered_map<uint32_t, TexRoute> tex_routes;
+  // Sticky texture serving (see resolve_texture in draw_item): the last
+  // ADOPTED (served-live) words state per (mesh << 3 | slot). Serves the
+  // site's previous art while the current binding's decode is in flight
+  // (the console's own mip-transition look), and powers the
+  // detail-downgrade hold: a strict base-area shrink keeps serving the
+  // previous state's store entry for the hold window. Render thread only.
+  struct TexStickySite {
+    uint64_t words_key = 0;
+    uint64_t area = 0;
+    // Nonzero = a downgrade is being held, first seen at this frame. The
+    // site adopts the smaller binding once the downgrade persists past
+    // skate3_native_render_scene_detail_hold frames.
+    uint64_t downgrade_since = 0;
+  };
+  std::unordered_map<uint64_t, TexStickySite> tex_sticky;
   // First frame a texture object resolved white-with-heal-in-flight:
   // brand-new items (no sticky fallback) skip drawing for a short window
   // instead of flashing white.
@@ -8111,79 +8172,72 @@ void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
   if (t.valid) g_r.retired_srv_slots.emplace_back(t.srv_slot, submission);
 }
 
-// ---- Words-keyed decode lookaside ------------------------------------------
-// The guest streamer oscillates one texture OBJECT between two mip states for
-// seconds at a time (fetch words flapping A<->B, the banner churn logs) and
-// binds fresh objects onto content another object already carried. The
-// object-keyed cache holds exactly ONE decode per object, so every rebind
-// cost a full worker re-decode round trip, serving stale or white art for
-// the duration. Displaced decodes now PARK here keyed by their fetch words;
-// a rebind whose new words match a parked decode swaps it back in with zero
-// decode. The payload fingerprint is re-verified on every take; the shared
-// physical mip pool reuses addresses for different content over time.
-std::atomic<uint64_t> g_look_hit{0};
-std::atomic<uint64_t> g_look_stale{0};
-std::atomic<uint64_t> g_look_park{0};
+// ---- Content store helpers --------------------------------------------------
+// The store is words-keyed; the guest
+// streamer's object retargeting (mip flap A<->B, detail demote, object
+// reuse) is just different keys, so both states of any transition stay
+// resident and no rebind can ever serve another binding's art.
+std::atomic<uint64_t> g_store_evicted{0};
+constexpr size_t kTexStoreCap = 3072;
 
-void ParkGuestTexture(GuestTexture&& t, uint64_t frame, uint64_t submission) {
-  if (!t.valid || !REXCVAR_GET(skate3_native_render_scene_tex_lookaside)) {
-    RetireGuestTexture(t, submission);
-    return;
-  }
-  const uint64_t key = FetchWordsKey(t.fetch_words);
-  auto [it, fresh] = g_r.tex_lookaside.try_emplace(key);
-  if (!fresh) {
-    RetireGuestTexture(it->second, submission);
-  }
-  it->second = std::move(t);
-  g_r.tex_lookaside_used[key] = frame;
-  g_look_park.fetch_add(1, std::memory_order_relaxed);
-  if (g_r.tex_lookaside.size() > 1024) {
-    // Evict the least-recently-used half (parked entries hold SRV slots).
-    std::vector<std::pair<uint64_t, uint64_t>> ages;  // (last-used frame, key)
-    ages.reserve(g_r.tex_lookaside_used.size());
-    for (const auto& [k, f] : g_r.tex_lookaside_used) {
-      ages.emplace_back(f, k);
+uint32_t SwapU32(uint32_t v);  // defined with the decode helpers below
+
+// Seqlock-stable read of a texture object's six fetch words, guest -> host
+// order. The streamer rewrites the words word-by-word on its own thread; a
+// mixed snapshot decodes a coherent image of the WRONG memory (a shared
+// mip-pool page reads as a collage of neighbor art), and the result is
+// stable, valid-looking content no fingerprint can reject after the fact;
+// the read itself must be self-consistent. Two consecutive identical
+// snapshots (4 attempts) or the caller keeps its previous route/skips.
+bool ReadStableTexWords(uint8_t* base, uint32_t tex_ptr, uint32_t out[6]) {
+  uint32_t raw[6];
+  uint32_t raw2[6];
+  bool stable = false;
+  for (int attempt = 0; attempt < 4 && !stable; ++attempt) {
+    if (!GuestTryCopy(raw, base + tex_ptr + 7 * 4, sizeof(raw)) ||
+        !GuestTryCopy(raw2, base + tex_ptr + 7 * 4, sizeof(raw2))) {
+      return false;
     }
-    std::nth_element(ages.begin(), ages.begin() + ages.size() / 2, ages.end());
-    for (size_t i = 0; i < ages.size() / 2; ++i) {
-      const auto lit = g_r.tex_lookaside.find(ages[i].second);
-      if (lit != g_r.tex_lookaside.end()) {
-        RetireGuestTexture(lit->second, submission);
-        g_r.tex_lookaside.erase(lit);
-      }
-      g_r.tex_lookaside_used.erase(ages[i].second);
-    }
+    stable = std::memcmp(raw, raw2, sizeof(raw)) == 0;
   }
+  if (!stable) {
+    return false;
+  }
+  for (uint32_t i = 0; i < 6; ++i) {
+    out[i] = SwapU32(raw[i]);
+  }
+  return true;
 }
 
-// On a verified hit the parked decode's ownership (SRV slot included) moves
-// to `out` and the function returns true.
-bool TakeParkedTexture(uint8_t* base, const uint32_t words[6],
-                       uint64_t submission, GuestTexture* out) {
-  if (!REXCVAR_GET(skate3_native_render_scene_tex_lookaside)) {
-    return false;
+// Store LRU eviction, run once per frame: superseded words states (old mip
+// levels, pre-demote detail sets, one-shot UI art) hold SRV slots + GPU
+// memory until nothing has routed to them for a while. Never evicts
+// entries touched within the last few frames.
+void EvictTexStore(uint64_t frame_number, uint64_t submission) {
+  if (g_r.tex_store.size() <= kTexStoreCap) {
+    return;
   }
-  const uint64_t key = FetchWordsKey(words);
-  const auto it = g_r.tex_lookaside.find(key);
-  if (it == g_r.tex_lookaside.end()) {
-    return false;
+  std::vector<std::pair<uint64_t, uint64_t>> ages;  // (last-used frame, key)
+  ages.reserve(g_r.tex_store.size());
+  for (const auto& [k, t] : g_r.tex_store) {
+    if (t.last_used_frame + 4 < frame_number) {
+      ages.emplace_back(t.last_used_frame, k);
+    }
   }
-  const uint64_t fp = SampleProbeFingerprint(base, it->second);
-  if (fp == 0 || fp != it->second.payload_fp) {
-    // The mip pool reused this address range for different content since
-    // parking; the parked decode is stale, drop it.
-    RetireGuestTexture(it->second, submission);
-    g_r.tex_lookaside.erase(it);
-    g_r.tex_lookaside_used.erase(key);
-    g_look_stale.fetch_add(1, std::memory_order_relaxed);
-    return false;
+  const size_t excess = g_r.tex_store.size() - kTexStoreCap / 2;
+  const size_t n = std::min(ages.size(), excess);
+  if (n == 0) {
+    return;
   }
-  *out = std::move(it->second);
-  g_r.tex_lookaside.erase(it);
-  g_r.tex_lookaside_used.erase(key);
-  g_look_hit.fetch_add(1, std::memory_order_relaxed);
-  return true;
+  std::nth_element(ages.begin(), ages.begin() + (n - 1), ages.end());
+  for (size_t i = 0; i < n; ++i) {
+    const auto it = g_r.tex_store.find(ages[i].second);
+    if (it != g_r.tex_store.end()) {
+      RetireGuestTexture(it->second, submission);
+      g_r.tex_store.erase(it);
+    }
+  }
+  g_store_evicted.fetch_add(n, std::memory_order_relaxed);
 }
 
 // ---- Staged texture decode (worker-thread half) ---------------------------
@@ -8269,7 +8323,7 @@ void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
 // live here because they need the resource/item types).
 struct StagedTexResult {
   uint32_t key = 0;        // guest texture object address (object-keyed cache)
-  uint64_t words_key = 0;  // != 0: words-keyed cache (g_r.textures_2d) instead
+  uint64_t words_key = 0;  // != 0: content-store result (g_r.tex_store)
   bool cube = false;       // environment cube (g_r.cube_textures)
   GuestTexture gt;
   StagedTexCommit commit;
@@ -10134,21 +10188,9 @@ void ApplyGaugeComposites(const NativeGuestOutputRenderContext& context,
   }
 }
 
-// Fetch-constant read from a renderengine::Texture object (words [7..12]).
-bool EnsureGuestTexture(const NativeGuestOutputRenderContext& context, uint8_t* base,
-                        uint32_t tex_ptr, GuestTexture& out) {
-  uint32_t words[6] = {};
-  {
-    uint32_t raw[6];
-    if (!GuestTryCopy(raw, base + tex_ptr + 7 * 4, sizeof(raw))) {
-      return false;
-    }
-    for (uint32_t i = 0; i < 6; ++i) {
-      words[i] = SwapU32(raw[i]);
-    }
-  }
-  return EnsureGuestTextureFromWords(context, base, words, out);
-}
+// (The object-keyed EnsureGuestTexture wrapper is gone: everything decodes
+// from an explicit stable words snapshot, ReadStableTexWords +
+// EnsureGuestTextureFromWords, and lands in the words-keyed store.)
 
 // Environment CUBE map for the water / reflective-glass reflection term
 // (t6). Six faces untiled independently per level (Xenos cubes are 2D-tiled
@@ -11797,8 +11839,13 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     if (tex_ptr == 0) {
       return;
     }
-    auto it = g_r.textures.find(tex_ptr);
-    if (it != g_r.textures.end()) {
+    uint32_t words[6];
+    if (!ReadStableTexWords(base, tex_ptr, words) || words[1] == 0) {
+      return;  // unreadable / mid-rewrite / demoted: the draw path routes it
+    }
+    const uint64_t key = FetchWordsKey(words);
+    auto it = g_r.tex_store.find(key);
+    if (it != g_r.tex_store.end()) {
       if (!it->second.valid || frame_number < it->second.recheck_frame ||
           !REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
         return;  // negative caches retry via the draw path's schedule
@@ -11813,7 +11860,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
         return;
       }
       RetireGuestTexture(it->second, command_processor->GetCurrentSubmission());
-      g_r.textures.erase(it);
+      g_r.tex_store.erase(it);
     }
     if (!within()) {
       ++wc.deferred;
@@ -11821,33 +11868,24 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     }
     ++wc.decodes;
     GuestTexture gt;
-    EnsureGuestTexture(context, base, tex_ptr, gt);
+    EnsureGuestTextureFromWords(context, base, words, gt);
     if (!gt.valid) {
       // Negative-cache exactly like the draw path so a permanently
-      // unreadable texture cannot hold warmup open. Guarded reads: a decode
-      // can fail precisely BECAUSE the object is unreadable right now (the
-      // prewarm sees objects mid-load); a raw re-read would fault.
-      if (gt.fetch_words[0] == 0 && gt.fetch_words[1] == 0) {
-        for (uint32_t k = 0; k < 6; ++k) {
-          uint32_t w = 0;
-          if (!GuestTryLoadU32(base, tex_ptr + (7 + k) * 4, &w)) {
-            break;
-          }
-          gt.fetch_words[k] = w;
-        }
-      }
+      // unreadable payload cannot hold warmup open.
+      std::memcpy(gt.fetch_words, words, sizeof(gt.fetch_words));
       gt.retry_after_frame = frame_number + 120;
     }
-    g_r.textures.emplace(tex_ptr, gt);
+    gt.last_used_frame = frame_number;
+    g_r.tex_store.emplace(key, gt);
   };
   // Draw-time fetch-word bindings (streamed artwork / decal ad overrides)
-  // share the words-keyed cache with the 2D pass.
+  // share the same store.
   const auto warm_fetch_words = [&](const uint32_t words[6]) {
     if (words[1] == 0) {
       return;
     }
     const uint64_t fkey = FetchWordsKey(words);
-    if (g_r.textures_2d.contains(fkey)) {
+    if (g_r.tex_store.contains(fkey)) {
       return;
     }
     if (!within()) {
@@ -11860,7 +11898,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     if (regen < 2 || !EnsureHudTileRegen(context, base, words, regen, gt)) {
       EnsureGuestTextureFromWords(context, base, words, gt);
     }
-    g_r.textures_2d.emplace(fkey, gt);
+    gt.last_used_frame = frame_number;
+    g_r.tex_store.emplace(fkey, gt);
   };
 
   warm_fetch_words(item.diffuse_fetch);
@@ -11924,15 +11963,6 @@ void EnqueueMeshMiss(uint32_t mesh) {
   }
 }
 
-void EnqueueTexMiss(uint32_t tex) {
-  std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-  if (g_miss_queue.size() < 65536 && g_miss_inflight_tex.insert(tex).second) {
-    PrewarmEntry e{0, 0, tex};
-    e.miss = true;
-    g_miss_queue.push_back(e);
-    g_prewarm_cv.notify_one();
-  }
-}
 
 // Words-keyed texture miss (streamed-artwork posters / event ads): the art
 // exists only as draw-time fetch words. Decoded unbudgeted inline these were
@@ -11991,28 +12021,18 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     return;
   }
   if (e.mesh == 0 && e.tex != 0) {
-    // Steady-state texture / environment-cube miss (see EnqueueTexMiss /
-    // EnqueueCubeMiss): stage the decode up to a filled upload resource; the
-    // commit records the GPU copies + SRV and swaps the cache entry.
+    // Environment-cube miss (see EnqueueCubeMiss, the only object-keyed
+    // texture path left): stage the decode up to a filled upload resource;
+    // the commit records the GPU copies + SRV.
     StagedTexResult tr;
     tr.key = e.tex;
-    tr.cube = e.cube;
+    tr.cube = true;
     NativeGuestOutputRenderContext stage_ctx{};
     stage_ctx.backend = NativeGuestOutputBackend::kD3D12;
     stage_ctx.d3d12.device = g_r.device;
     g_tex_stage_out = &tr.commit;
-    tr.valid = e.cube ? EnsureGuestCubeTexture(stage_ctx, base, e.tex, tr.gt)
-                      : EnsureGuestTexture(stage_ctx, base, e.tex, tr.gt);
+    tr.valid = EnsureGuestCubeTexture(stage_ctx, base, e.tex, tr.gt);
     g_tex_stage_out = nullptr;
-    if (!tr.valid && tr.gt.fetch_words[0] == 0 && tr.gt.fetch_words[1] == 0) {
-      for (uint32_t k = 0; k < 6; ++k) {
-        uint32_t w = 0;
-        if (!GuestTryLoadU32(base, e.tex + (7 + k) * 4, &w)) {
-          break;
-        }
-        tr.gt.fetch_words[k] = w;
-      }
-    }
     PrewarmResult res;
     res.item.mesh = 0;  // texture-only result (DrawItem::mesh has no default)
     res.mesh_valid = false;
@@ -12074,18 +12094,16 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     if (tex_ptr == 0) {
       return;
     }
-    // Words-aware dedupe: a reused object address whose fetch words moved
-    // (the streamer rebinding it to new content) must re-stage; the old
-    // permanent per-address set skipped it and the content surfaced as a
-    // draw-path white flash instead. Unchanged words still skip.
-    uint32_t words[6] = {};
-    for (uint32_t k = 0; k < 6; ++k) {
-      if (!GuestTryLoadU32(base, tex_ptr + (7 + k) * 4, &words[k])) {
-        return;
-      }
+    // Stable words snapshot: the decode and its store key both come from
+    // this snapshot, so a mid-rewrite object can never stage a mixed state.
+    uint32_t words[6];
+    if (!ReadStableTexWords(base, tex_ptr, words) || words[1] == 0) {
+      return;
     }
     const uint64_t wkey = FetchWordsKey(words);
     {
+      // Words-aware dedupe: the same content staged once per load; a
+      // rebound object (new words) re-stages under its new key.
       std::lock_guard<std::mutex> lock(g_prewarm_mutex);
       const auto [it, fresh] = g_prewarm_tex_seen.try_emplace(tex_ptr, wkey);
       if (!fresh) {
@@ -12096,23 +12114,17 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
       }
     }
     StagedTexResult tr;
-    tr.key = tex_ptr;
+    tr.words_key = wkey;
     // Staged mode uses only context.d3d12.device (copies/barrier/SRV are
     // exported for the commit), so a device-only context suffices.
     NativeGuestOutputRenderContext stage_ctx{};
     stage_ctx.backend = NativeGuestOutputBackend::kD3D12;
     stage_ctx.d3d12.device = g_r.device;
     g_tex_stage_out = &tr.commit;
-    tr.valid = EnsureGuestTexture(stage_ctx, base, tex_ptr, tr.gt);
+    tr.valid = EnsureGuestTextureFromWords(stage_ctx, base, words, tr.gt);
     g_tex_stage_out = nullptr;
-    if (!tr.valid && tr.gt.fetch_words[0] == 0 && tr.gt.fetch_words[1] == 0) {
-      for (uint32_t k = 0; k < 6; ++k) {
-        uint32_t w = 0;
-        if (!GuestTryLoadU32(base, tex_ptr + (7 + k) * 4, &w)) {
-          break;
-        }
-        tr.gt.fetch_words[k] = w;
-      }
+    if (!tr.valid) {
+      std::memcpy(tr.gt.fetch_words, words, sizeof(tr.gt.fetch_words));
     }
     res.textures.push_back(std::move(tr));
   };
@@ -12401,25 +12413,80 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         continue;
       }
       if (t.words_key != 0) {
-        // Words-keyed result (posters/ads): lands in the 2D/words cache.
-        auto wit = g_r.textures_2d.find(t.words_key);
-        if (wit != g_r.textures_2d.end()) {
-          // A complete re-decode must displace an incomplete cached entry
-          // even when the mip-0 fingerprint (which never covered the zeroed
-          // higher-mip blocks) matches.
+        // Store commit: the result files under its decode-time words key
+        // unconditionally; a rebound object simply routes elsewhere, so a
+        // worker result can never land on the wrong identity. The only
+        // remaining valid->valid swap class is an in-place content change
+        // at the same words (event-ad rotation, mip-pool fills, composed
+        // lightmap pages); the payload verify above covers exactly that.
+        const bool tr_key =
+            !g_trace_keys.empty() && g_trace_keys.count(t.words_key) != 0;
+        auto wit = g_r.tex_store.find(t.words_key);
+        if (tr_key) {
+          REXLOG_INFO(
+              "tex-trace: f{} COMMIT key={:016X} valid={} vfail={} "
+              "fp={:016X} inc={} nb={} cached={}",
+              frame_number, t.words_key, t.valid ? 1 : 0,
+              t.verify_failed ? 1 : 0, t.gt.payload_fp,
+              t.gt.incomplete ? 1 : 0, t.gt.near_black ? 1 : 0,
+              wit != g_r.tex_store.end()
+                  ? (wit->second.valid ? "valid" : "invalid")
+                  : "none");
+        }
+        if (wit != g_r.tex_store.end()) {
+          // Same-content dedup, except a complete re-decode always
+          // displaces an incomplete cached entry (truncated tiled-mip copy:
+          // the zeroed blocks live in mips the fingerprint never samples).
           const bool same_content = t.valid && wit->second.valid &&
                                     t.gt.payload_fp == wit->second.payload_fp &&
                                     !(wit->second.incomplete && !t.gt.incomplete);
           if (same_content || (!t.valid && wit->second.valid)) {
+            // Keep the cached decode ("keep the old decode when the payload
+            // became unreadable": mips stream out at range). A failed heal
+            // of a still-serving entry needs no retry stamp: the payload
+            // poll re-detects on its own cadence and the miss-inflight set
+            // already dedupes.
+            if (!t.valid && !t.verify_failed) {
+              g_heal_decode_fail.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (same_content && t.gt.near_black && wit->second.near_black &&
+                wit->second.nb_redecodes < 255) {
+              // A forced near-black re-decode came back identical: one more
+              // confirmation toward "genuinely uniform content".
+              ++wit->second.nb_redecodes;
+            }
             if (t.gt.texture) t.gt.texture->Release();
             if (t.gt.upload) t.gt.upload->Release();
             continue;
           }
+          if (t.valid && wit->second.valid) {
+            // In-place content swap: the only commit class a player can
+            // SEE; rolling-capped log so a flicker sighting names its
+            // texture.
+            static std::atomic<uint32_t> s_swap_logs{0};
+            static std::atomic<int64_t> s_swap_win{0};
+            const int64_t now_s =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            int64_t swin = s_swap_win.load(std::memory_order_relaxed);
+            if (now_s - swin >= 5 &&
+                s_swap_win.compare_exchange_strong(swin, now_s)) {
+              s_swap_logs.store(0, std::memory_order_relaxed);
+            }
+            if (s_swap_logs.fetch_add(1) < 8) {
+              REXLOG_INFO(
+                  "native-scene: texture heal commit key={:016X} fp {:016X} "
+                  "-> {:016X}",
+                  t.words_key, wit->second.payload_fp, t.gt.payload_fp);
+            }
+          }
           if (!t.valid) {
             t.gt.fail_count = wit->second.fail_count;  // keep the backoff arc
           }
+          t.gt.last_used_frame = wit->second.last_used_frame;
           RetireGuestTexture(wit->second, command_processor->GetCurrentSubmission());
-          g_r.textures_2d.erase(wit);
+          g_r.tex_store.erase(wit);
         }
         if (t.valid) {
           CommitStagedGuestTexture(context, t.gt, t.commit);
@@ -12427,111 +12494,26 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         } else {
           t.gt.fail_count = BumpFail(t.gt.fail_count);
           t.gt.retry_after_frame = frame_number + RetryBackoff(t.gt.fail_count);
+          // Failed decodes render white: log each once (capped) so white
+          // meshes stay attributable to a specific texture.
+          static std::unordered_set<uint64_t> logged_failed;
+          if (logged_failed.size() < 64 &&
+              logged_failed.insert(t.words_key).second) {
+            REXLOG_INFO(
+                "native-scene: texture decode FAILED key={:016X} "
+                "fetch=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                t.words_key, t.gt.fetch_words[0], t.gt.fetch_words[1],
+                t.gt.fetch_words[2], t.gt.fetch_words[3], t.gt.fetch_words[4],
+                t.gt.fetch_words[5]);
+          }
         }
-        g_r.textures_2d.emplace(t.words_key, t.gt);
+        g_r.tex_store.emplace(t.words_key, t.gt);
         continue;
       }
-      auto tit = g_r.textures.find(t.key);
-      if (tit != g_r.textures.end()) {
-        // Same-content dedup, except a complete re-decode always displaces
-        // an incomplete cached entry (truncated tiled-mip copy: the zeroed
-        // blocks live in mips the fingerprint never samples).
-        const bool same_content =
-            t.valid && tit->second.valid &&
-            std::memcmp(t.gt.fetch_words, tit->second.fetch_words,
-                        sizeof(t.gt.fetch_words)) == 0 &&
-            t.gt.payload_fp == tit->second.payload_fp &&
-            !(tit->second.incomplete && !t.gt.incomplete);
-        if (same_content || (!t.valid && tit->second.valid)) {
-          // The cached decode is as good or better ("keep the old decode
-          // when the payload became unreadable": mips stream out at range).
-          // Heals of a STILL-SERVING entry retry fast and flat: the payload
-          // is normally mid-stream and lands within a fraction of a second,
-          // a failed guarded read returns in microseconds, and the old
-          // escalating ladder (8..120 frames) held freshly promoted mips
-          // stale/low-res for visible seconds (the medium-distance texture
-          // pop-in: skate3_1295 re-logged one promote 8x while its heals
-          // starved). After ~30 fast attempts (payload never settling,
-          // permanently churning content) fall back to the ladder.
-          if (!t.valid) {
-            tit->second.fail_count = BumpFail(tit->second.fail_count);
-            if (!t.verify_failed) {
-              g_heal_decode_fail.fetch_add(1, std::memory_order_relaxed);
-            }
-            tit->second.retry_after_frame =
-                frame_number + (tit->second.fail_count <= 30
-                                    ? 6
-                                    : RetryBackoff(tit->second.fail_count));
-          }
-          if (t.gt.texture) t.gt.texture->Release();
-          if (t.gt.upload) t.gt.upload->Release();
-          continue;
-        }
-        // Miss-driven revalidation heal (words/payload changed, or a failed
-        // entry that now decodes): swap the entry. A displaced decode whose
-        // WORDS differ from the incoming one parks in the lookaside: a mip
-        // flap (words A<->B for seconds) then swaps straight back with zero
-        // decode instead of another worker round trip. A same-words
-        // displacement (payload changed in place) is stale content: retire.
-        // Content-changing valid->valid swaps are the only commits a player
-        // can SEE; capped log so a flicker sighting names its texture.
-        if (t.valid && tit->second.valid &&
-            t.gt.payload_fp != tit->second.payload_fp) {
-          // Rolling cap (the flat 64 burned at the load screen): a
-          // black-flash sighting mid-play must name its commit.
-          static std::atomic<uint32_t> s_swap_logs{0};
-          static std::atomic<int64_t> s_swap_win{0};
-          const int64_t now_s =
-              std::chrono::duration_cast<std::chrono::seconds>(
-                  std::chrono::steady_clock::now().time_since_epoch())
-                  .count();
-          int64_t swin = s_swap_win.load(std::memory_order_relaxed);
-          if (now_s - swin >= 5 &&
-              s_swap_win.compare_exchange_strong(swin, now_s)) {
-            s_swap_logs.store(0, std::memory_order_relaxed);
-          }
-          if (s_swap_logs.fetch_add(1) < 8) {
-            REXLOG_INFO(
-                "native-scene: texture heal commit obj={:08X} fp {:016X} -> "
-                "{:016X} words_{}",
-                t.key, tit->second.payload_fp, t.gt.payload_fp,
-                std::memcmp(tit->second.fetch_words, t.gt.fetch_words,
-                            sizeof(t.gt.fetch_words)) == 0
-                    ? "same"
-                    : "diff");
-          }
-        }
-        if (!t.valid) {
-          t.gt.fail_count = tit->second.fail_count;  // keep the backoff arc
-        }
-        const uint64_t heal_submission = command_processor->GetCurrentSubmission();
-        if (tit->second.valid && t.valid &&
-            std::memcmp(tit->second.fetch_words, t.gt.fetch_words,
-                        sizeof(t.gt.fetch_words)) != 0) {
-          ParkGuestTexture(std::move(tit->second), frame_number, heal_submission);
-        } else {
-          RetireGuestTexture(tit->second, heal_submission);
-        }
-        g_r.textures.erase(tit);
-      }
-      if (t.valid) {
-        CommitStagedGuestTexture(context, t.gt, t.commit);
-        committed_tex = true;
-      } else {
-        t.gt.fail_count = BumpFail(t.gt.fail_count);
-        t.gt.retry_after_frame = frame_number + RetryBackoff(t.gt.fail_count);
-        // Failed decodes render white; log each once (capped) so white
-        // meshes stay attributable to a specific texture.
-        static std::unordered_set<uint32_t> logged_failed;
-        if (logged_failed.size() < 64 && logged_failed.insert(t.key).second) {
-          REXLOG_INFO(
-              "native-scene: texture decode FAILED obj={:08X} fetch=[{:08X} {:08X} "
-              "{:08X} {:08X} {:08X} {:08X}]",
-              t.key, t.gt.fetch_words[0], t.gt.fetch_words[1], t.gt.fetch_words[2],
-              t.gt.fetch_words[3], t.gt.fetch_words[4], t.gt.fetch_words[5]);
-        }
-      }
-      g_r.textures.emplace(t.key, t.gt);
+      // No words key and not a cube: an empty/failed stage slot; release
+      // whatever it carries (nothing routes to it).
+      if (t.gt.texture) t.gt.texture->Release();
+      if (t.gt.upload) t.gt.upload->Release();
     }
     g_prewarm_done.fetch_add(1, std::memory_order_relaxed);
   }
@@ -12729,20 +12711,12 @@ void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context)
   // rebuild the world with the new rules this frame.
   if (g_flush_textures.exchange(false, std::memory_order_relaxed)) {
     const uint64_t submission = command_processor->GetCurrentSubmission();
-    for (auto& [key, t] : g_r.textures) {
+    for (auto& [key, t] : g_r.tex_store) {
       RetireGuestTexture(t, submission);
     }
-    g_r.textures.clear();
-    for (auto& [key, t] : g_r.textures_2d) {
-      RetireGuestTexture(t, submission);
-    }
-    g_r.textures_2d.clear();
+    g_r.tex_store.clear();
+    g_r.tex_routes.clear();
     g_r.words_sticky.clear();
-    for (auto& [key, t] : g_r.tex_lookaside) {
-      RetireGuestTexture(t, submission);
-    }
-    g_r.tex_lookaside.clear();
-    g_r.tex_lookaside_used.clear();
     g_r.tex_sticky.clear();
     g_r.tex_pending_first.clear();
     REXLOG_INFO("native-scene: texture cache flushed (debug dialog)");
@@ -13141,14 +13115,14 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
-        "look[hit={} stale={} park={} held={}] "
+        "store[n={} routes={} evict={}] "
         "heal[vfail={} dfail={} demote={}] serve[sticky={} skipnew={} adstale={} adnone={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
         "bones_rescued={}] dynobj[valid={} drawn={}] refl[pair={} flat={} gate={:#x}]",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
-        g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.textures_2d.size(),
-        g_r.meshes.size(), g_r.textures.size(),
+        g_draws_2d_other.load(), g_draws_2d_dropped.load(), g_r.tex_store.size(),
+        g_r.meshes.size(), g_r.tex_store.size(),
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
         g_ropa_flip.load(), g_ropa_mismatch.load(), g_ropa_relaxed.load(),
@@ -13162,8 +13136,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_rej_no_dynstate.load(), g_rej_dyn_range.load(),
         g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load(),
         g_rr_decode_fail.load(), g_rr_no_bones.load(), g_rr_mesh_deferred.load(),
-        g_rr_tex_deferred.load(), g_look_hit.load(), g_look_stale.load(),
-        g_look_park.load(), g_r.tex_lookaside.size(), g_heal_verify_fail.load(),
+        g_rr_tex_deferred.load(), g_r.tex_store.size(), g_r.tex_routes.size(),
+        g_store_evicted.load(), g_heal_verify_fail.load(),
         g_heal_decode_fail.load(), g_demote_hold.load(),
         g_tex_sticky_served.load(), g_skip_new.load(), g_ad_stale_served.load(),
         g_ad_placeholder.load(), scene.shadow_valid,
@@ -13232,6 +13206,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   g_r.bone_ring_offset = 0;
   g_r.ropa_ring_offset = 0;
 
+  {
+    const std::string tm(REXCVAR_GET(skate3_native_render_scene_trace_mesh));
+    const uint32_t parsed =
+        tm.empty() ? 0u : uint32_t(std::strtoul(tm.c_str(), nullptr, 16));
+    if (parsed != g_trace_mesh_addr) {
+      g_trace_mesh_addr = parsed;
+      g_trace_keys.clear();
+      g_trace_sig.clear();
+      REXLOG_INFO("tex-trace: mesh={:08X} {}", parsed,
+                  parsed ? "TRACING" : "off");
+    }
+  }
+
   // ---- Loading -> gameplay takeover (seamless boot / map-change loads) ----
   // The loading-screen prewarm (menus branch above) already decoded the
   // registered world behind the load; the FIRST substantial post-load scene
@@ -13299,11 +13286,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // Commit finished worker decodes every frame (streamed arenas decode on
   // the workers before their first draw instead of hitching the first frame
   // that sees them). Near-no-op when nothing completed. The workers also
-  // serve the draw path's steady-state misses (EnqueueMeshMiss/EnqueueTexMiss),
-  // so make sure they exist even on a session that never showed a loading
-  // screen with the pipeline up.
+  // serve the draw path's steady-state misses (EnqueueMeshMiss/
+  // EnqueueWordsMiss), so make sure they exist even on a session that never
+  // showed a loading screen with the pipeline up.
   EnsurePrewarmWorkers();
   PrewarmCommit(context, frame_number);
+  // Content-store LRU: superseded words states (old mip levels, pre-demote
+  // detail sets, one-shot UI art) age out once nothing routes to them.
+  EvictTexStore(frame_number, command_processor->GetCurrentSubmission());
 
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
@@ -13474,7 +13464,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (mesh_budget == 0 || mesh_budget > 16) mesh_budget = 16;
   }
   uint32_t mesh_decodes = 0;
-  uint32_t tex_decodes = 0;
   // Item drawing body. environment.decal items draw in the same opaque pass:
   // they ARE the wall/ground sections they cover, with the art composited
   // in-shader (alpha-blending them as separate overlay geometry punched
@@ -13497,8 +13486,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // the fingerprint recheck every frame keeps the first ad ever decoded at
   // that address and the wall posters diverge from the emulated frame.
   const auto find_words_texture = [&](uint64_t key) {
-    auto it = g_r.textures_2d.find(key);
-    if (it != g_r.textures_2d.end() && it->second.valid &&
+    auto it = g_r.tex_store.find(key);
+    if (it != g_r.tex_store.end()) {
+      it->second.last_used_frame = frame_number;
+    }
+    if (it != g_r.tex_store.end() && it->second.valid &&
         frame_number >= it->second.recheck_frame &&
         REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
       it->second.recheck_frame = frame_number + 16;
@@ -13528,7 +13520,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                        bool retained) -> const GuestTexture* {
     const uint64_t fkey = FetchWordsKey(words);
     auto fit = find_words_texture(fkey);
-    if (fit == g_r.textures_2d.end()) {
+    if (fit == g_r.tex_store.end()) {
       if (!retained) {
         EnqueueWordsMiss(fkey, words);
       }
@@ -13544,8 +13536,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     const auto pit = g_r.words_sticky.find(site);
     if (pit != g_r.words_sticky.end() && pit->second != fkey) {
-      const auto old = g_r.textures_2d.find(pit->second);
-      if (old != g_r.textures_2d.end() && old->second.valid) {
+      const auto old = g_r.tex_store.find(pit->second);
+      if (old != g_r.tex_store.end() && old->second.valid) {
+        old->second.last_used_frame = frame_number;
         g_ad_stale_served.fetch_add(1, std::memory_order_relaxed);
         return &old->second;
       }
@@ -13692,12 +13685,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
 
-    // Resolve guest textures (white fallback). Cached decodes revalidate
-    // against the live fetch words; streaming reuses texture objects. The
-    // object addresses were readable on the game thread this frame; NO
-    // VirtualQuery here; it takes the process VAD lock, which the guest
-    // streaming threads hammer, and ~2 calls per item stalled the whole
-    // renderer to 3 fps.
+    // Resolve guest textures (white fallback) through the words-keyed
+    // content store: object -> stable live words -> store entry
+    // (console identity semantics; a
+    // retargeted or reused object is just a different key, never a stale
+    // serve). The object addresses were readable on the game thread this
+    // frame; NO VirtualQuery here; it takes the process VAD lock, which
+    // the guest streaming threads hammer, and ~2 calls per item stalled
+    // the whole renderer to 3 fps.
     // Set by resolve_texture_raw when it returns the white fallback while a
     // decode is in flight (first-sight miss or a still-failing heal); the
     // sticky wrapper below then serves the item's last-good texture instead.
@@ -13706,172 +13701,164 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (tex_ptr == 0) {
         return &g_r.white;
       }
-      if (item.retained) {
-        // Retained item: the guest texture object may be gone; no live
-        // fetch-word reads, no revalidation, no miss enqueues. Serve the
-        // cached decode or white.
-        const auto rit = g_r.textures.find(tex_ptr);
-        return rit != g_r.textures.end() && rit->second.valid ? &rit->second
-                                                              : &g_r.white;
-      }
-      auto tit = g_r.textures.find(tex_ptr);
-      if (tit != g_r.textures.end()) {
+      const bool trm = g_trace_mesh_addr != 0 && item.mesh == g_trace_mesh_addr;
+      auto rit = g_r.tex_routes.find(tex_ptr);
+      if (!item.retained) {
+        // Route refresh: seqlock-stable read of the live fetch words (a
+        // mid-rewrite mixed snapshot must never become a key; it would
+        // decode a coherent image of the WRONG memory, the pool-page
+        // collage class). An unstable read keeps the previous route for a
+        // frame. Retained items skip all live reads: the object may be
+        // gone; their route is frozen at retention.
         uint32_t live[6];
-        for (uint32_t k = 0; k < 6; ++k) {
-          live[k] = REX_LOAD_U32(tex_ptr + (7 + k) * 4);
-        }
-        const bool retry_failed =
-            !tit->second.valid && frame_number >= tit->second.retry_after_frame;
-        // Content revalidation: a decode taken while the payload was still
-        // streaming in is garbage (checkered/blacked-out surfaces) and the
-        // fetch words never change when the content lands afterwards.
-        // Re-decode when the sampled payload changed; keep the old decode
-        // when the payload became unreadable (mip streamed out at range).
-        bool payload_changed = false;
-        if (tit->second.valid && frame_number >= tit->second.recheck_frame &&
-            REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
-          // Escalating cadence (2/4/8 then 16): a decode taken while the
-          // payload was still streaming in reads back garbage (the "goes
-          // black, then reloads" flash); a fixed 16-frame recheck left it
-          // on screen for up to the full interval. Fresh entries re-verify
-          // fast, then settle back to the cheap steady-state cadence.
-          tit->second.recheck_frame =
-              frame_number + (tit->second.recheck_count < 3
-                                  ? (2ull << tit->second.recheck_count)
-                                  : 16ull);
-          const uint64_t fp = SampleProbeFingerprint(base, tit->second);
-          const bool fp_new = fp != 0 && fp != tit->second.payload_fp;
-          if (tit->second.recheck_count < 3) {
-            ++tit->second.recheck_count;
-          }
-          // An incomplete decode (truncated tiled-mip copy, zeroed
-          // blocks) re-decodes regardless of the mip-0 fingerprint: the
-          // missing bytes are in HIGHER mips the probes never sample.
-          // near_black re-decodes like incomplete: the compose may have
-          // finished between the decode and its probe sample, leaving a
-          // stable fingerprint on a black verdict; without this the
-          // bright fallback would stick forever. The commit's
-          // same_content dedup drops the re-decode when the page really
-          // is still black (one worker round trip per steady poll).
-          payload_changed = fp_new || tit->second.incomplete ||
-                            tit->second.near_black;
-        }
-        // words_changed re-decodes are throttled by retry_after_frame on the
-        // VALID entry (retry_failed already gates invalid ones): streaming
-        // mip oscillation (words flapping A<->B for seconds, see the banner
-        // churn logs) re-detected the mismatch EVERY frame while a heal was
-        // already in flight or failing: thousands of queued decodes and log
-        // spam that delayed the legitimate heal and stretched the visible
-        // stale-art window.
-        const bool words_changed =
-            std::memcmp(live, tit->second.fetch_words, sizeof(live)) != 0 &&
-            (!tit->second.valid || frame_number >= tit->second.retry_after_frame);
-        if (words_changed && tit->second.valid && (live[1] & 0xFFFFF000u) == 0u) {
-          // Streamer DEMOTED mip 0 out (base address cleared; only the mip
-          // chain stays resident). The cached decode carries the full chain
-          // - strictly better than honoring the demote, so adopt the new
-          // words to stop the mismatch re-detecting, stop payload rechecks
-          // (the old mip-0 pool range is already reused by other content),
-          // and skip the doomed re-decode (base 0 fails instantly; the
-          // retry ladder burned a worker round trip every backoff period
-          // for as long as the demote lasted). A re-promote changes the
-          // words again and heals normally.
-          std::memcpy(tit->second.fetch_words, live, sizeof(live));
-          tit->second.recheck_frame = UINT64_MAX;
-          tit->second.fail_count = 0;
-          g_demote_hold.fetch_add(1, std::memory_order_relaxed);
-          return &tit->second;
-        }
-        if (retry_failed || payload_changed || words_changed) {
-          if (words_changed) {
-            // Streaming mip rebind: when the new words match a parked
-            // decode (mip flap A<->B, or content this object was rebound
-            // onto), swap it in NOW: zero decode round trip, no stale-art
-            // window. The displaced decode parks in its place.
-            GuestTexture parked;
-            const uint64_t look_submission =
-                command_processor->GetCurrentSubmission();
-            if (TakeParkedTexture(base, live, look_submission, &parked)) {
-              ParkGuestTexture(std::move(tit->second), frame_number,
-                               look_submission);
-              tit->second = std::move(parked);
-              // Re-verify soon: the fingerprint matched this frame, but the
-              // payload may still be settling under the streamer.
-              tit->second.recheck_frame = frame_number + 2;
-              tit->second.recheck_count = 0;
-              static std::atomic<uint32_t> s_look_logs{0};
-              if (s_look_logs.fetch_add(1) < 32) {
-                REXLOG_INFO(
-                    "native-scene: texture lookaside swap obj={:08X} "
-                    "words=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                    tex_ptr, live[0], live[1], live[2], live[3], live[4],
-                    live[5]);
+        if (ReadStableTexWords(base, tex_ptr, live)) {
+          const bool demoted = (live[1] & 0xFFFFF000u) == 0u;
+          if (rit == g_r.tex_routes.end()) {
+            rit = g_r.tex_routes.emplace(tex_ptr, RendererState::TexRoute{})
+                      .first;
+            std::memcpy(rit->second.words, live, sizeof(live));
+            rit->second.key = FetchWordsKey(live);
+            rit->second.demoted = demoted;
+          } else if (demoted) {
+            // Mip-0 demoted (base address cleared; the old pool range is
+            // already reused): hold the pre-demote route; its decode
+            // carries the full chain, strictly better, and suspend its
+            // payload polls (the probes would read the reused pool and
+            // heal in foreign bytes). A re-promote publishes fresh words
+            // and re-routes.
+            if (!rit->second.demoted) {
+              rit->second.demoted = true;
+              g_demote_hold.fetch_add(1, std::memory_order_relaxed);
+              if (trm) {
+                REXLOG_INFO("tex-trace: f{} obj={:08X} DEMOTED (route held, "
+                            "polls suspended)",
+                            frame_number, tex_ptr);
               }
-              return tit->second.valid ? &tit->second : &g_r.white;
             }
-          }
-          // Re-decode churn diagnostic: repeated fetch-word or payload
-          // changes on one object = streaming oscillation, visible as
-          // texture flicker on the affected meshes.
-          static std::atomic<uint32_t> s_redecode_logs{0};
-          if (s_redecode_logs.fetch_add(1) < 256) {
-            REXLOG_INFO(
-                "native-scene: texture re-decode obj={:08X} reason={}{}{} "
-                "old=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] new=[{:08X} {:08X} "
-                "{:08X} {:08X} {:08X} {:08X}]",
-                tex_ptr, words_changed ? "words" : "", payload_changed ? "payload" : "",
-                retry_failed ? "retry" : "", tit->second.fetch_words[0],
-                tit->second.fetch_words[1], tit->second.fetch_words[2],
-                tit->second.fetch_words[3], tit->second.fetch_words[4],
-                tit->second.fetch_words[5], live[0], live[1], live[2], live[3], live[4],
-                live[5]);
-          }
-          // Heal on the workers: keep serving the current decode (no white
-          // flash, no inline-decode hitch); the commit swaps the entry. A
-          // failed retry keeps the entry's retry clock ticking via the
-          // commit's retry_after_frame stamp.
-          EnqueueTexMiss(tex_ptr);
-          if (retry_failed) {
-            tit->second.retry_after_frame = frame_number + 120;
+          } else if (std::memcmp(live, rit->second.words, sizeof(live)) != 0) {
+            if (trm) {
+              REXLOG_INFO(
+                  "tex-trace: f{} obj={:08X} REROUTE old=[{:08X} {:08X} "
+                  "{:08X} {:08X} {:08X} {:08X}] new=[{:08X} {:08X} {:08X} "
+                  "{:08X} {:08X} {:08X}]",
+                  frame_number, tex_ptr, rit->second.words[0],
+                  rit->second.words[1], rit->second.words[2],
+                  rit->second.words[3], rit->second.words[4],
+                  rit->second.words[5], live[0], live[1], live[2], live[3],
+                  live[4], live[5]);
+            }
+            std::memcpy(rit->second.words, live, sizeof(live));
+            rit->second.key = FetchWordsKey(live);
+            rit->second.demoted = false;
           } else {
-            // Valid entry heal in flight: next retry no sooner than +4
-            // frames (a worker round trip is 1-3); the commit pushes this
-            // further out (+30) when the fresh decode failed.
-            tit->second.retry_after_frame = frame_number + 4;
+            rit->second.demoted = false;
           }
+        } else if (trm) {
+          REXLOG_INFO("tex-trace: f{} obj={:08X} words UNSTABLE (mid-rewrite)",
+                      frame_number, tex_ptr);
         }
       }
-      if (tit == g_r.textures.end()) {
-        // New texture object: streaming routinely binds fresh objects onto
-        // content another object already had decoded (and parked); serve a
-        // words-matched parked decode instantly instead of a white flash.
-        uint32_t nwords[6];
-        for (uint32_t k = 0; k < 6; ++k) {
-          nwords[k] = REX_LOAD_U32(tex_ptr + (7 + k) * 4);
+      if (rit == g_r.tex_routes.end()) {
+        // Unreadable/unstable object with no prior route: nothing safe to
+        // serve or decode yet; next frame's read settles it.
+        tex_pending = true;
+        return &g_r.white;
+      }
+      const RendererState::TexRoute& route = rit->second;
+      auto sit = g_r.tex_store.find(route.key);
+      if (sit == g_r.tex_store.end()) {
+        if (item.retained || route.demoted) {
+          // Retained: no enqueues, no live reads. Demote-held with nothing
+          // cached: the pre-demote pool may already be reused; a decode
+          // would commit foreign bytes under a good key. White/sticky until
+          // a re-promote publishes live words.
+          tex_pending = true;
+          return &g_r.white;
         }
-        GuestTexture parked;
-        if (TakeParkedTexture(base, nwords,
-                              command_processor->GetCurrentSubmission(),
-                              &parked)) {
-          parked.recheck_frame = frame_number + 2;
-          parked.recheck_count = 0;
-          tit = g_r.textures.emplace(tex_ptr, std::move(parked)).first;
-          return &tit->second;
-        }
-        // Decode on the workers; white for the 1-3 frames that takes
+        // Decode on the workers; white/sticky for the 1-3 frames that takes
         // (inline decode measured ~10 ms avg / ~70 ms max, the panning
         // lag spikes).
-        EnqueueTexMiss(tex_ptr);
-        ++tex_decodes;
+        if (trm) {
+          REXLOG_INFO("tex-trace: f{} obj={:08X} MISS key={:016X} enqueued",
+                      frame_number, tex_ptr, route.key);
+        }
+        EnqueueWordsMiss(route.key, route.words);
         g_rr_tex_deferred.fetch_add(1, std::memory_order_relaxed);
         tex_pending = true;
         return &g_r.white;
       }
-      if (!tit->second.valid) {
-        tex_pending = true;  // failed decode with a retry scheduled
+      GuestTexture& e = sit->second;
+      e.last_used_frame = frame_number;
+      if (!e.valid) {
+        // Failed decode: retry on its backoff clock (the payload usually
+        // lands within a few frames of first sight; the commit stamps the
+        // real backoff).
+        if (!item.retained && !route.demoted &&
+            frame_number >= e.retry_after_frame) {
+          e.retry_after_frame = frame_number + 120;
+          EnqueueWordsMiss(route.key, route.words);
+        }
+        if (trm) {
+          REXLOG_INFO("tex-trace: f{} obj={:08X} INVALID entry key={:016X} "
+                      "(retry at f{})",
+                      frame_number, tex_ptr, route.key, e.retry_after_frame);
+        }
+        tex_pending = true;
         return &g_r.white;
       }
-      return &tit->second;
+      // Payload revalidation, the one irreducible heuristic: the game
+      // streams content IN PLACE at addresses the words already point to
+      // (event-ad rotation, mip-pool fills, composed lightmap pages) with
+      // no CPU-visible event. Escalating cadence (2/4/8 then 16): a decode
+      // taken while the payload was still streaming reads back garbage;
+      // fresh entries re-verify fast, then settle to the cheap steady
+      // cadence. An incomplete decode (truncated tiled-mip copy) and a
+      // near_black verdict re-decode regardless of the mip-0 fingerprint;
+      // the commit's same-content dedup absorbs the no-ops. Suspended while
+      // the route is demote-held (the probes would read the reused pool).
+      if (!item.retained && !route.demoted &&
+          frame_number >= e.recheck_frame &&
+          REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
+        e.recheck_frame =
+            frame_number +
+            (e.recheck_count < 3 ? (2ull << e.recheck_count) : 16ull);
+        const uint64_t fp = SampleProbeFingerprint(base, e);
+        const bool fp_new = fp != 0 && fp != e.payload_fp;
+        if (trm) {
+          REXLOG_INFO(
+              "tex-trace: f{} obj={:08X} poll key={:016X} fp={:016X} "
+              "cached={:016X} new={} inc={} nb={} cnt={}",
+              frame_number, tex_ptr, route.key, fp, e.payload_fp,
+              fp_new ? 1 : 0, e.incomplete ? 1 : 0, e.near_black ? 1 : 0,
+              e.recheck_count);
+        }
+        if (e.recheck_count < 3) {
+          ++e.recheck_count;
+        }
+        if (fp_new || e.incomplete || (e.near_black && e.nb_redecodes < 3)) {
+          // Re-decode churn diagnostic: repeated in-place payload changes
+          // on one key = streaming oscillation, visible as texture flicker
+          // on the affected meshes.
+          static std::atomic<uint32_t> s_redecode_logs{0};
+          if (s_redecode_logs.fetch_add(1) < 256) {
+            REXLOG_INFO(
+                "native-scene: texture re-decode key={:016X} reason={}{}{} "
+                "words=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                route.key, fp_new ? "fp" : "", e.incomplete ? "inc" : "",
+                e.near_black ? "nb" : "", e.fetch_words[0], e.fetch_words[1],
+                e.fetch_words[2], e.fetch_words[3], e.fetch_words[4],
+                e.fetch_words[5]);
+          }
+          if (trm) {
+            REXLOG_INFO("tex-trace: f{} obj={:08X} ENQUEUE heal key={:016X} "
+                        "reason={}{}{}",
+                        frame_number, tex_ptr, route.key, fp_new ? "fp" : "",
+                        e.incomplete ? "inc" : "", e.near_black ? "nb" : "");
+          }
+          EnqueueWordsMiss(route.key, e.fetch_words);
+        }
+      }
+      return &e;
     };
     // Sticky serving: streaming rotates content onto NEW texture objects (a
     // mip promote is usually a fresh object: 287 first-sight objects vs 73
@@ -13896,8 +13883,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // Slots with legitimately dark content (diffuse, decal art, spec)
       // are untouched. Applied in the wrapper so retained items get the
       // same protection.
+      const bool trm = g_trace_mesh_addr != 0 && item.mesh == g_trace_mesh_addr;
       if ((slot == 1 || slot == 2) && t != &g_r.white && t->valid &&
           t->near_black) {
+        if (trm) {
+          REXLOG_INFO("tex-trace: f{} slot={} obj={:08X} NEAR-BLACK -> white",
+                      frame_number, slot, tex_ptr);
+        }
         static std::atomic<uint32_t> s_nb_logs{0};
         if (s_nb_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
           REXLOG_INFO(
@@ -13912,21 +13904,98 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       const uint64_t skey = (uint64_t(item.mesh) << 3) | slot;
       if (t != &g_r.white) {
-        g_r.tex_sticky[skey] = tex_ptr;
+        RendererState::TexStickySite& site = g_r.tex_sticky[skey];
+        // Material-detail downgrade hold: the game's streaming demotes a
+        // nearby mesh to its UN (undetailed) material for a fraction of a
+        // second and back, the visible flash to completely different/
+        // blurry art. Under words identity a demote is just a smaller-area
+        // key; the site's last-adopted decode is still resident in the
+        // store, so keep serving it while the downgrade is young. A
+        // persistent downgrade (a real demote as the player leaves) adopts
+        // after the hold window.
+        const int32_t hold = REXCVAR_GET(skate3_native_render_scene_detail_hold);
+        const uint64_t cur_key = FetchWordsKey(t->fetch_words);
+        const uint64_t cur_area = FetchWordsArea(t->fetch_words);
+        if (hold > 0 && site.area > cur_area && site.words_key != 0) {
+          const auto hit = g_r.tex_store.find(site.words_key);
+          const GuestTexture* held =
+              hit != g_r.tex_store.end() && hit->second.valid ? &hit->second
+                                                              : nullptr;
+          if (held != nullptr) {
+            // The held entry may no longer be polled by any live route;
+            // re-probe its payload on its own recheck clock so a reused
+            // pool page abandons the hold instead of serving foreign
+            // bytes.
+            hit->second.last_used_frame = frame_number;
+            if (frame_number >= hit->second.recheck_frame) {
+              hit->second.recheck_frame = frame_number + 16;
+              const uint64_t fp = SampleProbeFingerprint(base, hit->second);
+              if (fp == 0 || fp != hit->second.payload_fp) {
+                held = nullptr;
+              }
+            }
+          }
+          if (held != nullptr) {
+            if (site.downgrade_since == 0) {
+              site.downgrade_since = frame_number;
+              static std::atomic<uint32_t> s_hold_logs{0};
+              if (s_hold_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+                REXLOG_INFO(
+                    "native-scene: detail-downgrade HOLD mesh={:08X} slot={} "
+                    "held={:016X} bound={:016X} area {} -> {}",
+                    item.mesh, slot, site.words_key, cur_key, site.area,
+                    cur_area);
+              }
+            }
+            if (frame_number - site.downgrade_since < uint64_t(hold)) {
+              if (trm && ((frame_number - site.downgrade_since) & 63u) == 0) {
+                REXLOG_INFO(
+                    "tex-trace: f{} slot={} DETAIL-HOLD serving fp={:016X} "
+                    "(bound area {} < {})",
+                    frame_number, slot, held->payload_fp, cur_area,
+                    site.area);
+              }
+              return held;
+            }
+          }
+        }
+        if (trm && site.words_key != 0 && site.words_key != cur_key) {
+          REXLOG_INFO(
+              "tex-trace: f{} slot={} ADOPT key {:016X}(area {}) -> "
+              "{:016X}(area {})",
+              frame_number, slot, site.words_key, site.area, cur_key,
+              cur_area);
+        }
+        site.words_key = cur_key;
+        site.area = cur_area;
+        site.downgrade_since = 0;
         if (!g_r.tex_pending_first.empty()) {
           g_r.tex_pending_first.erase(tex_ptr);
         }
         return t;
       }
       if (tex_pending) {
+        // The current binding's decode is in flight: serve the site's
+        // previous art from the store, the console's own mip-transition
+        // look instead of a white flash.
         const auto sit = g_r.tex_sticky.find(skey);
-        if (sit != g_r.tex_sticky.end() && sit->second != tex_ptr) {
-          const auto old = g_r.textures.find(sit->second);
-          if (old != g_r.textures.end() && old->second.valid) {
+        if (sit != g_r.tex_sticky.end() && sit->second.words_key != 0) {
+          const auto old = g_r.tex_store.find(sit->second.words_key);
+          if (old != g_r.tex_store.end() && old->second.valid) {
+            old->second.last_used_frame = frame_number;
             g_tex_sticky_served.fetch_add(1, std::memory_order_relaxed);
+            if (trm) {
+              REXLOG_INFO("tex-trace: f{} slot={} STICKY serving key={:016X} "
+                          "(pending {:08X})",
+                          frame_number, slot, sit->second.words_key, tex_ptr);
+            }
             return &old->second;
           }
         }
+      }
+      if (trm && t == &g_r.white) {
+        REXLOG_INFO("tex-trace: f{} slot={} serving WHITE (req {:08X})",
+                    frame_number, slot, tex_ptr);
       }
       return t;
     };
@@ -14145,6 +14214,39 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         ri.fp_lightmap = fp_of(lightmap);
         ri.fp_macro = fp_of(macro_tex);
         ri.fp_decal = fp_of(decal_tex);
+      }
+    }
+    if (g_trace_mesh_addr != 0 && item.mesh == g_trace_mesh_addr) {
+      // Traced-mesh per-frame summary: SERVED state (post-resolve), logged
+      // when anything changes. The mesh's texture objects also register for
+      // the worker-commit trace.
+      const auto fp_of = [](const GuestTexture* t) -> uint64_t {
+        return t != nullptr && t->valid ? t->payload_fp : 0;
+      };
+      for (const GuestTexture* t :
+           {diffuse, lightmap, macro_tex, decal_tex}) {
+        if (t != nullptr && t != &g_r.white) {
+          g_trace_keys.insert(FetchWordsKey(t->fetch_words));
+        }
+      }
+      uint64_t sig = uint64_t(item.diffuse_tex) ^
+                     (uint64_t(item.decal_art) << 16) ^
+                     (uint64_t(item.lightmap_tex) << 32) ^
+                     (uint64_t(item.macro_tex) << 48);
+      sig ^= fp_of(diffuse) * 3 ^ fp_of(decal_tex) * 5 ^ fp_of(lightmap) * 7 ^
+             fp_of(macro_tex) * 11;
+      sig ^= item.retained ? 1 : 0;
+      uint64_t& last = g_trace_sig[item.ctx];
+      if (sig != last) {
+        last = sig;
+        REXLOG_INFO(
+            "tex-trace: f{} SERVED ctx={:08X} retained={} "
+            "dif={:08X}/{:016X} dec={:08X}/{:016X} lm={:08X}/{:016X} "
+            "mac={:08X}/{:016X}",
+            frame_number, item.ctx, item.retained ? 1 : 0, item.diffuse_tex,
+            fp_of(diffuse), item.decal_art, fp_of(decal_tex),
+            item.lightmap_tex, fp_of(lightmap), item.macro_tex,
+            fp_of(macro_tex));
       }
     }
     // Exact env families without decal art bind the material's spec/ecc/
@@ -14744,7 +14846,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       key *= 1099511628211ull;
     }
     auto it = find_words_texture(key);
-    if (it == g_r.textures_2d.end()) {
+    if (it == g_r.tex_store.end()) {
       // HUD/spline art decodes inline (small; async would flash UI elements
       // white on first sight). The big streamed posters go through
       // resolve_fetch_words -> the worker queue instead. Small radial tiles
@@ -14767,7 +14869,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
       context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-      it = g_r.textures_2d.emplace(key, gt).first;
+      gt.last_used_frame = frame_number;
+      it = g_r.tex_store.emplace(key, gt).first;
     }
     return it->second.valid ? &it->second : &g_r.white;
   };
