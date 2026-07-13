@@ -21,6 +21,10 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+// Xbox-controller capture combos (see the hotkey block): the artifacts under
+// investigation are too brief to reach the keyboard from the pad.
+#include <Xinput.h>
+#pragma comment(lib, "xinput9_1_0.lib")
 #endif
 
 #include <rex/cvar.h>
@@ -366,6 +370,17 @@ void OnFrameEnd(uint8_t* base) {
       REXLOG_INFO("native-render: F8, texture + mesh caches flushed");
     }
     f8_was_down = f8_down;
+    // F7: dump the rolling scene-composition ring (last ~900 frames of
+    // per-item signatures); press within a few seconds of SEEING a 1-2
+    // frame artifact; diffing the artifact frame against neighbors in the
+    // CSV names the item that flashed.
+    static bool f7_was_down = false;
+    const bool f7_down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (f7_down && !f7_was_down) {
+      skate3::native_scene::RequestSceneRingDump();
+      REXLOG_INFO("native-render: F7, scene ring dump requested");
+    }
+    f7_was_down = f7_down;
     static bool f10_was_down = false;
     const bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (f10_down && !f10_was_down) {
@@ -377,6 +392,47 @@ void OnFrameEnd(uint8_t* base) {
                   g_frame_index);
     }
     f10_was_down = f10_down;
+    // Xbox controller capture combos (the artifacts are too brief to reach
+    // the keyboard from the pad): RB+X = F10-style immediate capture,
+    // RB+A = F7 scene-ring dump (retroactive ~17 s, so a slightly late
+    // press still contains the flash frame). Pad 0; disconnected pads
+    // re-probe on a backoff; XInputGetState is slow for absent devices.
+    {
+      static bool combo_x_was = false;
+      static bool combo_a_was = false;
+      static uint32_t pad_retry = 0;
+      static bool pad_seen = true;
+      if (pad_seen || ++pad_retry >= 240) {
+        pad_retry = 0;
+        XINPUT_STATE xs{};
+        if (XInputGetState(0, &xs) == ERROR_SUCCESS) {
+          pad_seen = true;
+          const WORD b = xs.Gamepad.wButtons;
+          const bool rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+          const bool cx = rb && (b & XINPUT_GAMEPAD_X) != 0;
+          const bool ca = rb && (b & XINPUT_GAMEPAD_A) != 0;
+          if (cx && !combo_x_was) {
+            g_collecting = true;
+            g_immediate = true;
+            g_collect_counter = 0;
+            skate3::native_scene::StartRecording(1);
+            REXLOG_INFO(
+                "native-render snapshot: RB+X, immediate single-frame capture "
+                "at frame {}",
+                g_frame_index);
+          }
+          combo_x_was = cx;
+          if (ca && !combo_a_was) {
+            skate3::native_scene::RequestSceneRingDump();
+            REXLOG_INFO("native-render: RB+A, scene ring dump requested");
+          }
+          combo_a_was = ca;
+        } else {
+          pad_seen = false;
+          combo_x_was = combo_a_was = false;
+        }
+      }
+    }
   }
   // P: cycle the synthetic camera pan probe (judder isolation: a host-
   // driven constant-rate pan injected at a selectable pipeline stage; see
@@ -902,5 +958,44 @@ extern "C" REX_FUNC(sub_82B79FC0) {
   __imp__sub_82B79FC0(ctx, base);
   if (enabled) {
     skate3::native_scene::OnDrawDone(base, 2, r4, r5, r6, ctx.r3.u32 != 0 ? ctx.r3.u32 : r7);
+  }
+}
+
+// ---- v3 shadow-mat reader hooks (observers only; see
+// native/skate3_native_v3_shadow_mat.h). Declared here instead of including
+// the header so this section is a pure append.
+
+namespace skate3::native_v3_mat {
+void OnConstantTable(uint8_t* base, uint32_t table, uint32_t count);
+}  // namespace skate3::native_v3_mat
+
+// renderengine::ProgramBuffer::Xbox2CreateConstantTable: builds a shader's
+// 8-byte {name, register, dataType, numConstants} record array. Register
+// conventions VERIFIED in generated/skate3_recomp.60.cpp:37720: ENTRY r3 =
+// shader-blob holder (+16 = CTAB rel offset), r4 = destination record array
+// (NULL on the sizing pass: the Initialize caller at .60.cpp:38221 passes
+// ProgramBuffer + *(u32*)(PB+8) + 20 on the fill pass and stores the return
+// count at PB+4), r5 = out name-bytes; EXIT r3 = record count. Firing once
+// per shader table as it is built gives the reflect reader every table with
+// no ProgramBuffer back-pointer needed.
+extern "C" REX_FUNC(sub_82A77EA0) {
+  const uint32_t table = ctx.r4.u32;
+  __imp__sub_82A77EA0(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_v3_mat::OnConstantTable(base, table, ctx.r3.u32);
+  }
+}
+
+// LivingWorld batch pack writer (unnamed; called per entity per sim tick
+// from the tail of cLivingWorldPresEntityManager::Update), the LOD-
+// pedestrian skinning-palette source: fused UpdateBoneTransforms+Pack writing the
+// concatenated per-mesh 4x3 palettes into cModelInstance.m_matrices. r3 =
+// the cLivingWorldPresEntity-derived entity; post-call m_matrices holds the
+// packed rows.
+extern "C" REX_FUNC(sub_827C1D38) {
+  const uint32_t entity = ctx.r3.u32;
+  __imp__sub_827C1D38(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_v3::OnLwPack(base, entity);
   }
 }

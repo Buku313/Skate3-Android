@@ -5,7 +5,8 @@
 // c8 the color multiplier, used exactly as staged.
 cbuffer C : register(b0) {
   float4 m[10];  // m[0..3] proj rows, m[4..7] world rows, m[8] color,
-                 // m[9].x = apply D3D9 half-pixel (2D ortho draws only)
+                 // m[9].x = apply D3D9 half-pixel (2D ortho draws only),
+                 // m[9].y = sharp-magnification amount (0 = plain bilinear)
 };
 Texture2D<float4> tex : register(t0);
 SamplerState smp : register(s1);
@@ -31,6 +32,67 @@ VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float4 color : COLOR0)
   o.color = color;
   return o;
 }
+// Catmull-Rom reconstruction (9 bilinear fetches). Sharper interpolation
+// than plain bilinear for magnified art; the sharpen pass below restores
+// edge contrast the source's own 1-texel antialiasing loses under
+// magnification.
+float4 SampleCR(float2 uv, float2 ts) {
+  float2 sp = uv * ts;
+  float2 tc = floor(sp - 0.5) + 0.5;
+  float2 f = sp - tc;
+  float2 f2 = f * f;
+  float2 f3 = f2 * f;
+  float2 w0 = f2 - 0.5 * (f3 + f);
+  float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+  float2 w3 = 0.5 * (f3 - f2);
+  float2 w2 = 1.0 - w0 - w1 - w3;
+  float2 w12 = w1 + w2;
+  float2 t0 = (tc - 1.0) / ts;
+  float2 t3 = (tc + 2.0) / ts;
+  float2 t12 = (tc + w2 / w12) / ts;
+  float4 c = tex.Sample(smp, float2(t0.x, t0.y)) * (w0.x * w0.y);
+  c += tex.Sample(smp, float2(t12.x, t0.y)) * (w12.x * w0.y);
+  c += tex.Sample(smp, float2(t3.x, t0.y)) * (w3.x * w0.y);
+  c += tex.Sample(smp, float2(t0.x, t12.y)) * (w0.x * w12.y);
+  c += tex.Sample(smp, float2(t12.x, t12.y)) * (w12.x * w12.y);
+  c += tex.Sample(smp, float2(t3.x, t12.y)) * (w3.x * w12.y);
+  c += tex.Sample(smp, float2(t0.x, t3.y)) * (w0.x * w3.y);
+  c += tex.Sample(smp, float2(t12.x, t3.y)) * (w12.x * w3.y);
+  c += tex.Sample(smp, float2(t3.x, t3.y)) * (w3.x * w3.y);
+  return c;
+}
 float4 ps_main(VSOut i) : SV_Target {
-  return tex.Sample(smp, i.uv) * m[8] * i.color;
+  float4 c = tex.Sample(smp, i.uv);
+  // Sharp magnification (m[9].y = skate3_native_render_scene_2d_sharp):
+  // much of the HUD samples APT cached-bitmap tiles whose texel count
+  // equals their 720p display size; at 2-3x output scales they magnify
+  // into a soft blur under plain bilinear while atlas-glyph text (8-10
+  // texels per 720p pixel) stays crisp. Where the fetch is MAGNIFIED,
+  // reconstruct with Catmull-Rom and apply a locally-CLAMPED unsharp mask
+  // (no halos: the result never leaves the neighborhood's value range).
+  // Minified/1:1 content (density-rich atlases, replay video at 1x) is
+  // untouched by the magnification gate.
+  if (m[9].y > 0.0) {
+    float2 ts;
+    tex.GetDimensions(ts.x, ts.y);
+    float2 tpp = fwidth(i.uv) * ts;  // texel footprint per output pixel
+    float mag = 1.0 / max(max(tpp.x, tpp.y), 1e-4);
+    if (mag > 1.25) {
+      float4 cr = SampleCR(i.uv, ts);
+      float2 px = 1.0 / ts;
+      float4 n0 = tex.Sample(smp, i.uv + float2(-0.5, -0.5) * px);
+      float4 n1 = tex.Sample(smp, i.uv + float2(0.5, -0.5) * px);
+      float4 n2 = tex.Sample(smp, i.uv + float2(-0.5, 0.5) * px);
+      float4 n3 = tex.Sample(smp, i.uv + float2(0.5, 0.5) * px);
+      float4 blur = (n0 + n1 + n2 + n3) * 0.25;
+      // Ramp in across 1.25x..2x so density-1 tiles at 2-3x output get the
+      // full amount while barely-magnified art is barely touched.
+      float amt = m[9].y * saturate((mag - 1.25) / 0.75);
+      float4 s = cr + (cr - blur) * amt;
+      float4 lo = min(min(n0, n1), min(n2, n3));
+      float4 hi = max(max(n0, n1), max(n2, n3));
+      c = clamp(s, min(lo, cr), max(hi, cr));
+    }
+  }
+  return c * m[8] * i.color;
 }

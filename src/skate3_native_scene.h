@@ -139,6 +139,21 @@ struct DrawItem {
   // Detected via the AttribulatorMaterialName channel; consumed by
   // CaptureSkinnedState.
   bool ropa;
+  // ROPA shape blending (set by InterpolateDynamicItems): decoded shape
+  // generations (DynDecodeJob seq) + weights reproducing the SAME temporal
+  // kernel the body bones / garment world were evaluated with this frame:
+  // the 8-tap boxcar when the world took it, else the plain bracketing
+  // lerp. shape_count == 0 = no pairing this frame (draw the newest cached
+  // decode). The stepped cloth shape against the interpolated body was the
+  // tee jelly/clip-through (worse at LOWER fps: the excursion scales with
+  // the guest period); a plain 2-generation lerp against the BOXCAR-
+  // filtered body left the same period-scaled mismatch; the two filters
+  // answer the same 60 Hz limb signal with different frequency responses,
+  // so the kernels must match exactly.
+  static constexpr int kShapeGens = 10;
+  uint64_t shape_seq[kShapeGens] = {};
+  float shape_w[kShapeGens] = {};
+  int shape_count = 0;
   // Exact world-material shading family, classified from
   // AttribulatorMaterialName (models verified against the game's own pixel
   // shaders):
@@ -446,6 +461,13 @@ int CycleSyntheticPan();
 // camera with the stick at a steady rate while it runs; offline analysis
 // shows whether the game's own pose sequence is irregular at the source.
 void RecordCameraSignal(double seconds);
+
+// F7: dump the rolling per-frame scene-composition ring (one compact
+// signature per item per frame for the last ~900 frames) to
+// logs/scene_ring_<ts>.csv on the render thread's next frame. Diffing the
+// artifact frame against its neighbors names exactly which item appeared /
+// vanished / changed textures during a 1-2 frame flash no capture can catch.
+void RequestSceneRingDump();
 
 // Bone-signal recorder (wheel-guard diagnosis): for `seconds`, records every
 // raw entity pose (ring pushes: bone palettes / rigid worlds, timestamps)

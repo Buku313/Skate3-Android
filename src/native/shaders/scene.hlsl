@@ -419,7 +419,9 @@ float4 ps_main(VSOut i) : SV_Target {
       // proxyworld/incandescent: D^2 * scale. No shadow receive, no kd, no
       // material multiplier on the fog term.
       if (fam < 10.5) {
-        float3 lmg = lightmap.Sample(smp, i.uv2).rgb;
+        // Console lightmap semantics: bilinear, clamped, mip 0 (see the
+        // main env fetch below).
+        float3 lmg = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
         lin = dlin * max(lmg * lmg, sh_env.z) * sh_env.y;
         if (fam < 9.5) {
           lin *= sh_env.w;
@@ -445,7 +447,13 @@ float4 ps_main(VSOut i) : SV_Target {
         float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
                                     : decal_art.Sample(smp_clamp, i.uv3);
         dlin = lerp(dlin, dk.rgb * dk.rgb, dk.a);
-        ov = lerp(float3(1.0, 1.0, 1.0), ov, 1.0 - dk.a);
+        // The macro weathering overlay applies OVER the composited art:
+        // ApplyOverlay(cOverlay, ApplyDecal(...)) in the decalenvironment
+        // source. The previous `ov = lerp(1, ov, 1-dk.a)` fade rendered the
+        // paint unweathered: on the PCU Library ramp stencils the measured
+        // native/emulated brightness error was 1.19x at paint alpha~1,
+        // 1.05x at ~0.35 and 1.0x off-patch: exactly 1/ov for ov~0.84,
+        // the no-fade model (measured from a matched A/B capture pair).
       }
       float3 dcol = dlin * ov;
       // CSM shadow term s = sat(infront + 1 - coverage) from the native
@@ -495,7 +503,12 @@ float4 ps_main(VSOut i) : SV_Target {
       if (abs(misc.z - 9.0) < 0.5) {
         return float4(tint.r, 0.0, 1.0 - tint.r, 1.0);
       }
-      float3 lml = min(lmg * lmg, s + sh_color.rgb);
+      // tint.r == 0 = the real lightmap has not resolved yet (first-sight
+      // decode in flight; t1 = the white fallback). Min-clamping the
+      // fallback against the CSM term rendered in-shadow surfaces as BLACK
+      // patches for the decode window (the ramp-stencil "black square
+      // flash"); serve unshadowed brightness until the real page lands.
+      float3 lml = tint.r > 0.0 ? min(lmg * lmg, s + sh_color.rgb) : lmg * lmg;
       // GetTangentLight with the neutral (flat) normal map:
       // 0.39 * 2.39562 exactly. Fam 13 has no kd term at all; its body is
       // D^2 * lml * ALPHA, premultiplied once in the shader on top of the
@@ -642,6 +655,24 @@ float4 ps_main(VSOut i) : SV_Target {
     float3 cce = saturate(sqrt(max(tme * 0.5, 0.0)) * 1.41);
     return float4(cce, out_a);
   }
+  // environment.decal surfaces: the paint/graffiti art (t4) is composited
+  // over the base diffuse by ITS alpha, opaque output; these meshes ARE
+  // the wall/ground there. The art maps with uv3, the second half-pair of
+  // the packed half4 first texcoord (validated offline: sampling with the
+  // tiling uv0 repeats it: "Stereo Stereo Stereo"; the fmt-26 second
+  // element is the lightmap unwrap, not the decal's). Composited BEFORE the
+  // macro overlay: the weathering applies over the paint too
+  // (ApplyOverlay(cOverlay, ApplyDecal(...)); the old order left the paint
+  // unweathered, the too-white ramp stencils).
+  if (overlay.w > 0.0) {
+    // overlay.w == 2 marks environment.decal_tileable: the art tiles across
+    // the surface (rock/cliff faces) and must WRAP; clamp stretched the
+    // border texels into giant streaks. Single placements clamp (their
+    // transparent border keeps everything outside the placement clear).
+    float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
+                                : decal_art.Sample(smp_clamp, i.uv3);
+    albedo.rgb = lerp(albedo.rgb, dk.rgb, dk.a);
+  }
   // Macro overlay: large-scale grime/cracks multiplied over the diffuse at
   // uv * macroOverlayUVScale, faded by macroOverlayOpacity: the ground and
   // wall weathering. WHITE is the neutral (materials without weathering
@@ -653,21 +684,6 @@ float4 ps_main(VSOut i) : SV_Target {
     float4 m = macro.Sample(smp, i.uv * overlay.x);
     albedo.rgb *= lerp(float3(1.0, 1.0, 1.0), sqrt(m.rgb), overlay.y * m.a);
   }
-  // environment.decal surfaces: the paint/graffiti art (t4) is composited
-  // over the base diffuse by ITS alpha, opaque output; these meshes ARE
-  // the wall/ground there. The art maps with uv3, the second half-pair of
-  // the packed half4 first texcoord (validated offline: sampling with the
-  // tiling uv0 repeats it: "Stereo Stereo Stereo"; the fmt-26 second
-  // element is the lightmap unwrap, not the decal's).
-  if (overlay.w > 0.0) {
-    // overlay.w == 2 marks environment.decal_tileable: the art tiles across
-    // the surface (rock/cliff faces) and must WRAP; clamp stretched the
-    // border texels into giant streaks. Single placements clamp (their
-    // transparent border keeps everything outside the placement clear).
-    float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
-                                : decal_art.Sample(smp_clamp, i.uv3);
-    albedo.rgb = lerp(albedo.rgb, dk.rgb, dk.a);
-  }
   // tint.r > 0 marks items with a lightmap bound (2x baked lighting);
   // otherwise fall back to derivative face shading. The lighting term stays
   // separate from the albedo so the CSM receive below can min-clamp IT, the
@@ -676,7 +692,10 @@ float4 ps_main(VSOut i) : SV_Target {
   if (tint.b > 0.0) {
     light = float3(1.0, 1.0, 1.0);  // unlit (sky dome)
   } else if (tint.r > 0.0) {
-    light = lightmap.Sample(smp, i.uv2).rgb * 2.0;
+    // Console lightmap semantics: bilinear, clamped, mip 0; the composed
+    // atlas pages are single-level; mip/wrap sampling bled neighbor cells
+    // and page edges (see the exact env fetch).
+    light = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb * 2.0;
   } else {
     // Smooth per-vertex normal when the mesh has one; face normal from
     // position derivatives otherwise.

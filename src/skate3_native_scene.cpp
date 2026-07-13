@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -32,6 +33,8 @@
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_v3_shadow.h"
+#include "native/skate3_native_v3_shadow_mat.h"
+#include "native/skate3_hud_tile.h"
 
 #if defined(REX_HAS_D3D12) && REX_HAS_D3D12
 #include <rex/graphics/d3d12/command_processor.h>
@@ -226,6 +229,77 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_entity_fade, true, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynamic_items, true, "Skate 3",
                     "Publish dynamic entities (characters, props, cloth)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ropa_inline, false, "Skate 3",
+                    "Decode CPU-cloth (ROPA) garment VBs inline on the render thread "
+                    "instead of the worker jobs. Measured 4.3ms avg per garment "
+                    "decode (committed-resource allocation dominates) AND it does not "
+                    "address the jelly; the mismatch is the cloth shape having no "
+                    "place on the interpolation play clock, not decode latency. Kept "
+                    "for experiments only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ropa_blend, true, "Skate 3",
+                    "Lerp CPU-cloth shape generations onto the motion-smoothing play "
+                    "clock at draw time (pose<->shape pairing via the interp ring); "
+                    "the stepped shape against the interpolated body was the tee "
+                    "jelly/clip-through, worse at LOWER fps. OFF = newest decode "
+                    "(old behavior).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_2d_tile_regen, 4, "Skate 3",
+                     "Regenerate small 2D/HUD cached-bitmap tiles at Nx resolution "
+                     "when they fit the radial (concentric-circle) model: the score "
+                     "ring quadrants / meter arcs the APT UI rasterizes at 720p "
+                     "display size and every faithful renderer shows soft. The tile's "
+                     "radius->color profile is measured, validated (fit err <=3/255; "
+                     "ring quadrants measure ~1, non-radial art ~30 and falls back) "
+                     "and re-rendered as exact circle art with authored AA ramps "
+                     "tightened to output-pixel width. 0 = off, 2-4 = factor. Hot "
+                     "(affects NEW decodes; cached tiles keep their resolution until "
+                     "content churn).")
+    .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_2d_sharp, 0.0, "Skate 3",
+                      "Sharp-magnification amount for the 2D/HUD overlay (0 = plain "
+                      "bilinear, up to 2). Much of the APT (Flash) HUD samples "
+                      "cached-bitmap tiles whose texel count equals their 720p display "
+                      "size (score digits, gauge ring, compass; measured density 1.0 "
+                      "in the 2D draw stream) while text batches sample 512x512 glyph "
+                      "atlases at 8-10 texels/pixel; at 2-3x output scales the tiles "
+                      "blur under bilinear while atlas text stays crisp; the same on "
+                      "console/emulated, the content is simply 720p. Catmull-Rom + "
+                      "clamped unsharp mask where the fetch is magnified (>1.25x), "
+                      "ramped to full by 2x; minified/1:1 fetches untouched. DEFAULT "
+                      "0 (off): sharpened ramps read worse than the soft "
+                      "bilinear; the honest fix is higher-res source pixels (APT "
+                      "cache-tile rasterization scale), not edge-contrast synthesis.")
+    .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ropa_boxcar, true, "Skate 3",
+                    "Blend CPU-cloth shape generations through the SAME 8-tap boxcar "
+                    "kernel the body bones/garment world are filtered with (see "
+                    "smooth_camera_filter_ms) instead of a plain 2-generation lerp. "
+                    "The plain lerp reconstructs the 60Hz limb signal SHARPLY while "
+                    "the boxcar rounds the body ~a window; the cloth led the body "
+                    "through every direction change by an excursion that scales with "
+                    "the guest period (the residual tee jelly after the blend fix). "
+                    "OFF = plain bracketing lerp (for A/B).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_ropa_bias, 0, "Skate 3",
+                     "Shift the ROPA pose<->shape pairing by N ring poses (+ = fresher "
+                     "shape, - = older), a live trim for any residual constant drape "
+                     "lag/lead while skating. 0 = the paired generation.")
+    .range(-2, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_ropa_delay, 0, "Skate 3",
+                     "Delay CPU-cloth VB snapshots by N guest frames before the worker "
+                     "decode, phase-aligning the cloth SHAPE with the motion-smoothing "
+                     "play clock the body renders on (~2 periods behind now). Without "
+                     "it the drape is ~2 frames AHEAD of the rendered body; it hangs "
+                     "where the body WILL be and leads it through direction changes "
+                     "(the tee jelly / clip-through-torso). DEFAULT 0: in practice "
+                     "the garment LAGGED, and delay made it worse; the "
+                     "phase model was backwards. Kept for experiments.")
+    .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_lookaside, true, "Skate 3",
                     "Park texture decodes displaced by streaming mip rebinds in a "
@@ -765,6 +839,10 @@ struct Draw2d {
   uint32_t fetch[6];  // texture fetch constant (shadow slot 0)
   float consts[36];   // VS c0..c8
   std::vector<uint8_t> verts;  // filled at frame end (little-endian dwords)
+  // Set by ApplyGaugeComposites on the render thread's frame-local copy:
+  // >= 0 redirects this draw to a per-GAUGE composite texture (the quad's
+  // uvs are rewritten to sample its slice of the joint regeneration).
+  int composite_srv = -1;
 };
 std::mutex g_2d_mutex;
 std::vector<Draw2d> g_frame_2d;  // capture in submission order
@@ -822,6 +900,112 @@ std::atomic<uint64_t> g_palette_base_plus1{0};
 std::atomic<uint64_t> g_refl_pair{0};
 std::atomic<uint64_t> g_refl_flat{0};
 std::atomic<uint32_t> g_refl_gate{0};
+
+// ---- F7 scene-composition ring (see RequestSceneRingDump in the header) ----
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ring, true, "Skate 3",
+                    "Record a rolling per-frame scene-composition ring (~900 "
+                    "frames); F7 dumps it to logs/scene_ring_<ts>.csv for "
+                    "diffing 1-2 frame artifacts no capture can catch")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+struct SceneRingItem {
+  uint32_t ctx;
+  uint32_t mesh;
+  uint32_t diffuse;
+  uint32_t lightmap;
+  uint32_t vb_obj;
+  // Full material texture set: a one-frame spec/normal/macro/decal-art
+  // resolution glitch changes shading (e.g. an unmasked sky reflection on a
+  // reflective bank face) with the diffuse/lightmap identical; the first
+  // ring revision could not see those.
+  uint32_t spec;
+  uint32_t macro;
+  uint32_t decal_art;
+  uint32_t wnormal;
+  uint32_t indices;      // summed index counts of the item's draw entries
+  uint16_t drawn;        // draw calls actually issued (0 = skipped at draw)
+  uint8_t env_family;
+  uint8_t char_family;
+  uint8_t flags;  // 1 transparent 2 water 4 skinned 8 retained 16 pending
+                  // 32 caster_bank 64 decal
+  uint8_t route;  // 0 skipped pre-pass, 1 opaque pass, 2 blended sub-pass
+  // SERVED-content fingerprints, stamped in draw_item after the resolves:
+  // the object pointers above cannot see an in-place content swap (a heal
+  // commit changes what a texture shows with every pointer identical);
+  // a fp that changes A->B->A across the flash frame names the texture,
+  // the slot, and both contents. 0 = white fallback / not resolved.
+  uint64_t fp_diffuse;
+  uint64_t fp_lightmap;
+  uint64_t fp_macro;
+  uint64_t fp_decal;
+};
+struct SceneRingFrame {
+  uint64_t frame = 0;
+  float cam[3] = {};
+  bool v3_walk = false;
+  // Per-frame captured globals: a one-frame glitch in any of these shifts
+  // shading on every consumer with the composition identical.
+  float fog[6] = {};        // ramp xyz + color rgb
+  float family_rows[4] = {};
+  float sky_height = 0.0f;
+  bool shadow_valid = false;
+  std::vector<SceneRingItem> items;
+};
+std::deque<SceneRingFrame> g_scene_ring;  // render thread only
+constexpr size_t kSceneRingFrames = 2400;
+std::atomic<bool> g_scene_ring_dump{false};
+
+// Render thread, frame end: write the whole ring as CSV. One F line per
+// frame, then one I line per item (hex object addresses to match every
+// other diagnostic).
+void MaybeDumpSceneRing() {
+  if (!g_scene_ring_dump.exchange(false, std::memory_order_acq_rel)) {
+    return;
+  }
+  char path[128];
+  std::snprintf(path, sizeof(path), "logs/scene_ring_%lld.csv",
+                static_cast<long long>(std::time(nullptr)));
+  std::ofstream f(path);
+  if (!f) {
+    REXLOG_WARN("native-scene ring: cannot open {}", path);
+    return;
+  }
+  f << "kind,frame,ctx,mesh,diffuse,lightmap,vb,spec,macro,decal_art,"
+       "wnormal,indices,drawn,env_fam,char_fam,flags,route,fp_diffuse,"
+       "fp_lightmap,fp_macro,fp_decal\n";
+  char line[256];
+  for (const SceneRingFrame& fr : g_scene_ring) {
+    std::snprintf(line, sizeof(line),
+                  "F,%llu,cam,%.2f,%.2f,%.2f,items,%zu,fog,%.5f,%.4f,"
+                  "%.3f,%.4f,%.4f,%.4f,fam,%.4f,%.4f,%.4f,%.4f,sky,%.1f,"
+                  "shadow,%d\n",
+                  static_cast<unsigned long long>(fr.frame), double(fr.cam[0]),
+                  double(fr.cam[1]), double(fr.cam[2]), fr.v3_walk ? 1 : 0,
+                  fr.items.size(), double(fr.fog[0]), double(fr.fog[1]),
+                  double(fr.fog[2]), double(fr.fog[3]), double(fr.fog[4]),
+                  double(fr.fog[5]), double(fr.family_rows[0]),
+                  double(fr.family_rows[1]), double(fr.family_rows[2]),
+                  double(fr.family_rows[3]), double(fr.sky_height),
+                  fr.shadow_valid ? 1 : 0);
+    f << line;
+    for (const SceneRingItem& it : fr.items) {
+      std::snprintf(line, sizeof(line),
+                    "I,%llu,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,"
+                    "%u,%u,%u,%u,%u,%u,%016llX,%016llX,%016llX,%016llX\n",
+                    static_cast<unsigned long long>(fr.frame), it.ctx, it.mesh,
+                    it.diffuse, it.lightmap, it.vb_obj, it.spec, it.macro,
+                    it.decal_art, it.wnormal, it.indices, unsigned(it.drawn),
+                    unsigned(it.env_family), unsigned(it.char_family),
+                    unsigned(it.flags), unsigned(it.route),
+                    static_cast<unsigned long long>(it.fp_diffuse),
+                    static_cast<unsigned long long>(it.fp_lightmap),
+                    static_cast<unsigned long long>(it.fp_macro),
+                    static_cast<unsigned long long>(it.fp_decal));
+      f << line;
+    }
+  }
+  REXLOG_INFO("native-scene ring: wrote {} frames -> {}", g_scene_ring.size(),
+              path);
+}
 // Character-lighting capture telemetry: attempts vs validated captures per
 // family (see CaptureCharLighting).
 std::atomic<uint64_t> g_char_attempts{0};
@@ -853,6 +1037,14 @@ std::atomic<uint64_t> g_ropa_mismatch{0};
 // NPC was far enough away again (log signature: `ropa mesh=... score=2
 // flag=(1.000,...)` repeating while stale climbed with rescued flat).
 std::atomic<uint64_t> g_ropa_relaxed{0};
+// mesh -> newest enqueued cloth-shape generation (DynDecodeJob seq). GUEST
+// render thread only: written by the dyn-job enqueue, read by the interp
+// ring's pose ingestion (the pose <-> shape pairing).
+std::unordered_map<uint32_t, uint64_t> g_ropa_last_seq;
+// Shape blends served / skipped (generation missing from the ring) per
+// stats window.
+std::atomic<uint64_t> g_ropa_blend_drawn{0};
+std::atomic<uint64_t> g_ropa_blend_miss{0};
 // Frames a ropa garment was HELD on its previous resolved state (or dropped
 // when no previous state existed) because the GPU-resident decode still
 // pairs with the other mode; see g_ropa_resident.
@@ -935,6 +1127,7 @@ uint64_t g_guest_frame = 0;
 // Guest render thread: per-frame sums (one Add per guest frame).
 PerfWindow g_pw_capture;   // hook-time capture work (sort lists + RenderMesh)
 PerfWindow g_pw_build;     // BuildFrameScene
+PerfWindow g_pw_pal_tail;  // frame tail: palette snapshot-ring rotation
 PerfWindow g_pw_guest_dt;  // guest frame interval (guest fps + spike max)
 uint64_t g_capture_frame_ns = 0;  // guest render thread only; folded per frame
 // Command processor thread: per-RenderScene-call segments.
@@ -2167,6 +2360,10 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
 bool Enabled() { return SceneEnabled(); }
 
 void FlushTextureCache() { g_flush_textures.store(true, std::memory_order_relaxed); }
+
+void RequestSceneRingDump() {
+  g_scene_ring_dump.store(true, std::memory_order_release);
+}
 void FlushMeshCache() { g_flush_meshes.store(true, std::memory_order_relaxed); }
 
 int CycleSyntheticPan() {
@@ -2954,6 +3151,12 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
         return false;
       }
     } else {
+      // The garment's rigid world is the accepted draw-time bank matrix
+      // (c188/c191): the game stages it tick-exact with the deformed VB
+      // content and with the body palettes packed at EndJobs. (A guest-side
+      // entity L2W read at StartJobs predates the tick's locomotion update;
+      // serving that as the draw world rendered the whole shirt one guest
+      // tick behind the body, a constant velocity-proportional drape lag.)
       const uint32_t m = main_pass ? 191u : 188u;
       float rows[12];
       bool plausible = true;
@@ -3402,24 +3605,6 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       }
     }
     if (dx * dx + dy * dy + dz * dz < 25.0f) {
-      if (!g_fog_frame_done) {
-        float rows[8];
-        for (int i = 0; i < 8; ++i) {
-          rows[i] = LoadGuestF32(base, bank + (20 + i) * 4);
-        }
-        // Sanity-gate before trusting the layout: ramp scale is a tiny
-        // per-meter slope, the exponent is a small power, the fog color is a
-        // dim linear-space rgb and the transmittance scale a small factor.
-        const bool sane = rows[0] >= 0.0f && rows[0] < 0.1f && std::fabs(rows[1]) < 16.0f &&
-                          rows[2] > 0.0f && rows[2] <= 8.0f && rows[4] >= 0.0f &&
-                          rows[4] <= 4.0f && rows[5] >= 0.0f && rows[5] <= 4.0f &&
-                          rows[6] >= 0.0f && rows[6] <= 4.0f && std::fabs(rows[7]) <= 1.0f;
-        if (sane) {
-          std::memcpy(g_fog_rows, rows, sizeof(rows));
-          g_fog_have = true;
-          g_fog_frame_done = true;
-        }
-      }
       const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
       // POSITIVE family check for the receiver-row capture, by shader debug
       // path: the value gates below cannot fully discriminate;
@@ -3462,6 +3647,76 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         }
         return check(g_cur_vs_obj.load(std::memory_order_relaxed)) == 2;
       };
+      // Fog rows (VS c5 ramp / c6 color): POSITIVE family gate like the
+      // receiver rows below, for the same reason: the camera-keyed c4 check
+      // alone lets ANY main-pass-layout draw win the first-draw race, and
+      // the dam spillway's water shaders keep the camera at c4 with a
+      // water-teal where fog c6 lives, values that PASSED the range gate
+      // and tinted every distance-fogged surface (the bank mist band, the
+      // far dirt hill) saturated blue for exactly the one frame that
+      // capture served (the approach-flicker blue flash; F7 scene-ring
+      // proved composition/textures identical across the artifact frame).
+      // Same failure class as the flowingwater tone hijack documented at
+      // env_receiver_ps.
+      if (!g_fog_frame_done && env_receiver_ps()) {
+        float rows[8];
+        for (int i = 0; i < 8; ++i) {
+          rows[i] = LoadGuestF32(base, bank + (20 + i) * 4);
+        }
+        // Range gate (kept as a second line of defense): ramp scale is a
+        // tiny per-meter slope, the exponent is a small power, the fog color
+        // is a dim linear-space rgb and the transmittance scale small.
+        const bool sane = rows[0] >= 0.0f && rows[0] < 0.1f && std::fabs(rows[1]) < 16.0f &&
+                          rows[2] > 0.0f && rows[2] <= 8.0f && rows[4] >= 0.0f &&
+                          rows[4] <= 4.0f && rows[5] >= 0.0f && rows[5] <= 4.0f &&
+                          rows[6] >= 0.0f && rows[6] <= 4.0f && std::fabs(rows[7]) <= 1.0f;
+        if (sane) {
+          std::memcpy(g_fog_rows, rows, sizeof(rows));
+          g_fog_have = true;
+          g_fog_frame_done = true;
+        }
+      } else if (!g_fog_frame_done) {
+        // Confirmation probe for the blue-flash fix: a NON-env draw whose
+        // rows would have passed the old value-only gate with a fog color
+        // far from the current one is exactly the frame that used to flash
+        // - each hit here is one prevented flash, naming the hijacker.
+        float rows[8];
+        for (int i = 0; i < 8; ++i) {
+          rows[i] = LoadGuestF32(base, bank + (20 + i) * 4);
+        }
+        const bool would = rows[0] >= 0.0f && rows[0] < 0.1f && std::fabs(rows[1]) < 16.0f &&
+                           rows[2] > 0.0f && rows[2] <= 8.0f && rows[4] >= 0.0f &&
+                           rows[4] <= 4.0f && rows[5] >= 0.0f && rows[5] <= 4.0f &&
+                           rows[6] >= 0.0f && rows[6] <= 4.0f && std::fabs(rows[7]) <= 1.0f;
+        if (would) {
+          const float dr = rows[4] - g_fog_rows[4];
+          const float dg = rows[5] - g_fog_rows[5];
+          const float db = rows[6] - g_fog_rows[6];
+          if (dr * dr + dg * dg + db * db > 0.01f) {
+            // Rolling cap (the flat 32 burned at the load screen).
+            static std::atomic<uint32_t> s_fog_rejects{0};
+            static std::atomic<int64_t> s_fog_win{0};
+            const int64_t now_s =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            int64_t win = s_fog_win.load(std::memory_order_relaxed);
+            if (now_s - win >= 5 &&
+                s_fog_win.compare_exchange_strong(win, now_s)) {
+              s_fog_rejects.store(0, std::memory_order_relaxed);
+            }
+            if (s_fog_rejects.fetch_add(1, std::memory_order_relaxed) < 8) {
+              REXLOG_INFO(
+                  "native-scene: fog capture REJECTED by family gate "
+                  "(prevented flash): vs_obj={:08X} ps_obj={:08X} "
+                  "color=({:.3f},{:.3f},{:.3f}) vs current ({:.3f},{:.3f},{:.3f})",
+                  g_cur_vs_obj.load(std::memory_order_relaxed),
+                  g_cur_ps_obj.load(std::memory_order_relaxed), rows[4], rows[5],
+                  rows[6], g_fog_rows[4], g_fog_rows[5], g_fog_rows[6]);
+            }
+          }
+        }
+      }
       // Not gated on the shadows cvar: the captured rows also carry the
       // scene exposure / material multiplier / sun direction consumed by the
       // exact world shading (rows 40/45/24..26); shading must not die when
@@ -4745,6 +5000,10 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     double t = 0.0;
     std::vector<float> b;  // bone palette (skinned), raw captured rows
     float w[16] = {};      // world (rigid)
+    // ROPA: the newest cloth-shape generation (dyn job seq) that existed
+    // when this pose was captured, the shape that belongs WITH this pose
+    // (constant enqueue offset; the draw lerps the bracketing generations).
+    uint64_t shape_seq = 0;
   };
   struct DynHist {
     DynPose ring[kRing];
@@ -5225,6 +5484,12 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       }
       p.b = item.bones;
       std::memcpy(p.w, item.world, sizeof(p.w));
+      p.shape_seq = 0;
+      if (item.ropa) {
+        // Guest thread only, like the enqueue that writes it.
+        const auto sit = g_ropa_last_seq.find(item.mesh);
+        p.shape_seq = sit != g_ropa_last_seq.end() ? sit->second : 0;
+      }
       h.count = std::min(h.count + 1, kRing);
       if (skinned && !item.caster_bank && !item.retained) {
         h.last_persp_t = p.t;
@@ -5303,6 +5568,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     static std::vector<float> acc;  // guest render thread only
     float wacc[16] = {};
     bool ok = true;
+    // Did the rigid world take the 8-tap boxcar this frame (vs the plain
+    // pair-lerp)? The ROPA shape kernel below must match it exactly.
+    bool rigid_world_boxcar = false;
     if (filter_w > 0.0005 && h.count >= 4) {
       constexpr int kTaps = 8;
       acc.assign(skinned ? item.bones.size() : 0, 0.0f);
@@ -5519,6 +5787,101 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         }
       } else {
         std::memcpy(item.world, wacc, sizeof(wacc));
+        rigid_world_boxcar = filter_w > 0.0005 && h.count >= 4;
+      }
+    }
+    // ROPA shape pairing: express the EXACT temporal kernel the garment's
+    // world (and the body's bones) were just evaluated with as weights over
+    // the decoded shape generations (DynDecodeJob seq). The previous plain
+    // 2-generation lerp removed the stepping but reconstructed the 60 Hz
+    // limb signal SHARPLY against the 50 ms boxcar-rounded body, two
+    // different frequency responses to the same signal, diverging at every
+    // piecewise-linear corner by an excursion that scales with the per-tick
+    // step size (the residual tee jelly, worse at a 60 fps guest cap;
+    // emulated applies no filter at all and shows none). The kernel follows
+    // the world's LIVE decision: boxcar taps only when the world actually
+    // took the boxcar this frame (not the spin-collapse pair-lerp
+    // fallback), so cloth and body always ride the same filter.
+    if (item.ropa && !skinned) {
+      item.shape_count = 0;
+      const int bias = std::clamp<int>(
+          REXCVAR_GET(skate3_native_render_scene_ropa_bias), -2, 2);
+      // Bracket the ring at tt exactly like accum_at (same walk, same span
+      // clamp) and return the bracketing pair's shape generations + alpha.
+      const auto shape_at = [&](double tt, uint64_t& s0, uint64_t& s1,
+                                float& a) {
+        int hi = h.newest;
+        int lo = (h.newest + kRing - 1) % kRing;
+        for (int step = 1; step < h.count - 1; ++step) {
+          if (h.ring[lo].t <= tt) {
+            break;
+          }
+          hi = lo;
+          lo = (lo + kRing - 1) % kRing;
+        }
+        // Live pairing trim (skate3_native_render_scene_ropa_bias): step
+        // the shape source N ring poses fresher/older than the bracket.
+        int blo = lo, bhi = hi;
+        for (int b = 0; b < bias; ++b) {
+          if (bhi == h.newest) break;
+          blo = bhi;
+          bhi = (bhi + 1) % kRing;
+        }
+        for (int b = 0; b > bias; --b) {
+          bhi = blo;
+          blo = (blo + kRing - 1) % kRing;
+        }
+        const DynPose& p0 = h.ring[blo];
+        const DynPose& p1 = h.ring[bhi];
+        if (p0.shape_seq == 0 || p1.shape_seq == 0) {
+          return false;
+        }
+        const double span = std::max(h.ring[hi].t - h.ring[lo].t, 0.0005);
+        s0 = p0.shape_seq;
+        s1 = p1.shape_seq;
+        a = float(std::clamp((tt - h.ring[lo].t) / span, 0.0, 1.0));
+        return true;
+      };
+      const auto add_gen = [&](uint64_t seq, float wgt) {
+        if (wgt <= 0.0f) {
+          return;
+        }
+        for (int k = 0; k < item.shape_count; ++k) {
+          if (item.shape_seq[k] == seq) {
+            item.shape_w[k] += wgt;
+            return;
+          }
+        }
+        if (item.shape_count < DrawItem::kShapeGens) {
+          item.shape_seq[item.shape_count] = seq;
+          item.shape_w[item.shape_count] = wgt;
+          ++item.shape_count;
+        }
+        // Overflow: the weight is dropped; the draw renormalizes over the
+        // generations it has (kShapeGens=10 covers the 8-tap window's
+        // distinct brackets even at a 140 Hz guest).
+      };
+      if (rigid_world_boxcar &&
+          REXCVAR_GET(skate3_native_render_scene_ropa_boxcar)) {
+        constexpr int kShapeTaps = 8;  // == the body kernel's kTaps
+        for (int tap = 0; tap < kShapeTaps; ++tap) {
+          const double tt = std::min(
+              play_e - filter_w * 0.5 + (tap + 0.5) * filter_w / kShapeTaps,
+              h.ring[h.newest].t);
+          uint64_t s0 = 0, s1 = 0;
+          float a = 0.0f;
+          if (shape_at(tt, s0, s1, a)) {
+            add_gen(s0, (1.0f - a) / kShapeTaps);
+            add_gen(s1, a / kShapeTaps);
+          }
+        }
+      } else {
+        uint64_t s0 = 0, s1 = 0;
+        float a = 0.0f;
+        if (shape_at(play_e, s0, s1, a)) {
+          add_gen(s0, 1.0f - a);
+          add_gen(s1, a);
+        }
       }
     }
     if (flick_check("interp")) {
@@ -6008,6 +6371,24 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;
       }
       scene.items.push_back(std::move(item));
+    } else {
+      // Silent world-item drop attribution (the F7 rings show world meshes
+      // MISSING for 8-11 frame episodes, the mesh
+      // flicker): a transient BuildItemGeometry failure (guarded reads
+      // fail while the streamer relocates the mesh/material structures)
+      // is indistinguishable from a game-culled record without this log.
+      static std::atomic<uint32_t> s_wbuild_logs{0};
+      static std::atomic<int64_t> s_wbuild_win{0};
+      const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+      int64_t win = s_wbuild_win.load(std::memory_order_relaxed);
+      if (now_s - win >= 5 && s_wbuild_win.compare_exchange_strong(win, now_s)) {
+        s_wbuild_logs.store(0, std::memory_order_relaxed);
+      }
+      if (s_wbuild_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+        REXLOG_INFO("native-scene: world item build FAILED ctx={:08X}", r.a);
+      }
     }
   }
   // Ropa garments whose resolved mode FLIPPED this frame: state as published
@@ -6440,6 +6821,133 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
 
+  // (Moved BEFORE the smoothing block: the interp ring's pose ingestion
+  // pairs each pose with g_ropa_last_seq; the shape snapshot of the SAME
+  // frame must be enqueued first or every pose pairs with the previous
+  // frame's shape, a constant one-period drape lag. The snapshot also now
+  // reads RAW captured items, matching the raw VB it snapshots.)
+  // Dynamic cloth decode jobs (see DynDecodeJob): snapshot CHANGED (or
+  // first-seen) skinned/ropa payloads for the workers; the render thread
+  // never decodes them inline; a first-sight NPC/garment appears 1-2 frames
+  // late instead of hitching the frame it streams in on. GuestTryCopy is
+  // safe here: the game just drew from these payloads this frame.
+  {
+    // mesh -> last enqueued fingerprint (guest render thread only). Static
+    // skinned meshes enqueue once; ropa every frame.
+    static std::unordered_map<uint32_t, uint64_t> s_dyn_fp_sent;
+    static uint64_t s_dyn_seq = 0;
+    if (s_dyn_fp_sent.size() > 4096) {
+      s_dyn_fp_sent.clear();
+    }
+    std::vector<DynDecodeJob> jobs;
+    for (const DrawItem& item : scene.items) {
+      if (!(item.skinned || item.ropa) || item.cloth_quads || item.ib_addr == 0) {
+        continue;
+      }
+      if (item.ropa && REXCVAR_GET(skate3_native_render_scene_ropa_inline)) {
+        continue;  // ropa decodes inline on the render thread (zero-lag)
+      }
+      if (item.ropa && item.dbg_src == 4) {
+        // Rescued ropa re-publishes LAST frame's resolved state (mode +
+        // palette + world); decoding THIS frame's payload under it mixes
+        // frames, at a sim flip that is the ribbon. Keep the previous
+        // decode on the GPU: a fully coherent N-1 garment (the draw path
+        // tolerates the fingerprint mismatch for dynamic payloads).
+        continue;
+      }
+      // The decode is MODE-dependent for ropa (rigid decodes zero the blend
+      // weight/index attributes, see DecodeMesh), so a mode flip must
+      // re-enqueue even when the payload bytes did not change: fold the
+      // resolved mode into the dedup key.
+      const uint64_t fp_key =
+          item.fingerprint ^
+          ((item.ropa && item.skinned && !item.bones.empty()) ? 1u : 0u);
+      const auto prev = s_dyn_fp_sent.find(item.mesh);
+      const bool first_sight = prev == s_dyn_fp_sent.end();
+      const uint64_t prev_fp = first_sight ? 0 : prev->second;
+      if (!first_sight && prev_fp == fp_key) {
+        continue;
+      }
+      DynDecodeJob job;
+      job.item = item;
+      job.item.bones.clear();
+      job.seq = ++s_dyn_seq;
+      job.vb.resize(item.vb_bytes);
+      if (!GuestTryCopy(job.vb.data(), base + item.vb_addr, item.vb_bytes)) {
+        continue;
+      }
+      if (item.ropa && item.skinned && !item.bones.empty() &&
+          !RopaPayloadCoherent(item, job.vb)) {
+        // The cloth sim rewrote this VB between the draw-time capture and
+        // this frame-end snapshot (mode flip in flight): decoding it under
+        // the skinned palette is the mangled ribbon. Keep the old decode
+        // this frame; next frame's capture sees the flipped flag and
+        // resolves mode and payload together.
+        g_ropa_mismatch.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      job.ib.resize(size_t(item.ib_count) * 2);
+      if (!GuestTryCopy(job.ib.data(), base + item.ib_addr, job.ib.size())) {
+        continue;
+      }
+      s_dyn_fp_sent[item.mesh] = item.fingerprint;
+      if (item.ropa) {
+        // The pose <-> shape pairing key (see DynPose::shape_seq). Recorded
+        // at CREATION (the delay queue below postpones submission, not
+        // identity).
+        g_ropa_last_seq[item.mesh] = job.seq;
+        if (g_ropa_last_seq.size() > 256) {
+          g_ropa_last_seq.clear();
+        }
+      }
+      jobs.push_back(std::move(job));
+    }
+    // ROPA phase alignment (skate3_native_render_scene_ropa_delay): the
+    // body renders on the motion-smoothing play clock, ~2 guest periods
+    // behind now; a cloth snapshot submitted immediately decodes into a
+    // shape ~2 frames AHEAD of the rendered body (the drape hangs where
+    // the body WILL be; jelly / clip-through on direction changes; the
+    // console pairs body N with shape N). Ropa snapshots pass through a
+    // small per-mesh delay queue so the committed shape lands on the same
+    // clock as the interpolated body.
+    {
+      const int32_t delay = REXCVAR_GET(skate3_native_render_scene_ropa_delay);
+      static std::unordered_map<uint32_t, std::deque<DynDecodeJob>> s_ropa_delay;
+      if (delay > 0) {
+        std::vector<DynDecodeJob> ready;
+        ready.reserve(jobs.size());
+        for (DynDecodeJob& j : jobs) {
+          if (!j.item.ropa) {
+            ready.push_back(std::move(j));
+            continue;
+          }
+          auto& q = s_ropa_delay[j.item.mesh];
+          q.push_back(std::move(j));
+          while (q.size() > size_t(delay)) {
+            ready.push_back(std::move(q.front()));
+            q.pop_front();
+          }
+        }
+        jobs.swap(ready);
+        if (s_ropa_delay.size() > 256) {
+          s_ropa_delay.clear();  // outfit-change growth backstop
+        }
+      } else if (!s_ropa_delay.empty()) {
+        s_ropa_delay.clear();
+      }
+    }
+    if (!jobs.empty()) {
+      std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+      for (DynDecodeJob& j : jobs) {
+        if (g_dyn_jobs.size() >= 32) {
+          break;  // workers behind: the cloth skips a sim frame
+        }
+        g_dyn_jobs.push_back(std::move(j));
+      }
+      g_prewarm_cv.notify_all();
+    }
+  }
+
   // Camera re-timing (see SmoothCamera): replace the guest's sim-stepped
   // pose with a host-clock-interpolated one so panning is smooth at render
   // rate. All consumers (items, sky follow, sorting, outline) use the
@@ -6827,81 +7335,6 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_proxy_frame_done = false;
   g_dynobj_frame_done = false;
 
-  // Dynamic cloth decode jobs (see DynDecodeJob): snapshot CHANGED (or
-  // first-seen) skinned/ropa payloads for the workers; the render thread
-  // never decodes them inline; a first-sight NPC/garment appears 1-2 frames
-  // late instead of hitching the frame it streams in on. GuestTryCopy is
-  // safe here: the game just drew from these payloads this frame.
-  {
-    // mesh -> last enqueued fingerprint (guest render thread only). Static
-    // skinned meshes enqueue once; ropa every frame.
-    static std::unordered_map<uint32_t, uint64_t> s_dyn_fp_sent;
-    static uint64_t s_dyn_seq = 0;
-    if (s_dyn_fp_sent.size() > 4096) {
-      s_dyn_fp_sent.clear();
-    }
-    std::vector<DynDecodeJob> jobs;
-    for (const DrawItem& item : scene.items) {
-      if (!(item.skinned || item.ropa) || item.cloth_quads || item.ib_addr == 0) {
-        continue;
-      }
-      if (item.ropa && item.dbg_src == 4) {
-        // Rescued ropa re-publishes LAST frame's resolved state (mode +
-        // palette + world); decoding THIS frame's payload under it mixes
-        // frames, at a sim flip that is the ribbon. Keep the previous
-        // decode on the GPU: a fully coherent N-1 garment (the draw path
-        // tolerates the fingerprint mismatch for dynamic payloads).
-        continue;
-      }
-      // The decode is MODE-dependent for ropa (rigid decodes zero the blend
-      // weight/index attributes, see DecodeMesh), so a mode flip must
-      // re-enqueue even when the payload bytes did not change: fold the
-      // resolved mode into the dedup key.
-      const uint64_t fp_key =
-          item.fingerprint ^
-          ((item.ropa && item.skinned && !item.bones.empty()) ? 1u : 0u);
-      const auto prev = s_dyn_fp_sent.find(item.mesh);
-      const bool first_sight = prev == s_dyn_fp_sent.end();
-      const uint64_t prev_fp = first_sight ? 0 : prev->second;
-      if (!first_sight && prev_fp == fp_key) {
-        continue;
-      }
-      DynDecodeJob job;
-      job.item = item;
-      job.item.bones.clear();
-      job.seq = ++s_dyn_seq;
-      job.vb.resize(item.vb_bytes);
-      if (!GuestTryCopy(job.vb.data(), base + item.vb_addr, item.vb_bytes)) {
-        continue;
-      }
-      if (item.ropa && item.skinned && !item.bones.empty() &&
-          !RopaPayloadCoherent(item, job.vb)) {
-        // The cloth sim rewrote this VB between the draw-time capture and
-        // this frame-end snapshot (mode flip in flight): decoding it under
-        // the skinned palette is the mangled ribbon. Keep the old decode
-        // this frame; next frame's capture sees the flipped flag and
-        // resolves mode and payload together.
-        g_ropa_mismatch.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
-      job.ib.resize(size_t(item.ib_count) * 2);
-      if (!GuestTryCopy(job.ib.data(), base + item.ib_addr, job.ib.size())) {
-        continue;
-      }
-      s_dyn_fp_sent[item.mesh] = item.fingerprint;
-      jobs.push_back(std::move(job));
-    }
-    if (!jobs.empty()) {
-      std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-      for (DynDecodeJob& j : jobs) {
-        if (g_dyn_jobs.size() >= 32) {
-          break;  // workers behind: the cloth skips a sim frame
-        }
-        g_dyn_jobs.push_back(std::move(j));
-      }
-      g_prewarm_cv.notify_all();
-    }
-  }
 
   // Ropa mode-flip HOLD (must run AFTER the dyn-job enqueue above so the
   // new mode's decode is already in flight with the fresh capture): the
@@ -7074,10 +7507,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     g_frame_draw_fetch.clear();
   }
 
-  // v3 shadow-mode readers (Phase 2): compare this frame's authoritative
-  // guest-structure reads against everything the capture path just built.
-  // Observers only: must run before the move-publish below.
-  skate3::native_v3::OnFrameBuilt(base, records, count, scene);
+  // v3 tail: shadow-mode compares (Phase 2 observers) and the shadow-mat
+  // readers. Timed as one block (`v3=` in the perf line); this tail is on
+  // the guest render thread, and its spikes were the pan stutter.
+  {
+    const auto v3_t0 = PerfClock::now();
+    skate3::native_v3::OnFrameBuilt(base, records, count, scene);
+    skate3::native_v3_mat::OnFrameBuilt(base, records, count, scene);
+    g_pw_v3.Add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             PerfClock::now() - v3_t0)
+                             .count()));
+  }
 
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;
@@ -7115,6 +7555,9 @@ struct MeshBuffers {
   // flicker", stops up close where 1cm still resolves). These meshes draw
   // with the backface-culling PSO instead.
   bool two_sided_sheet = false;
+  // ROPA only: the decoded vertex array (num_verts x 14 floats, the scene
+  // VS layout) retained for draw-time shape blending onto the play clock.
+  std::vector<float> ropa_verts;
 };
 
 struct GuestTexture {
@@ -7170,6 +7613,18 @@ struct GuestTexture {
   UINT srv_mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   uint32_t srv_mips = 0;
   bool valid = false;
+  // A tiled mip's padded macro-row copy faulted and fell back to the
+  // reported size; blocks beyond it uploaded as ZERO (the half-black
+  // banner mip: tiled addressing puts the image's bottom rows past
+  // min_size). The entry serves (better than white) but keeps re-decoding
+  // until a complete copy lands; the commit prefers complete decodes.
+  bool incomplete = false;
+  // Decode-time SampleProbeNearBlack verdict: the payload was near-uniform
+  // black when this decode was taken (a lightmap page mid-compose). The
+  // lightmap-slot resolve serves the white fallback instead (tint.r == 0 ->
+  // the unshadowed-bright window, 59810af semantics) until a heal lands
+  // real content; other slots ignore it (black diffuse content is legal).
+  bool near_black = false;
 };
 
 // Cache key for draw-time fetch-word texture bindings (streamed artwork /
@@ -7311,6 +7766,41 @@ uint64_t SampleProbeFingerprint(uint8_t* base, const GuestTexture& t) {
     h = (h ^ v) * 1099511628211ull;
   }
   return h;
+}
+
+// Near-UNIFORM payload detector, sampled over the same probe grid at decode
+// time. A COMPOSED lightmap page or weathering overlay is never one flat
+// value across its whole mip-0 (a daylight bake / grime map atlases many
+// surfaces), but a page decoded mid-compose is uniform fill: zeroed OR a
+// flat grey (the reported "black/grey squares": a zero-only detector
+// is structurally blind to grey). A real-but-garbage lightmap binds with
+// tint.r > 0 so the CSM min-clamp renders BLACK (the door 59810af's
+// white-fallback shader gate cannot see), and since 59810af a garbage macro
+// multiplies OVER the decal paint. Consumers act on this only for the
+// WHITE-NEUTRAL slots (lightmap/macro); uniform diffuse/spec content is
+// legal and unaffected.
+bool SampleProbeNearBlack(uint8_t* base, const GuestTexture& t) {
+  if (t.probe_count < 16) {
+    return false;  // range-fallback entries (cubes): not enough coverage
+  }
+  uint64_t a = 0, b = 0;
+  bool have_a = false, have_b = false;
+  for (uint32_t i = 0; i < t.probe_count; ++i) {
+    uint64_t v = 0;
+    if (!GuestTryCopy(&v, base + t.probe_addr[i], sizeof(v))) {
+      return false;
+    }
+    if (!have_a) {
+      a = v;
+      have_a = true;
+    } else if (v != a && !have_b) {
+      b = v;
+      have_b = true;
+    } else if (v != a && v != b) {
+      return false;  // 3+ distinct block values = real composed content
+    }
+  }
+  return true;  // <= 2 distinct block values across the whole probe grid
 }
 
 // Host format mapping for the formats Skate 3 uses (mirrors the SDK's
@@ -7492,6 +7982,22 @@ struct RendererState {
   ID3D12Resource* bone_ring = nullptr;
   uint8_t* bone_ring_cpu = nullptr;
   uint32_t bone_ring_offset = 0;
+  // ROPA shape-generation ring (per garment mesh): the last decoded vertex
+  // arrays keyed by dyn_seq, so the draw can combine the generations under
+  // the interp pass's kernel weights (the body's own 8-tap boxcar /
+  // pair-lerp: the stepped OR filter-mismatched shape against the
+  // interpolated body was the tee jelly). Plus a persistent-mapped upload
+  // ring the per-frame blended verts are written into (regioned like the
+  // bone ring).
+  struct RopaGen {
+    uint64_t seq = 0;
+    std::vector<float> verts;  // num_verts x 14 floats (scene VS layout)
+  };
+  std::unordered_map<uint32_t, std::deque<RopaGen>> ropa_shapes;
+  static constexpr uint32_t kRopaRegionSize = 1u << 20;
+  ID3D12Resource* ropa_ring = nullptr;
+  uint8_t* ropa_ring_cpu = nullptr;
+  uint32_t ropa_ring_offset = 0;
   // 2D overlay (HUD/APT replay): alpha-blended depth-less pipeline drawing
   // the captured inline vertices from a per-frame upload ring.
   ID3D12PipelineState* pso_2d = nullptr;
@@ -7529,6 +8035,19 @@ struct RendererState {
   // textures through the device fetch shadow, not renderengine objects.
   // Keyed by an FNV hash of the 6 fetch words.
   std::unordered_map<uint64_t, GuestTexture> textures_2d;
+  // Decoded 1x RGBA of the small HUD tiles (filled by EnsureHudTileRegen
+  // before its radial gate); the per-GAUGE composite path reads these to
+  // rebuild whole gauges (ApplyGaugeComposites).
+  struct Tile1x {
+    uint32_t w = 0, h = 0;
+    uint32_t swizzle = 0;  // fetch dword3 swizzle (SRV composition)
+    std::vector<uint32_t> px;
+  };
+  std::unordered_map<uint64_t, Tile1x> tiles_rgba;
+  // Per-gauge composite regenerations, keyed by the member tiles' words +
+  // layout (content changes reallocate the tiles -> new words -> new key).
+  // valid=false entries are negative caches (joint fit rejected).
+  std::unordered_map<uint64_t, GuestTexture> gauge_composites;
   // Last successfully resolved words-key per streamed-art site
   // (mesh << 1 | slot; slot 0 = diffuse override, 1 = decal override).
   // Serves the site's previous art while a new-mip-words decode is in
@@ -8095,6 +8614,15 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     }
     g_skin_probe[item.mesh] = std::move(probe);
   }
+  // ROPA shape blending: retain the decoded vertex array (14 floats per
+  // vertex, the scene VS layout) so consecutive generations can be lerped
+  // onto the motion-smoothing play clock at draw time; the stepped shape
+  // against the interpolated body was the tee jelly (worse at LOWER fps:
+  // the excursion scales with the guest period; emulated pairs pose N with
+  // shape N and shows none of it).
+  if (item.ropa) {
+    out.ropa_verts.assign(dst, dst + size_t(num_verts) * 14);
+  }
   vb->Unmap(0, nullptr);
   // Blend indices outside the captured palette read garbage rows and mangle
   // the vertex. Indices are plain bone numbers, bone k = palette rows 3k.
@@ -8557,6 +9085,7 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
   out.payload_size = size;
   BuildPayloadProbes(info, addr, ox, oy, pitch_blocks, size, out);
   out.payload_fp = SampleProbeFingerprint(base, out);
+  out.near_black = SampleProbeNearBlack(base, out);
   out.recheck_frame = 0;
   out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
   return true;
@@ -8575,6 +9104,19 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   fetch.dword_4 = words[4];
   fetch.dword_5 = words[5];
   if (fetch.type != xenos::FetchConstantType::kTexture || fetch.base_address == 0) {
+    return false;
+  }
+  // Pre-validate the raw format BEFORE Prepare: TextureInfo::Prepare calls
+  // TextureExtent::Calculate, which divides by the format table's
+  // block_width/block_height/bytes_per_block; a garbage fetch constant
+  // (freed texture object read mid-teardown during a map change) carries a
+  // format whose table entry has zeros and crashed a prewarm worker with an
+  // integer divide-by-zero (dump skate3.exe.pre-icon.24004, second load
+  // into Daly Estates).
+  const rex::graphics::FormatInfo* pre_fi =
+      rex::graphics::FormatInfo::Get(uint32_t(fetch.format));
+  if (pre_fi == nullptr || pre_fi->block_width == 0 || pre_fi->block_height == 0 ||
+      pre_fi->bytes_per_block() == 0) {
     return false;
   }
   rex::graphics::TextureInfo info;
@@ -8664,17 +9206,27 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     s.size = m == 0 ? info.memory.base_size : ext.all_blocks() * bytes_per_block;
     s.min_size = s.size;
     if (info.is_tiled) {
-      // Tiled addressing swizzles across 32x32-BLOCK macro tiles, so a small
-      // texture with a macro-aligned fetch pitch stores blocks far beyond its
-      // naive linear size (the 32x32 DXT5 HUD compass icons, pitch 128
-      // texels: last block at offset 5952 vs base_size 1024; the size guard
-      // zeroed 48 of 64 blocks, "icons sliced off"). Copy whole macro rows;
-      // if that over-reaches the committed allocation the copy loop below
-      // falls back to the reported size.
+      // Tiled addressing swizzles across 32x32-BLOCK macro tiles AND, for
+      // narrow block formats, interleaves across 64x64/128x128-block
+      // portions whose byte extent EXCEEDS the linear size; 16bpp reaches
+      // 0xC00 bytes from a 32x32 tile origin vs the naive 32*32*2 = 0x800.
+      // The previous padded-macro-ROW estimate (added for the 32x32 DXT5
+      // HUD compass icons, whose last block sat at 5952 vs base_size 1024)
+      // missed that interleave: every 16bpp mip's swizzled offsets for the
+      // BOTTOM half of its rows landed past the estimate, the range guard
+      // zeroed them, and every PCU Library banner rendered with its lower
+      // half black at mip-1 viewing distance (MIP DIAG: guard_zeroed
+      // exactly total/2 on 64x64 fmt-4 mips, total/1 on packed oy=16 mips).
+      // Size the copy with the SDK's swizzle-aware upper bound instead; if
+      // that over-reaches the committed allocation the copy loop below
+      // falls back to the reported size and marks the decode incomplete.
+      const uint32_t mw = std::max(width >> m, 1u);
       const uint32_t mh = std::max(height >> m, 1u);
-      const uint32_t rows = (mh + block_h - 1) / block_h + oy;
-      const uint32_t padded_rows = (rows + 31u) & ~31u;
-      s.size = std::max(s.size, padded_rows * s.pitch_blocks * bytes_per_block);
+      const uint32_t right = (mw + block_w - 1) / block_w + ox;
+      const uint32_t bottom = (mh + block_h - 1) / block_h + oy;
+      s.size = std::max(
+          s.size, rex::graphics::texture_util::GetTiledAddressUpperBound2D(
+                      right, bottom, s.pitch_blocks, bytes_per_block_log2));
     }
     s.ox = ox;
     s.oy = oy;
@@ -8683,6 +9235,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   }
   tex_scratch.resize(scratch_total);
   uint32_t mips_copied = 0;
+  bool copy_truncated = false;
   for (uint32_t m = 0; m < mip_count; ++m) {
     MipSrc& s = srcs[m];
     if (!GuestTryCopy(tex_scratch.data() + s.scratch_off,
@@ -8692,7 +9245,12 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
                         base + (0xA0000000u | s.addr), s.min_size)) {
         break;
       }
+      // Tiled fallback: the padded macro rows hold real blocks past
+      // min_size; every one of them uploads as ZERO below (the PCU
+      // Library half-black banner mips). The decode is marked incomplete
+      // so the draw path keeps retrying until the pool commits.
       s.size = s.min_size;
+      copy_truncated = true;
     }
     ++mips_copied;
   }
@@ -8700,6 +9258,17 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     return false;
   }
   mip_count = mips_copied;
+  out.incomplete = copy_truncated;
+  if (copy_truncated) {
+    static std::atomic<uint32_t> s_trunc_logs{0};
+    if (s_trunc_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+      REXLOG_INFO(
+          "native-scene: texture decode INCOMPLETE (tiled mip copy fell back "
+          "to min_size: zeroed tail blocks) {}x{} mips={} w1={:08X}; will "
+          "re-decode until complete",
+          width, height, mip_count, words[1]);
+    }
+  }
 
   // Per-mip upload footprints (D3D12 alignment rules).
   struct MipPlan {
@@ -8754,6 +9323,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     const uint32_t src_size = srcs[m].size;
     const uint8_t* guest = tex_scratch.data() + srcs[m].scratch_off;
     const uint32_t row_bytes = p.cols * bytes_per_block;
+    uint32_t guard_zeroed = 0;  // blocks zeroed by the range guard (diag)
     for (uint32_t by = 0; by < p.rows; ++by) {
       uint8_t* out_row = mapping + p.offset + size_t(by) * p.pitch;
       for (uint32_t bx = 0; bx < p.cols; ++bx) {
@@ -8766,6 +9336,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
         }
         if (source_offset + bytes_per_block > src_size) {
           std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+          ++guard_zeroed;
           continue;
         }
         std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + source_offset,
@@ -8779,6 +9350,38 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
           value = uint16_t((value & 0x07E0u) | ((value >> 11) & 0x1Fu) |
                            ((value & 0x1Fu) << 11));
           std::memcpy(out_row + i, &value, sizeof(value));
+        }
+      }
+    }
+    // Half-black-mip diagnostic (PCU Library banners): discriminate "the
+    // guest pool genuinely holds zeros for this mip" from "our addressing
+    // zeroed/misread it". Samples 32 uploaded blocks spread over the mip;
+    // guard_zeroed separates range-guard zeroing from zero CONTENT.
+    if (m > 0) {
+      uint32_t zero_samples = 0;
+      const uint32_t total_blocks = p.rows * p.cols;
+      for (uint32_t s = 0; s < 32; ++s) {
+        const uint32_t bi = uint32_t(uint64_t(total_blocks - 1) * s / 31u);
+        const uint32_t by = bi / p.cols;
+        const uint32_t bx = bi % p.cols;
+        uint64_t q = 0;
+        std::memcpy(&q, mapping + p.offset + size_t(by) * p.pitch +
+                            size_t(bx) * bytes_per_block,
+                    std::min<uint32_t>(8, bytes_per_block));
+        zero_samples += q == 0 ? 1 : 0;
+      }
+      if (total_blocks >= 32 && (guard_zeroed * 4 >= total_blocks ||
+                                 zero_samples >= 12)) {
+        static std::atomic<uint32_t> s_mip_diag{0};
+        if (s_mip_diag.fetch_add(1, std::memory_order_relaxed) < 24) {
+          REXLOG_INFO(
+              "native-scene: MIP DIAG {}x{} mip {}/{} zero_samples={}/32 "
+              "guard_zeroed={}/{} ox={} oy={} pitch_b={} size={} min={} "
+              "tiled={} fmt={} w0={:08X} w1={:08X} w2={:08X} mip_addr={:08X}",
+              width, height, m, mip_count, zero_samples, guard_zeroed,
+              total_blocks, ox, oy, src_pitch_blocks, src_size,
+              srcs[m].min_size, info.is_tiled ? 1 : 0, uint32_t(info.format),
+              words[0], words[1], words[2], srcs[m].addr);
         }
       }
     }
@@ -8864,9 +9467,671 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   BuildPayloadProbes(info, srcs[0].addr, srcs[0].ox, srcs[0].oy,
                      srcs[0].pitch_blocks, srcs[0].size, out);
   out.payload_fp = SampleProbeFingerprint(base, out);
+  out.near_black = SampleProbeNearBlack(base, out);
   out.recheck_frame = 0;
   out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
   return true;
+}
+
+// ---- APT cached-bitmap tile regeneration (skate3_hud_tile.h) -------------
+// The 2D/HUD path's small runtime-rasterized tiles (score ring quadrants,
+// meter arcs) carry exactly one texel per 720p display pixel: the one HUD
+// class that stays soft at any render scale on every faithful renderer
+// (the content is CPU-written by the APT filter rasterizer; Xenia cannot
+// scale it either). Where a tile fits the radial model, re-render it at
+// factor-x as exact circle art before upload. Only the inline words-keyed
+// 2D resolve uses this; everything else keeps the plain decode.
+
+// BC1 color endpoints expand with BIT-REPLICATION, not integer scaling;
+// the low bits matter (the glass-streetlight lesson, commit 72287a9).
+void DecodeBc1ColorBlock(const uint8_t* blk, bool always_four,
+                         uint32_t texels[16]) {
+  const uint16_t c0 = uint16_t(blk[0] | (blk[1] << 8));
+  const uint16_t c1 = uint16_t(blk[2] | (blk[3] << 8));
+  uint8_t pal[4][4];  // rgba
+  const auto expand = [](uint16_t c, uint8_t* o) {
+    const uint32_t r5 = (c >> 11) & 31u, g6 = (c >> 5) & 63u, b5 = c & 31u;
+    o[0] = uint8_t((r5 << 3) | (r5 >> 2));
+    o[1] = uint8_t((g6 << 2) | (g6 >> 4));
+    o[2] = uint8_t((b5 << 3) | (b5 >> 2));
+    o[3] = 255;
+  };
+  expand(c0, pal[0]);
+  expand(c1, pal[1]);
+  if (always_four || c0 > c1) {
+    for (int k = 0; k < 3; ++k) {
+      pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k] + 1) / 3);
+      pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k] + 1) / 3);
+    }
+    pal[2][3] = pal[3][3] = 255;
+  } else {
+    for (int k = 0; k < 3; ++k) {
+      pal[2][k] = uint8_t((pal[0][k] + pal[1][k]) / 2);
+      pal[3][k] = 0;
+    }
+    pal[2][3] = 255;
+    pal[3][3] = 0;  // 3-color mode: index 3 = transparent black
+  }
+  uint32_t idx;
+  std::memcpy(&idx, blk + 4, 4);
+  for (int t = 0; t < 16; ++t) {
+    const uint8_t* p = pal[(idx >> (2 * t)) & 3u];
+    texels[t] = uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+                (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+  }
+}
+
+void DecodeBc3Block(const uint8_t* blk, uint32_t texels[16]) {
+  DecodeBc1ColorBlock(blk + 8, /*always_four=*/true, texels);
+  const uint8_t a0 = blk[0], a1 = blk[1];
+  uint64_t bits = 0;
+  for (int i = 0; i < 6; ++i) {
+    bits |= uint64_t(blk[2 + i]) << (8 * i);
+  }
+  for (int t = 0; t < 16; ++t) {
+    const uint32_t k = uint32_t(bits >> (3 * t)) & 7u;
+    uint32_t a;
+    if (k == 0) {
+      a = a0;
+    } else if (k == 1) {
+      a = a1;
+    } else if (a0 > a1) {
+      a = ((8 - k) * a0 + (k - 1) * a1) / 7;
+    } else if (k == 6) {
+      a = 0;
+    } else if (k == 7) {
+      a = 255;
+    } else {
+      a = ((6 - k) * a0 + (k - 1) * a1) / 5;
+    }
+    texels[t] = (texels[t] & 0x00FFFFFFu) | (a << 24);
+  }
+}
+
+// Decode a small 2D fetch (mip 0) to RGBA, regenerate radially at
+// `factor`x, and serve it as an R8G8B8A8 texture. Returns false (leaving
+// `out` untouched apart from scratch fields) whenever anything disqualifies
+// the tile; the caller then takes the plain EnsureGuestTextureFromWords
+// path. Inline render-thread paths only (never the staged worker split).
+bool EnsureHudTileRegen(const NativeGuestOutputRenderContext& context,
+                        uint8_t* base, const uint32_t words[6], int factor,
+                        GuestTexture& out) {
+  if (g_tex_stage_out != nullptr) {
+    return false;
+  }
+  xenos::xe_gpu_texture_fetch_t fetch = {};
+  fetch.dword_0 = words[0];
+  fetch.dword_1 = words[1];
+  fetch.dword_2 = words[2];
+  fetch.dword_3 = words[3];
+  fetch.dword_4 = words[4];
+  fetch.dword_5 = words[5];
+  if (fetch.type != xenos::FetchConstantType::kTexture || fetch.base_address == 0) {
+    return false;
+  }
+  const rex::graphics::FormatInfo* pre_fi =
+      rex::graphics::FormatInfo::Get(uint32_t(fetch.format));
+  if (pre_fi == nullptr || pre_fi->block_width == 0 || pre_fi->block_height == 0 ||
+      pre_fi->bytes_per_block() == 0) {
+    return false;
+  }
+  rex::graphics::TextureInfo info;
+  if (!rex::graphics::TextureInfo::Prepare(fetch, &info)) {
+    return false;
+  }
+  if (info.dimension != xenos::DataDimension::k2DOrStacked || info.is_stacked ||
+      info.memory.base_address == 0 || info.memory.base_size == 0) {
+    return false;
+  }
+  const auto base_fmt = rex::graphics::GetBaseFormat(info.format);
+  if (base_fmt != xenos::TextureFormat::k_DXT1 &&
+      base_fmt != xenos::TextureFormat::k_DXT4_5 &&
+      base_fmt != xenos::TextureFormat::k_8_8_8_8) {
+    return false;
+  }
+  const uint32_t width = info.width + 1u;
+  const uint32_t height = info.height + 1u;
+  if (width < 16 || height < 16 || width > 128 || height > 128) {
+    return false;
+  }
+  HostTextureFormat host;
+  if (!GetHostTextureFormat(info.format, host)) {
+    return false;
+  }
+  const rex::graphics::FormatInfo* format_info = info.format_info();
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (bytes_per_block == 0 || (bytes_per_block & (bytes_per_block - 1)) != 0) {
+    return false;
+  }
+  const uint32_t bytes_per_block_log2 = uint32_t(std::countr_zero(bytes_per_block));
+  const uint32_t block_w = format_info->block_width;
+  const uint32_t block_h = format_info->block_height;
+
+  // Guest copy of mip 0 (same swizzle-aware sizing as the plain decode; a
+  // truncated copy simply falls back; never regenerate partial content).
+  uint32_t ox = 0, oy = 0;
+  const uint32_t mip_addr = info.GetMipLocation(0, &ox, &oy, true);
+  const uint32_t pitch_blocks = info.extent.block_pitch_h;
+  uint32_t src_size = info.memory.base_size;
+  if (info.is_tiled) {
+    const uint32_t right = (width + block_w - 1) / block_w + ox;
+    const uint32_t bottom = (height + block_h - 1) / block_h + oy;
+    src_size = std::max(
+        src_size, rex::graphics::texture_util::GetTiledAddressUpperBound2D(
+                      right, bottom, pitch_blocks, bytes_per_block_log2));
+  }
+  static thread_local std::vector<uint8_t> guest_scratch;
+  guest_scratch.resize(src_size);
+  if (!GuestTryCopy(guest_scratch.data(), base + (0xA0000000u | mip_addr), src_size)) {
+    return false;
+  }
+
+  // De-tile + endian-swap into linear block rows.
+  const uint32_t cols = (width + block_w - 1) / block_w;
+  const uint32_t rows = (height + block_h - 1) / block_h;
+  static thread_local std::vector<uint8_t> block_scratch;
+  block_scratch.resize(size_t(cols) * rows * bytes_per_block);
+  for (uint32_t by = 0; by < rows; ++by) {
+    for (uint32_t bx = 0; bx < cols; ++bx) {
+      uint32_t source_offset;
+      if (info.is_tiled) {
+        source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+            int32_t(bx + ox), int32_t(by + oy), pitch_blocks, bytes_per_block_log2));
+      } else {
+        source_offset = ((by + oy) * pitch_blocks + bx + ox) * bytes_per_block;
+      }
+      if (source_offset + bytes_per_block > src_size) {
+        return false;  // out-of-range block: fall back, don't fabricate
+      }
+      std::memcpy(block_scratch.data() + (size_t(by) * cols + bx) * bytes_per_block,
+                  guest_scratch.data() + source_offset, bytes_per_block);
+    }
+  }
+  SwapGuestEndian(block_scratch.data(), uint32_t(block_scratch.size()),
+                  info.endianness);
+
+  // Decode to RGBA (canonical channel order; the SRV swizzle below applies
+  // the fetch swizzle exactly like the plain path would).
+  std::vector<uint32_t> rgba(size_t(width) * height);
+  if (base_fmt == xenos::TextureFormat::k_8_8_8_8) {
+    for (uint32_t y = 0; y < height; ++y) {
+      std::memcpy(rgba.data() + size_t(y) * width,
+                  block_scratch.data() + size_t(y) * cols * bytes_per_block,
+                  size_t(width) * 4);
+    }
+  } else {
+    for (uint32_t by = 0; by < rows; ++by) {
+      for (uint32_t bx = 0; bx < cols; ++bx) {
+        uint32_t texels[16];
+        const uint8_t* blk =
+            block_scratch.data() + (size_t(by) * cols + bx) * bytes_per_block;
+        if (base_fmt == xenos::TextureFormat::k_DXT1) {
+          DecodeBc1ColorBlock(blk, /*always_four=*/false, texels);
+        } else {
+          DecodeBc3Block(blk, texels);
+        }
+        for (uint32_t ty = 0; ty < 4; ++ty) {
+          const uint32_t y = by * 4 + ty;
+          if (y >= height) {
+            break;
+          }
+          for (uint32_t tx = 0; tx < 4; ++tx) {
+            const uint32_t x = bx * 4 + tx;
+            if (x < width) {
+              rgba[size_t(y) * width + x] = texels[ty * 4 + tx];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Retain the decoded 1x pixels for the per-GAUGE composite path (before
+  // the gate on purpose: composites also need tiles whose own fit fails).
+  {
+    if (g_r.tiles_rgba.size() > 256) {
+      g_r.tiles_rgba.clear();
+    }
+    RendererState::Tile1x& t1 = g_r.tiles_rgba[FetchWordsKey(words)];
+    t1.w = width;
+    t1.h = height;
+    t1.swizzle = fetch.swizzle;
+    t1.px = rgba;
+  }
+
+  // Radial fit + regeneration (the actual gate: non-radial art rejects).
+  float fit_err = 0.0f;
+  std::vector<uint32_t> up;
+  if (!skate3::hud_tile::RegenerateRadial(rgba.data(), int(width), int(height),
+                                          factor, up, &fit_err)) {
+    return false;
+  }
+  const uint32_t uw = width * uint32_t(factor);
+  const uint32_t uh = height * uint32_t(factor);
+  {
+    static std::atomic<uint32_t> s_regen_logs{0};
+    const uint32_t n = s_regen_logs.fetch_add(1, std::memory_order_relaxed);
+    if (n < 16 || (n & 63u) == 0) {
+      REXLOG_INFO(
+          "native-scene: HUD tile radial-regen {}x{} -> {}x{} fit_err={:.2f} "
+          "fmt={} w1={:08X} (n={})",
+          width, height, uw, uh, fit_err, uint32_t(info.format), words[1], n);
+    }
+  }
+
+  // Upload as a single-mip R8G8B8A8 texture; SRV swizzle = the fetch
+  // swizzle over canonical RGBA (identical to the plain path's composition
+  // for the DXT/8888 host formats, whose host swizzle is RGBA).
+  ID3D12Device* device = context.d3d12.device;
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = uw;
+  desc.Height = uh;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&out.texture)))) {
+    return false;
+  }
+  const uint32_t pitch = (uw * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+                         ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+  out.upload = CreateUploadBuffer(device, size_t(pitch) * uh);
+  if (!out.upload) {
+    out.texture->Release();
+    out.texture = nullptr;
+    return false;
+  }
+  uint8_t* mapping = nullptr;
+  out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+  for (uint32_t y = 0; y < uh; ++y) {
+    std::memcpy(mapping + size_t(y) * pitch, up.data() + size_t(y) * uw,
+                size_t(uw) * 4);
+  }
+  out.upload->Unmap(0, nullptr);
+  auto* command_processor = context.d3d12.command_processor;
+  auto& list = command_processor->GetDeferredCommandList();
+  D3D12_TEXTURE_COPY_LOCATION dst{};
+  dst.pResource = out.texture;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION src{};
+  src.pResource = out.upload;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  src.PlacedFootprint.Footprint.Width = uw;
+  src.PlacedFootprint.Footprint.Height = uh;
+  src.PlacedFootprint.Footprint.Depth = 1;
+  src.PlacedFootprint.Footprint.RowPitch = pitch;
+  list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                        out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  if (!AllocGuestSrvSlot(out.srv_slot)) {
+    out.texture->Release();
+    out.texture = nullptr;
+    return false;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
+  srv.Texture2D.MipLevels = 1;
+  out.srv_format = srv.Format;
+  out.srv_mapping = srv.Shader4ComponentMapping;
+  out.srv_mips = 1;
+  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+  slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
+  device->CreateShaderResourceView(out.texture, &srv, slot);
+
+  std::memcpy(out.fetch_words, words, 6 * sizeof(uint32_t));
+  out.payload_addr = 0xA0000000u | info.memory.base_address;
+  out.payload_size = src_size;
+  BuildPayloadProbes(info, mip_addr, ox, oy, pitch_blocks, src_size, out);
+  out.payload_fp = SampleProbeFingerprint(base, out);
+  out.near_black = SampleProbeNearBlack(base, out);
+  out.recheck_frame = 0;
+  out.incomplete = false;
+  out.valid = true;
+  return true;
+}
+
+// ---- Per-GAUGE composite reconstruction ----------------------------------
+// The radial gauges compose 2x2 quadrant quads around a shared corner, and
+// the quadrant pairs come from DIFFERENT source rasterizations of the same
+// band (arcs up to ~half a texel apart in radius, band weights visibly
+// different: the 180-degree pairs match, the mirrored
+// pairs differ). Any PER-TILE regeneration renders each quadrant faithful
+// to its own art, so the authored mismatch shows as seams/style steps at
+// every cardinal point. The fix operates per GAUGE: group the quadrant
+// draws that share a corner (same element transform), rebuild the whole
+// gauge as ONE 1x composite laid out exactly as the game samples it, fit
+// ONE radial model across all quadrants jointly, regenerate ONE continuous
+// factor-x texture, and rewrite the quads' uvs to sample their slice of
+// it. One model + one texture: no seams, no style split, and no clamp-band
+// cross (the composite has real content across the seam lines). The
+// per-quadrant deviations from the joint model ride the fit residual,
+// soft, exactly like the source art blends them.
+void ApplyGaugeComposites(const NativeGuestOutputRenderContext& context,
+                          std::vector<Draw2d>& scene_2d) {
+  const int factor =
+      std::clamp<int>(REXCVAR_GET(skate3_native_render_scene_2d_tile_regen), 0, 4);
+  if (factor < 2 || g_r.srv_heap == nullptr) {
+    return;
+  }
+  struct Quad {
+    int draw;
+    float x0, y0, x1, y1;         // local rect
+    float ux0, ux1, vy0, vy1;      // u at x0/x1, v at y0/y1 (orientation)
+    uint64_t wkey;
+    uint32_t thash;                // transform hash (consts)
+  };
+  std::vector<Quad> quads;
+  for (int i = 0; i < int(scene_2d.size()); ++i) {
+    const Draw2d& d = scene_2d[i];
+    if (d.prim != 4 || d.count != 6 || d.stride != 28 ||
+        (d.fetch[0] & 0x3u) != 2 || d.fetch[1] == 0 ||
+        d.verts.size() != size_t(6) * 28) {
+      continue;
+    }
+    float xs[6], ys[6], us[6], vs[6];
+    for (int v = 0; v < 6; ++v) {
+      const uint8_t* p = d.verts.data() + size_t(v) * 28;
+      std::memcpy(&xs[v], p + 0, 4);
+      std::memcpy(&ys[v], p + 4, 4);
+      std::memcpy(&us[v], p + 16, 4);
+      std::memcpy(&vs[v], p + 20, 4);
+    }
+    Quad q{};
+    q.x0 = *std::min_element(xs, xs + 6);
+    q.x1 = *std::max_element(xs, xs + 6);
+    q.y0 = *std::min_element(ys, ys + 6);
+    q.y1 = *std::max_element(ys, ys + 6);
+    const float sx = q.x1 - q.x0, sy = q.y1 - q.y0;
+    if (sx < 24.0f || sx > 129.0f || std::fabs(sx - sy) > 0.6f) {
+      continue;
+    }
+    // Every vertex on a rect corner; collect the uv orientation.
+    bool corners = true;
+    bool got_ux0 = false, got_ux1 = false, got_vy0 = false, got_vy1 = false;
+    for (int v = 0; v < 6 && corners; ++v) {
+      const bool at_x0 = std::fabs(xs[v] - q.x0) < 0.05f;
+      const bool at_x1 = std::fabs(xs[v] - q.x1) < 0.05f;
+      const bool at_y0 = std::fabs(ys[v] - q.y0) < 0.05f;
+      const bool at_y1 = std::fabs(ys[v] - q.y1) < 0.05f;
+      corners = (at_x0 || at_x1) && (at_y0 || at_y1);
+      if (at_x0) { q.ux0 = us[v]; got_ux0 = true; }
+      if (at_x1) { q.ux1 = us[v]; got_ux1 = true; }
+      if (at_y0) { q.vy0 = vs[v]; got_vy0 = true; }
+      if (at_y1) { q.vy1 = vs[v]; got_vy1 = true; }
+    }
+    if (!corners || !got_ux0 || !got_ux1 || !got_vy0 || !got_vy1) {
+      continue;
+    }
+    // Full-tile quads only (uv spans ~1 in both axes, either direction).
+    if (std::fabs(std::fabs(q.ux1 - q.ux0) - 1.0f) > 0.1f ||
+        std::fabs(std::fabs(q.vy1 - q.vy0) - 1.0f) > 0.1f) {
+      continue;
+    }
+    uint64_t th = 1469598103934665603ull;
+    for (int c = 0; c < 36; ++c) {
+      uint32_t bits;
+      std::memcpy(&bits, &d.consts[c], 4);
+      th ^= bits;
+      th *= 1099511628211ull;
+    }
+    q.thash = uint32_t(th ^ (th >> 32));
+    q.wkey = FetchWordsKey(d.fetch);
+    q.draw = i;
+    quads.push_back(q);
+  }
+  if (quads.size() < 4) {
+    return;
+  }
+  // Group by (transform, shared corner). Each quad registers its 4 corners;
+  // a gauge = one corner point with all four rect positions present.
+  struct Corner {
+    std::vector<int> qidx;
+  };
+  std::unordered_map<uint64_t, Corner> corners;
+  const auto ckey = [](uint32_t th, float x, float y) {
+    const int64_t qx = llround(double(x) * 4.0);
+    const int64_t qy = llround(double(y) * 4.0);
+    uint64_t k = th;
+    k = k * 1099511628211ull ^ uint64_t(qx + (int64_t(1) << 30));
+    k = k * 1099511628211ull ^ uint64_t(qy + (int64_t(1) << 30));
+    return k;
+  };
+  for (int qi = 0; qi < int(quads.size()); ++qi) {
+    const Quad& q = quads[qi];
+    corners[ckey(q.thash, q.x0, q.y0)].qidx.push_back(qi);
+    corners[ckey(q.thash, q.x1, q.y0)].qidx.push_back(qi);
+    corners[ckey(q.thash, q.x0, q.y1)].qidx.push_back(qi);
+    corners[ckey(q.thash, q.x1, q.y1)].qidx.push_back(qi);
+  }
+  std::vector<char> claimed(scene_2d.size(), 0);
+  for (auto& [key, corner] : corners) {
+    if (corner.qidx.size() < 4) {
+      continue;
+    }
+    // Positions around the shared point: bit0 = rect right of it, bit1 =
+    // rect below it. All four must be present with equal sizes.
+    int rep[4] = {-1, -1, -1, -1};
+    std::vector<int> members[4];
+    float s = 0.0f;
+    float cx = 0.0f, cy = 0.0f;
+    bool ok = true;
+    for (const int qi : corner.qidx) {
+      const Quad& q = quads[qi];
+      if (claimed[q.draw]) {
+        ok = false;
+        break;
+      }
+      // Which of this quad's corners is the shared point?
+      float px, py;
+      int pos = -1;
+      for (int cxi = 0; cxi < 2 && pos < 0; ++cxi) {
+        for (int cyi = 0; cyi < 2 && pos < 0; ++cyi) {
+          px = cxi ? q.x1 : q.x0;
+          py = cyi ? q.y1 : q.y0;
+          if (ckey(q.thash, px, py) == key) {
+            pos = (cxi ? 0 : 1) | (cyi ? 0 : 2);  // rect right/below of point
+          }
+        }
+      }
+      if (pos < 0) {
+        ok = false;
+        break;
+      }
+      const float qs = q.x1 - q.x0;
+      if (s == 0.0f) {
+        s = qs;
+        cx = pos & 1 ? q.x0 : q.x1;
+        cy = pos & 2 ? q.y0 : q.y1;
+      } else if (std::fabs(qs - s) > 0.3f) {
+        ok = false;
+        break;
+      }
+      if (rep[pos] < 0) {
+        rep[pos] = qi;
+      } else if (quads[rep[pos]].wkey != q.wkey) {
+        ok = false;  // two DIFFERENT tiles at one position: not a gauge
+        break;
+      }
+      members[pos].push_back(qi);
+    }
+    if (!ok || rep[0] < 0 || rep[1] < 0 || rep[2] < 0 || rep[3] < 0) {
+      continue;
+    }
+    const int S = int(std::lround(s));
+    if (S < 24 || S > 128) {
+      continue;
+    }
+    // Group content hash: member tiles (position order) + layout + factor.
+    uint64_t ghash = 1469598103934665603ull;
+    bool tiles_ok = true;
+    const RendererState::Tile1x* tiles[4] = {};
+    for (int pos = 0; pos < 4 && tiles_ok; ++pos) {
+      const Quad& q = quads[rep[pos]];
+      const auto it = g_r.tiles_rgba.find(q.wkey);
+      if (it == g_r.tiles_rgba.end() || int(it->second.w) != S ||
+          int(it->second.h) != S) {
+        tiles_ok = false;  // density != 1 or tile not decoded yet
+        break;
+      }
+      tiles[pos] = &it->second;
+      ghash = ghash * 1099511628211ull ^ q.wkey;
+      ghash = ghash * 1099511628211ull ^
+              uint64_t((q.ux1 < q.ux0 ? 1 : 0) | (q.vy1 < q.vy0 ? 2 : 0) |
+                       (uint64_t(pos) << 2));
+    }
+    if (!tiles_ok) {
+      continue;
+    }
+    ghash = ghash * 1099511628211ull ^ uint64_t(S);
+    ghash = ghash * 1099511628211ull ^ uint64_t(factor);
+    auto git = g_r.gauge_composites.find(ghash);
+    if (git == g_r.gauge_composites.end()) {
+      // Build the 1x composite exactly as the game samples the quads:
+      // composite texel (I,J) = the art at local point (cx - S + I,
+      // cy - S + J) through the containing quad's own uv mapping.
+      std::vector<uint32_t> comp(size_t(2 * S) * (2 * S));
+      for (int J = 0; J < 2 * S; ++J) {
+        for (int I = 0; I < 2 * S; ++I) {
+          const int pos = (I >= S ? 1 : 0) | (J >= S ? 2 : 0);
+          const Quad& q = quads[rep[pos]];
+          const RendererState::Tile1x& t = *tiles[pos];
+          const float px = cx - float(S) + float(I);
+          const float py = cy - float(S) + float(J);
+          const float u =
+              q.ux0 + (px - q.x0) * (q.ux1 - q.ux0) / (q.x1 - q.x0);
+          const float v =
+              q.vy0 + (py - q.y0) * (q.vy1 - q.vy0) / (q.y1 - q.y0);
+          const int col = std::clamp(int(std::lround(u * float(S) - 0.5f)), 0, S - 1);
+          const int row = std::clamp(int(std::lround(v * float(S) - 0.5f)), 0, S - 1);
+          comp[size_t(J) * (2 * S) + I] = t.px[size_t(row) * S + col];
+        }
+      }
+      GuestTexture gt{};
+      float fit_err = 0.0f;
+      std::vector<uint32_t> up;
+      if (skate3::hud_tile::RegenerateRadial(comp.data(), 2 * S, 2 * S, factor,
+                                             up, &fit_err,
+                                             /*max_fit_err=*/6.0f)) {
+        // Upload (single-mip R8G8B8A8; SRV composes the fetch swizzle).
+        const uint32_t uw = uint32_t(2 * S * factor);
+        ID3D12Device* device = context.d3d12.device;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = uw;
+        desc.Height = uw;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        const uint32_t pitch =
+            (uw * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+            ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+        uint8_t* mapping = nullptr;
+        if (SUCCEEDED(device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr, IID_PPV_ARGS(&gt.texture))) &&
+            (gt.upload = CreateUploadBuffer(device, size_t(pitch) * uw)) != nullptr &&
+            SUCCEEDED(gt.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping))) &&
+            AllocGuestSrvSlot(gt.srv_slot)) {
+          for (uint32_t y = 0; y < uw; ++y) {
+            std::memcpy(mapping + size_t(y) * pitch, up.data() + size_t(y) * uw,
+                        size_t(uw) * 4);
+          }
+          gt.upload->Unmap(0, nullptr);
+          auto* command_processor = context.d3d12.command_processor;
+          auto& list = command_processor->GetDeferredCommandList();
+          D3D12_TEXTURE_COPY_LOCATION dst{};
+          dst.pResource = gt.texture;
+          dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+          D3D12_TEXTURE_COPY_LOCATION src{};
+          src.pResource = gt.upload;
+          src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+          src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+          src.PlacedFootprint.Footprint.Width = uw;
+          src.PlacedFootprint.Footprint.Height = uw;
+          src.PlacedFootprint.Footprint.Depth = 1;
+          src.PlacedFootprint.Footprint.RowPitch = pitch;
+          list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+          context.d3d12.push_transition_barrier(
+              context.d3d12.command_processor_user_data, gt.texture,
+              D3D12_RESOURCE_STATE_COPY_DEST,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+          D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+          srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+          srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          srv.Shader4ComponentMapping = ComposeSrvSwizzle(
+              tiles[0]->swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+          srv.Texture2D.MipLevels = 1;
+          D3D12_CPU_DESCRIPTOR_HANDLE slot =
+              g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+          slot.ptr += size_t(gt.srv_slot) * g_r.srv_size;
+          device->CreateShaderResourceView(gt.texture, &srv, slot);
+          gt.valid = true;
+          static std::atomic<uint32_t> s_gauge_logs{0};
+          const uint32_t n = s_gauge_logs.fetch_add(1, std::memory_order_relaxed);
+          if (n < 16 || (n & 63u) == 0) {
+            REXLOG_INFO(
+                "native-scene: GAUGE composite {}x{} -> {}x{} fit_err={:.2f} "
+                "(4 quadrants joint) (n={})",
+                2 * S, 2 * S, uw, uw, fit_err, n);
+          }
+        }
+      }
+      if (!gt.valid) {
+        if (gt.texture) {
+          gt.texture->Release();
+          gt.texture = nullptr;
+        }
+        if (gt.upload) {
+          gt.upload->Release();
+          gt.upload = nullptr;
+        }
+      }
+      if (g_r.gauge_composites.size() > 64) {
+        for (auto& [k2, old] : g_r.gauge_composites) {
+          if (old.texture) old.texture->Release();
+          if (old.upload) old.upload->Release();
+          if (old.valid) g_r.srv_free.push_back(old.srv_slot);
+        }
+        g_r.gauge_composites.clear();
+      }
+      git = g_r.gauge_composites.emplace(ghash, gt).first;
+    }
+    if (!git->second.valid) {
+      continue;  // negative cache: joint fit rejected
+    }
+    // Redirect every member draw (incl. glow multipass duplicates) to its
+    // slice of the composite: uv = art texel coords of the joint layout.
+    for (int pos = 0; pos < 4; ++pos) {
+      for (const int qi : members[pos]) {
+        const Quad& q = quads[qi];
+        Draw2d& d = scene_2d[q.draw];
+        claimed[q.draw] = 1;
+        d.composite_srv = int(git->second.srv_slot);
+        for (int v = 0; v < 6; ++v) {
+          uint8_t* p = d.verts.data() + size_t(v) * 28;
+          float x, y;
+          std::memcpy(&x, p + 0, 4);
+          std::memcpy(&y, p + 4, 4);
+          const float u = (x - cx + float(S) + 0.5f) / float(2 * S);
+          const float w = (y - cy + float(S) + 0.5f) / float(2 * S);
+          std::memcpy(p + 16, &u, 4);
+          std::memcpy(p + 20, &w, 4);
+        }
+      }
+    }
+  }
 }
 
 // Fetch-constant read from a renderengine::Texture object (words [7..12]).
@@ -8911,6 +10176,14 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   fetch.dword_4 = words[4];
   fetch.dword_5 = words[5];
   if (fetch.type != xenos::FetchConstantType::kTexture || fetch.base_address == 0) {
+    return false;
+  }
+  // Same divide-by-zero pre-guard as EnsureGuestTextureFromWords (garbage
+  // format -> zero block dims inside Prepare's extent math).
+  const rex::graphics::FormatInfo* pre_fi =
+      rex::graphics::FormatInfo::Get(uint32_t(fetch.format));
+  if (pre_fi == nullptr || pre_fi->block_width == 0 || pre_fi->block_height == 0 ||
+      pre_fi->bytes_per_block() == 0) {
     return false;
   }
   rex::graphics::TextureInfo info;
@@ -10028,6 +11301,17 @@ bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
     }
   }
 
+  if (!g_r.ropa_ring) {
+    g_r.ropa_ring = CreateUploadBuffer(
+        device, size_t(RendererState::kRopaRegionSize) * RendererState::kBoneRegions);
+    if (!g_r.ropa_ring ||
+        FAILED(g_r.ropa_ring->Map(0, nullptr,
+                                  reinterpret_cast<void**>(&g_r.ropa_ring_cpu)))) {
+      g_r.failed = true;
+      return false;
+    }
+  }
+
   if (!g_r.ui_ring) {
     g_r.ui_ring = CreateUploadBuffer(
         device, size_t(RendererState::kUiRegionSize) * RendererState::kUiRegions);
@@ -10525,7 +11809,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       }
       it->second.recheck_frame = frame_number + 16;
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
-      if (fp == 0 || fp == it->second.payload_fp) {
+      if (!it->second.incomplete && (fp == 0 || fp == it->second.payload_fp)) {
         return;
       }
       RetireGuestTexture(it->second, command_processor->GetCurrentSubmission());
@@ -10572,7 +11856,10 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     }
     ++wc.decodes;
     GuestTexture gt;
-    EnsureGuestTextureFromWords(context, base, words, gt);
+    const int32_t regen = REXCVAR_GET(skate3_native_render_scene_2d_tile_regen);
+    if (regen < 2 || !EnsureHudTileRegen(context, base, words, regen, gt)) {
+      EnsureGuestTextureFromWords(context, base, words, gt);
+    }
     g_r.textures_2d.emplace(fkey, gt);
   };
 
@@ -11029,6 +12316,24 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         res.fp = r.buffers.fingerprint;
         res.skinned = r.item.skinned;
       }
+      // ROPA shape-generation ring: retain this decode's vertex array
+      // (keyed by dyn_seq) for the draw-time blend onto the play clock.
+      // Runs even when the GPU buffers get dropped as identical below;
+      // the SEQ still advances and the interp ring may reference it.
+      if (r.item.ropa && r.buffers.dyn_seq != 0 && !superseded &&
+          !r.buffers.ropa_verts.empty()) {
+        auto& ring = g_r.ropa_shapes[r.item.mesh];
+        ring.push_back({r.buffers.dyn_seq, std::move(r.buffers.ropa_verts)});
+        // 16 generations = ~114 ms at a 140 Hz guest: the 8-tap boxcar
+        // kernel reaches filter_w/2 (~25 ms) past the play clock (itself
+        // ~2 guest periods behind), plus decode-latency slack.
+        while (ring.size() > 16) {
+          ring.pop_front();
+        }
+        if (g_r.ropa_shapes.size() > 64) {
+          g_r.ropa_shapes.clear();  // outfit-change growth backstop
+        }
+      }
       if (mit != g_r.meshes.end() &&
           (mit->second.fingerprint == r.buffers.fingerprint || superseded)) {
         // Identical content already cached (lost the race against the draw
@@ -11099,8 +12404,12 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         // Words-keyed result (posters/ads): lands in the 2D/words cache.
         auto wit = g_r.textures_2d.find(t.words_key);
         if (wit != g_r.textures_2d.end()) {
+          // A complete re-decode must displace an incomplete cached entry
+          // even when the mip-0 fingerprint (which never covered the zeroed
+          // higher-mip blocks) matches.
           const bool same_content = t.valid && wit->second.valid &&
-                                    t.gt.payload_fp == wit->second.payload_fp;
+                                    t.gt.payload_fp == wit->second.payload_fp &&
+                                    !(wit->second.incomplete && !t.gt.incomplete);
           if (same_content || (!t.valid && wit->second.valid)) {
             if (t.gt.texture) t.gt.texture->Release();
             if (t.gt.upload) t.gt.upload->Release();
@@ -11124,11 +12433,15 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       }
       auto tit = g_r.textures.find(t.key);
       if (tit != g_r.textures.end()) {
+        // Same-content dedup, except a complete re-decode always displaces
+        // an incomplete cached entry (truncated tiled-mip copy: the zeroed
+        // blocks live in mips the fingerprint never samples).
         const bool same_content =
             t.valid && tit->second.valid &&
             std::memcmp(t.gt.fetch_words, tit->second.fetch_words,
                         sizeof(t.gt.fetch_words)) == 0 &&
-            t.gt.payload_fp == tit->second.payload_fp;
+            t.gt.payload_fp == tit->second.payload_fp &&
+            !(tit->second.incomplete && !t.gt.incomplete);
         if (same_content || (!t.valid && tit->second.valid)) {
           // The cached decode is as good or better ("keep the old decode
           // when the payload became unreadable": mips stream out at range).
@@ -11160,6 +12473,34 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         // flap (words A<->B for seconds) then swaps straight back with zero
         // decode instead of another worker round trip. A same-words
         // displacement (payload changed in place) is stale content: retire.
+        // Content-changing valid->valid swaps are the only commits a player
+        // can SEE; capped log so a flicker sighting names its texture.
+        if (t.valid && tit->second.valid &&
+            t.gt.payload_fp != tit->second.payload_fp) {
+          // Rolling cap (the flat 64 burned at the load screen): a
+          // black-flash sighting mid-play must name its commit.
+          static std::atomic<uint32_t> s_swap_logs{0};
+          static std::atomic<int64_t> s_swap_win{0};
+          const int64_t now_s =
+              std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+          int64_t swin = s_swap_win.load(std::memory_order_relaxed);
+          if (now_s - swin >= 5 &&
+              s_swap_win.compare_exchange_strong(swin, now_s)) {
+            s_swap_logs.store(0, std::memory_order_relaxed);
+          }
+          if (s_swap_logs.fetch_add(1) < 8) {
+            REXLOG_INFO(
+                "native-scene: texture heal commit obj={:08X} fp {:016X} -> "
+                "{:016X} words_{}",
+                t.key, tit->second.payload_fp, t.gt.payload_fp,
+                std::memcmp(tit->second.fetch_words, t.gt.fetch_words,
+                            sizeof(t.gt.fetch_words)) == 0
+                    ? "same"
+                    : "diff");
+          }
+        }
         if (!t.valid) {
           t.gt.fail_count = tit->second.fail_count;  // keep the backoff arc
         }
@@ -11767,13 +13108,14 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     const double guest_dt_ms = g_pw_guest_dt.AvgMs();
     REXLOG_INFO(
         "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
-        "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms | render={:.2f}/{:.2f}ms "
+        "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms v3={:.2f}/{:.2f}ms | render={:.2f}/{:.2f}ms "
         "items={:.2f}/{:.2f}ms shadow={:.2f}/{:.2f}ms "
         "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
         "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}]",
         guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
         g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
-        g_pw_build.MaxMs(), g_pw_render.AvgMs(), g_pw_render.MaxMs(),
+        g_pw_build.MaxMs(), g_pw_v3.AvgMs(), g_pw_v3.MaxMs(),
+        g_pw_render.AvgMs(), g_pw_render.MaxMs(),
         g_pw_items.AvgMs(), g_pw_items.MaxMs(), g_pw_shadow.AvgMs(),
         g_pw_shadow.MaxMs(), g_pw_mesh_decode.count.load(std::memory_order_relaxed),
         g_pw_mesh_decode.AvgMs(), g_pw_mesh_decode.MaxMs(),
@@ -11784,9 +13126,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_cam_changes.exchange(0, std::memory_order_relaxed),
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
         g_cam_max_streak.exchange(0, std::memory_order_relaxed));
-    for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_render,
-                          &g_pw_items, &g_pw_shadow, &g_pw_mesh_decode,
-                          &g_pw_tex_decode, &g_pw_commit}) {
+    for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_v3,
+                          &g_pw_render, &g_pw_items, &g_pw_shadow,
+                          &g_pw_mesh_decode, &g_pw_tex_decode, &g_pw_commit}) {
       w->Reset();
     }
   }
@@ -11795,7 +13137,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={} blend={} blendmiss={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
@@ -11811,7 +13153,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
         g_ropa_flip.load(), g_ropa_mismatch.load(), g_ropa_relaxed.load(),
         g_ropa_hold.load(), g_ropa_caster.load(), g_pub_incoherent.load(),
-        g_stretch_veto.load(), g_dyn_gap.load(),
+        g_stretch_veto.load(),
+        g_ropa_blend_drawn.load(), g_ropa_blend_miss.load(), g_dyn_gap.load(),
         g_skinned_items.load(),
         g_skinned_skipped.load(), g_capture_foreign_bank.load(),
         g_rigid_pending.load(), g_rigid_dropped.load(),
@@ -11887,6 +13230,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       uint32_t(frame_number % RendererState::kBoneRegions) *
       RendererState::kBoneRegionSize;
   g_r.bone_ring_offset = 0;
+  g_r.ropa_ring_offset = 0;
 
   // ---- Loading -> gameplay takeover (seamless boot / map-change loads) ----
   // The loading-screen prewarm (menus branch above) already decoded the
@@ -12088,6 +13432,37 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
   uint32_t drawn = 0;
   uint32_t item_index = 0;
+  // F7 scene-composition ring (RequestSceneRingDump): one compact signature
+  // per scene item per frame, ~900 frames deep. A 1-2 frame artifact (the
+  // dam-bank blue flash) is uncapturable by F10/F11; the ring lets a
+  // keypress seconds later name exactly which item appeared / vanished /
+  // changed textures on the artifact frame. Entries are recorded at
+  // classification below; draw_item stamps the issued-draw count, so an
+  // item that early-returned (deferred mesh, skip-new, fade skip) shows
+  // drawn=0 that frame.
+  SceneRingFrame* ring_frame = nullptr;
+  std::unordered_map<const DrawItem*, uint32_t> ring_map;
+  if (REXCVAR_GET(skate3_native_render_scene_ring) && debug_mode == 0) {
+    g_scene_ring.emplace_back();
+    while (g_scene_ring.size() > kSceneRingFrames) {
+      g_scene_ring.pop_front();
+    }
+    ring_frame = &g_scene_ring.back();
+    ring_frame->frame = frame_number;
+    std::memcpy(ring_frame->cam, scene.cam_pos, sizeof(ring_frame->cam));
+    ring_frame->fog[0] = scene.fog_ramp[0];
+    ring_frame->fog[1] = scene.fog_ramp[1];
+    ring_frame->fog[2] = scene.fog_ramp[2];
+    ring_frame->fog[3] = scene.fog_color[0];
+    ring_frame->fog[4] = scene.fog_color[1];
+    ring_frame->fog[5] = scene.fog_color[2];
+    std::memcpy(ring_frame->family_rows, scene.family_rows,
+                sizeof(ring_frame->family_rows));
+    ring_frame->sky_height = scene.sky_height;
+    ring_frame->shadow_valid = scene.shadow_valid;
+    ring_frame->items.reserve(scene.items.size());
+    ring_map.reserve(scene.items.size());
+  }
   // Inline decode budget for DYNAMIC payloads only (skinned/cloth/ropa
   // buffers that change every frame). Static meshes and all textures route
   // to the decode workers on miss; the render thread never pays their
@@ -12128,7 +13503,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
       it->second.recheck_frame = frame_number + 16;
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
-      if (fp != 0 && fp != it->second.payload_fp) {
+      const bool fp_new = fp != 0 && fp != it->second.payload_fp;
+      if (it->second.recheck_count < 3) {
+        ++it->second.recheck_count;
+      }
+      if (it->second.incomplete || fp_new) {
         // In-place content rotation (event ads stream the next poster into
         // the same buffer; the words, and so the key, never change): heal
         // on the workers; keep serving the current decode meanwhile.
@@ -12192,11 +13571,21 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // props) loads/heals on the decode workers via the miss queue; a
     // texture decode averages ~10 ms and panning surfaces dozens of new
     // payloads in one frame; inline decode WAS the panning lag spike.
-    // Dynamic payloads (skinned/ropa, CPU-rewritten every frame) are kept
+    // Dynamic payloads (skinned, CPU-rewritten every frame) are kept
     // fresh by the dyn decode jobs (guest-thread snapshot -> worker), one
     // frame behind the sim; only their FIRST sight decodes inline. The
     // cloth-quads particle path (gated off by default) still re-decodes
     // inline on change; it has no job route.
+    // EXCEPTION: ROPA garments decode INLINE (skate3_native_render_scene_
+    // ropa_inline): the worker route put the GPU-resident cloth shape 1-2
+    // frames behind the body, visible as jelly/clip-through-torso during
+    // direction changes (the shape only pauses when motion is steady). A
+    // garment decode is sub-millisecond (a few hundred verts; it was
+    // lumped in with the expensive texture decodes in the perf overhaul),
+    // and the game's ping-pong double buffer makes the LIVE read tear-safe
+    // (the sim writes the other half).
+    const bool ropa_inline =
+        item.ropa && REXCVAR_GET(skate3_native_render_scene_ropa_inline);
     const bool dynamic_payload = item.skinned || item.cloth_quads || item.ropa;
     auto it = g_r.meshes.find(item.mesh);
     if (item.retained &&
@@ -12209,7 +13598,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
         REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
-      if (item.cloth_quads) {
+      if (item.cloth_quads || ropa_inline) {
         const uint64_t submission = command_processor->GetCurrentSubmission();
         g_r.retired.emplace_back(it->second.vb, submission);
         g_r.retired.emplace_back(it->second.ib, submission);
@@ -12222,7 +13611,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     if (it == g_r.meshes.end()) {
-      if (!item.cloth_quads) {
+      if (!item.cloth_quads && !ropa_inline) {
         // ALL mesh misses decode on the workers, including first-sight
         // skinned entities (a streamed-in NPC appears 1-2 frames late
         // instead of hitching the frame; the dyn decode jobs usually land
@@ -12350,11 +13739,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               frame_number + (tit->second.recheck_count < 3
                                   ? (2ull << tit->second.recheck_count)
                                   : 16ull);
+          const uint64_t fp = SampleProbeFingerprint(base, tit->second);
+          const bool fp_new = fp != 0 && fp != tit->second.payload_fp;
           if (tit->second.recheck_count < 3) {
             ++tit->second.recheck_count;
           }
-          const uint64_t fp = SampleProbeFingerprint(base, tit->second);
-          payload_changed = fp != 0 && fp != tit->second.payload_fp;
+          // An incomplete decode (truncated tiled-mip copy, zeroed
+          // blocks) re-decodes regardless of the mip-0 fingerprint: the
+          // missing bytes are in HIGHER mips the probes never sample.
+          // near_black re-decodes like incomplete: the compose may have
+          // finished between the decode and its probe sample, leaving a
+          // stable fingerprint on a black verdict; without this the
+          // bright fallback would stick forever. The commit's
+          // same_content dedup drops the re-decode when the page really
+          // is still black (one worker round trip per steady poll).
+          payload_changed = fp_new || tit->second.incomplete ||
+                            tit->second.near_black;
         }
         // words_changed re-decodes are throttled by retry_after_frame on the
         // VALID entry (retry_failed already gates invalid ones): streaming
@@ -12485,6 +13885,28 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                      uint32_t slot) -> const GuestTexture* {
       tex_pending = false;
       const GuestTexture* t = resolve_texture_raw(tex_ptr);
+      // Near-uniform-black decodes on the WHITE-NEUTRAL slots (1 lightmap,
+      // 2 macro) serve the white fallback until a heal lands real content.
+      // Lightmap: a real-but-black page binds with tint.r > 0 and the CSM
+      // min-clamp renders the surface BLACK (the door 59810af's shader gate
+      // cannot see). Macro: since 59810af the weathering multiplies OVER
+      // the composited decal art, so a mid-stream dark macro decode turns
+      // the paint into the black-square flash; white is the macro's
+      // authored neutral (materials without weathering bind default_white).
+      // Slots with legitimately dark content (diffuse, decal art, spec)
+      // are untouched. Applied in the wrapper so retained items get the
+      // same protection.
+      if ((slot == 1 || slot == 2) && t != &g_r.white && t->valid &&
+          t->near_black) {
+        static std::atomic<uint32_t> s_nb_logs{0};
+        if (s_nb_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+          REXLOG_INFO(
+              "native-scene: near-black decode obj={:08X} slot={} served as "
+              "white fallback (mid-compose/stream content)",
+              tex_ptr, slot);
+        }
+        return &g_r.white;
+      }
       if (item.retained || tex_ptr == 0) {
         return t;
       }
@@ -12709,6 +14131,21 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // PS hair branch samples it at the raw second texcoord. The white
       // fallback keeps failed decodes opaque rather than invisible.
       decal_tex = resolve_texture(item.hair_alpha_tex, 5);
+    }
+    // F7 ring: stamp the SERVED content fingerprints (see SceneRingItem);
+    // pointer identity cannot see an in-place content swap.
+    if (ring_frame != nullptr) {
+      const auto rit = ring_map.find(&item);
+      if (rit != ring_map.end()) {
+        SceneRingItem& ri = ring_frame->items[rit->second];
+        const auto fp_of = [](const GuestTexture* t) -> uint64_t {
+          return t != nullptr && t->valid ? t->payload_fp : 0;
+        };
+        ri.fp_diffuse = fp_of(diffuse);
+        ri.fp_lightmap = fp_of(lightmap);
+        ri.fp_macro = fp_of(macro_tex);
+        ri.fp_decal = fp_of(decal_tex);
+      }
     }
     // Exact env families without decal art bind the material's spec/ecc/
     // refmask map (or the animated.tree noise tint) in the free decal slot;
@@ -12959,7 +14396,91 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cube_gpu.ptr += size_t(cube_tex->srv_slot) * g_r.srv_size;
     context.d3d12.set_graphics_root_descriptor_table(
         context.d3d12.command_processor_user_data, 8, cube_gpu);
-    list.D3DIASetVertexBuffers(0, 1, &buffers.vb_view);
+    // ROPA shape blend (see RendererState::ropa_shapes): combine the shape
+    // generations with the kernel weights InterpolateDynamicItems computed
+    // (the SAME 8-tap boxcar / pair-lerp the body bones and garment world
+    // took this frame) into the per-frame ropa upload ring and draw from
+    // it; the stepped cloth shape against the interpolated body was the
+    // tee jelly/clip-through, and a filter-MISMATCHED blend (plain lerp vs
+    // boxcar body) kept a period-scaled residue of it. Positions/normals
+    // (floats 0..6) blend; packed attributes (blend words, uvs: floats
+    // 7..13) copy from the newest generation present. Generations missing
+    // from the ring (evicted / decode in flight) renormalize over what IS
+    // present when at least half the kernel's weight survives.
+    D3D12_VERTEX_BUFFER_VIEW item_vbv = buffers.vb_view;
+    if (item.ropa && item.shape_count > 0 &&
+        REXCVAR_GET(skate3_native_render_scene_ropa_blend)) {
+      const std::vector<float>* gv[DrawItem::kShapeGens] = {};
+      float gw[DrawItem::kShapeGens] = {};
+      int ng = 0;
+      float total = 0.0f;
+      uint64_t newest_seq = 0;
+      const std::vector<float>* newest = nullptr;
+      // Generations must match the RESIDENT decode's extent exactly; the
+      // index buffer references that many vertices. After a re-stream/
+      // outfit swap the ring briefly holds stale-size generations; binding
+      // one against the current IB reads past the bound VB and collapses
+      // triangles (a momentary partial-invisible blink). Stale sizes drop
+      // out here; if too much kernel weight is stale, the raw resident VB
+      // draws instead (always self-consistent).
+      const size_t want_floats =
+          size_t(buffers.vb_view.SizeInBytes) / sizeof(float);
+      const auto rit = g_r.ropa_shapes.find(item.mesh);
+      if (rit != g_r.ropa_shapes.end()) {
+        for (int k = 0; k < item.shape_count; ++k) {
+          for (const RendererState::RopaGen& g : rit->second) {
+            if (g.seq != item.shape_seq[k]) {
+              continue;
+            }
+            if (g.verts.size() != want_floats) {
+              break;  // stale-size generation (re-stream/outfit swap)
+            }
+            gv[ng] = &g.verts;
+            gw[ng] = item.shape_w[k];
+            total += item.shape_w[k];
+            ++ng;
+            if (g.seq >= newest_seq) {
+              newest_seq = g.seq;
+              newest = &g.verts;
+            }
+            break;
+          }
+        }
+      }
+      const uint32_t region =
+          uint32_t(frame_number % RendererState::kBoneRegions) *
+          RendererState::kRopaRegionSize;
+      const uint32_t bytes = uint32_t(want_floats * sizeof(float));
+      if (ng > 0 && total >= 0.5f && newest != nullptr &&
+          buffers.vb_view.StrideInBytes == 56 &&
+          g_r.ropa_ring_offset + bytes <= RendererState::kRopaRegionSize) {
+        float* dst = reinterpret_cast<float*>(g_r.ropa_ring_cpu + region +
+                                              g_r.ropa_ring_offset);
+        const float inv = 1.0f / total;
+        for (size_t v = 0; v + 14 <= want_floats; v += 14) {
+          float blend7[7] = {};
+          for (int k = 0; k < ng; ++k) {
+            const float* src = gv[k]->data() + v;
+            const float wk = gw[k] * inv;
+            for (int f = 0; f < 7; ++f) {
+              blend7[f] += src[f] * wk;
+            }
+          }
+          // One store per float: dst is write-combined upload memory.
+          std::memcpy(dst + v, blend7, sizeof(blend7));
+          std::memcpy(dst + v + 7, newest->data() + v + 7, 7 * sizeof(float));
+        }
+        item_vbv.BufferLocation = g_r.ropa_ring->GetGPUVirtualAddress() +
+                                  region + g_r.ropa_ring_offset;
+        item_vbv.SizeInBytes = bytes;
+        item_vbv.StrideInBytes = buffers.vb_view.StrideInBytes;
+        g_r.ropa_ring_offset += (bytes + 255u) & ~255u;
+        g_ropa_blend_drawn.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        g_ropa_blend_miss.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    list.D3DIASetVertexBuffers(0, 1, &item_vbv);
     list.D3DIASetIndexBuffer(&buffers.ib_view);
     for (const DrawEntry& draw : item.draws) {
       if (draw.prim == 4) {
@@ -12972,6 +14493,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index, draw.base_vertex,
                                    0);
       ++drawn;
+      if (ring_frame != nullptr) {
+        const auto rit = ring_map.find(&item);
+        if (rit != ring_map.end()) {
+          ++ring_frame->items[rit->second].drawn;
+        }
+      }
     }
   };
 
@@ -13023,6 +14550,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (debug_mode == 3 && index >= 20) {
       break;
     }
+    if (ring_frame != nullptr) {
+      SceneRingItem ri{};
+      ri.ctx = item.ctx;
+      ri.mesh = item.mesh;
+      ri.diffuse = item.diffuse_tex;
+      ri.lightmap = item.lightmap_tex;
+      ri.vb_obj = item.vb_obj;
+      ri.spec = item.spec_tex;
+      ri.macro = item.macro_tex;
+      ri.decal_art = item.decal_art;
+      ri.wnormal = item.water_normal;
+      uint32_t idx_total = 0;
+      for (const DrawEntry& e : item.draws) {
+        idx_total += e.index_count;
+      }
+      ri.indices = idx_total;
+      ri.env_family = item.env_family;
+      ri.char_family = item.char_family;
+      ri.flags = uint8_t((item.transparent ? 1u : 0u) | (item.water ? 2u : 0u) |
+                         (item.skinned ? 4u : 0u) | (item.retained ? 8u : 0u) |
+                         (item.pending ? 16u : 0u) |
+                         (item.caster_bank ? 32u : 0u) |
+                         (item.decal ? 64u : 0u));
+      ring_map.emplace(&item, uint32_t(ring_frame->items.size()));
+      ring_frame->items.push_back(ri);
+    }
     // Hair with a validated lighting capture joins the sorted alpha
     // sub-pass (strand coverage blend, depth test on / z-write off, the
     // game's own hair render state); without the capture it stays on the
@@ -13041,25 +14594,68 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                              char_capture_ok &&
                              REXCVAR_GET(skate3_native_render_scene_entity_fade);
     const float fade_a = entity_fade ? CharFadeAlpha(item) : 1.0f;
-    if (entity_fade && fade_a <= 0.004f) {
+    // One-frame fade-blink guard: a mesh that rendered ~opaque last frame
+    // cannot legitimately sit at alpha 0 this frame; the game's spawn/
+    // distance fades ramp over ~0.5 s. An opaque->0 step means a garbage/
+    // foreign constant row served the alpha this capture (the clone-shared
+    // char-rows suspect; observed as part of the tee flickering invisible
+    // for a moment). Repair: draw the item OPAQUE this frame (skip the fade
+    // skip + the mid-fade blend routing) and log it. The last-alpha map
+    // updates from the RAW value, so a persisting alpha 0 (real despawn /
+    // spawn settle) only gets one repaired frame and then skips normally.
+    bool fade_blink = false;
+    if (item.char_family != 0 && debug_mode == 0) {
+      static std::unordered_map<uint32_t, uint8_t> s_fade_opaque;  // render thread
+      uint8_t& was_opaque = s_fade_opaque[item.mesh];
+      if (entity_fade && fade_a <= 0.004f && was_opaque) {
+        fade_blink = true;
+        static std::atomic<uint64_t> s_blinks{0};
+        const uint64_t n = s_blinks.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16 || (n & 255u) == 0) {
+          REXLOG_INFO(
+              "native-scene: fade BLINK repaired mesh={:08X} fam={} ropa={} "
+              "src={} rows13=({:.3f},{:.3f},{:.3f},{:.3f}) "
+              "rows14=({:.3f},{:.3f}) (n={})",
+              item.mesh, item.char_family, item.ropa ? 1 : 0, item.dbg_src,
+              item.char_rows[13 * 4 + 0], item.char_rows[13 * 4 + 1],
+              item.char_rows[13 * 4 + 2], item.char_rows[13 * 4 + 3],
+              item.char_rows[14 * 4 + 0], item.char_rows[14 * 4 + 1], n);
+        }
+      }
+      was_opaque = (!entity_fade || fade_a > 0.9f) ? 1 : 0;
+      if (s_fade_opaque.size() > 1024) {
+        s_fade_opaque.clear();
+      }
+    }
+    if (entity_fade && fade_a <= 0.004f && !fade_blink) {
       continue;
     }
-    const bool char_fade_blend = char_fade_zwrite(item);
+    const bool char_fade_blend = char_fade_zwrite(item) && !fade_blink;
     // environment.reflective_trans (fam 13): blended glass canopies, joins
     // the sorted alpha sub-pass whenever its exact branch is live (same
     // shadow_valid gate as cam_pos.w = -fam; the legacy fallback renders it
     // opaque exactly as before classification).
     const bool refl_trans_blend =
         item.env_family == 13 && scene.shadow_valid;
+    const auto stamp_route = [&](uint8_t route) {
+      if (ring_frame != nullptr) {
+        const auto rit = ring_map.find(&item);
+        if (rit != ring_map.end()) {
+          ring_frame->items[rit->second].route = route;
+        }
+      }
+    };
     if ((item.transparent || item.water || hair_blend || glass_blend ||
          refl_trans_blend || char_fade_blend) &&
         debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
+        stamp_route(2);
       }
       continue;
     }
     opaque_items.emplace_back(view_dist2(item), &item);
+    stamp_route(1);
   }
   if (REXCVAR_GET(skate3_native_render_scene_sort_opaque) && debug_mode == 0) {
     std::stable_sort(opaque_items.begin(), opaque_items.end(),
@@ -13151,10 +14747,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (it == g_r.textures_2d.end()) {
       // HUD/spline art decodes inline (small; async would flash UI elements
       // white on first sight). The big streamed posters go through
-      // resolve_fetch_words -> the worker queue instead.
+      // resolve_fetch_words -> the worker queue instead. Small radial tiles
+      // (score ring quadrants / meter arcs) regenerate at Nx first, see
+      // EnsureHudTileRegen; everything else keeps the plain decode.
       const auto hud_t0 = PerfClock::now();
       GuestTexture gt;
-      EnsureGuestTextureFromWords(context, base, fetch, gt);
+      const int32_t regen = REXCVAR_GET(skate3_native_render_scene_2d_tile_regen);
+      if (regen < 2 || !EnsureHudTileRegen(context, base, fetch, regen, gt)) {
+        EnsureGuestTextureFromWords(context, base, fetch, gt);
+      }
       g_pw_tex_decode.Add(perf_ns_since(hud_t0));
       if (!gt.valid) {
         static std::unordered_set<uint64_t> logged;
@@ -13359,6 +14960,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       scene_2d = g_scene_2d;
     }
     if (!scene_2d.empty()) {
+      // Per-GAUGE composite reconstruction (frame-local rewrite: redirects
+      // grouped quadrant quads to joint regenerated textures).
+      ApplyGaugeComposites(context, scene_2d);
       list.D3DSetPipelineState(g_r.pso_2d);
       // One shared draw routine for both the RTT passes and the screen pass.
       // ui_region/ui_offset continue after the spline pass's allocations.
@@ -13372,7 +14976,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           return;
         }
         std::memcpy(g_r.ui_ring_cpu + ui_region + ui_offset, d.verts.data(), bytes);
-        const uint32_t srv_slot = resolve_2d_texture(d.fetch)->srv_slot;
+        const uint32_t srv_slot = d.composite_srv >= 0
+                                      ? uint32_t(d.composite_srv)
+                                      : resolve_2d_texture(d.fetch)->srv_slot;
         float constants[40];
         std::memcpy(constants, d.consts, sizeof(d.consts));
         // 2D ortho draws have no translation row in the projection (c3 ==
@@ -13381,7 +14987,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         const bool ortho = d.consts[12] == 0.0f && d.consts[13] == 0.0f &&
                            d.consts[14] == 0.0f && d.consts[15] == 1.0f;
         constants[36] = ortho ? 1.0f : 0.0f;
-        constants[37] = 0.0f;
+        // m[9].y: sharp-magnification amount for APT cached-bitmap tiles
+        // (see the cvar; the shader gates on actual fetch magnification).
+        constants[37] = float(std::clamp(
+            REXCVAR_GET(skate3_native_render_scene_2d_sharp), 0.0, 2.0));
         constants[38] = 0.0f;
         constants[39] = 0.0f;
         list.D3DSetGraphicsRoot32BitConstants(0, 40, constants, 0);
@@ -13417,6 +15026,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
   g_pw_render.Add(perf_ns_since(render_t0));
   const uint64_t frames = g_frames_rendered.fetch_add(1) + 1;
+  MaybeDumpSceneRing();
   LogFrameStats(scene, frames, drawn, drawn_2d, drawn_spline, shadow_ready,
                 shadow_draws);
   return true;
