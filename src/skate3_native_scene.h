@@ -309,6 +309,20 @@ struct FrameScene {
   // blue in every capture), refreshed from the guest edge-detect draw when
   // it runs. Consumed by the outline composite when any item is selected.
   float outline_color[4] = {0.21569f, 0.64706f, 1.0f, 1.0f};
+  // Photo-editor postfx chain (photo_fx.hlsl, exact ucode ports): the live
+  // PS/VS constant rows of the game's own postfx passes, captured per frame
+  // at the SetPending_AluConstants hook while a photo-mission photo editor
+  // is up, plus the fetch words of the two static input textures the chain
+  // samples (the 512x2 vignette gradient and the grain texture). Pass order:
+  // visualfx, dof downsample, tap9dofMotionBlur, tap9dof, uber, fisheye.
+  struct PhotoFx {
+    bool valid = false;
+    float ps[6][32][4] = {};
+    float vs[6][8][4] = {};
+    uint32_t vignette_fetch[6] = {};
+    uint32_t grain_fetch[6] = {};
+  };
+  PhotoFx photo_fx;
   std::vector<DrawItem> items;
 };
 
@@ -364,6 +378,11 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
 // / contrast effects are the game's own postfx chain, which only the
 // emulated path executes.
 void OnPhotoReplayUpdate();
+// Called from the Sk8::FE::FrontEndState_Replay2::TakePhoto hook: a photo
+// was just taken (replay editor / photo mission). Arms the photo-grab
+// forced-readback window for the frames that render and CPU-grab the
+// screenshot target.
+void OnTakePhoto();
 void OnMovieDecode();
 void OnMovieFrame(uint8_t* base, uint32_t renderer);
 

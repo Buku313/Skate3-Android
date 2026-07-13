@@ -751,6 +751,20 @@ extern "C" REX_FUNC(sub_825623F0) {
   __imp__sub_825623F0(ctx, base);
 }
 
+// Sk8::FE::FrontEndState_Replay2::TakePhoto(): fires once when the player
+// takes a photo (replay editor / photo mission Select). The game then
+// renders the shot into the 1152x640 PostFX screenshot target, resolves it,
+// and ScreenshotBackEnd::GrabScreenshot CPU-reads the resolved guest memory
+// to JPEG-encode it, which is all zeros unless resolve readback is forced
+// (the invisible-final-photo bug: an F11 capture showed the grab texture
+// 0x04911000 memory fully zero). Arms the photo-grab readback window.
+extern "C" REX_FUNC(sub_826147C8) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnTakePhoto();
+  }
+  __imp__sub_826147C8(ctx, base);
+}
+
 // rw::movie::MovieDecoder::Decode(int, VideoRenderable**,
 // SubtitleRenderable*): fires per decoded FMV frame while any movie plays
 // (boot intro logos and all other rw::movie playback). Heartbeat for the

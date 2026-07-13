@@ -140,6 +140,41 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_photo_yield, true, "Skate 3",
                     "is fine. Detected by polling the FrontEndManager NIS push-state "
                     "stack (plus the PhotoReplayController heartbeat as a backup).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_photo_readback, true, "Skate 3",
+    "While a photo flow is active (the photo-mission editor, or a few "
+    "seconds after any TakePhoto), arm the SDK's forced small-resolve CPU "
+    "readback (native_render_force_resolve_readback_max_length) and lift "
+    "emulated-draw suppression. The game takes photos by CPU-reading a "
+    "resolved 1152x640 PostFX screenshot target from guest memory "
+    "(ScreenshotBackEnd::GrabScreenshot -> JPEG); photo missions keep the "
+    "gameplay presence context so no readback path ever ran and the grabbed "
+    "memory stayed all-zero; the final photo display and the saved photo "
+    "were BLACK. Costs one synchronous readback per small resolve, photo-flow "
+    "frames only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_photo_native, true, "Skate 3",
+    "Render the photo-mission photo editor NATIVELY, applying the game's "
+    "own postfx chain (depth of field / saturation / brightness / contrast "
+    "/ lens vignette) as exact ucode ports (photo_fx.hlsl: visualfx -> DOF "
+    "downsample -> tap9dofMotionBlur -> tap9dof -> uber -> fisheye) driven "
+    "by the LIVE constants the game stages for its own (suppressed) postfx "
+    "draws each frame. Takes precedence over "
+    "skate3_native_render_scene_photo_yield; if the pass captures are not "
+    "yet fresh (first frames of the editor), the scene renders without the "
+    "effects until they land. Known deltas: the motion-accumulation feed "
+    "(see photo_native_accum), the bloom pyramid contribution (disabled in "
+    "every editor capture), grade LUT served as identity, deck AO.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_photo_native_accum, 0, "Skate 3",
+    "Source for the visualfx pass's quarter-res motion-accumulation input "
+    "(the game feeds a jitter-accumulated buffer natively unmodeled): 0 = "
+    "black, 1 = downsampled scene (pre-grade), 2 = downsampled final frame. "
+    "Compare against the emulated editor (F11 pair) and keep the match.")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_pause_native, true, "Skate 3",
                     "Keep the NATIVE renderer active through the in-game pause menu "
                     "instead of yielding to the emulated output. Pause is told apart "
@@ -568,6 +603,13 @@ REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
 // (pitch > 512, in the mode-2 suppressed band) execute; see
 // skate3_native_render_scene_menu_rtt_passes.
 REXCVAR_DECLARE(int32_t, native_render_suppress_mode);
+// SDK-level forced resolve readback window (rexglue command_processor.cpp /
+// both backends' IssueCopy): when > 0, resolves up to that byte length are
+// synchronously read back to CPU-visible guest memory regardless of
+// readback_resolve and gameplay state. Armed by UpdatePhotoGrabWindow while
+// a photo flow is active; the game CPU-reads the resolved screenshot
+// target to build the photo JPEG.
+REXCVAR_DECLARE(int32_t, native_render_force_resolve_readback_max_length);
 // SDK-level async pipeline compilation (rexglue command_processor.cpp): the
 // d3d12 backend SKIPS draws whose pipeline is still compiling. Forced
 // synchronous during menu contexts by YieldForMenus so one-shot portrait
@@ -2811,6 +2853,120 @@ void OnAddRenderInstance(uint8_t* base, uint32_t instance) {
   QueueModelMeshes(base, model);
 }
 
+// ---- Photo-editor postfx capture (FrameScene::PhotoFx / photo_fx.hlsl) ----
+// While a photo flow is active (g_photo_flow_frame, armed by
+// UpdatePhotoGrabWindow), the SetPending_AluConstants hook snapshots each
+// postfx pass's final PS/VS constant rows plus the device fetch-constant
+// shadow (device+0x480, the source SetPending_FetchConstants emits to the
+// ring) at the moment the game flushes them, the only reliable point:
+// draw-entry bank reads return stale values for these postfx draws (the
+// same staleness class the blur capture works around with its c0 gate).
+enum PfxPass {
+  kPfxVisualFx = 0,
+  kPfxDofDown,
+  kPfxDofMB,
+  kPfxDof,
+  kPfxUber,
+  kPfxFisheye,
+  kPfxPassCount
+};
+struct PfxCapture {
+  float ps[32][4];
+  float vs[8][4];
+  uint32_t fetch[8][6];
+  int64_t ps_ns;  // PerfClock stamp of the last PS-row capture (0 = never)
+  bool vs_seen;
+};
+PfxCapture g_pfx_cap[kPfxPassCount] = {};
+std::atomic<bool> g_photo_flow_frame{false};
+// Defined with the yield helpers below (anonymous namespace); used by the
+// BuildFrameScene publish gate (the chain must only run while the editor
+// itself is up).
+namespace {
+const char* PhotoEditorSignal(uint8_t* base);
+}  // namespace
+
+// Debug-path classification, cached per shader object (guest render thread
+// only, like the blur classifier). -1 = not a photo postfx shader.
+int ClassifyPfxShader(uint8_t* base, uint32_t obj) {
+  if (obj == 0 || !GuestReadableApprox(base, obj)) {
+    return -1;
+  }
+  static std::unordered_map<uint32_t, int> cache;
+  auto it = cache.find(obj);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  char text[112] = {};
+  for (int k = 0; k < 111; ++k) {
+    text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+    if (text[k] == '\0') break;
+  }
+  int pass = -1;
+  if (std::strstr(text, "postfx_visualfxPS") != nullptr) {
+    pass = kPfxVisualFx;
+  } else if (std::strstr(text, "bloom_dof_motionblur_dof_dowsample") != nullptr) {
+    // sic: the game's own shader name carries the 'dowsample' typo.
+    pass = kPfxDofDown;
+  } else if (std::strstr(text, "bloom_dof_tap9dofMotionBlur") != nullptr) {
+    pass = kPfxDofMB;
+  } else if (std::strstr(text, "bloom_dof_tap9dofPS") != nullptr) {
+    pass = kPfxDof;
+  } else if (std::strstr(text, "postfx_uberPS") != nullptr) {
+    pass = kPfxUber;
+  } else if (std::strstr(text, "postfx_basictex_fisheye") != nullptr) {
+    pass = kPfxFisheye;
+  }
+  if (cache.size() < 4096) {
+    cache.emplace(obj, pass);
+  }
+  return pass;
+}
+
+void CapturePfxConstants(uint8_t* base, uint32_t bank_ptr, uint32_t device,
+                         bool pixel) {
+  // Shader labels can be swapped in the OnSetShader hook; classify both.
+  int pass = ClassifyPfxShader(base, g_cur_ps_obj.load(std::memory_order_relaxed));
+  if (pass < 0) {
+    pass = ClassifyPfxShader(base, g_cur_vs_obj.load(std::memory_order_relaxed));
+  }
+  if (pass < 0) {
+    return;
+  }
+  PfxCapture& cap = g_pfx_cap[pass];
+  // First-hit diagnostics: which passes ever capture, and on which side.
+  static uint8_t s_seen[kPfxPassCount][2] = {};
+  if (!s_seen[pass][pixel ? 0 : 1]) {
+    s_seen[pass][pixel ? 0 : 1] = 1;
+    REXLOG_INFO("native-scene: pfx capture first hit pass={} {} bank={:08X}", pass,
+                pixel ? "PS" : "VS", bank_ptr);
+  }
+  if (pixel) {
+    for (int r = 0; r < 32; ++r) {
+      for (int i = 0; i < 4; ++i) {
+        cap.ps[r][i] = LoadGuestF32(base, bank_ptr + uint32_t(r * 4 + i) * 4);
+      }
+    }
+    if (device != 0 && GuestReadableApprox(base, device + 0x480)) {
+      for (int s = 0; s < 8; ++s) {
+        for (int w = 0; w < 6; ++w) {
+          cap.fetch[s][w] = REX_LOAD_U32(device + 0x480 + uint32_t(s * 6 + w) * 4);
+        }
+      }
+    }
+    cap.ps_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    PerfClock::now().time_since_epoch())
+                    .count();
+  } else {
+    for (int r = 0; r < 8; ++r) {
+      for (int i = 0; i < 4; ++i) {
+        cap.vs[r][i] = LoadGuestF32(base, bank_ptr + uint32_t(r * 4 + i) * 4);
+      }
+    }
+    cap.vs_seen = true;
+  }
+}
+
 void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t ptr,
                         uint32_t device) {
   (void)base;
@@ -2823,6 +2979,9 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
   }
   if (bank == 0x4400) {
     g_ps_bank.store(ptr, std::memory_order_relaxed);
+    if (g_photo_flow_frame.load(std::memory_order_relaxed)) {
+      CapturePfxConstants(base, ptr, device, /*pixel=*/true);
+    }
     return;
   }
   if (bank != 0x4000) {
@@ -2830,6 +2989,9 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
   }
   g_vs_uploads.fetch_add(1, std::memory_order_relaxed);
   g_vs_bank.store(ptr, std::memory_order_relaxed);
+  if (g_photo_flow_frame.load(std::memory_order_relaxed)) {
+    CapturePfxConstants(base, ptr, device, /*pixel=*/false);
+  }
 }
 
 // Last PhotoReplayController::Update heartbeat, nanoseconds on PerfClock
@@ -2839,6 +3001,21 @@ static std::atomic<int64_t> g_photo_replay_last_ns{-1};
 
 void OnPhotoReplayUpdate() {
   g_photo_replay_last_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          PerfClock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+}
+
+// Last FrontEndState_Replay2::TakePhoto heartbeat: a photo was just taken
+// (replay editor or photo mission). The frames that follow render and
+// CPU-grab the 1152x640 screenshot target, so the forced-readback window
+// (UpdatePhotoGrabWindow) stays armed for a few seconds after it. Same
+// thread contract as the photo-replay heartbeat above.
+static std::atomic<int64_t> g_take_photo_last_ns{-1};
+
+void OnTakePhoto() {
+  g_take_photo_last_ns.store(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           PerfClock::now().time_since_epoch())
           .count(),
@@ -4415,6 +4592,29 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
             g_proxy_frame_done = true;
           }
         }
+      }
+    }
+  }
+  // Photo-editor postfx capture FALLBACK at the draw hook: the SetPending
+  // hook is the preferred site, but if the postfx constants never flush
+  // through it (or classification misses there), capture here from the
+  // last-known bank pointers; a draw capture proved the
+  // visualfx PS rows read correctly from g_ps_bank at this point.
+  if (flags2d == 0 && SceneEnabled() &&
+      g_photo_flow_frame.load(std::memory_order_relaxed)) {
+    int pfx_pass = ClassifyPfxShader(base, g_cur_ps_obj.load(std::memory_order_relaxed));
+    if (pfx_pass < 0) {
+      pfx_pass = ClassifyPfxShader(base, g_cur_vs_obj.load(std::memory_order_relaxed));
+    }
+    if (pfx_pass >= 0) {
+      const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+      const uint32_t vs_bank = g_vs_bank.load(std::memory_order_relaxed);
+      const uint32_t dev = g_device.load(std::memory_order_relaxed);
+      if (ps_bank != 0) {
+        CapturePfxConstants(base, ps_bank, dev, /*pixel=*/true);
+      }
+      if (vs_bank != 0) {
+        CapturePfxConstants(base, vs_bank, dev, /*pixel=*/false);
       }
     }
   }
@@ -8290,6 +8490,74 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
   g_ui_blur_seen = false;
+  // Photo-editor postfx: publish the live pass captures when the photo
+  // EDITOR itself is up (not the wider TakePhoto readback window: the
+  // chain must never run over ordinary gameplay frames) and every pass has
+  // fresh rows (the game stages its postfx constants each frame regardless
+  // of draw suppression). The vignette and grain fetch words come from the
+  // fisheye/uber fetch-shadow snapshots (slot 2 / slot 6 per the
+  // ring-verified bindings).
+  if (uint8_t* pfx_base = g_guest_base.load(std::memory_order_relaxed);
+      pfx_base != nullptr && g_photo_flow_frame.load(std::memory_order_relaxed) &&
+      PhotoEditorSignal(pfx_base) != nullptr) {
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               PerfClock::now().time_since_epoch())
+                               .count();
+    bool fresh = true;
+    for (int p = 0; p < kPfxPassCount; ++p) {
+      if (g_pfx_cap[p].ps_ns == 0 || now_ns - g_pfx_cap[p].ps_ns > 1'000'000'000 ||
+          !g_pfx_cap[p].vs_seen) {
+        fresh = false;
+      }
+    }
+    if (!fresh) {
+      // Name the missing pass(es), once per ~2 s while in the window.
+      static int64_t s_diag_ns = 0;
+      if (now_ns - s_diag_ns > 2'000'000'000) {
+        s_diag_ns = now_ns;
+        char buf[160];
+        int off = 0;
+        for (int p = 0; p < kPfxPassCount; ++p) {
+          const int64_t age_ms =
+              g_pfx_cap[p].ps_ns == 0 ? -1 : (now_ns - g_pfx_cap[p].ps_ns) / 1'000'000;
+          off += std::snprintf(buf + off, sizeof(buf) - off, " p%d[ps%lldms vs%d]", p,
+                               (long long)age_ms, g_pfx_cap[p].vs_seen ? 1 : 0);
+          if (off >= int(sizeof(buf)) - 24) break;
+        }
+        REXLOG_INFO("native-scene: pfx captures NOT fresh:{}", buf);
+      }
+    }
+    if (fresh) {
+      scene.photo_fx.valid = true;
+      for (int p = 0; p < kPfxPassCount; ++p) {
+        std::memcpy(scene.photo_fx.ps[p], g_pfx_cap[p].ps,
+                    sizeof(scene.photo_fx.ps[p]));
+        std::memcpy(scene.photo_fx.vs[p], g_pfx_cap[p].vs,
+                    sizeof(scene.photo_fx.vs[p]));
+      }
+      std::memcpy(scene.photo_fx.vignette_fetch, g_pfx_cap[kPfxFisheye].fetch[2],
+                  sizeof(scene.photo_fx.vignette_fetch));
+      std::memcpy(scene.photo_fx.grain_fetch, g_pfx_cap[kPfxUber].fetch[6],
+                  sizeof(scene.photo_fx.grain_fetch));
+      static bool s_pfx_logged = false;
+      if (!s_pfx_logged) {
+        s_pfx_logged = true;
+        REXLOG_INFO(
+            "native-scene: photo postfx captures LIVE (visualfx c0=({:.3f},{:.3f},"
+            "{:.3f},{:.3f}) dof c0.x={:.4f} uber c5=({:.3f},{:.3f},{:.3f},{:.3f}) "
+            "fisheye c1=({:.3f},{:.3f},{:.3f}) vignette=[{:08X} {:08X}] "
+            "grain=[{:08X} {:08X}])",
+            g_pfx_cap[kPfxVisualFx].ps[0][0], g_pfx_cap[kPfxVisualFx].ps[0][1],
+            g_pfx_cap[kPfxVisualFx].ps[0][2], g_pfx_cap[kPfxVisualFx].ps[0][3],
+            g_pfx_cap[kPfxDof].ps[0][0], g_pfx_cap[kPfxUber].ps[5][0],
+            g_pfx_cap[kPfxUber].ps[5][1], g_pfx_cap[kPfxUber].ps[5][2],
+            g_pfx_cap[kPfxUber].ps[5][3], g_pfx_cap[kPfxFisheye].ps[1][0],
+            g_pfx_cap[kPfxFisheye].ps[1][1], g_pfx_cap[kPfxFisheye].ps[1][2],
+            scene.photo_fx.vignette_fetch[0], scene.photo_fx.vignette_fetch[1],
+            scene.photo_fx.grain_fetch[0], scene.photo_fx.grain_fetch[1]);
+      }
+    }
+  }
   std::memcpy(g_fog_cam, scene.cam_pos, sizeof(g_fog_cam));
   g_fog_frame_done = false;
   g_shadow_frame_done = false;
@@ -9007,6 +9275,34 @@ struct RendererState {
   bool outline_mask_srv_allocated = false;
   ID3D12PipelineState* pso_outline_mask = nullptr;
   ID3D12PipelineState* pso_outline_edge = nullptr;
+  // Photo-editor postfx chain (photo_fx.hlsl: exact ucode ports, see
+  // FrameScene::PhotoFx). Own root signature: root CBV b0 (the pass's 256
+  // captured/baked constant rows) + eight single-SRV tables t0..t7 + three
+  // static samplers. Intermediates at the game's exact half/quarter sizes
+  // (the DOF tap offsets are baked for them); the full-res stages run at
+  // output resolution. pfx_quarter persists across frames (accumulation
+  // input). All pfx color targets idle in RENDER_TARGET state.
+  static constexpr uint32_t kPfxHalfW = 576, kPfxHalfH = 320;
+  static constexpr uint32_t kPfxQuarterW = 288, kPfxQuarterH = 160;
+  ID3D12RootSignature* pfx_root_sig = nullptr;
+  // PSO order: depthpack, visualfx, dof_down, dof_mb, dof, uber, fisheye, blit.
+  ID3D12PipelineState* pfx_pso[8] = {};
+  ID3D12Resource* pfx_full[2] = {};   // output-res RGBA8 (visualfx out, uber out)
+  ID3D12Resource* pfx_half[2] = {};   // 576x320 RGBA8
+  ID3D12Resource* pfx_quarter = nullptr;  // 288x160 RGBA8 accumulation
+  ID3D12Resource* pfx_depth = nullptr;    // output-res packed-depth RGBA8
+  ID3D12Resource* pfx_lut = nullptr;      // 32^3 identity grade LUT (RGBA8)
+  ID3D12Resource* pfx_lut_upload = nullptr;
+  bool pfx_lut_uploaded = false;
+  ID3D12Resource* pfx_cb = nullptr;  // upload heap, persistently mapped
+  uint8_t* pfx_cb_ptr = nullptr;
+  // Fixed SRV slots: 0/1 = pfx_full, 2/3 = pfx_half, 4 = quarter, 5 =
+  // packed depth, 6 = LUT, 7 = the native MSAA/1x depth resource.
+  uint32_t pfx_srv[8] = {};
+  bool pfx_srv_allocated = false;
+  uint32_t pfx_width = 0, pfx_height = 0;
+  bool pfx_ready = false;
+  bool pfx_failed = false;
   uint32_t rtv_size = 0;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // Buffers replaced by re-decode, kept alive until the GPU has finished the
@@ -11668,8 +11964,9 @@ bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
   ID3D12Device* device = context.d3d12.device;
   if (!g_r.rtv_heap) {
     // Slots 0/1 = guest output / MSAA color; 2+ = APT render-to-texture
-    // targets.
-    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8,
+    // targets; 5/6 = blur intermediates; 7 = outline mask; 8..13 = the
+    // photo-editor postfx chain (full x2, half x2, quarter, packed depth).
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 16,
                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_r.rtv_heap)))) {
       g_r.failed = true;
@@ -11724,6 +12021,258 @@ bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
       return false;
     }
   }
+  return true;
+}
+
+// ---- Photo-editor postfx chain (photo_fx.hlsl) -----------------------------
+// Root signature + eight PSOs + the fixed-size intermediates. Lazy: built on
+// the first photo-editor frame (a one-time ~100 ms compile the frozen-scene
+// editor absorbs invisibly). Output-sized targets are (re)built per frame by
+// the render block on size change.
+bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
+  if (g_r.pfx_ready) {
+    return true;
+  }
+  if (g_r.pfx_failed) {
+    return false;
+  }
+  ID3D12Device* device = context.d3d12.device;
+  const auto fail = [&](const char* what) {
+    REXLOG_ERROR("native-scene: photo postfx pipeline setup failed ({})", what);
+    g_r.pfx_failed = true;
+    return false;
+  };
+  // Root signature: root CBV b0 + eight single-SRV tables (t0..t7; each can
+  // point anywhere in the SRV heap, the established pattern) + samplers.
+  if (g_r.pfx_root_sig == nullptr) {
+    D3D12_ROOT_PARAMETER params[9] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_DESCRIPTOR_RANGE ranges[8] = {};
+    const uint32_t regs[8] = {0, 1, 2, 3, 4, 6, 7, 5};
+    for (int i = 0; i < 8; ++i) {
+      ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      ranges[i].NumDescriptors = 1;
+      ranges[i].BaseShaderRegister = regs[i];
+      params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
+      params[1 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
+      params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_STATIC_SAMPLER_DESC smp[3] = {};
+    smp[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    smp[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp[0].MaxLOD = D3D12_FLOAT32_MAX;
+    smp[0].ShaderRegister = 0;
+    smp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    smp[1] = smp[0];
+    smp[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;  // packed depth
+    smp[1].ShaderRegister = 1;
+    smp[2] = smp[0];
+    smp[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;  // grain
+    smp[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    smp[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    smp[2].ShaderRegister = 2;
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters = 9;
+    desc.pParameters = params;
+    desc.NumStaticSamplers = 3;
+    desc.pStaticSamplers = smp;
+    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    if (!context.d3d12.create_root_signature(context.d3d12.command_processor_user_data,
+                                             &desc, &g_r.pfx_root_sig)) {
+      return fail("root signature");
+    }
+  }
+  // Shaders + PSOs. Pass order matches RendererState::pfx_pso.
+  struct Entry {
+    const char* vs;
+    const char* ps;
+    DXGI_FORMAT rtv;
+  };
+  const Entry entries[8] = {
+      {"vs_raw", "ps_depthpack", DXGI_FORMAT_R8G8B8A8_UNORM},
+      {"vs_offset", "ps_visualfx", DXGI_FORMAT_R8G8B8A8_UNORM},
+      {"vs_offset", "ps_dof_down", DXGI_FORMAT_R8G8B8A8_UNORM},
+      {"vs_offset", "ps_dof_mb", DXGI_FORMAT_R8G8B8A8_UNORM},
+      {"vs_offset", "ps_dof", DXGI_FORMAT_R8G8B8A8_UNORM},
+      {"vs_raw", "ps_uber", DXGI_FORMAT_R8G8B8A8_UNORM},
+      {"vs_scaled", "ps_fisheye", context.d3d12.guest_output_format},
+      {"vs_raw", "ps_blit", DXGI_FORMAT_R8G8B8A8_UNORM},
+  };
+  const D3D_SHADER_MACRO msaa_defines[] = {{"PFX_MSAA", "1"}, {nullptr, nullptr}};
+  for (int i = 0; i < 8; ++i) {
+    ID3DBlob* vs = nullptr;
+    ID3DBlob* ps = nullptr;
+    ID3DBlob* errors = nullptr;
+    const D3D_SHADER_MACRO* defs = (i == 0 && g_r.msaa > 1) ? msaa_defines : nullptr;
+    if (FAILED(D3DCompile(kPhotoFxShaderSource, sizeof(kPhotoFxShaderSource) - 1,
+                          "photo_fx", defs, nullptr, entries[i].vs, "vs_5_0", 0, 0,
+                          &vs, &errors)) ||
+        FAILED(D3DCompile(kPhotoFxShaderSource, sizeof(kPhotoFxShaderSource) - 1,
+                          "photo_fx", defs, nullptr, entries[i].ps, "ps_5_0", 0, 0,
+                          &ps, &errors))) {
+      REXLOG_ERROR("native-scene: photo postfx shader compile failed ({}): {}",
+                   entries[i].ps,
+                   errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+      g_r.pfx_failed = true;
+      return false;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = g_r.pfx_root_sig;
+    pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1;
+    pso.RTVFormats[0] = entries[i].rtv;
+    pso.SampleDesc.Count = 1;
+    const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pfx_pso[i]));
+    vs->Release();
+    ps->Release();
+    if (FAILED(hr)) {
+      return fail(entries[i].ps);
+    }
+  }
+  // Fixed-size intermediates + the identity grade LUT + the CB ring.
+  {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = desc.Format;
+    struct Fixed {
+      ID3D12Resource** res;
+      uint32_t w, h;
+    };
+    const Fixed fixed[3] = {
+        {&g_r.pfx_half[0], RendererState::kPfxHalfW, RendererState::kPfxHalfH},
+        {&g_r.pfx_half[1], RendererState::kPfxHalfW, RendererState::kPfxHalfH},
+        {&g_r.pfx_quarter, RendererState::kPfxQuarterW, RendererState::kPfxQuarterH},
+    };
+    for (const Fixed& f : fixed) {
+      if (*f.res != nullptr) {
+        continue;
+      }
+      desc.Width = f.w;
+      desc.Height = f.h;
+      if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 &clear, IID_PPV_ARGS(f.res)))) {
+        return fail("intermediate target");
+      }
+    }
+    if (g_r.pfx_lut == nullptr) {
+      // 32^3 identity grade LUT (the editor captures run with the LUT blend
+      // weight at 0; identity keeps any treatment that enables it neutral
+      // instead of garbage). Coordinate mapping mirrors the uber literals:
+      // u = g*0.96875 + 0.015625, v = r*(-0.96875) + 0.984375 (flipped),
+      // w = b*0.96875 + 0.015625, so voxel (ix,iy,iz) stores
+      // r = (0.984375 - v)/0.96875, g = (u - 0.015625)/0.96875, b likewise.
+      D3D12_RESOURCE_DESC lut{};
+      lut.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+      lut.Width = 32;
+      lut.Height = 32;
+      lut.DepthOrArraySize = 32;
+      lut.MipLevels = 1;
+      lut.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      lut.SampleDesc.Count = 1;
+      if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &lut,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&g_r.pfx_lut)))) {
+        return fail("LUT");
+      }
+      // Upload: 32 rows of 32 texels x 32 slices, 256-byte row pitch.
+      const uint32_t row_pitch = 256;
+      const uint32_t slice_pitch = row_pitch * 32;
+      g_r.pfx_lut_upload = CreateUploadBuffer(device, size_t(slice_pitch) * 32);
+      if (g_r.pfx_lut_upload == nullptr) {
+        return fail("LUT upload");
+      }
+      uint8_t* p = nullptr;
+      if (FAILED(g_r.pfx_lut_upload->Map(0, nullptr, reinterpret_cast<void**>(&p)))) {
+        return fail("LUT map");
+      }
+      for (uint32_t iz = 0; iz < 32; ++iz) {
+        for (uint32_t iy = 0; iy < 32; ++iy) {
+          uint8_t* row = p + size_t(iz) * slice_pitch + size_t(iy) * row_pitch;
+          const float v = (float(iy) + 0.5f) / 32.0f;
+          const float w = (float(iz) + 0.5f) / 32.0f;
+          const float r = (0.984375f - v) / 0.96875f;
+          const float b = (w - 0.015625f) / 0.96875f;
+          for (uint32_t ix = 0; ix < 32; ++ix) {
+            const float u = (float(ix) + 0.5f) / 32.0f;
+            const float g = (u - 0.015625f) / 0.96875f;
+            row[ix * 4 + 0] = uint8_t(std::clamp(r, 0.0f, 1.0f) * 255.0f + 0.5f);
+            row[ix * 4 + 1] = uint8_t(std::clamp(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+            row[ix * 4 + 2] = uint8_t(std::clamp(b, 0.0f, 1.0f) * 255.0f + 0.5f);
+            row[ix * 4 + 3] = 255;
+          }
+        }
+      }
+      g_r.pfx_lut_upload->Unmap(0, nullptr);
+    }
+    if (g_r.pfx_cb == nullptr) {
+      // 8 pass slots x 4 KB x 4 frames in flight.
+      g_r.pfx_cb = CreateUploadBuffer(device, 8u * 4096u * 4u);
+      if (g_r.pfx_cb == nullptr ||
+          FAILED(g_r.pfx_cb->Map(0, nullptr,
+                                 reinterpret_cast<void**>(&g_r.pfx_cb_ptr)))) {
+        return fail("constant ring");
+      }
+    }
+  }
+  if (!g_r.pfx_srv_allocated) {
+    for (uint32_t& s : g_r.pfx_srv) {
+      s = g_r.srv_next++;
+    }
+    g_r.pfx_srv_allocated = true;
+  }
+  // Fixed-target RTVs (heap slots 10/11 = halves, 12 = quarter) + SRVs.
+  {
+    const auto make_views = [&](ID3D12Resource* res, uint32_t rtv_slot,
+                                uint32_t srv_slot) {
+      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      rtv.ptr += size_t(rtv_slot) * g_r.rtv_size;
+      device->CreateRenderTargetView(res, nullptr, rtv);
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Texture2D.MipLevels = 1;
+      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+      slot.ptr += size_t(srv_slot) * g_r.srv_size;
+      device->CreateShaderResourceView(res, &srv, slot);
+    };
+    make_views(g_r.pfx_half[0], 10, g_r.pfx_srv[2]);
+    make_views(g_r.pfx_half[1], 11, g_r.pfx_srv[3]);
+    make_views(g_r.pfx_quarter, 12, g_r.pfx_srv[4]);
+    // LUT SRV (Texture3D).
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture3D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+    slot.ptr += size_t(g_r.pfx_srv[6]) * g_r.srv_size;
+    device->CreateShaderResourceView(g_r.pfx_lut, &srv, slot);
+  }
+  g_r.pfx_ready = true;
+  REXLOG_INFO("native-scene: photo postfx pipeline ready (8 passes, msaa={})",
+              g_r.msaa);
   return true;
 }
 
@@ -13231,11 +13780,9 @@ bool YieldForMovie() {
   return yield;
 }
 
-bool YieldForPhotoEditor(uint8_t* base) {
-  if (!REXCVAR_GET(skate3_native_render_scene_photo_yield)) {
-    return false;
-  }
-  static bool s_in_photo_editor = false;
+// The photo-editor detection, shared by the yield and the photo-grab
+// readback window: nullptr when inactive, else the name of the signal.
+const char* PhotoEditorSignal(uint8_t* base) {
   const char* signal = nullptr;
   {
     constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
@@ -13263,19 +13810,101 @@ bool YieldForPhotoEditor(uint8_t* base) {
       signal = "PhotoReplayController heartbeat";
     }
   }
+  return signal;
+}
+
+// The photo-grab readback window (see skate3_native_render_scene_photo_readback):
+// while the photo editor is up OR a TakePhoto fired within the last few
+// seconds, (a) arm the SDK's forced small-resolve CPU readback so the
+// resolved screenshot target actually lands in guest memory for the CPU
+// JPEG encode, and (b) lift emulated-draw suppression so the passes that
+// render that target execute even when the native output is active (a
+// no-op while the photo yield has the native output inactive anyway).
+// Runs every frame from RenderScene regardless of the yield decisions.
+void UpdatePhotoGrabWindow(uint8_t* base) {
+  // The grab target is 1152x640x4 = 0x2D0000 bytes (the same surface the
+  // SDK's Import-Skater special case reads); the thumb path is smaller.
+  // Framebuffer-sized resolves (0x384000 at 1280x720) stay excluded.
+  constexpr int32_t kForceReadbackMaxLength = 0x2D0000;
+  static bool s_armed = false;
+  static int32_t s_readback_saved = 0;
+  static bool s_suppress_saved = false;
+  bool want = false;
+  if (REXCVAR_GET(skate3_native_render_scene_photo_readback)) {
+    want = PhotoEditorSignal(base) != nullptr;
+    if (!want) {
+      const int64_t last_ns = g_take_photo_last_ns.load(std::memory_order_relaxed);
+      if (last_ns >= 0) {
+        const int64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                PerfClock::now().time_since_epoch())
+                .count();
+        want = now_ns - last_ns < 3'000'000'000;
+      }
+    }
+  }
+  // Same window arms the photo postfx constant capture (CapturePfxConstants
+  // runs on the guest thread at the SetPending hook).
+  g_photo_flow_frame.store(want, std::memory_order_relaxed);
+  if (want && !s_armed) {
+    s_readback_saved = REXCVAR_GET(native_render_force_resolve_readback_max_length);
+    if (s_readback_saved <= 0) {
+      REXCVAR_SET(native_render_force_resolve_readback_max_length,
+                  kForceReadbackMaxLength);
+    }
+    s_suppress_saved = REXCVAR_GET(native_render_suppress_emulated_draws);
+    if (s_suppress_saved) {
+      REXCVAR_SET(native_render_suppress_emulated_draws, false);
+    }
+    REXLOG_INFO(
+        "native-scene: photo flow - forcing small-resolve CPU readback "
+        "(the photo grab reads the resolved screenshot target from guest "
+        "memory){}",
+        s_suppress_saved ? " + emulated draw suppression OFF" : "");
+    s_armed = true;
+  } else if (!want && s_armed) {
+    if (s_readback_saved <= 0) {
+      REXCVAR_SET(native_render_force_resolve_readback_max_length,
+                  s_readback_saved);
+    }
+    if (s_suppress_saved) {
+      REXCVAR_SET(native_render_suppress_emulated_draws, true);
+    }
+    REXLOG_INFO(
+        "native-scene: photo flow ended - resolve readback{} restored",
+        s_suppress_saved ? " + suppression" : "");
+    s_armed = false;
+  }
+}
+
+bool YieldForPhotoEditor(uint8_t* base) {
+  // The native photo-fx chain (photo_fx.hlsl, photo_native cvar) takes
+  // precedence: the editor stays native and RenderScene applies the game's
+  // postfx as exact ported passes with live-captured constants.
+  const bool native_fx = REXCVAR_GET(skate3_native_render_scene_photo_native);
+  if (!native_fx && !REXCVAR_GET(skate3_native_render_scene_photo_yield)) {
+    return false;
+  }
+  static bool s_in_photo_editor = false;
+  const char* signal = PhotoEditorSignal(base);
   const bool photo_active = signal != nullptr;
   if (photo_active != s_in_photo_editor) {
     s_in_photo_editor = photo_active;
     if (photo_active) {
       REXLOG_INFO(
-          "native-scene: photo editor - yielding to emulated output ({}; the "
-          "game's postfx applies the photo effects)",
+          "native-scene: photo editor - {} ({})",
+          native_fx ? "staying NATIVE (ported postfx chain)"
+                    : "yielding to emulated output (the game's postfx applies "
+                      "the photo effects)",
           signal);
     } else {
-      REXLOG_INFO("native-scene: photo editor closed - native output resumes");
+      REXLOG_INFO("native-scene: photo editor closed");
     }
   }
-  return photo_active;
+  if (native_fx) {
+    return false;
+  }
+  return photo_active && REXCVAR_GET(skate3_native_render_scene_photo_yield);
 }
 
 // Create-a-skater editor (the 'Edit Skater' screen: skater + garage wall,
@@ -13841,10 +14470,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // same captured-APT 2D replay as the gameplay HUD, and the backdrop is the
   // ordinary native world. Loading screens and the boot frontend still
   // render emulated (complete and correct there).
+  // The photo-grab readback window runs before any yield decision so it
+  // updates every frame in every mode (the grab must work whether the photo
+  // flow renders yielded-emulated or native).
+  uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
+  if (base != nullptr) {
+    UpdatePhotoGrabWindow(base);
+  }
   if (YieldForMenus(context)) {
     return false;
   }
-  uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
   if (base == nullptr) {
     return false;
   }
@@ -15858,6 +16493,396 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
   if (outline_ready) {
     RenderOutlineComposite(context, scene, output_rtv, viewport, scissor);
+  }
+
+  // ---- Photo-editor postfx chain (photo_fx.hlsl: exact ucode ports) ----
+  // While the photo-mission photo editor is up and every pass's live
+  // constants were captured this frame, apply the game's own chain over the
+  // resolved native frame: depth pack -> visualfx (grade/vignette/CoC) ->
+  // DOF downsample -> tap9dofMotionBlur -> tap9dof -> uber -> fisheye.
+  if (scene.photo_fx.valid &&
+      REXCVAR_GET(skate3_native_render_scene_photo_native) &&
+      EnsurePhotoFxPipeline(context)) {
+    ID3D12Device* device = context.d3d12.device;
+    const auto pfx_to_srv = [&](ID3D12Resource* r) {
+      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    };
+    const auto pfx_to_rt = [&](ID3D12Resource* r) {
+      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+    };
+    const auto pfx_flush = [&] {
+      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+    };
+    // Output-sized targets (visualfx out, uber out, packed depth).
+    bool pfx_ok = true;
+    if (g_r.pfx_width != context.guest_output_width ||
+        g_r.pfx_height != context.guest_output_height || g_r.pfx_full[0] == nullptr) {
+      ID3D12Resource** res[3] = {&g_r.pfx_full[0], &g_r.pfx_full[1], &g_r.pfx_depth};
+      const uint32_t rtv_slots[3] = {8, 9, 13};
+      const uint32_t srv_slots[3] = {g_r.pfx_srv[0], g_r.pfx_srv[1], g_r.pfx_srv[5]};
+      D3D12_HEAP_PROPERTIES heap{};
+      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      D3D12_RESOURCE_DESC desc{};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      desc.Width = context.guest_output_width;
+      desc.Height = context.guest_output_height;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      D3D12_CLEAR_VALUE clear{};
+      clear.Format = desc.Format;
+      for (int i = 0; i < 3 && pfx_ok; ++i) {
+        if (*res[i] != nullptr) {
+          g_r.retired.emplace_back(*res[i], command_processor->GetCurrentSubmission());
+          *res[i] = nullptr;
+        }
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                   D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                   &clear, IID_PPV_ARGS(res[i])))) {
+          pfx_ok = false;
+          break;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += size_t(rtv_slots[i]) * g_r.rtv_size;
+        device->CreateRenderTargetView(*res[i], nullptr, rtv);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+        slot.ptr += size_t(srv_slots[i]) * g_r.srv_size;
+        device->CreateShaderResourceView(*res[i], &srv, slot);
+      }
+      if (pfx_ok) {
+        g_r.pfx_width = context.guest_output_width;
+        g_r.pfx_height = context.guest_output_height;
+      }
+    }
+    if (pfx_ok) {
+      // Identity grade-LUT upload (once).
+      if (!g_r.pfx_lut_uploaded) {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = g_r.pfx_lut;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = g_r.pfx_lut_upload;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        src.PlacedFootprint.Footprint.Width = 32;
+        src.PlacedFootprint.Footprint.Height = 32;
+        src.PlacedFootprint.Footprint.Depth = 32;
+        src.PlacedFootprint.Footprint.RowPitch = 256;
+        list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        context.d3d12.push_transition_barrier(
+            context.d3d12.command_processor_user_data, g_r.pfx_lut,
+            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        g_r.pfx_lut_uploaded = true;
+      }
+      // Native depth SRV (re-created every photo frame; the depth resource
+      // is rebuilt on output resize).
+      {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = DXGI_FORMAT_R32_FLOAT;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (g_r.msaa > 1) {
+          sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        } else {
+          sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          sd.Texture2D.MipLevels = 1;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+        slot.ptr += size_t(g_r.pfx_srv[7]) * g_r.srv_size;
+        device->CreateShaderResourceView(g_r.depth, &sd, slot);
+      }
+      // Guest-output SRV (the finished native frame = the chain's scene
+      // input), re-pointed like the blur block does.
+      {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = context.d3d12.guest_output_format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+        slot.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
+        device->CreateShaderResourceView(context.d3d12.guest_output_resource, &srv, slot);
+      }
+      // The two static input textures (fetch words captured at the game's
+      // own uber/fisheye flushes): the 512x2 vignette gradient + the grain.
+      const GuestTexture* vig =
+          resolve_2d_texture(scene.photo_fx.vignette_fetch, /*force_inline=*/true);
+      const GuestTexture* grain =
+          resolve_2d_texture(scene.photo_fx.grain_fetch, /*force_inline=*/true);
+      const uint32_t vig_slot =
+          (vig != nullptr && vig->valid) ? vig->srv_slot : g_r.white.srv_slot;
+      const uint32_t grain_slot =
+          (grain != nullptr && grain->valid) ? grain->srv_slot : g_r.white.srv_slot;
+
+      // Baked literal rows c250..c255 per pass (the shader asset footers the
+      // game loads via PM4 LOAD_ALU_CONSTANT to PS rows 252+; values read
+      // from capture).
+      static constexpr float kPfxLiterals[kPfxPassCount][6][4] = {
+          // visualfx
+          {{0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {-0.200000003f, 1.0f, 1.41412354f, 2.0f},
+           {1.51991853e-05f, 0.99609381f, 0.00389099144f, 0.00392156886f},
+           {0.200000003f, 0.300000012f, 0.5f, 1.0f}},
+          // dof downsample
+          {{0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0.000868055562f, 0.00156250002f, 0.25f, 0.00100000005f}},
+          // tap9dofMotionBlur
+          {{0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {1.0f, 1.5f, 9.99999975e-05f, 0.00392156886f},
+           {1.51991853e-05f, 0.99609381f, 0.00389099144f, 0.0f}},
+          // tap9dof
+          {{0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0.100000001f, 0, 0, 0}},
+          // uber
+          {{0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {2.0f, 0.5f, -1.0f, 0.0f},
+           {0.015625f, 0.984375f, 0.96875f, -0.96875f},
+           {1.0f, 0, 0, 0}},
+          // fisheye
+          {{0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {0, 0, 0, 0},
+           {-1.0f, 0.5f, 0, 0},
+           {-0.5f, -0.888888896f, 1.0f, 1.77777779f}},
+      };
+      const uint32_t cb_slot_base = uint32_t(frame_number % 4) * 8;
+      uint32_t cb_slot_next = 0;
+      const auto fill_cb = [&](int pass) -> D3D12_GPU_VIRTUAL_ADDRESS {
+        const uint32_t slot = cb_slot_base + (cb_slot_next++);
+        uint8_t* dst = g_r.pfx_cb_ptr + size_t(slot) * 4096;
+        std::memset(dst, 0, 4096);
+        float* rows = reinterpret_cast<float*>(dst);
+        if (pass >= 0) {
+          std::memcpy(rows, scene.photo_fx.ps[pass], sizeof(scene.photo_fx.ps[pass]));
+          std::memcpy(rows + 240 * 4, scene.photo_fx.vs[pass],
+                      sizeof(scene.photo_fx.vs[pass]));
+          std::memcpy(rows + 250 * 4, kPfxLiterals[pass], sizeof(kPfxLiterals[pass]));
+        }
+        rows[248 * 4 + 0] = float(context.guest_output_width);
+        rows[248 * 4 + 1] = float(context.guest_output_height);
+        return g_r.pfx_cb->GetGPUVirtualAddress() + size_t(slot) * 4096;
+      };
+      const D3D12_GPU_DESCRIPTOR_HANDLE pfx_heap_start =
+          g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+      const auto pfx_bind = [&](uint32_t param, uint32_t slot) {
+        D3D12_GPU_DESCRIPTOR_HANDLE h = pfx_heap_start;
+        h.ptr += size_t(slot) * g_r.srv_size;
+        context.d3d12.set_graphics_root_descriptor_table(
+            context.d3d12.command_processor_user_data, param, h);
+      };
+      // Root parameter map: 1=t0 2=t1 3=t2 4=t3 5=t4 6=t6 7=t7 8=t5.
+      const auto pfx_bind_all = [&](uint32_t t0, uint32_t t1, uint32_t t2,
+                                    uint32_t t3, uint32_t t4, uint32_t t6,
+                                    uint32_t t7, uint32_t t5) {
+        pfx_bind(1, t0);
+        pfx_bind(2, t1);
+        pfx_bind(3, t2);
+        pfx_bind(4, t3);
+        pfx_bind(5, t4);
+        pfx_bind(6, t6);
+        pfx_bind(7, t7);
+        pfx_bind(8, t5);
+      };
+      const uint32_t W = g_r.white.srv_slot;
+      D3D12_VIEWPORT half_vp{0.0f, 0.0f, float(RendererState::kPfxHalfW),
+                             float(RendererState::kPfxHalfH), 0.0f, 1.0f};
+      D3D12_RECT half_sc{0, 0, LONG(RendererState::kPfxHalfW),
+                         LONG(RendererState::kPfxHalfH)};
+      D3D12_VIEWPORT quarter_vp{0.0f, 0.0f, float(RendererState::kPfxQuarterW),
+                                float(RendererState::kPfxQuarterH), 0.0f, 1.0f};
+      D3D12_RECT quarter_sc{0, 0, LONG(RendererState::kPfxQuarterW),
+                            LONG(RendererState::kPfxQuarterH)};
+      const auto set_rtv = [&](uint32_t rtv_slot) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += size_t(rtv_slot) * g_r.rtv_size;
+        list.D3DOMSetRenderTargets(1, &rtv, FALSE, nullptr);
+      };
+      list.D3DSetGraphicsRootSignature(g_r.pfx_root_sig);
+      list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      const int32_t accum_mode =
+          REXCVAR_GET(skate3_native_render_scene_photo_native_accum);
+
+      // 1) Depth pack: native depth (sample 0) -> the console D24-as-8888
+      //    layout at output res.
+      context.d3d12.push_transition_barrier(
+          context.d3d12.command_processor_user_data, g_r.depth,
+          D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      pfx_flush();
+      set_rtv(13);
+      list.RSSetViewport(viewport);
+      list.RSSetScissorRect(scissor);
+      list.D3DSetPipelineState(g_r.pfx_pso[0]);
+      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+      pfx_bind_all(W, W, W, W, g_r.pfx_srv[6], W, W, g_r.pfx_srv[7]);
+      list.D3DDrawInstanced(3, 1, 0, 0);
+      context.d3d12.push_transition_barrier(
+          context.d3d12.command_processor_user_data, g_r.depth,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+      pfx_to_srv(g_r.pfx_depth);
+      // Scene input -> SRV for the rest of the chain.
+      context.d3d12.push_transition_barrier(
+          context.d3d12.command_processor_user_data, context.d3d12.guest_output_resource,
+          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      pfx_flush();
+
+      // 2) Accumulation input (visualfx t3). Mode 0 = black, 1 = the scene
+      //    downsampled (this frame, the editor scene is frozen).
+      if (accum_mode == 0) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += size_t(12) * g_r.rtv_size;
+        const float black[4] = {0, 0, 0, 0};
+        list.D3DClearRenderTargetView(rtv, black, 0, nullptr);
+      } else if (accum_mode == 1) {
+        set_rtv(12);
+        list.RSSetViewport(quarter_vp);
+        list.RSSetScissorRect(quarter_sc);
+        list.D3DSetPipelineState(g_r.pfx_pso[7]);
+        list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+        pfx_bind_all(g_r.output_srv_slot, W, W, W, g_r.pfx_srv[6], W, W, W);
+        list.D3DDrawInstanced(3, 1, 0, 0);
+      }
+      pfx_to_srv(g_r.pfx_quarter);
+      pfx_flush();
+
+      // 3) visualfx (full res): scene + depth + accumulation -> pfx_full[0].
+      set_rtv(8);
+      list.RSSetViewport(viewport);
+      list.RSSetScissorRect(scissor);
+      list.D3DSetPipelineState(g_r.pfx_pso[1]);
+      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxVisualFx));
+      pfx_bind_all(g_r.output_srv_slot, g_r.pfx_srv[5], W, g_r.pfx_srv[4],
+                   g_r.pfx_srv[6], W, W, W);
+      list.D3DDrawInstanced(3, 1, 0, 0);
+      pfx_to_srv(g_r.pfx_full[0]);
+      pfx_flush();
+
+      // 4) DOF downsample: pfx_full[0] -> pfx_half[0].
+      set_rtv(10);
+      list.RSSetViewport(half_vp);
+      list.RSSetScissorRect(half_sc);
+      list.D3DSetPipelineState(g_r.pfx_pso[2]);
+      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxDofDown));
+      pfx_bind_all(g_r.pfx_srv[0], W, W, W, g_r.pfx_srv[6], W, W, W);
+      list.D3DDrawInstanced(3, 1, 0, 0);
+      pfx_to_srv(g_r.pfx_half[0]);
+      pfx_flush();
+
+      // 5) tap9dofMotionBlur: pfx_half[0] + depth -> pfx_half[1].
+      set_rtv(11);
+      list.D3DSetPipelineState(g_r.pfx_pso[3]);
+      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxDofMB));
+      pfx_bind_all(g_r.pfx_srv[2], g_r.pfx_srv[5], W, W, g_r.pfx_srv[6], W, W, W);
+      list.D3DDrawInstanced(3, 1, 0, 0);
+      pfx_to_srv(g_r.pfx_half[1]);
+      pfx_to_rt(g_r.pfx_half[0]);
+      pfx_flush();
+
+      // 6) tap9dof: pfx_half[1] -> pfx_half[0].
+      set_rtv(10);
+      list.D3DSetPipelineState(g_r.pfx_pso[4]);
+      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxDof));
+      pfx_bind_all(g_r.pfx_srv[3], W, W, W, g_r.pfx_srv[6], W, W, W);
+      list.D3DDrawInstanced(3, 1, 0, 0);
+      pfx_to_srv(g_r.pfx_half[0]);
+      pfx_flush();
+
+      // 7) uber (full res): graded sharp + depth + LUT + grain + blurred
+      //    half -> pfx_full[1].
+      set_rtv(9);
+      list.RSSetViewport(viewport);
+      list.RSSetScissorRect(scissor);
+      list.D3DSetPipelineState(g_r.pfx_pso[5]);
+      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxUber));
+      pfx_bind_all(g_r.pfx_srv[0], g_r.pfx_srv[5], W, W, g_r.pfx_srv[6],
+                   grain_slot, g_r.pfx_srv[2], W);
+      list.D3DDrawInstanced(3, 1, 0, 0);
+      pfx_to_srv(g_r.pfx_full[1]);
+      // The finished chain replaces the output: back to RT for fisheye.
+      context.d3d12.push_transition_barrier(
+          context.d3d12.command_processor_user_data, context.d3d12.guest_output_resource,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      pfx_flush();
+
+      // 8) fisheye (to screen): lens warp + vignette gradient + tint.
+      list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+      list.D3DSetPipelineState(g_r.pfx_pso[6]);
+      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxFisheye));
+      pfx_bind_all(g_r.pfx_srv[1], W, vig_slot, W, g_r.pfx_srv[6], W, W, W);
+      list.D3DDrawInstanced(3, 1, 0, 0);
+
+      // 9) Accumulation mode 2: next frame's visualfx t3 = the finished
+      //    frame downsampled (pfx_full[1] is still in SRV state here).
+      if (accum_mode == 2) {
+        pfx_to_rt(g_r.pfx_quarter);
+        pfx_flush();
+        set_rtv(12);
+        list.RSSetViewport(quarter_vp);
+        list.RSSetScissorRect(quarter_sc);
+        list.D3DSetPipelineState(g_r.pfx_pso[7]);
+        list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+        pfx_bind_all(g_r.pfx_srv[1], W, W, W, g_r.pfx_srv[6], W, W, W);
+        list.D3DDrawInstanced(3, 1, 0, 0);
+      }
+
+      // Restore steady states (all pfx color targets idle as RENDER_TARGET)
+      // + the main pass's root bindings for the 2D overlay.
+      pfx_to_rt(g_r.pfx_full[0]);
+      pfx_to_rt(g_r.pfx_full[1]);
+      pfx_to_rt(g_r.pfx_half[0]);
+      pfx_to_rt(g_r.pfx_half[1]);
+      if (accum_mode != 2) {
+        pfx_to_rt(g_r.pfx_quarter);
+      }
+      pfx_to_rt(g_r.pfx_depth);
+      pfx_flush();
+      list.RSSetViewport(viewport);
+      list.RSSetScissorRect(scissor);
+      list.D3DSetGraphicsRootSignature(g_r.root_signature);
+      if (g_r.shadow_cb != nullptr) {
+        const uint32_t cb_offset =
+            uint32_t(frame_number % RendererState::kShadowCbRegions) * 256u;
+        list.D3DSetGraphicsRootConstantBufferView(
+            6, g_r.shadow_cb->GetGPUVirtualAddress() + cb_offset);
+        list.D3DSetGraphicsRootConstantBufferView(
+            9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region);
+      }
+      static bool s_pfx_first = true;
+      if (s_pfx_first) {
+        s_pfx_first = false;
+        REXLOG_INFO(
+            "native-scene: photo editor postfx chain LIVE (native; accum mode {}, "
+            "vignette {}, grain {})",
+            accum_mode, vig_slot == W ? "WHITE-fallback" : "resolved",
+            grain_slot == W ? "WHITE-fallback" : "resolved");
+      }
+    }
   }
 
   // Popup background blur: exact port of the game's blur_hBlur/vBlur +
