@@ -31,6 +31,7 @@
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_guest_read.h"
+#include "native/skate3_native_v3_shadow.h"
 
 #if defined(REX_HAS_D3D12) && REX_HAS_D3D12
 #include <rex/graphics/d3d12/command_processor.h>
@@ -1414,46 +1415,11 @@ bool GuestReadableApprox(uint8_t* base, uint32_t addr) {
   return addr >= 0x10000;
 }
 
-// Lock-free guarded bulk copy for render-thread reads of guest payloads.
-// GuestRangeReadable's VirtualQuery loop takes the process VAD lock, which
-// the guest streaming threads hammer exactly while panning streams the world
-// in; every render-thread decode then queues behind them (multi-ms stalls;
-// same lock as the 3 fps PERF TRAP). An SEH-guarded memcpy costs nothing in
-// the good case and fails cleanly if streaming decommitted the range between
-// capture and decode. Own function, no C++ objects: SEH cannot share a frame
-// with unwinding.
-#if defined(_WIN32)
-// TWO TRAPS PROVEN FROM CRASH DUMPS OF THE REGISTRY-PREWARM PROBE; both
-// silently delete the guard and let the AV kill the process:
-// 1. clang marks std::memcpy nounwind, concludes the __except is
-//    unreachable, and compiles the whole function to `jmp memcpy` (seen in
-//    the shipped binary). Calling through a VOLATILE function pointer makes
-//    the callee opaque so the SEH scope must be kept.
-// 2. When this function is INLINED into a caller using the C++ EH
-//    personality (__CxxFrameHandler3), the __except scope is dropped in the
-//    merge, hence the noinline.
-// This means plain `__try { std::memcpy(...) } __except` NEVER protected
-// anything in optimized builds; any future guarded read must go through
-// this function.
-typedef void* (*GuestMemcpyFn)(void*, const void*, size_t);
-volatile GuestMemcpyFn g_guest_memcpy_fn = std::memcpy;
-__declspec(noinline) bool GuestTryCopy(void* dst, const void* src, size_t size) {
-  __try {
-    g_guest_memcpy_fn(dst, src, size);
-    return true;
-  } __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
-               GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR)
-                  ? EXCEPTION_EXECUTE_HANDLER
-                  : EXCEPTION_CONTINUE_SEARCH) {  // NOLINT
-    return false;
-  }
-}
-#else
-bool GuestTryCopy(void* dst, const void* src, size_t size) {
-  std::memcpy(dst, src, size);
-  return true;
-}
-#endif
+// Guarded bulk copy: skate3::native_scene::GuestTryCopy, moved to
+// native/skate3_native_guest_read.cpp so every guest reader shares the one
+// correctly-built SEH guard. The compiler-trap documentation
+// (volatile fn-ptr + noinline: plain __try{memcpy}__except compiles to an
+// UNPROTECTED `jmp memcpy`) moved with it.
 
 // SEH-guarded single-value guest loads for registry-time walks (the
 // loading-screen prewarm): unlike the capture-path walks, whose pointers
@@ -3125,6 +3091,7 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   if (!BuildItemGeometry(base, ctx, item)) {
     return 0;
   }
+  item.ctx = ctx;  // identity key for the palette serve / entity store
   // The bank only provably holds THIS mesh's constants when the last draw
   // that flushed it bound this mesh's buffers (see g_last_draw_ibvb);
   // `drew_inside` alone also accepted banks left by another entity's inline
@@ -7106,6 +7073,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::lock_guard<std::mutex> lock(g_palette_mutex);
     g_frame_draw_fetch.clear();
   }
+
+  // v3 shadow-mode readers (Phase 2): compare this frame's authoritative
+  // guest-structure reads against everything the capture path just built.
+  // Observers only: must run before the move-publish below.
+  skate3::native_v3::OnFrameBuilt(base, records, count, scene);
 
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;

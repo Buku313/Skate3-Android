@@ -229,6 +229,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_iso_installer.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_guest_read.cpp
+    src/native/skate3_native_v3_shadow.cpp
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp

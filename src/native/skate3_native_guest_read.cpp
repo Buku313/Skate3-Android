@@ -10,7 +10,55 @@
 
 #include "generated/skate3_init.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace skate3::native_scene {
+
+// Lock-free guarded bulk copy for reads of guest payloads (moved verbatim
+// from skate3_native_scene.cpp so every TU shares the one
+// correctly-built guard). GuestRangeReadable's VirtualQuery loop takes the
+// process VAD lock, which the guest streaming threads hammer exactly while
+// panning streams the world in; every render-thread decode then queues
+// behind them (multi-ms stalls; same lock as the 3 fps PERF TRAP). An
+// SEH-guarded memcpy costs nothing in the good case and fails cleanly if
+// streaming decommitted the range between capture and decode. Own function,
+// no C++ objects: SEH cannot share a frame with unwinding.
+#if defined(_WIN32)
+// TWO TRAPS PROVEN FROM CRASH DUMPS OF THE REGISTRY-PREWARM PROBE; both
+// silently delete the guard and let the AV kill the process:
+// 1. clang marks std::memcpy nounwind, concludes the __except is
+//    unreachable, and compiles the whole function to `jmp memcpy` (seen in
+//    the shipped binary). Calling through a VOLATILE function pointer makes
+//    the callee opaque so the SEH scope must be kept.
+// 2. When this function is INLINED into a caller using the C++ EH
+//    personality (__CxxFrameHandler3), the __except scope is dropped in the
+//    merge, hence the noinline.
+// This means plain `__try { std::memcpy(...) } __except` NEVER protected
+// anything in optimized builds; any future guarded read must go through
+// this function.
+namespace {
+typedef void* (*GuestMemcpyFn)(void*, const void*, size_t);
+volatile GuestMemcpyFn g_guest_memcpy_fn = std::memcpy;
+}  // namespace
+__declspec(noinline) bool GuestTryCopy(void* dst, const void* src, size_t size) {
+  __try {
+    g_guest_memcpy_fn(dst, src, size);
+    return true;
+  } __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+               GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR)
+                  ? EXCEPTION_EXECUTE_HANDLER
+                  : EXCEPTION_CONTINUE_SEARCH) {  // NOLINT
+    return false;
+  }
+}
+#else
+bool GuestTryCopy(void* dst, const void* src, size_t size) {
+  std::memcpy(dst, src, size);
+  return true;
+}
+#endif
 
 float GuestHalfToFloat(uint16_t h) {
   const uint32_t sign = uint32_t(h & 0x8000u) << 16;

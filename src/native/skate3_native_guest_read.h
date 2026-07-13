@@ -29,6 +29,13 @@ struct SkinSampleVert {
   bool pos_finite;  // every |p| < 1e7 (mid-sim-write garbage detection)
 };
 
+// SEH-guarded bulk copy of guest memory (host pointers; callers pass
+// base + guest_addr). Returns false when the range faults (streaming
+// decommit, bogus candidate pointer). ANY guarded guest read must go
+// through this function; see the compiler-trap comment at the definition:
+// open-coded __try{memcpy}__except compiles to an UNPROTECTED `jmp memcpy`.
+bool GuestTryCopy(void* dst, const void* src, size_t size);
+
 float GuestHalfToFloat(uint16_t h);
 
 // Bind-pose bbox diagonal of the item: the reference size every

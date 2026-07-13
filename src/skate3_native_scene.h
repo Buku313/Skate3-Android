@@ -20,6 +20,11 @@ struct DrawEntry {
 };
 
 struct DrawItem {
+  // Guest MeshContext this item was captured from (0 for frame-end world
+  // items served from the item cache). Identity key for the palette serve
+  // and the entity store: the owning cModelInstance is resolved backward by
+  // m_arrMeshContext containment (there is no forward mesh->owner pointer).
+  uint32_t ctx = 0;
   uint32_t mesh;      // guest mesh object address (resource cache key)
   uint32_t vb_obj;    // guest renderengine::VertexBuffer object (draw matching)
   uint32_t ib_obj;    // guest renderengine::IndexBuffer object (draw matching)
@@ -287,6 +292,13 @@ struct SubmitRecord {
 };
 
 bool Enabled();
+
+// The game's per-entity spawn/streaming fade as carried by the item's
+// validated character-lighting capture (peds c21.x, defaultcharacter c13.x,
+// cacstamp c22.x, vehicle body c20.x, hair strand scale). 1.0 for items
+// without a validated capture. Defined in skate3_native_scene.cpp; consumed
+// by the render passes.
+float CharFadeAlpha(const DrawItem& item);
 
 // Called from the cProcessArenaAsset::RegisterTexture hook: guid -> guest
 // renderengine::Texture object.
