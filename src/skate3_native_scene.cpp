@@ -191,19 +191,18 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_yield, true, "Skate 3",
                     "heartbeat; native rendering resumes within 0.5 s of the last "
                     "decoded frame.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cas_yield, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cas_yield, false, "Skate 3",
                     "Yield to the emulated output while the create-a-skater editor "
-                    "(the CAS 'Edit Skater' screen) is up. The editor is a special FE "
-                    "renderer: its own CAC shader variants (cac*_nisPS, different "
-                    "constant layouts than gameplay, so the char-lighting capture "
-                    "rejects every bank), per-frame texture-space composite passes "
-                    "(cac*_unwrapPS render the edited garment/skin art into textures) "
-                    "and its own DOF postfx chain, none of which the native scene "
-                    "models. Natively it showed wrong clothing tints/skin tone and "
-                    "broken live-edit previews. The emulated "
-                    "frame is complete and exact there (photo-editor class). Detected "
-                    "by polling the FrontEndManager push-state stack for screen id 15 "
-                    "(surveyed unique to the CAS editor across 40 gsnaps).")
+                    "(the CAS 'Edit Skater' screen) is up. OFF by default since the "
+                    "editor renders natively: the char-lighting capture understands "
+                    "the editor CAC compiles' shifted constant layout (see "
+                    "CaptureCharLighting's editor fam-2 retry), the texture-space "
+                    "composite passes (cac*_unwrapPS, pitch <= 512) execute under "
+                    "the pitch-selective suppression, and the ropa/palette VS layout "
+                    "is unchanged. Known native deltas: the deck's shift-recolor "
+                    "masks and the editor's own DOF chain are not modeled. Turn ON "
+                    "to get the exact emulated editor instead (photo-editor class; "
+                    "detected via FE push-state id 15 + the _nis shader heartbeat).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_menu_rtt_passes, true, "Skate 3",
@@ -3157,7 +3156,18 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   float* d = local;
   std::memset(local, 0, sizeof(local));
   uint8_t fam = item.char_family;
-  const auto rows_valid = [&](uint8_t f, float* light, float* expo, float* key) {
+  // `plus` = register-row shift for the create-a-skater EDITOR compiles of
+  // the fam-2 shaders (cacstamp_/cac_*_nisPS + the ropa variants): the whole
+  // cacstamp layout sits ONE ROW HIGHER there: light c10, key c16, exposure
+  // c14.z, ambMult c20.w, SH c25..c33 scaled by c22.y, alpha c23.x, tint c24
+  // (ucode-proven from cac_cloth_nisPS, offline-validated on every fam-2
+  // draw in capture: skin tint (0.80,0.68,0.64),
+  // key (1.0,0.95,0.9), expo 1.5, unit light at c10). The editor's VS/ropa
+  // palette layout is UNCHANGED (flag c7, palette c8, rigid c191 - draw-41
+  // VS disasm), and the editor hair compile keeps the gameplay fam-4 rows,
+  // so lighting rows are the only editor delta.
+  const auto rows_valid = [&](uint8_t f, uint32_t plus, float* light, float* expo,
+                              float* key) {
     uint32_t light_r = 9, key_r = 15, expo_r = 13, expo_c = 2;
     switch (f) {
       case 1: light_r = 0; key_r = 6; expo_r = 4; expo_c = 2; break;
@@ -3165,6 +3175,9 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
       case 4: light_r = 4; key_r = 16; expo_r = 8; expo_c = 2; break;
       case 5: light_r = 4; key_r = 15; expo_r = 8; expo_c = 2; break;
     }
+    light_r += plus;
+    key_r += plus;
+    expo_r += plus;
     float norm2 = 0.0f;
     for (int i = 0; i < 3; ++i) {
       light[i] = row(light_r, uint32_t(i));
@@ -3190,14 +3203,19 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   float light[3];
   float key[3];
   float expo = 0.0f;
-  if (!rows_valid(fam, light, &expo, key)) {
+  uint32_t plus = 0;
+  if (!rows_valid(fam, 0, light, &expo, key)) {
     // NPC skin (character_skin_defaultPS) shares the "character.skin"
     // attribulator name with the CAC player skin (cacstamp_skin) but uses
     // the DEFAULTCHARACTER register layout; the two banks are mutually
     // exclusive on the light-row position (the other layout's slot holds
-    // non-unit data), so a failed fam-2 read retries as fam 1.
-    if (fam == 2 && rows_valid(1, light, &expo, key)) {
+    // non-unit data), so a failed fam-2 read retries as fam 1, then as the
+    // EDITOR fam-2 layout (+1 row, see `plus` above); the create-a-skater
+    // screen's _nis compiles, where both standard maps read junk.
+    if (fam == 2 && rows_valid(1, 0, light, &expo, key)) {
       fam = 1;
+    } else if (fam == 2 && rows_valid(2, 1, light, &expo, key)) {
+      plus = 1;
     } else {
       static std::atomic<uint32_t> rej_log{0};
       const uint32_t n = rej_log.fetch_add(1, std::memory_order_relaxed);
@@ -3214,10 +3232,10 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   d[4] = key[0]; d[5] = key[1]; d[6] = key[2];
   d[7] = expo;
   if (fam == 1 || fam == 2) {
-    const uint32_t sh_base = fam == 1 ? 14u : 24u;
-    const float s = row(fam == 1 ? 12u : 21u, 1);
+    const uint32_t sh_base = (fam == 1 ? 14u : 24u) + plus;
+    const float s = row((fam == 1 ? 12u : 21u) + plus, 1);
     const float s2 = s * s;
-    const float amb_mult = row(fam == 1 ? 10u : 19u, 3);
+    const float amb_mult = row((fam == 1 ? 10u : 19u) + plus, 3);
     if (!(s > -8.0f && s < 8.0f) || !(amb_mult >= 0.0f && amb_mult < 16.0f)) {
       return;
     }
@@ -3235,11 +3253,12 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
       d[3 * 4 + c] -= row(sh_base + 7u, uint32_t(c));
     }
     if (fam == 2) {
-      // CAC diffuse/skin tint (c23): multiplies the squared diffuse.
+      // CAC diffuse/skin tint (c23; editor c24), multiplies the squared
+      // diffuse.
       bool tint_ok = true;
       float tint[3];
       for (int c = 0; c < 3; ++c) {
-        tint[c] = row(23u, uint32_t(c));
+        tint[c] = row(23u + plus, uint32_t(c));
         tint_ok = tint_ok && tint[c] >= 0.0f && tint[c] < 16.0f;
       }
       if (tint_ok) {
@@ -3249,7 +3268,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
         d[12 * 4 + 3] = 1.0f;
       }
     }
-    d[14 * 4 + 0] = std::clamp(row(fam == 1 ? 13u : 22u, 0), 0.0f, 1.0f);
+    d[14 * 4 + 0] = std::clamp(row((fam == 1 ? 13u : 22u) + plus, 0), 0.0f, 1.0f);
   } else if (fam == 3) {
     const float amb = row(19u, 3);
     if (!(amb >= 0.0f && amb < 16.0f)) return;
