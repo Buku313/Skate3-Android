@@ -549,6 +549,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_mips, true, "Skate 3",
 REXCVAR_DECLARE(bool, skate3_native_render);
 // Defined in native/skate3_native_lw.cpp (the LW entity store module).
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_palette);
+// SDK-level emulated-draw suppression (rexglue native_guest_renderer.cpp):
+// command processors skip emulated draw/resolve execution while the native
+// output is active. Temporarily overridden to false during menu contexts by
+// YieldForMenus (see skate3_native_render_scene_menu_unsuppress).
+REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
 
 namespace skate3::native_scene {
 namespace {
@@ -13262,6 +13267,43 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
           g_draws_2d_dropped.load(std::memory_order_relaxed));
     }
   }
+  // Menu-context un-suppression: the game produces some content as one-shot
+  // off-screen renders; the team-menu skater portrait boxes are a
+  // render-to-texture pass issued once when the screen opens (and re-issued
+  // after an edit). With emulated draws suppressed those passes never
+  // execute, the resolve never writes the portrait texture, and the boxes
+  // stay empty forever (the F11 emulated pair-shot showed the same empty box
+  // - the texture is persistent guest state that was simply never filled).
+  // While a menu context is up, clear the SDK suppress cvar so the emulated
+  // pipeline keeps every RTT/composite current; the extra GPU cost is
+  // menu-only. The saved value is restored on the first gameplay frame, so a
+  // user toggle of the underlying cvar in the debug dialog survives (it is
+  // re-read at each menu entry).
+  {
+    static bool s_unsup_forced = false;
+    static bool s_unsup_saved = false;
+    const bool want =
+        in_menus && REXCVAR_GET(skate3_native_render_scene_menu_unsuppress);
+    if (want && !s_unsup_forced) {
+      s_unsup_saved = REXCVAR_GET(native_render_suppress_emulated_draws);
+      if (s_unsup_saved) {
+        REXCVAR_SET(native_render_suppress_emulated_draws, false);
+        REXLOG_INFO(
+            "native-scene: menu context - emulated draw suppression OFF "
+            "(one-shot render-to-texture passes execute; restored on "
+            "gameplay)");
+      }
+      s_unsup_forced = true;
+    } else if (!want && s_unsup_forced) {
+      if (s_unsup_saved) {
+        REXCVAR_SET(native_render_suppress_emulated_draws, true);
+        REXLOG_INFO(
+            "native-scene: leaving menu context - emulated draw suppression "
+            "restored");
+      }
+      s_unsup_forced = false;
+    }
+  }
   const bool in_loading = in_menus && !pause_native;
   // Loading screens themselves render natively too (black + the captured 2D
   // loading UI) when enabled, everything after the first gameplay. The
@@ -13445,6 +13487,66 @@ bool YieldForPhotoEditor(uint8_t* base) {
     }
   }
   return photo_active;
+}
+
+// Create-a-skater editor (the 'Edit Skater' screen: skater + garage wall,
+// Skin/Clothing/Body Mods panels): a special FE renderer the native scene
+// does not model; the skater draws with editor-only CAC shader variants
+// (cacstamp_skin_nisPS / cac_cloth_nisPS / cac_face_nisPS...) whose constant
+// layouts differ from gameplay (the cacstamp map shifted +1 row: light c10,
+// key c16, SH c25..c33 scale c22.y, tint c24, alpha c23.x, measured
+// in capture), so every char-lighting capture is rejected and
+// the skater rendered legacy-shaded (grey tank, pale skin, black jeans). The
+// editor also runs per-frame texture-space composite passes (cac*_unwrapPS
+// paint the edited garment/skin art into textures) and its own DOF postfx;
+// live-edit previews are only correct with the full emulated chain. Yield
+// while it is up (photo-editor class: scene is a small frozen room, emulated
+// performance is fine; no cache or takeover-gate side effects; native
+// resumes the frame after the editor closes, and the un-suppressed yield
+// window also lets the game re-render the team-box skater portrait RTT that
+// follows an accepted edit).
+//
+// Detection: stateless per-frame poll of the FrontEndManager push-state
+// stack (same struct as YieldForPhotoEditor above) for a record with screen
+// id 15, surveyed across the 40 gsnaps on hand (gameplay, pause root 56,
+// team screen 63, photo editor {1,11}, FMV): id 15 appears exactly in the
+// CAS editor capture and nowhere else.
+bool YieldForCasEditor(uint8_t* base) {
+  if (!REXCVAR_GET(skate3_native_render_scene_cas_yield)) {
+    return false;
+  }
+  static bool s_in_cas_editor = false;
+  bool cas_active = false;
+  {
+    constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
+    uint32_t mgr = 0, beg = 0, end = 0;
+    if (GuestTryLoadU32(base, kFrontEndManagerPtr, &mgr) && mgr != 0 &&
+        GuestTryLoadU32(base, mgr + 0x210, &beg) &&
+        GuestTryLoadU32(base, mgr + 0x214, &end) && beg < end &&
+        end - beg <= 20 * 16) {
+      const uint32_t n = (end - beg) / 20;
+      for (uint32_t i = 0; i < n && !cas_active; ++i) {
+        uint32_t f0 = 0;
+        if (GuestTryLoadU32(base, beg + i * 20, &f0) && f0 == 15) {
+          cas_active = true;
+        }
+      }
+    }
+  }
+  if (cas_active != s_in_cas_editor) {
+    s_in_cas_editor = cas_active;
+    if (cas_active) {
+      REXLOG_INFO(
+          "native-scene: create-a-skater editor - yielding to emulated "
+          "output (FE push-state id 15; editor CAC shading + live composite "
+          "passes render exactly there)");
+    } else {
+      REXLOG_INFO(
+          "native-scene: create-a-skater editor closed - native output "
+          "resumes");
+    }
+  }
+  return cas_active;
 }
 
 // Frees retired buffers / recycles retired SRV slots whose last
@@ -13940,6 +14042,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     return false;
   }
   if (YieldForPhotoEditor(base)) {
+    return false;
+  }
+  if (YieldForCasEditor(base)) {
     return false;
   }
 
