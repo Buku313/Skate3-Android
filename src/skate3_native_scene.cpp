@@ -263,6 +263,25 @@ REXCVAR_DEFINE_BOOL(
     "gameplay frame. Menu-only cost: the midsize postfx-chain passes also "
     "execute there (mode 0 was the long-lived default before mode 2).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_menu_rtt_scope, 1, "Skate 3",
+    "When menu_rtt_passes is on, WHEN to hold suppress_mode at 0 during "
+    "menus. 0 = the whole menu context (pre-round behavior): the game's "
+    "postfx chain then executes emulated at 1152x640 x resolution scale "
+    "EVERY menu frame: under the pause menu that is the full world postfx, "
+    "on FMV/title screens the movie postfx, pacing the pipeline and "
+    "fighting the native renderer for the GPU (the menu sluggishness at a "
+    "high fps counter). 1 = only inside a PORTRAIT WINDOW: the FE "
+    "push-state stack contains a screen not known steady-safe (known: 0 = "
+    "FE root, 56 = pause root, 24 = FMV, 17 = pause challenge map), OR an "
+    "unsafe screen was entered/left within the last 3 s (one-shot portrait "
+    "RTT renders fire at those transitions), OR the CAS heartbeat is "
+    "fresh, OR the stack is unreadable; everything unknown fails OPEN to "
+    "mode 0. Outside the window menus run the "
+    "gameplay-proven mode-2 suppression (lightmap pages + <= 512 "
+    "composites still execute).")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_menu_unsuppress, false, "Skate 3",
     "ESCAPE HATCH, normally unnecessary: while a menu/pause/loading context "
@@ -407,19 +426,18 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ropa_blend, true, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(
     skate3_native_render_scene_2d_async_px, 1, "Skate 3",
-    "Pixel-count threshold above which 2D/HUD texture decodes route to the "
-    "words-miss decode workers instead of running inline on the render "
-    "thread. Inline 2D decodes stall the frame AND the guest (swap blocks; "
-    "guest_dt_max 100-256 ms in menu windows), and the cost "
-    "is NOT proportional to texel count: 8888 APT tiles pay a per-PIXEL "
-    "tiled-offset computation plus two CreateCommittedResource calls, so "
-    "even 64x64 tiles measured 3-19 ms. Default 1 = "
-    "everything async: a first sighting skips the quad for the 1-3 frames "
-    "the worker needs (imperceptible pop-in at render rate), a content "
-    "change keeps serving the stale decode until the commit swaps it. "
-    "0 = all inline (old "
-    "behavior); larger values gate by pixel count (the original big-art "
-    "threshold was 131072).")
+    "Pixel-count threshold above which 2D/HUD texture decodes are ELIGIBLE "
+    "for the words-miss decode workers. Eligible decodes (first sightings "
+    "and content changes alike) still run INLINE while the per-frame inline "
+    "budget (4 ms; fullscreen-class art gets double) lasts; the run-copy "
+    "untiler made even 1280x720 sub-millisecond, and the old always-async "
+    "policy made every APT re-raster (NEW address = new key = first "
+    "sighting) skip its quad for the 1-3 worker frames: menu elements and "
+    "fullscreen backdrops visibly BLINKED through animations. The workers are "
+    "the burst-overflow valve: past the budget, first sightings skip 1-3 "
+    "frames and content changes serve the stale decode until the commit. "
+    "0 = everything inline unconditionally; larger values exempt small art "
+    "from async eligibility entirely.")
     .range(0, 1 << 24)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_2d_sharp, 0.0, "Skate 3",
@@ -1386,6 +1404,11 @@ std::atomic<uint64_t> g_rej_bbox{0};
 // processor thread (render segments); read by the render thread's stats log.
 // Atomics with relaxed ordering: telemetry, not synchronization.
 using PerfClock = std::chrono::steady_clock;
+inline uint64_t PerfNsSince(PerfClock::time_point t0) {
+  return uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - t0)
+          .count());
+}
 struct PerfWindow {
   std::atomic<uint64_t> ns{0};
   std::atomic<uint64_t> max_ns{0};
@@ -3261,6 +3284,95 @@ bool CasEditorActive(uint8_t* base) {
     }
   }
   return false;
+}
+
+// Should the emulated sub-framebuffer RTT passes execute right now (the
+// menus' suppress_mode -> 0 forcing, see menu_rtt_scope)? The one-shot
+// skater-portrait RTT renders are the only reason menus need mode 0, and
+// they fire at SCREEN TRANSITIONS (screen open / accepted edit), but
+// holding mode 0 for the whole menu context kept the game's postfx chain
+// executing emulated at scale every menu frame (full world postfx under
+// the pause menu; movie postfx on FMV screens), pacing the pipeline
+// against the native renderer. Window = TRUE (mode 0) when:
+//  - the FE push-state stack is unreadable (fail open = old behavior), or
+//  - it contains any screen id NOT known steady-safe (0 = FE root, 56 =
+//    pause root, 24 = FMV, surveyed across captured sessions), or
+//  - it CHANGED within the last 3 s (covers unknown screens' entry
+//    one-shots and the open-race before the id lands), or
+//  - the CAS editor heartbeat is fresh.
+// Render thread only (statics). Every stack change logs its ids (capped)
+// so unknown portrait screens name themselves in the session log.
+bool PortraitRttWindowActive() {
+  if (CasEditorHeartbeatFresh()) {
+    return true;
+  }
+  uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
+  if (base == nullptr) {
+    return true;
+  }
+  constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
+  uint32_t mgr = 0, beg = 0, end = 0;
+  if (!GuestTryLoadU32(base, kFrontEndManagerPtr, &mgr) || mgr == 0 ||
+      !GuestTryLoadU32(base, mgr + 0x210, &beg) ||
+      !GuestTryLoadU32(base, mgr + 0x214, &end) || beg > end ||
+      end - beg > 20 * 16) {
+    return true;
+  }
+  const uint32_t n = (end - beg) / 20;
+  uint32_t ids[16] = {};
+  bool unknown_screen = false;
+  uint64_t sig = 1469598103934665603ull;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t f0 = 0;
+    if (!GuestTryLoadU32(base, beg + i * 20, &f0)) {
+      return true;
+    }
+    ids[i] = f0;
+    sig = (sig ^ f0) * 1099511628211ull;
+    // Steady-safe screens (no one-shot portrait RTT renders): 0 = FE root,
+    // 56 = pause root, 24 = FMV, 17 = pause challenge map (the game FLAPS
+    // [0,56]<->[0,17] ~1/s while the map is open, with 17
+    // unclassified every flap re-armed the grace window and held mode 0,
+    // pinning the map screen at 62-94 fps).
+    if (f0 != 0 && f0 != 56 && f0 != 24 && f0 != 17) {
+      unknown_screen = true;
+    }
+  }
+  static uint64_t s_last_sig = 0;
+  static int64_t s_change_ns = -1;
+  static bool s_prev_unknown = false;
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  if (sig != s_last_sig) {
+    s_last_sig = sig;
+    // Grace only when an UNSAFE screen is involved; entering one is
+    // already covered by presence (fail-open), so the window's real job is
+    // the tail after LEAVING one (the accepted-edit portrait re-render
+    // fires as the editor pops). Safe<->safe transitions (pause <->
+    // challenge map flapping) must not arm it.
+    if (unknown_screen || s_prev_unknown) {
+      s_change_ns = now_ns;
+    }
+    s_prev_unknown = unknown_screen;
+    static uint32_t s_logs = 0;
+    if (s_logs < 64) {
+      ++s_logs;
+      char buf[128] = "";  // n == 0 leaves the loop unrun; print "[]"
+      int off = 0;
+      for (uint32_t i = 0; i < n && off < int(sizeof(buf)) - 8; ++i) {
+        off += std::snprintf(buf + off, sizeof(buf) - off, "%s%u", i ? "," : "", ids[i]);
+      }
+      REXLOG_INFO(
+          "native-scene: FE stack changed: [{}] (portrait window {}; "
+          "steady-safe = 0/56/24/17)",
+          buf, unknown_screen ? "OPEN - unclassified screen" : "steady");
+    }
+  }
+  if (s_change_ns >= 0 && now_ns - s_change_ns < 3'000'000'000ll) {
+    return true;
+  }
+  return unknown_screen;
 }
 
 void OnRenderStateUpload(uint64_t mask, uint32_t bank, uint32_t ptr) {
@@ -8863,6 +8975,12 @@ struct MeshBuffers {
 struct GuestTexture {
   ID3D12Resource* texture = nullptr;
   ID3D12Resource* upload = nullptr;  // kept alive; copy recorded in deferred list
+  // In-place re-decode ping-pong partner (UpdateGuestTexture2DInPlace): the
+  // GPU may still be copying from the OTHER upload buffer for the previous
+  // frame's content change, so hot content alternates buffers instead of
+  // paying two CreateCommittedResource calls per change.
+  ID3D12Resource* upload_b = nullptr;
+  bool upload_flip = false;
   uint32_t fetch_words[6] = {};      // big-endian words as read for revalidation
   uint32_t srv_slot = 0;
   // For failed decodes: frame number for periodic retry (payload may stream
@@ -9488,6 +9606,7 @@ bool AllocGuestSrvSlot(uint32_t& slot) {
 void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
   if (t.texture) g_r.retired.emplace_back(t.texture, submission);
   if (t.upload) g_r.retired.emplace_back(t.upload, submission);
+  if (t.upload_b) g_r.retired.emplace_back(t.upload_b, submission);
   if (t.valid) g_r.retired_srv_slots.emplace_back(t.srv_slot, submission);
 }
 
@@ -10263,24 +10382,53 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
     size = min_size;
   }
 
-  // Untile into linear block rows, endian-swap per row.
+  // Untile into linear block rows, endian-swap per row. Run-copy untiling:
+  // same contiguity rule as the plain path (see EnsureGuestTextureFromWords):
+  // aligned x-runs of clamp(16 >> bpb_log2, 1, 8) blocks are contiguous.
   std::vector<uint8_t> linear(size_t(cols) * rows * bytes_per_block);
+  const uint32_t run_blocks = std::clamp(16u >> bytes_per_block_log2, 1u, 8u);
   for (uint32_t by = 0; by < rows; ++by) {
     uint8_t* out_row = linear.data() + size_t(by) * cols * bytes_per_block;
-    for (uint32_t bx = 0; bx < cols; ++bx) {
-      uint32_t source_offset;
-      if (info.is_tiled) {
-        source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
-            int32_t(bx + ox), int32_t(by + oy), pitch_blocks, bytes_per_block_log2));
+    if (!info.is_tiled) {
+      const uint32_t row_off = ((by + oy) * pitch_blocks + ox) * bytes_per_block;
+      const uint32_t row_bytes = cols * bytes_per_block;
+      if (row_off + row_bytes <= size) {
+        std::memcpy(out_row, gen_scratch.data() + row_off, row_bytes);
       } else {
-        source_offset = ((by + oy) * pitch_blocks + bx + ox) * bytes_per_block;
+        for (uint32_t bx = 0; bx < cols; ++bx) {
+          const uint32_t off = row_off + bx * bytes_per_block;
+          if (off + bytes_per_block > size) {
+            std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+            continue;
+          }
+          std::memcpy(out_row + size_t(bx) * bytes_per_block, gen_scratch.data() + off,
+                      bytes_per_block);
+        }
       }
-      if (source_offset + bytes_per_block > size) {
-        std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
-        continue;
+    } else {
+      uint32_t bx = 0;
+      while (bx < cols) {
+        const uint32_t x = bx + ox;
+        const uint32_t run = std::min(cols - bx, run_blocks - (x & (run_blocks - 1)));
+        const uint32_t off = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+            int32_t(x), int32_t(by + oy), pitch_blocks, bytes_per_block_log2));
+        const uint32_t bytes = run * bytes_per_block;
+        if (off + bytes <= size) {
+          std::memcpy(out_row + size_t(bx) * bytes_per_block, gen_scratch.data() + off,
+                      bytes);
+        } else {
+          for (uint32_t i = 0; i < run; ++i) {
+            const uint32_t boff = off + i * bytes_per_block;
+            if (boff + bytes_per_block > size) {
+              std::memset(out_row + size_t(bx + i) * bytes_per_block, 0, bytes_per_block);
+            } else {
+              std::memcpy(out_row + size_t(bx + i) * bytes_per_block,
+                          gen_scratch.data() + boff, bytes_per_block);
+            }
+          }
+        }
+        bx += run;
       }
-      std::memcpy(out_row + size_t(bx) * bytes_per_block, gen_scratch.data() + source_offset,
-                  bytes_per_block);
     }
     SwapGuestEndian(out_row, cols * bytes_per_block, info.endianness);
   }
@@ -10466,9 +10614,20 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
   return true;
 }
 
+// Phase attribution for the SLOW-inline-decode log: time inside D3D12
+// resource creation / the generated-mips path / the guest scratch copies,
+// reset at each EnsureGuestTextureFromWords entry (per thread: workers and
+// the render thread decode concurrently).
+thread_local uint64_t g_tex_dec_create_ns = 0;
+thread_local uint64_t g_tex_dec_gen_ns = 0;
+thread_local uint64_t g_tex_dec_copy_ns = 0;
+
 bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
                                  uint8_t* base, const uint32_t words[6],
                                  GuestTexture& out) {
+  g_tex_dec_create_ns = 0;
+  g_tex_dec_gen_ns = 0;
+  g_tex_dec_copy_ns = 0;
   std::memcpy(out.fetch_words, words, 6 * sizeof(uint32_t));
 
   xenos::xe_gpu_texture_fetch_t fetch = {};
@@ -10547,7 +10706,10 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     if (base_fmt == xenos::TextureFormat::k_DXT1 ||
         base_fmt == xenos::TextureFormat::k_8_8_8_8) {
       GuestTexture gen = out;  // keeps fetch_words already copied
-      if (UploadGeneratedMips(context, base, info, fetch.swizzle, gen)) {
+      const auto gen_t0 = PerfClock::now();
+      const bool gen_ok = UploadGeneratedMips(context, base, info, fetch.swizzle, gen);
+      g_tex_dec_gen_ns += PerfNsSince(gen_t0);
+      if (gen_ok) {
         out = gen;
         return true;
       }
@@ -10608,6 +10770,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     s.scratch_off = scratch_total;
     scratch_total += s.size;
   }
+  const auto copy_t0 = PerfClock::now();
   tex_scratch.resize(scratch_total);
   uint32_t mips_copied = 0;
   bool copy_truncated = false;
@@ -10629,6 +10792,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     }
     ++mips_copied;
   }
+  g_tex_dec_copy_ns += PerfNsSince(copy_t0);
   if (mips_copied == 0) {
     return false;
   }
@@ -10675,12 +10839,14 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   desc.MipLevels = UINT16(mip_count);
   desc.Format = host.resource_format;
   desc.SampleDesc.Count = 1;
+  const auto create_t0 = PerfClock::now();
   if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                              IID_PPV_ARGS(&out.texture)))) {
     return false;
   }
   out.upload = CreateUploadBuffer(device, upload_size);
+  g_tex_dec_create_ns += PerfNsSince(create_t0);
   if (!out.upload) {
     out.texture->Release();
     out.texture = nullptr;
@@ -10699,23 +10865,74 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     const uint8_t* guest = tex_scratch.data() + srcs[m].scratch_off;
     const uint32_t row_bytes = p.cols * bytes_per_block;
     uint32_t guard_zeroed = 0;  // blocks zeroed by the range guard (diag)
+    // Run-copy untiling. The per-BLOCK GetTiledOffset2D loop made a single
+    // 1280x720 8888 decode cost 3-13 ms (921k address computations + 4-byte
+    // memcpys); animating fullscreen menu art and FMV planes pay that on
+    // EVERY content change, which is where the menu frame spikes lived.
+    // From the tiling formula (util.cpp GetTiledOffset2D): within a row, an
+    // x-run aligned to run_blocks = clamp(16 >> bpb_log2, 1, 8) maps to
+    // CONTIGUOUS byte offsets; the micro term stays inside its 16-byte
+    // nibble group ((y & 0xE) contributes only multiples of 16 at every
+    // bpb), and runs <= 8 aligned blocks never cross the (x>>3)/(x>>5) mix
+    // boundaries. Linear mips copy whole rows.
+    //
+    // ROWS STAGE THROUGH A CACHED BUFFER, never the upload mapping directly:
+    // upload heaps are WRITE-COMBINED memory, and SwapGuestEndian/565-swap
+    // READ the row back; uncached WC reads cost ~33 ns/byte, which was the
+    // long-unattributed 35-135 ms decode class (512x512 = 1 MB = 34 ms,
+    // 1024x1024+chain = 135 ms; linear fit across a slow-decode log).
+    // The mapping gets exactly one streaming memcpy per row.
+    const uint32_t run_blocks =
+        std::clamp(16u >> bytes_per_block_log2, 1u, 8u);
+    static thread_local std::vector<uint8_t> row_buf;
+    row_buf.resize(row_bytes);
     for (uint32_t by = 0; by < p.rows; ++by) {
-      uint8_t* out_row = mapping + p.offset + size_t(by) * p.pitch;
-      for (uint32_t bx = 0; bx < p.cols; ++bx) {
-        uint32_t source_offset;
-        if (info.is_tiled) {
-          source_offset = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
-              int32_t(bx + ox), int32_t(by + oy), src_pitch_blocks, bytes_per_block_log2));
+      uint8_t* out_row = row_buf.data();
+      if (!info.is_tiled) {
+        const uint32_t row_off =
+            ((by + oy) * src_pitch_blocks + ox) * bytes_per_block;
+        if (row_off + row_bytes <= src_size) {
+          std::memcpy(out_row, guest + row_off, row_bytes);
         } else {
-          source_offset = ((by + oy) * src_pitch_blocks + bx + ox) * bytes_per_block;
+          for (uint32_t bx = 0; bx < p.cols; ++bx) {
+            const uint32_t off = row_off + bx * bytes_per_block;
+            if (off + bytes_per_block > src_size) {
+              std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+              ++guard_zeroed;
+              continue;
+            }
+            std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + off,
+                        bytes_per_block);
+          }
         }
-        if (source_offset + bytes_per_block > src_size) {
-          std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
-          ++guard_zeroed;
-          continue;
+      } else {
+        uint32_t bx = 0;
+        while (bx < p.cols) {
+          const uint32_t x = bx + ox;
+          const uint32_t run =
+              std::min(p.cols - bx, run_blocks - (x & (run_blocks - 1)));
+          const uint32_t off = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+              int32_t(x), int32_t(by + oy), src_pitch_blocks, bytes_per_block_log2));
+          const uint32_t bytes = run * bytes_per_block;
+          if (off + bytes <= src_size) {
+            std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + off, bytes);
+          } else {
+            // Padded macro rows past the copied size: per-block guard-zero
+            // (offsets within the run are contiguous, same proof as above).
+            for (uint32_t i = 0; i < run; ++i) {
+              const uint32_t boff = off + i * bytes_per_block;
+              if (boff + bytes_per_block > src_size) {
+                std::memset(out_row + size_t(bx + i) * bytes_per_block, 0,
+                            bytes_per_block);
+                ++guard_zeroed;
+              } else {
+                std::memcpy(out_row + size_t(bx + i) * bytes_per_block, guest + boff,
+                            bytes_per_block);
+              }
+            }
+          }
+          bx += run;
         }
-        std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + source_offset,
-                    bytes_per_block);
       }
       SwapGuestEndian(out_row, row_bytes, info.endianness);
       if (swap_rb_565) {
@@ -10727,6 +10944,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
           std::memcpy(out_row + i, &value, sizeof(value));
         }
       }
+      std::memcpy(mapping + p.offset + size_t(by) * p.pitch, out_row, row_bytes);
     }
     // Half-black-mip diagnostic (PCU Library banners): discriminate "the
     // guest pool genuinely holds zeros for this mip" from "our addressing
@@ -10851,6 +11069,227 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
 // (The object-keyed EnsureGuestTexture wrapper is gone: everything decodes
 // from an explicit stable words snapshot, ReadStableTexWords +
 // EnsureGuestTextureFromWords, and lands in the words-keyed store.)
+
+// In-place re-decode for HOT single-mip 2D content (video planes, animating
+// fullscreen menu/loading art): identical fetch words = identical layout, so
+// the committed texture, upload footprint and SRV slot are all reusable;
+// the retire+recreate path paid two CreateCommittedResource calls per
+// content change (~90/s during FMV playback, plus every animation step of
+// fullscreen frontend art). Non-pow2 single-mip entries only: pow2 entries
+// may own a real or generated mip chain (the full path handles those).
+// The TEAR-GUARD also lives here: the CPU writer (VP6 video decode, APT
+// re-raster) can be mid-write when the liveness probe fires; decoding a
+// half-written fullscreen payload shows a frame of mixed old/new content:
+// a subtle whole-screen brightness flicker on fades and video. The guest
+// copy retries until the probe fingerprint reads stable across it.
+bool UpdateGuestTexture2DInPlace(const NativeGuestOutputRenderContext& context,
+                                 uint8_t* base, GuestTexture& t) {
+  if (!t.valid || t.texture == nullptr || t.srv_mips != 1 || t.incomplete) {
+    return false;
+  }
+  xenos::xe_gpu_texture_fetch_t fetch = {};
+  fetch.dword_0 = t.fetch_words[0];
+  fetch.dword_1 = t.fetch_words[1];
+  fetch.dword_2 = t.fetch_words[2];
+  fetch.dword_3 = t.fetch_words[3];
+  fetch.dword_4 = t.fetch_words[4];
+  fetch.dword_5 = t.fetch_words[5];
+  if (fetch.type != xenos::FetchConstantType::kTexture || fetch.base_address == 0) {
+    return false;
+  }
+  const rex::graphics::FormatInfo* pre_fi =
+      rex::graphics::FormatInfo::Get(uint32_t(fetch.format));
+  if (pre_fi == nullptr || pre_fi->block_width == 0 || pre_fi->block_height == 0 ||
+      pre_fi->bytes_per_block() == 0) {
+    return false;
+  }
+  rex::graphics::TextureInfo info;
+  if (!rex::graphics::TextureInfo::Prepare(fetch, &info)) {
+    return false;
+  }
+  HostTextureFormat host;
+  if (!GetHostTextureFormat(info.format, host)) {
+    return false;
+  }
+  if (info.dimension != xenos::DataDimension::k2DOrStacked || info.is_stacked ||
+      info.width >= 8192 || info.height >= 8192 || info.memory.base_address == 0 ||
+      info.memory.base_size == 0 || info.memory.base_size > 64u * 1024u * 1024u) {
+    return false;
+  }
+  const rex::graphics::FormatInfo* format_info = info.format_info();
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (bytes_per_block == 0 || (bytes_per_block & (bytes_per_block - 1)) != 0) {
+    return false;
+  }
+  const uint32_t bytes_per_block_log2 = uint32_t(std::countr_zero(bytes_per_block));
+  const uint32_t width = info.width + 1u;
+  const uint32_t height = info.height + 1u;
+  if ((width & (width - 1)) == 0 && (height & (height - 1)) == 0) {
+    return false;  // pow2: may own a mip chain, full path
+  }
+  if (host.srv_format != t.srv_format) {
+    return false;  // the existing SRV recipe must stay exact
+  }
+  const uint32_t block_w = format_info->block_width;
+  const uint32_t block_h = format_info->block_height;
+
+  // Mip-0 source extent, same rules as the full decode.
+  uint32_t ox = 0, oy = 0;
+  const uint32_t addr = info.GetMipLocation(0, &ox, &oy, true);
+  if (addr == 0) {
+    return false;
+  }
+  const uint32_t pitch_blocks = info.extent.block_pitch_h;
+  const uint32_t cols = (width + block_w - 1) / block_w;
+  const uint32_t rows = (height + block_h - 1) / block_h;
+  const uint32_t min_size = info.memory.base_size;
+  uint32_t size = min_size;
+  if (info.is_tiled) {
+    size = std::max(size, rex::graphics::texture_util::GetTiledAddressUpperBound2D(
+                              cols + ox, rows + oy, pitch_blocks, bytes_per_block_log2));
+  }
+  static thread_local std::vector<uint8_t> inplace_scratch;
+  inplace_scratch.resize(size);
+
+  // Tear-guarded guest copy: retry while the writer races us.
+  uint64_t fp = 0;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const uint64_t fp_before = SampleProbeFingerprint(base, t);
+    if (!GuestTryCopy(inplace_scratch.data(), base + (0xA0000000u | addr), size)) {
+      if (min_size >= size ||
+          !GuestTryCopy(inplace_scratch.data(), base + (0xA0000000u | addr), min_size)) {
+        return false;  // payload unreadable: let the full path sort it out
+      }
+      size = min_size;
+    }
+    fp = SampleProbeFingerprint(base, t);
+    if (fp != 0 && fp == fp_before) {
+      break;
+    }
+  }
+
+  // Upload footprint (single mip at offset 0).
+  const uint32_t pitch =
+      (cols * bytes_per_block + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
+      ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+  const uint32_t upload_size = pitch * rows;
+  ID3D12Device* device = context.d3d12.device;
+  auto* command_processor = context.d3d12.command_processor;
+  ID3D12Resource*& up = t.upload_flip ? t.upload_b : t.upload;
+  if (up != nullptr && up->GetDesc().Width < upload_size) {
+    // Never expected (same words = same footprint): recreate defensively.
+    g_r.retired.emplace_back(up, command_processor->GetCurrentSubmission());
+    up = nullptr;
+  }
+  if (up == nullptr) {
+    up = CreateUploadBuffer(device, upload_size);
+    if (up == nullptr) {
+      return false;
+    }
+  }
+  uint8_t* mapping = nullptr;
+  if (FAILED(up->Map(0, nullptr, reinterpret_cast<void**>(&mapping)))) {
+    return false;
+  }
+  const bool swap_rb_565 =
+      rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_5_6_5;
+  const uint8_t* guest = inplace_scratch.data();
+  const uint32_t row_bytes = cols * bytes_per_block;
+  const uint32_t run_blocks = std::clamp(16u >> bytes_per_block_log2, 1u, 8u);
+  // Rows stage through a CACHED buffer; the endian/565 swaps read the row
+  // back, and reading the write-combined upload mapping costs ~33 ns/byte
+  // (the 35-135 ms decode class; see the plain path).
+  static thread_local std::vector<uint8_t> row_buf;
+  row_buf.resize(row_bytes);
+  for (uint32_t by = 0; by < rows; ++by) {
+    uint8_t* out_row = row_buf.data();
+    if (!info.is_tiled) {
+      const uint32_t row_off = ((by + oy) * pitch_blocks + ox) * bytes_per_block;
+      if (row_off + row_bytes <= size) {
+        std::memcpy(out_row, guest + row_off, row_bytes);
+      } else {
+        for (uint32_t bx = 0; bx < cols; ++bx) {
+          const uint32_t off = row_off + bx * bytes_per_block;
+          if (off + bytes_per_block > size) {
+            std::memset(out_row + size_t(bx) * bytes_per_block, 0, bytes_per_block);
+          } else {
+            std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + off,
+                        bytes_per_block);
+          }
+        }
+      }
+    } else {
+      uint32_t bx = 0;
+      while (bx < cols) {
+        const uint32_t x = bx + ox;
+        const uint32_t run = std::min(cols - bx, run_blocks - (x & (run_blocks - 1)));
+        const uint32_t off = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+            int32_t(x), int32_t(by + oy), pitch_blocks, bytes_per_block_log2));
+        const uint32_t bytes = run * bytes_per_block;
+        if (off + bytes <= size) {
+          std::memcpy(out_row + size_t(bx) * bytes_per_block, guest + off, bytes);
+        } else {
+          for (uint32_t i = 0; i < run; ++i) {
+            const uint32_t boff = off + i * bytes_per_block;
+            if (boff + bytes_per_block > size) {
+              std::memset(out_row + size_t(bx + i) * bytes_per_block, 0, bytes_per_block);
+            } else {
+              std::memcpy(out_row + size_t(bx + i) * bytes_per_block, guest + boff,
+                          bytes_per_block);
+            }
+          }
+        }
+        bx += run;
+      }
+    }
+    SwapGuestEndian(out_row, row_bytes, info.endianness);
+    if (swap_rb_565) {
+      for (uint32_t i = 0; i + 2 <= row_bytes; i += 2) {
+        uint16_t value;
+        std::memcpy(&value, out_row + i, sizeof(value));
+        value = uint16_t((value & 0x07E0u) | ((value >> 11) & 0x1Fu) |
+                         ((value & 0x1Fu) << 11));
+        std::memcpy(out_row + i, &value, sizeof(value));
+      }
+    }
+    std::memcpy(mapping + size_t(by) * pitch, out_row, row_bytes);
+  }
+  up->Unmap(0, nullptr);
+
+  // Barriers must land in the deferred list BEFORE the copy: flush both
+  // sides explicitly (earlier draws this frame sample the OLD content,
+  // later ones the new: same semantics as a retire+recreate mid-frame).
+  auto& list = command_processor->GetDeferredCommandList();
+  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                        t.texture,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
+  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  D3D12_TEXTURE_COPY_LOCATION dst{};
+  dst.pResource = t.texture;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION src{};
+  src.pResource = up;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint.Offset = 0;
+  src.PlacedFootprint.Footprint.Format = host.resource_format;
+  src.PlacedFootprint.Footprint.Width = cols * block_w;
+  src.PlacedFootprint.Footprint.Height = rows * block_h;
+  src.PlacedFootprint.Footprint.Depth = 1;
+  src.PlacedFootprint.Footprint.RowPitch = pitch;
+  list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
+                                        t.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+
+  t.upload_flip = !t.upload_flip;
+  t.payload_fp = fp;
+  t.near_black = SampleProbeNearBlack(base, t);
+  t.recheck_frame = 0;
+  return true;
+}
 
 // Environment CUBE map for the water / reflective-glass reflection term
 // (t6). Six faces untiled independently per level (Xenos cubes are 2D-tiled
@@ -12114,7 +12553,7 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
     const char* ps;
     DXGI_FORMAT rtv;
   };
-  const Entry entries[8] = {
+  const Entry entries[9] = {
       {"vs_raw", "ps_depthpack", DXGI_FORMAT_R8G8B8A8_UNORM},
       {"vs_offset", "ps_visualfx", DXGI_FORMAT_R8G8B8A8_UNORM},
       {"vs_offset", "ps_dof_down", DXGI_FORMAT_R8G8B8A8_UNORM},
@@ -13618,23 +14057,31 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   {
     static bool s_mode_forced = false;
     static int32_t s_mode_saved = 0;
+    // menu_rtt_scope 1: only hold mode 0 inside the portrait window
+    // (screen-transition grace / not-known-steady screens / CAS); outside
+    // it, menus keep the gameplay-proven mode-2 suppression instead of
+    // executing the game's postfx chain emulated at scale every frame
+    // (the pause-menu/title-screen GPU contention).
     const bool want =
-        in_menus && REXCVAR_GET(skate3_native_render_scene_menu_rtt_passes);
+        in_menus && REXCVAR_GET(skate3_native_render_scene_menu_rtt_passes) &&
+        (REXCVAR_GET(skate3_native_render_scene_menu_rtt_scope) == 0 ||
+         PortraitRttWindowActive());
     if (want && !s_mode_forced) {
       s_mode_saved = REXCVAR_GET(native_render_suppress_mode);
       if (s_mode_saved != 0) {
         REXCVAR_SET(native_render_suppress_mode, 0);
         REXLOG_INFO(
-            "native-scene: menu context - suppress mode {} -> 0 (portrait "
-            "RTT passes execute; restored on gameplay)",
+            "native-scene: portrait window - suppress mode {} -> 0 (RTT "
+            "passes execute; restored when the window closes)",
             s_mode_saved);
       }
       s_mode_forced = true;
     } else if (!want && s_mode_forced) {
       if (s_mode_saved != 0) {
         REXCVAR_SET(native_render_suppress_mode, s_mode_saved);
-        REXLOG_INFO("native-scene: leaving menu context - suppress mode {} restored",
-                    s_mode_saved);
+        REXLOG_INFO(
+            "native-scene: portrait window closed - suppress mode {} restored",
+            s_mode_saved);
       }
       s_mode_forced = false;
     }
@@ -16353,17 +16800,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       return &g_r.white;
     }
     const uint64_t key = FetchWordsKey(fetch);
-    // Routing (see the 2d_async_px cvar): inline 2D decodes stall the frame
-    // AND the guest, and the cost is NOT proportional to texel count (8888
-    // APT tiles pay a per-PIXEL tiled-offset loop + 2 CreateCommittedResource
-    // calls; 64x64 tiles measured 3-19 ms with the regen attempt on top)
-    // - so FIRST SIGHTINGS and COLD content changes decode on
-    // the words-miss workers. HOT content (changed within the last ~60
-    // frames: video planes, actively-animating menu/HUD elements) re-decodes
-    // INLINE under a small per-frame budget instead; the async round trip
-    // (probe cadence + worker + commit ~ 4-5 frames) capped animating UI at
-    // a ~30 Hz content rate, which read as "menus feel like 15-30 fps while
-    // the counter says 140".
+    // Routing (see the 2d_async_px cvar): INLINE-FIRST under the per-frame
+    // budget; the run-copy untiler + in-place hot updates made decodes
+    // cheap (1280x720 sub-ms; no CreateCommittedResource churn on content
+    // changes), so first sightings AND content changes decode inline for
+    // 1-frame content latency. The async workers are the burst-overflow
+    // valve only: they exist because inline decodes stall the frame AND the
+    // guest (swap blocks), which mattered when a screen change brought
+    // 100+ ms of per-pixel decode work, but routinely
+    // skipping first-sight quads made every APT re-raster (new address =
+    // new key) blink its element for 1-3 frames (the menu flicker).
     const int32_t async_px = REXCVAR_GET(skate3_native_render_scene_2d_async_px);
     const uint32_t px_w = (fetch[2] & 0x1FFFu) + 1;
     const uint32_t px_h = ((fetch[2] >> 13) & 0x1FFFu) + 1;
@@ -16389,18 +16835,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // them on their first decoded content.
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
       if (fp != 0 && fp != it->second.payload_fp) {
-        const bool hot =
-            frame_number - it->second.last_change_frame <= 60;
+        // Content changes decode INLINE while the per-frame budget lasts
+        // (1-frame latency for animating UI); fullscreen-class art gets an
+        // extended budget; serving it stale/blank is a whole-screen
+        // artifact, and the run-copy untiler made even 1280x720 cheap.
+        const bool fullscreen_class = uint64_t(px_w) * px_h >= 460'000;
         inline_redecode =
-            video || !async_ui || (hot && hot_inline_budget_ns > 0);
+            video || !async_ui || hot_inline_budget_ns > 0 ||
+            (fullscreen_class && hot_inline_budget_ns > -4'000'000);
         if (inline_redecode) {
+          // Same layout = update the committed texture in place (no
+          // CreateCommittedResource churn, SRV slot kept, tear-guarded).
+          const auto up_t0 = PerfClock::now();
+          if (UpdateGuestTexture2DInPlace(context, base, it->second)) {
+            const uint64_t up_ns = perf_ns_since(up_t0);
+            hot_inline_budget_ns -= int64_t(up_ns);
+            g_pw_tex_decode.Add(up_ns);
+            it->second.last_change_frame = frame_number;
+            return &it->second;
+          }
           RetireGuestTexture(it->second,
                              command_processor->GetCurrentSubmission());
           g_r.tex_store.erase(it);
           it = g_r.tex_store.end();  // falls into the inline decode below
         } else {
-          // Cold change (poster rotation class): heal on the workers,
-          // serve the stale decode meanwhile.
+          // Budget exhausted (burst overflow): heal on the workers, serve
+          // the stale decode meanwhile.
           EnqueueWordsMiss(key, fetch, /*ui=*/true);
           it->second.recheck_frame = frame_number + 2;
           g_2d_async_stale.fetch_add(1, std::memory_order_relaxed);
@@ -16416,10 +16876,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     if (it == g_r.tex_store.end()) {
-      if (async_ui && !video && !inline_redecode) {
-        // First sighting: decode on the workers and skip the quad for the
-        // 1-3 frames that takes (imperceptible pop-in at the render rate,
-        // vs a whole-frame render+guest stall inline).
+      // First sightings also decode INLINE while the budget lasts. The old
+      // always-async policy skipped the quad for the 1-3 worker-round-trip
+      // frames, but animating APT art re-rasterizes at NEW addresses, so
+      // every animation step was a "first sighting" and menu elements
+      // (including fullscreen backdrops) BLINKED through every animation
+      // (askip +150/window during navigation, visible
+      // menu flicker/brightness pulsing). Async remains the burst-overflow
+      // valve only.
+      const bool fullscreen_class = uint64_t(px_w) * px_h >= 460'000;
+      const bool inline_ok =
+          hot_inline_budget_ns > 0 ||
+          (fullscreen_class && hot_inline_budget_ns > -4'000'000);
+      if (async_ui && !video && !inline_redecode && !inline_ok) {
         EnqueueWordsMiss(key, fetch, /*ui=*/true);
         g_2d_async_skip.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
@@ -16440,10 +16909,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         const uint32_t n = s_slow.fetch_add(1, std::memory_order_relaxed);
         if (n < 24 || (n & 255u) == 0) {
           REXLOG_INFO(
-              "native-scene: SLOW inline 2D decode {:.1f}ms {}x{} "
-              "fetch=[{:08X} {:08X} {:08X}] forced={} (n={})",
-              double(decode_ns) / 1e6, px_w, px_h, fetch[0], fetch[1],
-              fetch[2], force_inline ? 1 : 0, n);
+              "native-scene: SLOW inline 2D decode {:.1f}ms (copy {:.1f} "
+              "create {:.1f} gen {:.1f}) {}x{} fetch=[{:08X} {:08X} {:08X}] "
+              "forced={} (n={})",
+              double(decode_ns) / 1e6, double(g_tex_dec_copy_ns) / 1e6,
+              double(g_tex_dec_create_ns) / 1e6, double(g_tex_dec_gen_ns) / 1e6,
+              px_w, px_h, fetch[0], fetch[1], fetch[2], force_inline ? 1 : 0, n);
         }
       }
       if (!gt.valid) {
@@ -16736,19 +17207,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           std::memcpy(rows + 240 * 4, scene.photo_fx.vs[pass],
                       sizeof(scene.photo_fx.vs[pass]));
           std::memcpy(rows + 250 * 4, kPfxLiterals[pass], sizeof(kPfxLiterals[pass]));
-          // Half-dest-pixel interpolator offsets: the game's quad VSs carry
-          // half a pixel of THEIR render target (visualfx dest 1152x640 in
-          // VS c3, fisheye dest 1280x720 framebuffer in VS c2) for
-          // D3D9-style texel alignment. The native full-res targets are
-          // guest_output-sized; substitute half a NATIVE pixel. (The
-          // half-res DOF passes keep the game's exact 576x320 targets, so
-          // their captured rows stay.) Guarded to the expected sub-pixel
-          // magnitudes so a mis-captured row can't become a visible shift.
-          if (pass == kPfxVisualFx || pass == kPfxFisheye) {
-            float* half_px = rows + (pass == kPfxVisualFx ? 243 : 242) * 4;
+          // The game's quad VSs add half a DEST texel to the sampling uv
+          // (visualfx c3 = 0.5/1152,0.5/640; dof passes c3 = 0.5/576,
+          // 0.5/320; fisheye c2 = 0.5/1280,0.5/720), D3D9/Xenos raster
+          // compensation: their pixel centers interpolate uv = i/W, so
+          // +half lands on the intended (i+0.5)/W. Our D3D12 fullscreen
+          // triangle interpolates (i+0.5)/W ALREADY; keeping the captured
+          // offsets shifts each pass's sampling by half a dest texel
+          // (content drifts up-left ~1.5 half-res texels across the three
+          // half-res DOF passes = the observed "blur starts above the
+          // pole" mask misregistration). ZERO them
+          // natively. Guarded to the expected sub-pixel magnitudes so a
+          // mis-captured row is left alone.
+          {
+            float* half_px =
+                rows + (pass == kPfxFisheye ? 242 : 243) * 4;
             if (std::fabs(half_px[0]) < 0.002f && std::fabs(half_px[1]) < 0.004f) {
-              half_px[0] = 0.5f / float(context.guest_output_width);
-              half_px[1] = 0.5f / float(context.guest_output_height);
+              half_px[0] = 0.0f;
+              half_px[1] = 0.0f;
             }
           }
         }
