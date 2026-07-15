@@ -172,6 +172,15 @@ REXCVAR_DEFINE_BOOL(
     "to the emulated fallback by itself.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_photo_display_yield, false, "Skate 3",
+    "Yield the photo DISPLAY-CARD screen to the emulated output while the "
+    "framed card is up. OFF (default) since the shutter burst: the game "
+    "CPU-composes the framed card into the card texture at the grab (the "
+    "burst makes its inputs real), and the native 2D replay samples that "
+    "same texture; the display screen renders fully native. Turn ON as a "
+    "safety hatch if the display screen misrenders natively.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_photo_native, true, "Skate 3",
     "Render the photo-mission photo editor NATIVELY, applying the game's "
     "own postfx chain (depth of field / saturation / brightness / contrast "
@@ -3016,6 +3025,53 @@ std::atomic<bool> g_photo_flow_frame{false};
 // full story): stamped by Publish2dDraws on the guest thread whenever the
 // card-signature quad is in the 2D stream; read by YieldForPhotoDisplay.
 std::atomic<int64_t> g_photo_card_seen_ns{-1};
+
+// Last ScreenshotBackEnd grab REQUEST (PerfClock ns): the game arms a grab
+// 1-2 frames before it renders the shot + card-composite frame sequence and
+// CPU-reads the resolves (GrabScreenshot -> OnScreenShot compose). The
+// shutter burst (UpdatePhotoGrabWindow) keys on this: the ONLY moment the
+// card-build's inputs can be made real under the native path.
+std::atomic<int64_t> g_photo_grab_request_ns{-1};
+
+void OnPhotoGrabRequest() {
+  g_photo_grab_request_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          PerfClock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+}
+
+// GrabScreenshot returned: the grab CPU-read the resolved shot, and the
+// OnScreenShot card compose that follows (same guest thread, same Update)
+// only reads memory the burst already copied. The burst closes here:
+// event-driven, no timers (a short grace in the window logic covers the
+// aux-target grab some flows issue on the following frame).
+std::atomic<int64_t> g_photo_grab_done_ns{-1};
+
+void OnPhotoGrabDone() {
+  g_photo_grab_done_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          PerfClock::now().time_since_epoch())
+          .count(),
+      std::memory_order_relaxed);
+}
+
+// True while the photo display-card quad is in the live 2D stream during an
+// armed photo flow; the compose auto-trace trigger
+// (skate3_native_render.cpp) keys on it.
+bool PhotoCardVisible() {
+  if (!g_photo_flow_frame.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  const int64_t seen = g_photo_card_seen_ns.load(std::memory_order_relaxed);
+  if (seen < 0) {
+    return false;
+  }
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             PerfClock::now().time_since_epoch())
+                             .count();
+  return now_ns - seen < 250'000'000;
+}
 // Defined with the yield helpers below (anonymous namespace); used by the
 // BuildFrameScene publish gate (the chain must only run while the editor
 // itself is up).
@@ -5152,7 +5208,10 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     std::lock_guard<std::mutex> lock(g_record_mutex);
     const bool frame_recorded = (g_frames_seen + 1) % g_record_stride == 0;
     const bool all_draws = REXCVAR_GET(skate3_native_render_snapshot_all_draws);
-    const size_t draw_cap = all_draws ? 200000 : 32768;
+    // 600k: a 360-frame all-draws photo-compose trace is ~470k records (a
+    // 200k cap cuts such a trace around frame 160, before the
+    // late-firing card compose).
+    const size_t draw_cap = all_draws ? 600000 : 32768;
     if (frame_recorded && (all_draws || flags2d != 0 || (g_record_frame % 60) < 2) &&
         g_recorded_draws.size() < draw_cap) {
       auto rec = std::make_unique<RecordedDraw>();
@@ -14637,14 +14696,32 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
   constexpr int32_t kForceReadbackMaxLength = 0x2D0000;
   static bool s_armed = false;
   static bool s_emulated_armed = false;
+  static bool s_burst_armed = false;
   static int64_t s_arm_ns = 0;
   static int64_t s_last_run_ns = 0;
   static int32_t s_readback_saved = 0;
   static bool s_suppress_saved = false;
   static bool s_halfpx_saved = false;
+  static int32_t s_burst_max_saved = 0;
+  static bool s_burst_suppress_saved = false;
+  static bool s_burst_halfpx_saved = false;
+  static int64_t s_burst_open_ns = 0;
   const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              PerfClock::now().time_since_epoch())
                              .count();
+  const auto disarm_burst = [&] {
+    s_burst_armed = false;
+    if (s_burst_max_saved <= 0) {
+      REXCVAR_SET(native_render_force_resolve_readback_max_length,
+                  s_burst_max_saved);
+    }
+    if (s_burst_suppress_saved) {
+      REXCVAR_SET(native_render_suppress_emulated_draws, true);
+    }
+    if (!s_burst_halfpx_saved) {
+      REXCVAR_SET(readback_resolve_half_pixel_offset, false);
+    }
+  };
   // This function only runs while the native renderer is producing frames
   // (RenderScene). A gap means the native path was toggled off or yielding
   // - grab writes legitimately paused, so give the watchdog a fresh grace
@@ -14687,6 +14764,32 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
     }
     s_emulated_armed = true;
   };
+  // Shader compilation goes SYNCHRONOUS for the whole photo flow; the
+  // menus lesson applied here: with async_shader_compilation on, the d3d12
+  // command processor SKIPS any draw whose pipeline is still compiling, and
+  // the photo display screen's framed-card compose is a ONE-SHOT pass.
+  // Its shaders have been suppressed-cold in every native session (and the
+  // pipeline caches were invalidated by SDK rebuilds), so the compose's
+  // draws were skipped at the exact moment they finally ran, which is why
+  // the card stayed un-framed EVEN IN EMULATED rendering.
+  // One-time compile stalls during a photo UI moment are invisible.
+  static bool s_async_forced = false;
+  static bool s_async_saved = false;
+  if (want && !s_async_forced) {
+    s_async_saved = REXCVAR_GET(async_shader_compilation);
+    if (s_async_saved) {
+      REXCVAR_SET(async_shader_compilation, false);
+      REXLOG_INFO(
+          "native-scene: photo flow - shader compilation synchronous (the "
+          "one-shot card compose can't skip still-compiling draws)");
+    }
+    s_async_forced = true;
+  } else if (!want && s_async_forced) {
+    if (s_async_saved) {
+      REXCVAR_SET(async_shader_compilation, true);
+    }
+    s_async_forced = false;
+  }
   if (want && !s_armed) {
     s_armed = true;
     s_arm_ns = now_ns;
@@ -14702,9 +14805,8 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
       g_photo_grab_native_armed.store(true, std::memory_order_relaxed);
       REXLOG_INFO(
           "native-scene: photo flow - NATIVE grab armed (suppression stays "
-          "on; the native output is downsampled + CPU-tiled into the guest "
-          "screenshot target each frame; the display-card screen yields to "
-          "the emulated output)");
+          "on; native output CPU-tiled into the guest screenshot target; "
+          "display card yields to emulated; shutter burst on grab request)");
     } else {
       arm_emulated();
       REXLOG_INFO(
@@ -14715,6 +14817,9 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
     }
   } else if (!want && s_armed) {
     s_armed = false;
+    if (s_burst_armed) {
+      disarm_burst();
+    }
     if (g_photo_grab_native_armed.exchange(false, std::memory_order_relaxed)) {
       REXLOG_INFO(
           "native-scene: photo flow ended - native grab wrote {} frames "
@@ -14755,11 +14860,75 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
     const int64_t basis = std::max(std::max(last_write, s_arm_ns), yield_end);
     if (now_ns - basis > 700'000'000) {
       g_photo_grab_native_armed.store(false, std::memory_order_relaxed);
+      if (s_burst_armed) {
+        disarm_burst();
+      }
       arm_emulated();
       REXLOG_WARN(
           "native-scene: photo flow - native grab produced no frames for "
           "700 ms; falling back to the forced-readback window{}",
           s_suppress_saved ? " + suppression lifted" : "");
+    }
+  }
+  // SHUTTER BURST: the game builds the framed card as a dedicated frame
+  // sequence at the grab - request (hooked: OnPhotoGrabRequest) -> render
+  // the shot + card-composite passes -> resolve -> GrabScreenshot/
+  // OnScreenShot CPU-read the resolves and CPU-compose the card texture.
+  // Under the native path those frames are suppressed and nothing lands in
+  // CPU memory, so the compose blends zeros = the un-framed card (proven:
+  // the control run's composite CPU copies all land inside this window;
+  // every post-hoc timing window missed it because the CONSUMER runs
+  // immediately at the shutter). For ~1.5 s from the request: suppression
+  // fully lifted + kFull readbacks up to 0x2D0000 (the full composite
+  // class; the handful of drains sits inside the shutter freeze the game
+  // already has). The emulated 0x04911000 resolve may overwrite the
+  // natively-written photo during the burst, same frozen scene, emulated
+  // 3x3 quality, the pre-native-grab standard, acceptable.
+  if (s_armed && !s_emulated_armed &&
+      g_photo_grab_native_armed.load(std::memory_order_relaxed)) {
+    const int64_t req = g_photo_grab_request_ns.load(std::memory_order_relaxed);
+    // EVENT-DRIVEN close: GrabScreenshot COMPLETING (post-call stamp,
+    // OnPhotoGrabDone) means every remaining card-build step, the
+    // OnScreenShot compose included, is CPU-side work on memory the burst
+    // already copied. The burst therefore spans exactly request ->
+    // grab-done: the 1-3 shot frames, the physical minimum, all inside the
+    // game's own shutter freeze, instead of a timer running into the
+    // display fly-in (the user-visible lag spike). A 150 ms grace after
+    // grab-done covers the aux-target grab some flows issue on the
+    // following frame; the 1.5 s cap remains only as the fallback for a
+    // request that never grabs.
+    const int64_t done_ns = g_photo_grab_done_ns.load(std::memory_order_relaxed);
+    const bool grab_done = done_ns > req && now_ns - done_ns > 150'000'000;
+    const bool burst_want =
+        req >= 0 && now_ns - req < 1'500'000'000 && !grab_done;
+    if (burst_want && !s_burst_armed) {
+      s_burst_armed = true;
+      s_burst_max_saved =
+          REXCVAR_GET(native_render_force_resolve_readback_max_length);
+      if (s_burst_max_saved <= 0) {
+        REXCVAR_SET(native_render_force_resolve_readback_max_length, 0x2D0000);
+      }
+      s_burst_suppress_saved = REXCVAR_GET(native_render_suppress_emulated_draws);
+      if (s_burst_suppress_saved) {
+        REXCVAR_SET(native_render_suppress_emulated_draws, false);
+      }
+      s_burst_halfpx_saved = REXCVAR_GET(readback_resolve_half_pixel_offset);
+      if (!s_burst_halfpx_saved) {
+        REXCVAR_SET(readback_resolve_half_pixel_offset, true);
+      }
+      s_burst_open_ns = now_ns;
+      REXLOG_INFO(
+          "native-scene: photo grab REQUEST - shutter burst OPEN "
+          "(suppression lifted + <=0x2D0000 kFull readbacks; the shot + "
+          "card-composite frames render and land in guest memory; closes "
+          "when the grab completes)");
+    } else if (!burst_want && s_burst_armed) {
+      disarm_burst();
+      REXLOG_INFO(
+          "native-scene: shutter burst closed after {} ms ({}) - "
+          "suppression + readback restored",
+          (now_ns - s_burst_open_ns) / 1'000'000,
+          grab_done ? "grab completed" : "1.5 s cap");
     }
   }
 }
@@ -14783,6 +14952,27 @@ bool YieldForPhotoDisplay() {
   static bool s_preroll = false;
   static bool s_suppress_saved = false;
   static int64_t s_preroll_ns = 0;
+  // Default OFF since the shutter burst was added: the framed card
+  // is CPU-composed into the card texture at the grab, and the native 2D
+  // replay samples that same texture; the display screen renders fully
+  // native (card + blurred backdrop + buttons). The yield remains as a
+  // safety hatch for display-screen regressions.
+  if (!REXCVAR_GET(skate3_native_render_scene_photo_display_yield)) {
+    if (s_preroll) {
+      s_preroll = false;
+      if (s_suppress_saved) {
+        REXCVAR_SET(native_render_suppress_emulated_draws, true);
+      }
+      if (g_photo_display_yielding.exchange(false, std::memory_order_relaxed)) {
+        g_photo_display_yield_end_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                PerfClock::now().time_since_epoch())
+                .count(),
+            std::memory_order_relaxed);
+      }
+    }
+    return false;
+  }
   const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              PerfClock::now().time_since_epoch())
                              .count();

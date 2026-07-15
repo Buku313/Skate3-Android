@@ -48,6 +48,17 @@ REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_frames, 4, "Skate 3",
                      "the snapshot")
     .range(1, 600)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Defined in skate3_native_scene.cpp (the recording filter lives there).
+REXCVAR_DECLARE(bool, skate3_native_render_snapshot_all_draws);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_photo_compose_trace, false, "Skate 3",
+    "Auto-capture an F10-style diagnostic recording (all draws, ~360 "
+    "frames + memory snapshot) the first time a photo display card comes "
+    "up in a session. Captures the game's one-shot framed-card compose "
+    "pass: its draws, source textures (frame art / logo / caption) and "
+    "geometry, for offline analysis. Writes ~100 MB into "
+    "native_render_snapshots once per session.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_stride, 1, "Skate 3",
                      "Record every Nth frame while collecting (long viewer recordings: "
                      "e.g. 12 = ~12 recorded frames/sec at 144fps)")
@@ -600,6 +611,28 @@ void OnFrameEnd(uint8_t* base) {
                   g_frame_index, mesh_count);
     }
   }
+  // Photo display-card compose auto-trace: the first time the framed card
+  // comes up in a session, record EVERY draw for ~360 frames + the memory
+  // snapshot; the game's one-shot card compose (frame art / logo / caption
+  // stamped over the photo) fires at an unpredictable moment within this
+  // window, and the capture pins its draws, source textures and geometry.
+  if (!g_collecting && REXCVAR_GET(skate3_native_render_photo_compose_trace)) {
+    static bool s_compose_trace_done = false;
+    if (!s_compose_trace_done && skate3::native_scene::PhotoCardVisible()) {
+      s_compose_trace_done = true;
+      REXCVAR_SET(skate3_native_render_snapshot_frames, 360);
+      REXCVAR_SET(skate3_native_render_snapshot_stride, 1);
+      REXCVAR_SET(skate3_native_render_snapshot_all_draws, true);
+      g_collecting = true;
+      g_collect_counter = 0;
+      skate3::native_scene::StartRecording(1);
+      REXLOG_INFO(
+          "native-render snapshot: photo display card up - compose trace "
+          "armed at frame {} (360 frames, all draws; snapshot cvars stay "
+          "changed for this session)",
+          g_frame_index);
+    }
+  }
   if (g_collecting) {
     // Immediate (F10) captures skip the arming frame: the scene-side
     // recording was only armed after this frame's BuildFrameScene ran, so
@@ -852,6 +885,27 @@ extern "C" REX_FUNC(sub_824FD550) {
     skate3::native_scene::OnTakePhoto();
   }
   __imp__sub_824FD550(ctx, base);
+  // Post-call: the grab has CPU-read the shot; the card compose that
+  // follows reads already-copied memory. Event-closes the shutter burst.
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnPhotoGrabDone();
+  }
+}
+
+// Sk8::BE::ScreenshotBackEnd grab REQUEST (sets the grab params + arms the
+// request flag; called by the FE photo flows 1-2 frames BEFORE the game
+// renders the shot + card-composite frame sequence whose resolves
+// GrabScreenshot/OnScreenShot then CPU-read). This is the only PREDICTIVE
+// shutter signal; the GrabScreenshot hook above fires AFTER those frames
+// already rendered (suppressed). Arms the shutter burst: suppression lifted
+// + full small-resolve readbacks for ~1.5 s so the card-build's inputs are
+// real (a logged control run showed the composite CPU copies land exactly
+// in this window; every post-hoc window/bound missed them).
+extern "C" REX_FUNC(sub_824FD4B0) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnPhotoGrabRequest();
+  }
+  __imp__sub_824FD4B0(ctx, base);
 }
 
 // rw::movie::MovieDecoder::Decode(int, VideoRenderable**,

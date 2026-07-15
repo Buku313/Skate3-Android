@@ -406,6 +406,15 @@ void OnPhotoReplayUpdate();
 // forced-readback window for the frames that render and CPU-grab the
 // screenshot target.
 void OnTakePhoto();
+// ScreenshotBackEnd grab REQUEST (fires 1-2 frames BEFORE the game renders
+// the shot + card-composite frame sequence): arms the shutter burst.
+void OnPhotoGrabRequest();
+// GrabScreenshot COMPLETED (post-call): every card-build read from here on
+// is CPU-side of already-copied memory, closes the shutter burst.
+void OnPhotoGrabDone();
+// True while the photo display-card quad is in the live 2D stream during an
+// armed photo flow; the compose auto-trace trigger keys on it.
+bool PhotoCardVisible();
 void OnMovieDecode();
 void OnMovieFrame(uint8_t* base, uint32_t renderer);
 
