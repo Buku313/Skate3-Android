@@ -837,6 +837,23 @@ extern "C" REX_FUNC(sub_826147C8) {
   __imp__sub_826147C8(ctx, base);
 }
 
+// Sk8::BE::ScreenshotBackEnd::GrabScreenshot(bool), the actual grab: the
+// game CPU-reads the resolved screenshot target from guest memory and
+// JPEG-encodes it. Fires in EVERY grab flow; the photo-mission Select
+// confirm does NOT go through FrontEndState_Replay2::TakePhoto (a logged
+// full photo-mission run never opened the card compose window), so this is
+// the canonical shutter heartbeat. Right after the grab
+// the FE composes the framed display card (white border / caption / logo)
+// over the JPEG texture in a ONE-SHOT RTT pass; the card compose window
+// (UpdatePhotoGrabWindow) keys off this timestamp so that pass executes and
+// its resolve lands in CPU guest memory for the native 2D decoder.
+extern "C" REX_FUNC(sub_824FD550) {
+  if (skate3::native_render::Enabled()) {
+    skate3::native_scene::OnTakePhoto();
+  }
+  __imp__sub_824FD550(ctx, base);
+}
+
 // rw::movie::MovieDecoder::Decode(int, VideoRenderable**,
 // SubtitleRenderable*): fires per decoded FMV frame while any movie plays
 // (boot intro logos and all other rw::movie playback). Heartbeat for the

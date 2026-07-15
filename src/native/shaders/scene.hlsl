@@ -39,7 +39,8 @@ cbuffer S : register(b1) {
   float4 sh_c1;     // cascade 1 scale.xy + offset.zw              [PS c1]
   float4 sh_c2;     // cascade 2 scale.xy + offset.zw              [PS c2]
   float4 sh_color;  // shadow color rgb [PS c8] + its luma in w
-  float4 sh_misc;   // x = depth bias [PS c5.x], y = enable
+  float4 sh_misc;   // x = depth bias [PS c5.x], y = enable,
+                    // zw = atlas dimensions (3*tile, tile)
   // Exact world-shading frame rows (consumed by the env-family branch):
   float4 sh_sun;    // xyz = sun direction [PS c6], w = scene exposure [c10.x]
   float4 sh_env;    // x = material multiplier [PS c11.y], yz = tree lightmap
@@ -52,6 +53,11 @@ cbuffer S : register(b1) {
   float4 dyn_amb;   // xyz = flat ambient (c15.rgb), w = bounce scale (c15.w)
   float4 dyn_misc;  // x = material multiplier (c14.y),
                     // y = static world-shadow floor (c8.w)
+  // Character CSM receive biases (game char PS bank, finest cascade first)
+  // + enable in w: the exact 9-tap character shadow sampling
+  // (cacstamp_skin_nisPS port; see SampleCsmShadow). sh_misc.zw carry the
+  // atlas dimensions for the point-snapped taps.
+  float4 sh_char;
 };
 // Character-family lighting (defaultcharacter.fx and friends): canonical
 // per-draw rows captured from the guest PIXEL constant bank at palette
@@ -133,9 +139,14 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
 // Native CSM atlas sample at a world position: finest covering cascade,
 // s = saturate(infront + 1 - coverage). Returns 1 (lit) when uncovered or
 // shadows are off. extra_bias suppresses receiver self-shadow acne on
-// surfaces that are themselves casters (characters, held board). A NEGATIVE
-// extra_bias selects the game's dynamicobject receive bias instead: a
-// per-cascade literal 0.007 (finest) / 0.015 (outer) replacing sh_misc.x
+// surfaces that are themselves casters (characters, held board), in DEPTH
+// UNITS like the game's own bias constants (receiver c5.x, the dynobj
+// literals); a world-metric bias was tried for the editor face band and
+// REVERTED: the band was the HAT casting (the game's shadow passes skip
+// it, see shadow_caster parity), not under-biasing, and the 0.144 m value
+// erased the legit head-onto-neck shadow. A NEGATIVE extra_bias selects
+// the game's dynamicobject receive bias instead: a per-cascade literal
+// 0.007 (finest) / 0.015 (outer) replacing sh_misc.x
 // (from the dynamicobject_defaultPS ucode). Props
 // are casters themselves, and with only the world bias (c5.x = 0 in every
 // capture) their flat tops compared against their own atlas depth; the
@@ -156,11 +167,45 @@ float SampleCsmShadow(float3 wp, float extra_bias) {
   if (casc <= 0.0) {
     return 1.0;
   }
+  float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
+                      luv.y * -0.5 + 0.5);
+  // Character receivers: the game's EXACT sampling (cacstamp_skin_nisPS
+  // ucode + live captured constants; offline-validated against the
+  // emulated frame). Reference = saturate(raw_depth - c9[cascade])
+  // (the per-cascade biases REPLACE the world receiver bias), NINE POINT
+  // taps at +-1 game-texel of the 512 tile (u step 1/1536 of the 3-tile
+  // atlas), binary sge each, averaged x 1/9 (literal c255.w). No coverage
+  // term: uncovered texels hold the far clear and compare lit.
+  if (extra_bias > 0.0 && sh_char.w > 0.0) {
+    float cbias = casc > 2.5 ? sh_char.z : (casc > 1.5 ? sh_char.y : sh_char.x);
+    float refd = saturate(dot(sh_z.xyz, wp) + sh_z.w - cbias);
+    // Tap offsets in game-map texels, BILINEAR-filtered like the game's
+    // fetches; the atlas blur dilates depth outward exactly so filtered
+    // compares stay valid across coverage edges; point-snapped taps
+    // quantized the penumbra into a stippled banding ("glisten"). Taps
+    // clamp half a texel inside the tile so filtering never bleeds the
+    // neighboring cascade.
+    float2 atlas_dim = float2(sh_misc.z, sh_misc.w);
+    float2 game_texel = float2(1.0 / 1536.0, 1.0 / 512.0);
+    float tile_x0 = (casc * 2.0 - 2.0) / 6.0;
+    float tile_x1 = casc * 2.0 / 6.0;
+    float acc = 0.0;
+    [unroll] for (int k = 0; k < 9; ++k) {
+      const float2 kOfs[9] = {float2(0.0, 0.0),   float2(-1.0, -1.0),
+                              float2(0.0, -1.0),  float2(1.0, -1.0),
+                              float2(-1.0, 0.0),  float2(1.0, 0.0),
+                              float2(-1.0, 1.0),  float2(0.0, 1.0),
+                              float2(1.0, 1.0)};
+      float2 s = suv + kOfs[k] * game_texel;
+      s.x = clamp(s.x, tile_x0 + 0.5 / atlas_dim.x, tile_x1 - 0.5 / atlas_dim.x);
+      s.y = clamp(s.y, 0.5 / atlas_dim.y, 1.0 - 0.5 / atlas_dim.y);
+      acc += shadow_atlas.Sample(smp_clamp, s).x >= refd ? 1.0 : 0.0;
+    }
+    return acc / 9.0;
+  }
   float bias = extra_bias < 0.0 ? (casc > 1.5 ? 0.015 : 0.007)
                                 : sh_misc.x + extra_bias;
   float rd = dot(sh_z.xyz, wp) + sh_z.w - bias;
-  float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
-                      luv.y * -0.5 + 0.5);
   float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
   return saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
 }
@@ -380,6 +425,12 @@ float4 ps_main(VSOut i) : SV_Target {
       // defaultcharacter/cacstamp PSes end `max oC0.w, c13.x / c22.x`:
       // the entity's spawn fade (see the livingworld comment above).
       out_a = ch_misc.x;
+      // character.alpha accessory (sunglass lens): coverage from the mesh's
+      // "alpha" channel at the raw second texcoord, like hair (cac_alphaPS:
+      // oC0.w = tf5(uv2).r * c22.x), routed to the blended sub-pass.
+      if (ch_misc.z > 0.5) {
+        out_a *= saturate(decal_art.Sample(smp, i.uv2).r);
+      }
     }
     // Exact tone chain: sqrt(0.5 * (max(x*E/4 + 0.75, 1) - sat(1 - x*E)^2)).
     float E = max(ch_key.w, 0.01);

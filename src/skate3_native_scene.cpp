@@ -154,6 +154,24 @@ REXCVAR_DEFINE_BOOL(
     "frames only.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_photo_grab_native, true, "Skate 3",
+    "Fulfill the photo grab NATIVELY while a photo flow is active: keep "
+    "emulated-draw suppression ON (the 40-50 fps editor cost was the "
+    "unsuppressed emulated pipeline rendering the whole scene + postfx at "
+    "scaled res every armed frame, proven by the kFast run: zero readback "
+    "drains, same fps) and instead downsample the native output to the "
+    "game's 1152x640 screenshot target each armed frame, read it back "
+    "(double-buffered, no GPU drain) and CPU-tile it big-endian into guest "
+    "memory at 0x04911000 where ScreenshotBackEnd::GrabScreenshot JPEG-"
+    "encodes it. In the photo editor the native output IS the ported postfx "
+    "chain result; in the plain TakePhoto window it is the plain frame, "
+    "both the correct grab semantics. OFF = the emulated fallback: forced "
+    "kFull resolve readbacks + suppression lifted for the whole window "
+    "(skate3_native_render_scene_photo_readback). If native frames stop "
+    "mid-window (mode toggle, unexpected yield), the window watchdog flips "
+    "to the emulated fallback by itself.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_photo_native, true, "Skate 3",
     "Render the photo-mission photo editor NATIVELY, applying the game's "
     "own postfx chain (depth of field / saturation / brightness / contrast "
@@ -306,11 +324,30 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadows, true, "Skate 3",
                     "material constants.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 1024, "Skate 3",
-                     "Shadow cascade tile resolution. The game renders 512, but the "
-                     "emulated baseline renders the pass resolution-scaled; 1024 "
-                     "matches the edge crispness players currently see.")
+                     "Shadow cascade tile resolution. The game's own atlas is "
+                     "three 512 tiles; the blur offsets scale with this value so "
+                     "the penumbra WIDTH stays console-equal at any resolution "
+                     "(like the emulated GPU: scaled raster, logical-texel blur). "
+                     "1024 = fine silhouettes at the game's softness; 512 = "
+                     "console-exact but visibly blocky edges up close.")
     .range(256, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_caster_parity, true,
+                    "Skate 3",
+                    "Character pieces cast dynamic shadows only when the game "
+                    "submitted them to its own shadow passes this frame (per-piece "
+                    "caster list; e.g. the CAS trucker hat never casts; natively "
+                    "casting it painted a hard brim band across the editor face). "
+                    "OFF = every published character piece casts (old behavior).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_char_shadow_exact, true,
+                    "Skate 3",
+                    "Characters sample the CSM atlas with the game's own math: "
+                    "per-cascade receive biases captured from the character PS "
+                    "banks and NINE point taps at +-1 game-texel averaged /9 "
+                    "(cacstamp_skin_nisPS ucode port). OFF = the legacy single "
+                    "bilinear tap + coverage term.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // Reflective-glass (env families 5/6) isolation controls for the F12
 // dialog: live A/B of each stage of the cube-reflection term against the
 // emulated look (F5).
@@ -941,6 +978,16 @@ std::vector<DrawItem> g_frame_dynitems;
 // for the post-draw state fixup (deferred / world-path captures draw after
 // their capture; the fixup fills palette or world from the actual draw).
 std::unordered_multimap<uint64_t, size_t> g_frame_pending_by_buffers;
+// Contexts submitted through an ORTHO (shadow caster-cascade) bank this
+// frame, i.e. items the GAME drew into its own shadow passes. The game's
+// caster list is per-piece: the CAS trucker hat submits ONLY to the main
+// view (verified in capture: every char piece has shadow-pass draws
+// except the hat); natively casting it painted a hard low-sun brim band
+// across the editor face that the emulated frame never shows. The native
+// atlas pass renders char pieces only when their ctx is in this set
+// (rescued/gap items inherit last frame's flag). Guarded by
+// g_palette_mutex; cleared at the end of BuildFrameScene.
+std::unordered_set<uint32_t> g_frame_ortho_ctx;
 // (ib_obj << 32 | vb_obj) -> dynitem indices whose character-lighting rows
 // should refresh on every later matching draw this frame. The one-shot
 // palette fixup usually pops on the shadow-CASTER draw, whose PS bank is
@@ -969,6 +1016,11 @@ std::unordered_map<uint64_t, std::array<uint32_t, 12>> g_frame_draw_fetch;
 // instance in the frame. Guest-render-thread only (capture hooks +
 // BuildFrameScene), no lock needed.
 std::unordered_map<uint32_t, std::array<float, 60>> g_char_rows_cache;
+// Frame-global character CSM receive biases (see FrameScene::char_shadow_bias)
+// + the guest frame they were captured on (served while <120 frames stale;
+// they only change with the scene lighting setup). Guest render thread only.
+float g_char_shadow_bias[3] = {};
+uint64_t g_char_shadow_bias_frame = 0;
 std::atomic<uint64_t> g_char_rows_reused{0};
 // mesh -> last published bone palette (skinned single-instance meshes).
 // Rescue for frames whose palette capture was REFUSED by the acceptance
@@ -1528,6 +1580,28 @@ uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
     }
     return f[0] * f[0] + f[1] * f[1] + f[2] * f[2] <= 0.0025f;
   };
+  // The ropa sim-INACTIVE flag row reads (1, ~0, JUNK, ~0); x is written
+  // bit-exact 1.0 by the game but z holds uninitialized memory (the CAS
+  // editor banks carry ~-2e23 there). The junk z fails every range check
+  // above, leaving the bank UNCLASSIFIABLE: the editor tee's main-pass
+  // capture then never succeeded, and the shadow (pre-pass) bank instead
+  // matched bone_at(7) MID-PALETTE (real palette at c5) = a one-bone-late
+  // palette that passes the 6-sample gate but fails the 32-sample publish
+  // veto every frame, the invisible edit-skater garment (captured:
+  // published bone k == bank bone k+1, bones 14/15
+  // junk, spread 112 vs bind 0.7). An out-of-range z under exact
+  // (1, ~0, *, ~0) is PROOF the row is a flag, never a bone row.
+  const auto ropa_flag_row_at = [&](uint32_t reg) -> bool {
+    float f[4];
+    for (int i = 0; i < 4; ++i) {
+      f[i] = LoadGuestF32(base, bank + (reg * 4 + uint32_t(i)) * 4);
+    }
+    if (!(std::fabs(f[0] - 1.0f) <= 1e-3f && std::fabs(f[1]) <= 1e-3f &&
+          std::fabs(f[3]) <= 1e-3f)) {
+      return false;
+    }
+    return !(f[2] > -1e7f && f[2] < 1e7f);
+  };
   // DETERMINISTIC main-pass detection first: that layout keeps the CAMERA
   // POSITION at c4 (palette at c7, or c8 behind a parameter row). Matching
   // c4 against the frame camera pins the layout without any scoring; the
@@ -1542,15 +1616,18 @@ uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
     const float dz = LoadGuestF32(base, bank + 18 * 4) - g_fog_cam[2];
     if (dx * dx + dy * dy + dz * dz < 25.0f &&
         (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
-      if (param_row_at(7) && bone_at(8)) return 8;
+      if ((param_row_at(7) || ropa_flag_row_at(7)) && bone_at(8)) return 8;
       if (bone_at(7)) return 7;
       return 0;
     }
   }
   if (bone_at(4)) return 4;
-  if (param_row_at(4) && bone_at(5)) return 5;
+  // The ropa junk-z flag check must run BEFORE bone_at(7): on a pre-pass
+  // ropa bank (flag c4, palette c5) rows c7.. are mid-palette bone rows and
+  // bone_at(7) matches them, the one-bone-late class.
+  if ((param_row_at(4) || ropa_flag_row_at(4)) && bone_at(5)) return 5;
   if (bone_at(7)) return 7;
-  if (param_row_at(7) && bone_at(8)) return 8;
+  if ((param_row_at(7) || ropa_flag_row_at(7)) && bone_at(8)) return 8;
   return 0;
 }
 
@@ -1740,11 +1817,19 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
   //     BankPaletteBase pins the main-pass layout with).
   const auto param_like = [&](uint32_t reg) -> bool {
     float f[4];
+    bool in_range = true;
     for (int i = 0; i < 4; ++i) {
       f[i] = LoadGuestF32(base, bank + (reg * 4 + uint32_t(i)) * 4);
       if (!(f[i] > -1e7f && f[i] < 1e7f)) {
-        return false;
+        in_range = false;
       }
+    }
+    if (!in_range) {
+      // (1, ~0, JUNK, ~0): the ropa sim-inactive flag row with
+      // uninitialized z (CAS editor banks); the out-of-range component
+      // PROVES it is not a bone row (see BankPaletteBase's twin check).
+      return std::fabs(f[0] - 1.0f) <= 1e-3f && std::fabs(f[1]) <= 1e-3f &&
+             std::fabs(f[3]) <= 1e-3f && !(f[2] > -1e7f && f[2] < 1e7f);
     }
     if (f[0] * f[0] + f[1] * f[1] + f[2] * f[2] <= 0.0025f) {
       return true;  // (0,0,0,w): the ropa flag row
@@ -2371,6 +2456,12 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
               } else {
                 item.char_family = 2;  // skin/face/cloth/leather/shift/ropa
               }
+              // character.alpha (exact): translucent accessory pieces
+              // (sunglass lenses), alpha from the "alpha" channel texture
+              // at uv2, blended after every opaque piece (see
+              // DrawItem::char_alpha; captured draw order:
+              // cac_alpha draws after all opaque CAC, before hair).
+              item.char_alpha = std::memcmp(sub, "alpha", 6) == 0;
             }
             // environment.decal / environment.decal_tileable: graffiti and
             // painted-branding overlay meshes (see DrawItem::decal).
@@ -2921,6 +3012,10 @@ struct PfxCapture {
 };
 PfxCapture g_pfx_cap[kPfxPassCount] = {};
 std::atomic<bool> g_photo_flow_frame{false};
+// Photo display-card sighting stamp (see the photo-grab helpers for the
+// full story): stamped by Publish2dDraws on the guest thread whenever the
+// card-signature quad is in the 2D stream; read by YieldForPhotoDisplay.
+std::atomic<int64_t> g_photo_card_seen_ns{-1};
 // Defined with the yield helpers below (anonymous namespace); used by the
 // BuildFrameScene publish gate (the chain must only run while the editor
 // itself is up).
@@ -3616,6 +3711,12 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
       }
     }
     d[14 * 4 + 0] = std::clamp(row((fam == 1 ? 13u : 22u) + plus, 0), 0.0f, 1.0f);
+    // character.alpha accessory (sunglass lens): tell the PS fam-1/2 branch
+    // to take alpha from the coverage texture at t4/uv2 (ch_misc.z); the
+    // item is routed to the blended sub-pass (see DrawItem::char_alpha).
+    if (item.char_alpha && item.hair_alpha_tex != 0) {
+      d[14 * 4 + 2] = 1.0f;
+    }
   } else if (fam == 3) {
     const float amb = row(19u, 3);
     if (!(amb >= 0.0f && amb < 16.0f)) return;
@@ -3673,6 +3774,24 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     d[14 * 4 + 0] = 1.0f;
   }
   d[14 * 4 + 1] = float(fam);
+  // Frame-global character CSM receive biases: one row below the light row
+  // in the fam-2 layouts (gameplay light c9 -> biases c8; editor light c10
+  // -> biases c9; verified in capture: (0.005,0.014,0.020)
+  // with the same values in every char bank). Captured once per frame from
+  // any validating fam-2 bank; consumed by the exact 9-tap char shadow
+  // sampling (FrameScene::char_shadow_bias).
+  if (fam == 2) {
+    const uint32_t bias_r = 8u + plus;
+    const float bx = row(bias_r, 0);
+    const float by = row(bias_r, 1);
+    const float bz = row(bias_r, 2);
+    if (bx > 0.0f && bx <= by && by <= bz && bz < 0.1f) {
+      g_char_shadow_bias[0] = bx;
+      g_char_shadow_bias[1] = by;
+      g_char_shadow_bias[2] = bz;
+      g_char_shadow_bias_frame = g_guest_frame;
+    }
+  }
   std::memcpy(item.char_rows, local, sizeof(item.char_rows));
   g_char_valid.fetch_add(1, std::memory_order_relaxed);
   // Remember the validated rows per garment for the cross-frame fallback
@@ -4229,6 +4348,18 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
     }
   }
   std::lock_guard<std::mutex> lock(g_palette_mutex);
+  // Record shadow-pass submissions per ctx (even refused/pending captures):
+  // the game's per-piece caster list = exactly the ctxs it submits through
+  // ortho banks; the native atlas pass mirrors it (see g_frame_ortho_ctx).
+  // Stamp the item copy too; the game draws its shadow passes FIRST, so
+  // every later copy (main pass, fixups, rescues, LW store ingest) carries
+  // the flag; a final pre-publish pass ORs the set over merged items.
+  const bool ortho_submit = !world_path && BankIsOrtho(base, bank);
+  if (ortho_submit) {
+    g_frame_ortho_ctx.insert(ctx);
+  }
+  item.shadow_caster =
+      ortho_submit || (ctx != 0 && g_frame_ortho_ctx.count(ctx) != 0);
   g_frame_dynitems.push_back(std::move(item));
   const size_t index = g_frame_dynitems.size() - 1;
   if (g_frame_dynitems[index].pending ||
@@ -7083,6 +7214,16 @@ void Publish2dDraws(uint8_t* base) {
         }
       }
     }
+    // Photo display-card sighting (see g_photo_card_seen_ns): fetch word2
+    // encodes exactly 504x640, the JPEG-decode card texture's unique dims.
+    if (g_photo_flow_frame.load(std::memory_order_relaxed) &&
+        (d.fetch[2] & 0x03FFFFFFu) == 0x004FE1F7u && d.src_stride == 24) {
+      g_photo_card_seen_ns.store(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              PerfClock::now().time_since_epoch())
+              .count(),
+          std::memory_order_relaxed);
+    }
     published.push_back(std::move(d));
   }
   std::lock_guard<std::mutex> lock(g_2d_mutex);
@@ -7248,9 +7389,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // leaving them in place across an early return (no perspective view, empty
   // frame) would desynchronize the indices stored in the records.
   std::vector<DrawItem> dynitems;
+  std::unordered_set<uint32_t> ortho_ctx;
   {
     std::lock_guard<std::mutex> lock(g_palette_mutex);
     dynitems.swap(g_frame_dynitems);
+    ortho_ctx.swap(g_frame_ortho_ctx);
     g_frame_pending_by_buffers.clear();
     g_frame_char_refresh.clear();
   }
@@ -8615,6 +8758,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
   }
+  // Character CSM receive biases (see the header comment): frame-coherent,
+  // served while fresh enough that a few capture-less frames don't flap the
+  // char shadow between the exact and legacy paths.
+  if (g_char_shadow_bias[0] > 0.0f &&
+      g_guest_frame - g_char_shadow_bias_frame <= 120) {
+    std::memcpy(scene.char_shadow_bias, g_char_shadow_bias,
+                sizeof(scene.char_shadow_bias));
+  }
   std::memcpy(scene.family_rows, g_family_rows, sizeof(g_family_rows));
   if (g_dynobj_have) {
     std::memcpy(scene.dynobj_rows, g_dynobj_rows, sizeof(g_dynobj_rows));
@@ -8954,6 +9105,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             scene.cam_pos[2], m00, m11, n);
       }
       return;
+    }
+  }
+  // Game shadow-pass parity (see g_frame_ortho_ctx): mark the items whose
+  // ctx the game submitted through an ortho caster bank this frame. Runs
+  // after every item source (merge, rescues, gap fill) and is OR-only:
+  // fresh captures default false, rescued/gap copies keep their stored
+  // flag, so a frame whose shadow capture was refused doesn't blink the
+  // entity's shadow off.
+  for (DrawItem& item : scene.items) {
+    if (item.ctx != 0 && ortho_ctx.count(item.ctx) != 0) {
+      item.shadow_caster = true;
     }
   }
   g_last_publish_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -9426,6 +9588,24 @@ struct RendererState {
   ID3D12PipelineState* pso_blur = nullptr;
   ID3D12PipelineState* pso_blur_blit = nullptr;
   ID3D12PipelineState* pso_blur_down = nullptr;
+  // Native photo grab (photo_grab_native): the blur downsample pass (whose
+  // 1152x640 blur space happens to BE the game's screenshot-target raster)
+  // renders the finished frame into blur_tex[0], which is then copied into
+  // one of these persistently-mapped READBACK buffers; the next armed frame
+  // CPU-tiles the completed one big-endian into the guest grab target. Two
+  // buffers so no frame ever waits on the GPU (a full kFull-style drain per
+  // frame was the old path's stall). Row pitch 1152*4 = 4608 is already
+  // 256-aligned.
+  static constexpr uint32_t kGrabRowPitch = kBlurWidth * 4;
+  ID3D12Resource* grab_readback[2] = {nullptr, nullptr};
+  uint8_t* grab_readback_ptr[2] = {nullptr, nullptr};
+  uint64_t grab_submission[2] = {0, 0};
+  bool grab_pending[2] = {false, false};
+  uint32_t grab_write_index = 0;
+  bool grab_failed = false;
+  // Window stats for the close log: frames written to guest + CPU tile time.
+  uint32_t grab_writes = 0;
+  uint64_t grab_cpu_us = 0;
   // Native FMV: overlay-2D pipeline variant whose PS combines the movie
   // player's three CPU-filled YUV plane textures (ps_yuv2d; substituted for
   // the captured movie quad in the 2D replay, see OnMovieFrame).
@@ -14335,41 +14515,160 @@ const char* PhotoEditorSignal(uint8_t* base) {
   return signal;
 }
 
-// The photo-grab readback window (see skate3_native_render_scene_photo_readback):
-// while the photo editor is up OR a TakePhoto fired within the last few
-// seconds, (a) arm the SDK's forced small-resolve CPU readback so the
-// resolved screenshot target actually lands in guest memory for the CPU
-// JPEG encode, and (b) lift emulated-draw suppression so the passes that
-// render that target execute even when the native output is active (a
-// no-op while the photo yield has the native output inactive anyway).
-// Runs every frame from RenderScene regardless of the yield decisions.
+// ---- Native photo grab (photo_grab_native) ---------------------------------
+// The grab content is produced NATIVELY while emulated-draw suppression stays
+// ON: RenderScene downsamples the finished native frame into blur_tex[0]
+// (1152x640: the blur space IS the game's screenshot raster), copies it to a
+// persistently-mapped READBACK buffer (double-buffered, never a GPU drain),
+// and the next armed frame CPU-tiles the completed one big-endian into the
+// guest screenshot target that ScreenshotBackEnd::GrabScreenshot reads.
+// Layout contract (traced through sub_824FD550 -> the sub_82A7DC20 surface
+// download): tiled Xenos 2D, 32bpp big-endian ARGB (guest byte order
+// A,R,G,B); the game XGUntileTextureLevel's it into a linear buffer and
+// hands the raw bytes to JPEG::WriteJPEG with no channel swap anywhere. The
+// 160x90 gallery thumb is CPU-resized from this same image INSIDE
+// GrabScreenshot (cImageOperateMan::ResizeJPEG); there is no second buffer
+// to fill. Ground truth fetch words (from capture): 1152x640
+// pitch 1152 k_8_8_8_8 tiled at 0x04911000 (the same surface the SDK's
+// Import-Skater special case hardcodes). The write transform is
+// byte-for-byte PROVEN offline against that capture's real readback
+// content: tiling + [A,R,G,B] guest order reproduced all 0x2D0000 bytes
+// with zero mismatches (alpha included: the emulated resolve also wrote
+// 255).
+constexpr uint32_t kGrabGuestAddr = 0x04911000;
+// The CPU (and the app's whole texture-decode path) accesses physical
+// memory through the 0xA0000000 cached-physical view; the gsnap ground
+// truth lives at 0xA4911000 and plain base+0x04911000 is NOT an alias of
+// those pages. All host-side reads/writes of the grab target go through
+// this view.
+constexpr uint32_t kGrabGuestView = 0xA0000000u | kGrabGuestAddr;
+// Photo window armed AND fulfilled natively this window (RenderScene's grab
+// block produces/consumes while this is set; the watchdog in
+// UpdatePhotoGrabWindow clears it and flips to the emulated fallback if
+// native frames stop landing).
+std::atomic<bool> g_photo_grab_native_armed{false};
+// Last successful guest write (PerfClock ns): the watchdog liveness signal.
+std::atomic<int64_t> g_grab_last_write_ns{-1};
+// The photo display-card quad was in the 2D stream this instant (PerfClock
+// ns, -1 = never). Stamped by Publish2dDraws (guest thread, runs every
+// guest frame regardless of yields) whenever the card-signature quad, the
+// 504x640 LINEAR JPEG-decode texture, unique to the photo display card,
+// is present. Drives YieldForPhotoDisplay: the display screen renders
+// EMULATED, because the game composes the framed card (white border /
+// caption / logo) in a ONE-SHOT pitch-1280 pass whose timing proved
+// unpredictable (observed anywhere from settle+0.8s to settle+4.0s; every
+// readback-window attempt missed it and cost seconds of concurrent-pipeline
+// lag). Yielded-emulated, the compose and the display chain just work
+// GPU-side with no readbacks, and with the native renderer not running
+// concurrently the frozen scene renders at the emulated pipeline's own
+// healthy rate. (g_photo_card_seen_ns itself is defined next to
+// g_photo_flow_frame; Publish2dDraws lives outside this anonymous
+// namespace.)
+// The display yield is active / when it last ended (watchdog interplay:
+// grab writes legitimately stop while yielded, and get fresh grace after).
+std::atomic<bool> g_photo_display_yielding{false};
+std::atomic<int64_t> g_photo_display_yield_end_ns{-1};
+
+// Validate the game-side target before writing guest memory: GrabScreenshot
+// reads its main-target dims from the postfx render manager (mgr =
+// *(0x83083C5C), width/height at mgr+380/384). The GPU address has been
+// 0x04911000 in every observed session, but refuse to write if the dims
+// chain does not confirm the expected 1152x640 raster.
+bool GrabTargetValid(uint8_t* base) {
+  uint32_t mgr = 0, w = 0, h = 0;
+  if (!GuestTryLoadU32(base, 0x83083C5C, &mgr) || mgr == 0 ||
+      !GuestTryLoadU32(base, mgr + 380, &w) ||
+      !GuestTryLoadU32(base, mgr + 384, &h)) {
+    return false;
+  }
+  return w == RendererState::kBlurWidth && h == RendererState::kBlurHeight;
+}
+
+// CPU-tile one mapped readback image (R10G10B10A2 rows at kGrabRowPitch)
+// into the guest screenshot target: assemble the tiled big-endian ARGB image
+// in a host staging buffer, then land it with one SEH-guarded copy. Inverse
+// of the decode path's run-copy untiler: at 32bpp a 4-texel-aligned x-run of
+// 4 maps to contiguous tiled bytes (same proof as the untiler's run_blocks =
+// 16 >> bpb_log2), so one GetTiledOffset2D per 4 texels. 1152x640 = 184k
+// offset computations, well under a millisecond.
+bool WriteGrabToGuest(uint8_t* base, const uint8_t* src) {
+  constexpr uint32_t kW = RendererState::kBlurWidth;
+  constexpr uint32_t kH = RendererState::kBlurHeight;
+  static thread_local std::vector<uint8_t> staging;
+  staging.resize(size_t(kW) * kH * 4);
+  for (uint32_t y = 0; y < kH; ++y) {
+    const uint32_t* row = reinterpret_cast<const uint32_t*>(
+        src + size_t(y) * RendererState::kGrabRowPitch);
+    for (uint32_t x = 0; x < kW; x += 4) {
+      const uint32_t off = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+          int32_t(x), int32_t(y), kW, 2));
+      uint32_t* dst = reinterpret_cast<uint32_t*>(staging.data() + off);
+      for (uint32_t i = 0; i < 4; ++i) {
+        // R10G10B10A2 (R bits 0..9, G 10..19, B 20..29), top 8 of each ->
+        // little-endian byte order A,R,G,B = the guest's big-endian ARGB.
+        const uint32_t v = row[x + i];
+        dst[i] = 0xFFu | ((v << 6) & 0xFF00u) | ((v << 4) & 0xFF0000u) |
+                 ((v << 2) & 0xFF000000u);
+      }
+    }
+  }
+  return GuestTryCopy(base + kGrabGuestView, staging.data(), staging.size());
+}
+
+// The photo-grab window (see skate3_native_render_scene_photo_readback /
+// photo_grab_native): while the photo editor is up OR a TakePhoto fired
+// within the last few seconds, the game CPU-reads the resolved screenshot
+// target from guest memory to JPEG-encode the photo. Two ways to fulfill it:
+//  - NATIVE (photo_grab_native, default): RenderScene writes the target
+//    itself from the native output; emulated-draw suppression stays ON, so
+//    the emulated pipeline never renders the scene+postfx concurrently (that
+//    concurrent 3x3-scale render was the editor's 40-50 fps, proven by the
+//    kFast run: zero readback drains, same fps).
+//  - EMULATED fallback: (a) arm the SDK's forced small-resolve CPU readback
+//    so the game's own resolve lands in guest memory, and (b) lift
+//    emulated-draw suppression so the passes that render the target execute.
+// Runs every frame from RenderScene regardless of the yield decisions. A
+// watchdog flips native -> emulated mid-window if no native grab write has
+// landed recently (mode toggle, unexpected yield, readback failure).
 void UpdatePhotoGrabWindow(uint8_t* base) {
   // The grab target is 1152x640x4 = 0x2D0000 bytes (the same surface the
   // SDK's Import-Skater special case reads); the thumb path is smaller.
   // Framebuffer-sized resolves (0x384000 at 1280x720) stay excluded.
   constexpr int32_t kForceReadbackMaxLength = 0x2D0000;
   static bool s_armed = false;
+  static bool s_emulated_armed = false;
+  static int64_t s_arm_ns = 0;
+  static int64_t s_last_run_ns = 0;
   static int32_t s_readback_saved = 0;
   static bool s_suppress_saved = false;
   static bool s_halfpx_saved = false;
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             PerfClock::now().time_since_epoch())
+                             .count();
+  // This function only runs while the native renderer is producing frames
+  // (RenderScene). A gap means the native path was toggled off or yielding
+  // - grab writes legitimately paused, so give the watchdog a fresh grace
+  // period on resume instead of instantly tripping the fallback
+  // (an emulated/native comparison toggle on the display
+  // screen fired the watchdog 2 ms after switching back).
+  if (s_armed && s_last_run_ns != 0 && now_ns - s_last_run_ns > 300'000'000) {
+    s_arm_ns = now_ns;
+  }
+  s_last_run_ns = now_ns;
   bool want = false;
   if (REXCVAR_GET(skate3_native_render_scene_photo_readback)) {
     want = PhotoEditorSignal(base) != nullptr;
     if (!want) {
       const int64_t last_ns = g_take_photo_last_ns.load(std::memory_order_relaxed);
       if (last_ns >= 0) {
-        const int64_t now_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                PerfClock::now().time_since_epoch())
-                .count();
         want = now_ns - last_ns < 3'000'000'000;
       }
     }
   }
   // Same window arms the photo postfx constant capture (CapturePfxConstants
-  // runs on the guest thread at the SetPending hook).
+  // runs on the guest thread at the draw-done hook).
   g_photo_flow_frame.store(want, std::memory_order_relaxed);
-  if (want && !s_armed) {
+  const auto arm_emulated = [&] {
     s_readback_saved = REXCVAR_GET(native_render_force_resolve_readback_max_length);
     if (s_readback_saved <= 0) {
       REXCVAR_SET(native_render_force_resolve_readback_max_length,
@@ -14386,28 +14685,145 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
     if (!s_halfpx_saved) {
       REXCVAR_SET(readback_resolve_half_pixel_offset, true);
     }
-    REXLOG_INFO(
-        "native-scene: photo flow - forcing small-resolve CPU readback "
-        "(the photo grab reads the resolved screenshot target from guest "
-        "memory){}",
-        s_suppress_saved ? " + emulated draw suppression OFF" : "");
+    s_emulated_armed = true;
+  };
+  if (want && !s_armed) {
     s_armed = true;
+    s_arm_ns = now_ns;
+    g_grab_last_write_ns.store(-1, std::memory_order_relaxed);
+    g_r.grab_writes = 0;
+    g_r.grab_cpu_us = 0;
+    // Drop any readback still pending from a previous window; its content
+    // is stale (pre-window) and must never land ahead of fresh frames.
+    g_r.grab_pending[0] = false;
+    g_r.grab_pending[1] = false;
+    if (REXCVAR_GET(skate3_native_render_scene_photo_grab_native) &&
+        !g_r.grab_failed) {
+      g_photo_grab_native_armed.store(true, std::memory_order_relaxed);
+      REXLOG_INFO(
+          "native-scene: photo flow - NATIVE grab armed (suppression stays "
+          "on; the native output is downsampled + CPU-tiled into the guest "
+          "screenshot target each frame; the display-card screen yields to "
+          "the emulated output)");
+    } else {
+      arm_emulated();
+      REXLOG_INFO(
+          "native-scene: photo flow - forcing small-resolve CPU readback "
+          "(the photo grab reads the resolved screenshot target from guest "
+          "memory){}",
+          s_suppress_saved ? " + emulated draw suppression OFF" : "");
+    }
   } else if (!want && s_armed) {
-    if (s_readback_saved <= 0) {
-      REXCVAR_SET(native_render_force_resolve_readback_max_length,
-                  s_readback_saved);
+    s_armed = false;
+    if (g_photo_grab_native_armed.exchange(false, std::memory_order_relaxed)) {
+      REXLOG_INFO(
+          "native-scene: photo flow ended - native grab wrote {} frames "
+          "(avg tile+write {} us)",
+          g_r.grab_writes,
+          g_r.grab_writes ? g_r.grab_cpu_us / g_r.grab_writes : 0);
     }
+    if (s_emulated_armed) {
+      s_emulated_armed = false;
+      if (s_readback_saved <= 0) {
+        REXCVAR_SET(native_render_force_resolve_readback_max_length,
+                    s_readback_saved);
+      }
+      if (s_suppress_saved) {
+        REXCVAR_SET(native_render_suppress_emulated_draws, true);
+      }
+      if (!s_halfpx_saved) {
+        REXCVAR_SET(readback_resolve_half_pixel_offset, false);
+      }
+      REXLOG_INFO(
+          "native-scene: photo flow ended - resolve readback{} restored",
+          s_suppress_saved ? " + suppression" : "");
+    }
+  }
+  // Watchdog: native mode armed but no grab write has landed within 700 ms
+  // of the window opening / the last write / the display yield ending;
+  // native frames stopped while the native output should be live
+  // (persistent yield, readback failure). Flip to the emulated fallback so
+  // the photo still works; one-way for the rest of this window. Skipped
+  // while the display-card yield is active: grab writes legitimately stop
+  // there (the photo was already taken and saved).
+  if (s_armed && !s_emulated_armed &&
+      !g_photo_display_yielding.load(std::memory_order_relaxed) &&
+      g_photo_grab_native_armed.load(std::memory_order_relaxed)) {
+    const int64_t last_write = g_grab_last_write_ns.load(std::memory_order_relaxed);
+    const int64_t yield_end =
+        g_photo_display_yield_end_ns.load(std::memory_order_relaxed);
+    const int64_t basis = std::max(std::max(last_write, s_arm_ns), yield_end);
+    if (now_ns - basis > 700'000'000) {
+      g_photo_grab_native_armed.store(false, std::memory_order_relaxed);
+      arm_emulated();
+      REXLOG_WARN(
+          "native-scene: photo flow - native grab produced no frames for "
+          "700 ms; falling back to the forced-readback window{}",
+          s_suppress_saved ? " + suppression lifted" : "");
+    }
+  }
+}
+
+// Photo display-card screen: yield to the emulated output while the framed
+// card is up (card-signature quad in the 2D stream, stamped by
+// Publish2dDraws). The game composes the framed card in a ONE-SHOT
+// pitch-1280 pass at an unpredictable moment after display-open
+// (observed settle+0.8s to settle+4.0s); chasing it with
+// suppression-lift + forced-readback windows never worked and cost
+// seconds of concurrent-pipeline lag. Yielded-emulated, the compose and the
+// display chain run GPU-side with no readbacks, exactly as on console, and
+// with the native renderer idle the frozen scene renders at the emulated
+// pipeline's own rate. A short PRE-ROLL lifts suppression while the native
+// output still presents, so the emulated framebuffer has repainted (the
+// card fly-in, live) before the swap, no stale-frame flash (the FMV-yield
+// lesson).
+bool YieldForPhotoDisplay() {
+  constexpr int64_t kCardGoneNs = 250'000'000;
+  constexpr int64_t kPreRollNs = 250'000'000;
+  static bool s_preroll = false;
+  static bool s_suppress_saved = false;
+  static int64_t s_preroll_ns = 0;
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             PerfClock::now().time_since_epoch())
+                             .count();
+  const int64_t seen = g_photo_card_seen_ns.load(std::memory_order_relaxed);
+  const bool card_up = g_photo_flow_frame.load(std::memory_order_relaxed) &&
+                       seen >= 0 && now_ns - seen < kCardGoneNs;
+  if (!card_up) {
+    if (s_preroll) {
+      s_preroll = false;
+      if (s_suppress_saved) {
+        REXCVAR_SET(native_render_suppress_emulated_draws, true);
+      }
+      if (g_photo_display_yielding.exchange(false, std::memory_order_relaxed)) {
+        g_photo_display_yield_end_ns.store(now_ns, std::memory_order_relaxed);
+        REXLOG_INFO(
+            "native-scene: photo display card gone - native output resumes "
+            "(suppression restored)");
+      }
+    }
+    return false;
+  }
+  if (!s_preroll) {
+    s_preroll = true;
+    s_preroll_ns = now_ns;
+    s_suppress_saved = REXCVAR_GET(native_render_suppress_emulated_draws);
     if (s_suppress_saved) {
-      REXCVAR_SET(native_render_suppress_emulated_draws, true);
-    }
-    if (!s_halfpx_saved) {
-      REXCVAR_SET(readback_resolve_half_pixel_offset, false);
+      REXCVAR_SET(native_render_suppress_emulated_draws, false);
     }
     REXLOG_INFO(
-        "native-scene: photo flow ended - resolve readback{} restored",
-        s_suppress_saved ? " + suppression" : "");
-    s_armed = false;
+        "native-scene: photo display card up - emulated pre-roll "
+        "(suppression lifted; yielding to the emulated output in {} ms so "
+        "the game's own card compose + display chain render there)",
+        kPreRollNs / 1'000'000);
   }
+  if (now_ns - s_preroll_ns < kPreRollNs) {
+    return false;
+  }
+  if (!g_photo_display_yielding.exchange(true, std::memory_order_relaxed)) {
+    REXLOG_INFO("native-scene: photo display - yielded to the emulated output");
+  }
+  return true;
 }
 
 bool YieldForPhotoEditor(uint8_t* base) {
@@ -14617,6 +15033,16 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
           REXCVAR_GET(skate3_native_render_scene_entity_fade)) {
         continue;
       }
+      // Per-piece caster parity: the game's own shadow passes skip some
+      // character pieces (the CAS trucker hat casts NOTHING; natively
+      // casting it painted a hard low-sun brim band across the editor face
+      // that the emulated frame never shows). Cast only what the game
+      // submitted through an ortho bank this frame (see
+      // DrawItem::shadow_caster / g_frame_ortho_ctx).
+      if (item.char_family != 0 && !item.shadow_caster &&
+          REXCVAR_GET(skate3_native_render_scene_shadow_caster_parity)) {
+        continue;
+      }
       // NO inline decode here (this block used to re-decode every cloth
       // garment every frame, ~2.9 ms, the 160 fps cap during real play).
       // The dyn decode jobs / worker miss queue keep the cache fresh, one
@@ -14750,7 +15176,16 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
         list.RSSetViewport(vp);
         D3D12_RECT rc{LONG(tile) * ci, 0, LONG(tile) * (ci + 1), LONG(tile)};
         list.RSSetScissorRect(rc);
-        const float bc[12] = {horizontal ? 1.0f : 0.0f, horizontal ? 0.0f : 1.0f,
+        // Blur tap offsets in GAME-map texels (the game's atlas tile is 512;
+        // its blur shader steps whole logical texels). At higher native tile
+        // resolutions the step scales up so the blur's WORLD reach, the
+        // penumbra width every receiver sees, stays console-equal: 512 tiles
+        // rendered the exact width but visibly blocky silhouettes;
+        // 1024 with unscaled 1-texel steps
+        // halved the game's softness. Matches the emulated GPU, which
+        // resolution-scales the raster while the blur offsets stay logical.
+        const float step = std::max(1.0f, float(tile) / 512.0f);
+        const float bc[12] = {horizontal ? step : 0.0f, horizontal ? 0.0f : step,
                               ntaps[ci], src_raw ? 1.0f : 0.0f,
                               kernels[ci][0], kernels[ci][1], kernels[ci][2], 0.0f,
                               float(tile) * ci, float(tile) * (ci + 1) - 1.0f,
@@ -15014,6 +15449,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     return false;
   }
   if (base == nullptr) {
+    return false;
+  }
+  if (YieldForPhotoDisplay()) {
     return false;
   }
   if (YieldForPhotoEditor(base)) {
@@ -15332,6 +15770,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[23] = 0.299f * sh[32] + 0.587f * sh[33] + 0.114f * sh[34];
       cb[24] = sh[20];  // depth bias (PS c5.x)
       cb[25] = 1.0f;    // enable
+      // sh_misc.zw = atlas dimensions (3*tile x tile) for the char path's
+      // point-snapped taps.
+      cb[26] = float(g_r.shadow_tile * 3);
+      cb[27] = float(g_r.shadow_tile);
+      // sh_char = the game's per-cascade character receive biases + enable
+      // (see FrameScene::char_shadow_bias; exact 9-tap char sampling).
+      if (scene.char_shadow_bias[0] > 0.0f &&
+          REXCVAR_GET(skate3_native_render_scene_char_shadow_exact)) {
+        cb[56] = scene.char_shadow_bias[0];
+        cb[57] = scene.char_shadow_bias[1];
+        cb[58] = scene.char_shadow_bias[2];
+        cb[59] = 1.0f;
+      }
     }
     // Exact world-shading frame rows (valid whenever the env-family PS bank
     // was captured this frame, independent of the shadow ATLAS being
@@ -16166,11 +16617,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         decal_tex = ad;
       }
     }
-    if (item.char_family >= 4 && item.char_family <= 5 &&
+    if (((item.char_family >= 4 && item.char_family <= 5) || item.char_alpha) &&
         item.hair_alpha_tex != 0) {
       // Hair strand coverage rides the (otherwise unused) decal slot; the
       // PS hair branch samples it at the raw second texcoord. The white
       // fallback keeps failed decodes opaque rather than invisible.
+      // character.alpha lenses use the same plumbing (ch_misc.z signals the
+      // fam-1/2 branch to take alpha from this texture).
       decal_tex = resolve_texture(item.hair_alpha_tex, 5);
     }
     // F7 ring: stamp the SERVED content fingerprints (see SceneRingItem);
@@ -16660,6 +17113,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const bool hair_blend = item.char_family >= 4 && item.char_family <= 5 &&
                             char_capture_ok;
     const bool glass_blend = item.char_family == 7 && char_capture_ok;
+    // character.alpha accessory pieces (sunglass lenses): translucent, alpha
+    // from the coverage texture at uv2 (ch_misc.z set by the capture); the
+    // game draws them after every opaque character piece (see
+    // DrawItem::char_alpha). Gated on the SAME capture validation as hair:
+    // without validated rows ch_misc.z is 0 and the item stays opaque.
+    const bool cac_alpha_blend = item.char_alpha && char_capture_ok &&
+                                 item.char_rows[14 * 4 + 2] > 0.0f;
     // Per-entity spawn/distance fade (CharFadeAlpha): the game submits
     // LivingWorld entity draws at alpha 0 through the whole spawn settle
     // (NPCs drop ~1 m to the ground before fading in) and ramps alpha with
@@ -16732,7 +17192,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     };
     if ((item.transparent || item.water || hair_blend || glass_blend ||
-         refl_trans_blend || char_fade_blend) &&
+         cac_alpha_blend || refl_trans_blend || char_fade_blend) &&
         debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
@@ -17497,6 +17957,197 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             "vignette {}, grain {})",
             accum_mode, vig_slot == W ? "WHITE-fallback" : "resolved",
             grain_slot == W ? "WHITE-fallback" : "resolved");
+      }
+    }
+  }
+
+  // ---- Native photo grab (photo_grab_native) ----
+  // Consume: CPU-tile the newest fence-completed readback into the guest
+  // screenshot target. Produce: downsample this frame's finished output
+  // (photo editor = the ported postfx chain result just drawn above; plain
+  // TakePhoto window = the plain frame, both the correct grab semantics)
+  // into blur_tex[0] via the blur chain's prefiltered downsample (its
+  // 1152x640 blur space IS the game's screenshot raster) and enqueue the
+  // copy into the free readback buffer. Runs BEFORE the 2D overlay so the
+  // photo never contains editor chrome / HUD, and before the blur block so
+  // this scratch use of blur_tex[0] is enqueued ahead of any blur rewrite.
+  if (g_photo_grab_native_armed.load(std::memory_order_relaxed) &&
+      g_r.pso_blur_down != nullptr && g_r.blur_tex[0] != nullptr &&
+      g_r.output_srv_allocated && !g_r.grab_failed) {
+    auto* grab_cp = context.d3d12.command_processor;
+    // Lazy readback-pair creation (persistently mapped; the copy is never
+    // waited on same-frame; the old path's per-resolve GPU drain was the
+    // editor's multi-second stall class).
+    if (g_r.grab_readback[0] == nullptr) {
+      D3D12_HEAP_PROPERTIES heap_props{};
+      heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+      D3D12_RESOURCE_DESC desc{};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      desc.Width =
+          UINT64(RendererState::kGrabRowPitch) * RendererState::kBlurHeight;
+      desc.Height = 1;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.SampleDesc.Count = 1;
+      desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      for (int i = 0; i < 2 && !g_r.grab_failed; ++i) {
+        if (FAILED(g_r.device->CreateCommittedResource(
+                &heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&g_r.grab_readback[i]))) ||
+            FAILED(g_r.grab_readback[i]->Map(
+                0, nullptr,
+                reinterpret_cast<void**>(&g_r.grab_readback_ptr[i])))) {
+          g_r.grab_failed = true;
+        }
+      }
+      if (g_r.grab_failed) {
+        REXLOG_ERROR(
+            "native-scene: photo grab readback creation failed - native "
+            "grab disabled (watchdog will fall back)");
+      }
+    }
+    if (!g_r.grab_failed) {
+      // Consume the newest completed buffer; retire older completed ones
+      // unwritten so stale content never lands after fresh content.
+      const uint64_t grab_completed = grab_cp->GetCompletedSubmission();
+      int newest = -1;
+      for (int i = 0; i < 2; ++i) {
+        if (g_r.grab_pending[i] && g_r.grab_submission[i] < grab_completed &&
+            (newest < 0 ||
+             g_r.grab_submission[i] > g_r.grab_submission[newest])) {
+          newest = i;
+        }
+      }
+      if (newest >= 0) {
+        static bool s_grab_write_warned = false;
+        const auto tile_t0 = PerfClock::now();
+        const bool wrote = GrabTargetValid(base) &&
+                           WriteGrabToGuest(base, g_r.grab_readback_ptr[newest]);
+        if (wrote) {
+          g_r.grab_cpu_us +=
+              uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                           PerfClock::now() - tile_t0)
+                           .count());
+          ++g_r.grab_writes;
+          g_grab_last_write_ns.store(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  PerfClock::now().time_since_epoch())
+                  .count(),
+              std::memory_order_relaxed);
+          if (g_r.grab_writes == 1) {
+            REXLOG_INFO(
+                "native-scene: photo grab - first native frame written to "
+                "guest 0x{:08X} via the 0xA0000000 view (tiled BE ARGB "
+                "1152x640)",
+                kGrabGuestAddr);
+          }
+        } else if (!s_grab_write_warned) {
+          s_grab_write_warned = true;
+          REXLOG_WARN(
+              "native-scene: photo grab - guest target validation/write "
+              "FAILED (dims chain mismatch or unmapped page); the window "
+              "watchdog will fall back to forced readbacks");
+        }
+        for (int i = 0; i < 2; ++i) {
+          if (g_r.grab_pending[i] && g_r.grab_submission[i] < grab_completed) {
+            g_r.grab_pending[i] = false;
+          }
+        }
+      }
+      // Produce into the free buffer (skip the frame if both are still in
+      // flight, never wait).
+      const uint32_t w = g_r.grab_write_index;
+      if (!g_r.grab_pending[w]) {
+        // Re-point the shared output SRV slot at the current output
+        // resource (it can change between frames, same idiom as the blur
+        // block below; if blur also runs this frame it recreates the same
+        // descriptor).
+        {
+          D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+          srv.Format = context.d3d12.guest_output_format;
+          srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+          srv.Texture2D.MipLevels = 1;
+          D3D12_CPU_DESCRIPTOR_HANDLE slot =
+              g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
+          slot.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
+          g_r.device->CreateShaderResourceView(
+              context.d3d12.guest_output_resource, &srv, slot);
+        }
+        context.d3d12.push_transition_barrier(
+            context.d3d12.command_processor_user_data,
+            context.d3d12.guest_output_resource,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+        D3D12_CPU_DESCRIPTOR_HANDLE grab_rtv =
+            g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        grab_rtv.ptr += size_t(5) * g_r.rtv_size;
+        list.D3DOMSetRenderTargets(1, &grab_rtv, FALSE, nullptr);
+        const D3D12_VIEWPORT grab_vp{0.0f,
+                                     0.0f,
+                                     float(RendererState::kBlurWidth),
+                                     float(RendererState::kBlurHeight),
+                                     0.0f,
+                                     1.0f};
+        const D3D12_RECT grab_sc{0, 0, LONG(RendererState::kBlurWidth),
+                                 LONG(RendererState::kBlurHeight)};
+        list.RSSetViewport(grab_vp);
+        list.RSSetScissorRect(grab_sc);
+        list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list.D3DSetPipelineState(g_r.pso_blur_down);
+        const float grab_consts[4] = {1.0f / float(context.guest_output_width),
+                                      1.0f / float(context.guest_output_height),
+                                      0.0f, 0.0f};
+        list.D3DSetGraphicsRoot32BitConstants(0, 4, grab_consts, 0);
+        {
+          D3D12_GPU_DESCRIPTOR_HANDLE h =
+              g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
+          h.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
+          context.d3d12.set_graphics_root_descriptor_table(
+              context.d3d12.command_processor_user_data, 1, h);
+        }
+        list.D3DDrawInstanced(3, 1, 0, 0);
+        // blur_tex[0] -> the readback buffer; restore steady states.
+        context.d3d12.push_transition_barrier(
+            context.d3d12.command_processor_user_data, g_r.blur_tex[0],
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        context.d3d12.push_transition_barrier(
+            context.d3d12.command_processor_user_data,
+            context.d3d12.guest_output_resource,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+        D3D12_TEXTURE_COPY_LOCATION grab_src{};
+        grab_src.pResource = g_r.blur_tex[0];
+        grab_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        grab_src.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION grab_dst{};
+        grab_dst.pResource = g_r.grab_readback[w];
+        grab_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        grab_dst.PlacedFootprint.Offset = 0;
+        grab_dst.PlacedFootprint.Footprint.Format =
+            context.d3d12.guest_output_format;
+        grab_dst.PlacedFootprint.Footprint.Width = RendererState::kBlurWidth;
+        grab_dst.PlacedFootprint.Footprint.Height = RendererState::kBlurHeight;
+        grab_dst.PlacedFootprint.Footprint.Depth = 1;
+        grab_dst.PlacedFootprint.Footprint.RowPitch =
+            RendererState::kGrabRowPitch;
+        list.D3DCopyTextureRegion(&grab_dst, 0, 0, 0, &grab_src, nullptr);
+        context.d3d12.push_transition_barrier(
+            context.d3d12.command_processor_user_data, g_r.blur_tex[0],
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+        // Restore the frame's output binding for the passes that follow.
+        list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
+        list.RSSetViewport(viewport);
+        list.RSSetScissorRect(scissor);
+        g_r.grab_submission[w] = grab_cp->GetCurrentSubmission();
+        g_r.grab_pending[w] = true;
+        g_r.grab_write_index = 1 - w;
       }
     }
   }

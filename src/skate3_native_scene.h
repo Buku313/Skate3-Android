@@ -148,6 +148,21 @@ struct DrawItem {
   // Detected via the AttribulatorMaterialName channel; consumed by
   // CaptureSkinnedState.
   bool ropa;
+  // character.alpha: translucent CAC accessory pieces (sunglass lenses).
+  // cac_alphaPS outputs alpha = the mesh's "alpha" channel texture sampled
+  // at the raw second texcoord x the entity alpha constant (ucode: oC0.w =
+  // tf5(uv2).r * c22.x) and the game draws them AFTER every opaque
+  // character piece: rendered opaque the lens is a solid black patch.
+  // Routed to the sorted alpha sub-pass like hair; the coverage texture
+  // rides the same hair_alpha_tex/decal-slot plumbing (ch_misc.z > 0
+  // signals the PS fam-2 branch to take alpha from t4@uv2).
+  bool char_alpha = false;
+  // The game submitted this ctx through an ortho (shadow caster-cascade)
+  // bank this frame; the game's caster list is PER-PIECE (the CAS trucker
+  // hat never enters the shadow passes) and the native atlas pass mirrors
+  // it for character items. Rescued/gap-filled copies inherit the stored
+  // flag so a refused-capture frame doesn't blink the entity's shadow.
+  bool shadow_caster = false;
   // ROPA shape blending (set by InterpolateDynamicItems): decoded shape
   // generations (DynDecodeJob seq) + weights reproducing the SAME temporal
   // kernel the body bones / garment world were evaluated with this frame:
@@ -279,6 +294,14 @@ struct FrameScene {
   // Consumed by the exact dynamicobject scene PS branch.
   bool dynobj_valid = false;
   float dynobj_rows[10] = {};
+  // Character-receiver per-cascade CSM receive biases, captured from a
+  // validated fam-2 character PIXEL bank (gameplay c8 / editor c9: one row
+  // below the light row; frame-global, e.g. (0.005, 0.014, 0.020)). The
+  // game's character shaders build their shadow reference as
+  // saturate(rd - bias[cascade]) and take NINE point taps of the atlas at
+  // +-1 game-texel, averaged (cacstamp_skin_nisPS ucode; literal 1/9 =
+  // c255.w). 0 = not captured -> legacy single-tap char path.
+  float char_shadow_bias[3] = {};
   // Sky-dome viewpos: sky.* meshes are camera-relative (sky.fx VS adds
   // g_vViewPos), but the game pins the sky viewpos Y at a fixed level
   // elevation (165.0 in every capture) so the skyline doesn't bob with the
