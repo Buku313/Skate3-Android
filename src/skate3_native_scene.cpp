@@ -175,6 +175,16 @@ REXCVAR_DEFINE_INT32(
     "Compare against the emulated editor (F11 pair) and keep the match.")
     .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_photo_native_debug, 0, "Skate 3",
+    "Photo-editor native postfx DEBUG VIEW drawn instead of the chain's "
+    "final output: 1 = the visualfx CoC map (DoF blur amount; black = in "
+    "focus, grey/white = blurred), 2 = packed-depth reconstruction (red = "
+    "near band saturate((1-d)*100), green/blue = d fraction ramps; a flat "
+    "screen here means the native depth is not reaching the chain). 0 = "
+    "off.")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_pause_native, true, "Skate 3",
                     "Keep the NATIVE renderer active through the in-game pause menu "
                     "instead of yielding to the emulated output. Pause is told apart "
@@ -610,6 +620,13 @@ REXCVAR_DECLARE(int32_t, native_render_suppress_mode);
 // a photo flow is active; the game CPU-reads the resolved screenshot
 // target to build the photo JPEG.
 REXCVAR_DECLARE(int32_t, native_render_force_resolve_readback_max_length);
+// SDK-level readback-downscale sample point (resolve_downscale shader): when
+// set, the scaled->1x extraction samples the CENTER host pixel of each
+// scale_x*scale_y block instead of the top-left one, compensating the
+// D3D9-style half-pixel offset that becomes a (scale/2)-pixel content shift
+// at scaled resolutions. Armed with the photo window so grabbed photos
+// sample host pixel centers.
+REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 // SDK-level async pipeline compilation (rexglue command_processor.cpp): the
 // d3d12 backend SKIPS draws whose pipeline is still compiling. Forced
 // synchronous during menu contexts by YieldForMenus so one-shot portrait
@@ -2855,12 +2872,14 @@ void OnAddRenderInstance(uint8_t* base, uint32_t instance) {
 
 // ---- Photo-editor postfx capture (FrameScene::PhotoFx / photo_fx.hlsl) ----
 // While a photo flow is active (g_photo_flow_frame, armed by
-// UpdatePhotoGrabWindow), the SetPending_AluConstants hook snapshots each
-// postfx pass's final PS/VS constant rows plus the device fetch-constant
-// shadow (device+0x480, the source SetPending_FetchConstants emits to the
-// ring) at the moment the game flushes them, the only reliable point:
-// draw-entry bank reads return stale values for these postfx draws (the
-// same staleness class the blur capture works around with its c0 gate).
+// UpdatePhotoGrabWindow), the OnDrawDone hook snapshots each postfx pass's
+// PS/VS constant rows (g_ps_bank/g_vs_bank, the game's staging banks) plus
+// the device fetch-constant shadow (device+0x480) at DRAW time, the same
+// reads the F11 per-draw records use, verified correct for every postfx
+// pass in captures 1783957072 and 1783963636. Upload-time (SetPending)
+// capture was removed: the game stages the next pass's rows while the
+// previous pass's shader is still bound, so upload-time snapshots mix
+// neighbouring passes' constants.
 enum PfxPass {
   kPfxVisualFx = 0,
   kPfxDofDown,
@@ -2979,9 +2998,6 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
   }
   if (bank == 0x4400) {
     g_ps_bank.store(ptr, std::memory_order_relaxed);
-    if (g_photo_flow_frame.load(std::memory_order_relaxed)) {
-      CapturePfxConstants(base, ptr, device, /*pixel=*/true);
-    }
     return;
   }
   if (bank != 0x4000) {
@@ -2989,9 +3005,13 @@ void OnVsConstantUpload(uint8_t* base, uint64_t mask, uint32_t bank, uint32_t pt
   }
   g_vs_uploads.fetch_add(1, std::memory_order_relaxed);
   g_vs_bank.store(ptr, std::memory_order_relaxed);
-  if (g_photo_flow_frame.load(std::memory_order_relaxed)) {
-    CapturePfxConstants(base, ptr, device, /*pixel=*/false);
-  }
+  // NOTE: the photo postfx constant capture used to also run here (upload
+  // time), but upload-time snapshots can attribute rows staged for the NEXT
+  // pass to the previous pass's shader (the game stages constants before
+  // rebinding), overwriting the correct draw-time capture taken by the
+  // OnDrawDone hook; the F11 per-draw records read the same banks at the
+  // draw hook and are correct for every postfx pass, so the draw hook is
+  // the sole capture site now.
 }
 
 // Last PhotoReplayController::Update heartbeat, nanoseconds on PerfClock
@@ -4595,11 +4615,12 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       }
     }
   }
-  // Photo-editor postfx capture FALLBACK at the draw hook: the SetPending
-  // hook is the preferred site, but if the postfx constants never flush
-  // through it (or classification misses there), capture here from the
-  // last-known bank pointers; a draw capture proved the
-  // visualfx PS rows read correctly from g_ps_bank at this point.
+  // Photo-editor postfx capture (SOLE site): read the game's staging banks
+  // at draw time, the same reads the F11 per-draw records use, verified
+  // correct for every postfx pass in captures 1783957072/1783963636. The
+  // former SetPending upload-time capture mixed neighbouring passes' rows
+  // (the game stages the next pass's constants before rebinding shaders)
+  // and has been removed.
   if (flags2d == 0 && SceneEnabled() &&
       g_photo_flow_frame.load(std::memory_order_relaxed)) {
     int pfx_pass = ClassifyPfxShader(base, g_cur_ps_obj.load(std::memory_order_relaxed));
@@ -9286,7 +9307,7 @@ struct RendererState {
   static constexpr uint32_t kPfxQuarterW = 288, kPfxQuarterH = 160;
   ID3D12RootSignature* pfx_root_sig = nullptr;
   // PSO order: depthpack, visualfx, dof_down, dof_mb, dof, uber, fisheye, blit.
-  ID3D12PipelineState* pfx_pso[8] = {};
+  ID3D12PipelineState* pfx_pso[9] = {};
   ID3D12Resource* pfx_full[2] = {};   // output-res RGBA8 (visualfx out, uber out)
   ID3D12Resource* pfx_half[2] = {};   // 576x320 RGBA8
   ID3D12Resource* pfx_quarter = nullptr;  // 288x160 RGBA8 accumulation
@@ -12102,9 +12123,12 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
       {"vs_raw", "ps_uber", DXGI_FORMAT_R8G8B8A8_UNORM},
       {"vs_scaled", "ps_fisheye", context.d3d12.guest_output_format},
       {"vs_raw", "ps_blit", DXGI_FORMAT_R8G8B8A8_UNORM},
+      // Debug visualizer (photo_native_debug cvar): CoC / packed-depth view
+      // drawn over the output instead of the fisheye result.
+      {"vs_raw", "ps_pfx_debug", context.d3d12.guest_output_format},
   };
   const D3D_SHADER_MACRO msaa_defines[] = {{"PFX_MSAA", "1"}, {nullptr, nullptr}};
-  for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < 9; ++i) {
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3DBlob* errors = nullptr;
@@ -12227,7 +12251,9 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
     }
     if (g_r.pfx_cb == nullptr) {
       // 8 pass slots x 4 KB x 4 frames in flight.
-      g_r.pfx_cb = CreateUploadBuffer(device, 8u * 4096u * 4u);
+      // 10 slots per frame region: depth pack + accum feed + 6 passes +
+      // accum mode 2 + the debug view.
+      g_r.pfx_cb = CreateUploadBuffer(device, 10u * 4096u * 4u);
       if (g_r.pfx_cb == nullptr ||
           FAILED(g_r.pfx_cb->Map(0, nullptr,
                                  reinterpret_cast<void**>(&g_r.pfx_cb_ptr)))) {
@@ -12271,7 +12297,7 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
     device->CreateShaderResourceView(g_r.pfx_lut, &srv, slot);
   }
   g_r.pfx_ready = true;
-  REXLOG_INFO("native-scene: photo postfx pipeline ready (8 passes, msaa={})",
+  REXLOG_INFO("native-scene: photo postfx pipeline ready (9 passes, msaa={})",
               g_r.msaa);
   return true;
 }
@@ -12593,7 +12619,15 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
     desc.Height = height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_D32_FLOAT;
+    // R32_TYPELESS, not D32_FLOAT: the photo-editor postfx depth pack
+    // samples this buffer through an R32_FLOAT SRV, and casting an SRV
+    // over a fully-typed depth resource is undefined in D3D12; on the
+    // playtest driver those reads returned the 1.0 clear value for the
+    // whole frame, which saturated the ported DoF CoC everywhere (the
+    // uniform smear + silhouette halos + scaffold ghosting of the first
+    // native photo-editor session; sim-verified as the cleared-depth
+    // variant V2).
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
     desc.SampleDesc.Count = g_r.msaa;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear{};
@@ -12607,7 +12641,12 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
     }
     g_r.depth_width = width;
     g_r.depth_height = height;
-    device->CreateDepthStencilView(g_r.depth, nullptr,
+    // The typeless resource needs an explicit DSV format.
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
+    dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv_desc.ViewDimension = g_r.msaa > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS
+                                          : D3D12_DSV_DIMENSION_TEXTURE2D;
+    device->CreateDepthStencilView(g_r.depth, &dsv_desc,
                                    g_r.dsv_heap->GetCPUDescriptorHandleForHeapStart());
 
     if (g_r.msaa > 1) {
@@ -13829,6 +13868,7 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
   static bool s_armed = false;
   static int32_t s_readback_saved = 0;
   static bool s_suppress_saved = false;
+  static bool s_halfpx_saved = false;
   bool want = false;
   if (REXCVAR_GET(skate3_native_render_scene_photo_readback)) {
     want = PhotoEditorSignal(base) != nullptr;
@@ -13856,6 +13896,13 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
     if (s_suppress_saved) {
       REXCVAR_SET(native_render_suppress_emulated_draws, false);
     }
+    // Sample host-pixel CENTERS in the scaled->1x readback extraction while
+    // the window is armed (photo quality: undoes the D3D9 half-pixel shift
+    // that becomes a scale/2-pixel offset at scaled resolutions).
+    s_halfpx_saved = REXCVAR_GET(readback_resolve_half_pixel_offset);
+    if (!s_halfpx_saved) {
+      REXCVAR_SET(readback_resolve_half_pixel_offset, true);
+    }
     REXLOG_INFO(
         "native-scene: photo flow - forcing small-resolve CPU readback "
         "(the photo grab reads the resolved screenshot target from guest "
@@ -13869,6 +13916,9 @@ void UpdatePhotoGrabWindow(uint8_t* base) {
     }
     if (s_suppress_saved) {
       REXCVAR_SET(native_render_suppress_emulated_draws, true);
+    }
+    if (!s_halfpx_saved) {
+      REXCVAR_SET(readback_resolve_half_pixel_offset, false);
     }
     REXLOG_INFO(
         "native-scene: photo flow ended - resolve readback{} restored",
@@ -16672,8 +16722,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
            {-1.0f, 0.5f, 0, 0},
            {-0.5f, -0.888888896f, 1.0f, 1.77777779f}},
       };
-      const uint32_t cb_slot_base = uint32_t(frame_number % 4) * 8;
+      const uint32_t cb_slot_base = uint32_t(frame_number % 4) * 10;
       uint32_t cb_slot_next = 0;
+      const int32_t pfx_debug =
+          REXCVAR_GET(skate3_native_render_scene_photo_native_debug);
       const auto fill_cb = [&](int pass) -> D3D12_GPU_VIRTUAL_ADDRESS {
         const uint32_t slot = cb_slot_base + (cb_slot_next++);
         uint8_t* dst = g_r.pfx_cb_ptr + size_t(slot) * 4096;
@@ -16684,9 +16736,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           std::memcpy(rows + 240 * 4, scene.photo_fx.vs[pass],
                       sizeof(scene.photo_fx.vs[pass]));
           std::memcpy(rows + 250 * 4, kPfxLiterals[pass], sizeof(kPfxLiterals[pass]));
+          // Half-dest-pixel interpolator offsets: the game's quad VSs carry
+          // half a pixel of THEIR render target (visualfx dest 1152x640 in
+          // VS c3, fisheye dest 1280x720 framebuffer in VS c2) for
+          // D3D9-style texel alignment. The native full-res targets are
+          // guest_output-sized; substitute half a NATIVE pixel. (The
+          // half-res DOF passes keep the game's exact 576x320 targets, so
+          // their captured rows stay.) Guarded to the expected sub-pixel
+          // magnitudes so a mis-captured row can't become a visible shift.
+          if (pass == kPfxVisualFx || pass == kPfxFisheye) {
+            float* half_px = rows + (pass == kPfxVisualFx ? 243 : 242) * 4;
+            if (std::fabs(half_px[0]) < 0.002f && std::fabs(half_px[1]) < 0.004f) {
+              half_px[0] = 0.5f / float(context.guest_output_width);
+              half_px[1] = 0.5f / float(context.guest_output_height);
+            }
+          }
         }
         rows[248 * 4 + 0] = float(context.guest_output_width);
         rows[248 * 4 + 1] = float(context.guest_output_height);
+        rows[249 * 4 + 0] = float(pfx_debug);
         return g_r.pfx_cb->GetGPUVirtualAddress() + size_t(slot) * 4096;
       };
       const D3D12_GPU_DESCRIPTOR_HANDLE pfx_heap_start =
@@ -16728,6 +16796,30 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       const int32_t accum_mode =
           REXCVAR_GET(skate3_native_render_scene_photo_native_accum);
+      // Live capture telemetry (~every 2 s while the chain runs): the rows
+      // that move with the editor sliders. Lets a session log confirm the
+      // draw-time capture tracks DoF (dof c0.x / dofmb c2.x, 0 = slider
+      // off), focus (visualfx c2.y), the grade matrix (visualfx c7) and the
+      // uber jitter phase against the emulated ground-truth values.
+      {
+        static uint64_t s_pfx_log_frame = 0;
+        if (frame_number - s_pfx_log_frame > 120) {
+          s_pfx_log_frame = frame_number;
+          const auto& fx = scene.photo_fx;
+          REXLOG_INFO(
+              "native-scene: pfx live rows: visualfx c2=({:.3f},{:.3f}) "
+              "c4.x={:.5f} c7=({:.4f},{:.4f},{:.4f},{:.4f}) | dofmb "
+              "c2.x={:.3f} | dof c0.x={:.3f} | uber c0.x={:.3f} "
+              "c2.x={:.4f} c5.x={:.3f} | vfx vs c3=({:.6f},{:.6f})",
+              fx.ps[kPfxVisualFx][2][0], fx.ps[kPfxVisualFx][2][1],
+              fx.ps[kPfxVisualFx][4][0], fx.ps[kPfxVisualFx][7][0],
+              fx.ps[kPfxVisualFx][7][1], fx.ps[kPfxVisualFx][7][2],
+              fx.ps[kPfxVisualFx][7][3], fx.ps[kPfxDofMB][2][0],
+              fx.ps[kPfxDof][0][0], fx.ps[kPfxUber][0][0],
+              fx.ps[kPfxUber][2][0], fx.ps[kPfxUber][5][0],
+              fx.vs[kPfxVisualFx][3][0], fx.vs[kPfxVisualFx][3][1]);
+        }
+      }
 
       // 1) Depth pack: native depth (sample 0) -> the console D24-as-8888
       //    layout at output res.
@@ -16836,6 +16928,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxFisheye));
       pfx_bind_all(g_r.pfx_srv[1], W, vig_slot, W, g_r.pfx_srv[6], W, W, W);
       list.D3DDrawInstanced(3, 1, 0, 0);
+
+      // 8b) Debug view (photo_native_debug): overwrite the output with the
+      //     visualfx CoC map (mode 1) or the packed-depth reconstruction
+      //     (mode 2): t0 = visualfx out, t1 = packed depth, both still in
+      //     SRV state here.
+      if (pfx_debug > 0 && g_r.pfx_pso[8] != nullptr) {
+        list.D3DSetPipelineState(g_r.pfx_pso[8]);
+        list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+        pfx_bind_all(g_r.pfx_srv[0], g_r.pfx_srv[5], W, W, g_r.pfx_srv[6], W,
+                     W, W);
+        list.D3DDrawInstanced(3, 1, 0, 0);
+      }
 
       // 9) Accumulation mode 2: next frame's visualfx t3 = the finished
       //    frame downsampled (pfx_full[1] is still in SRV state here).

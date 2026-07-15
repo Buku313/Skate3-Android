@@ -102,6 +102,20 @@ float4 ps_blit(VsOut i) : SV_Target {
   return t0.SampleLevel(s_lin, i.r0.zw, 0);
 }
 
+// Debug visualization (photo_native_debug): c[249].x selects
+//  1 = t0 alpha (the visualfx CoC) as grayscale
+//  2 = packed-depth reconstruction from t1 (r = (1-d)*100 sat, g/b = frac
+//      ramps of d for band inspection)
+float4 ps_pfx_debug(VsOut i) : SV_Target {
+  if (c[249].x < 1.5) {
+    float a = t0.SampleLevel(s_lin, i.r0.zw, 0).w;
+    return float4(a, a, a, 1);
+  }
+  float4 s = t1.SampleLevel(s_pt, i.r0.zw, 0);
+  float d = s.y * 1.51991853e-05 + s.w * 0.99609381 + s.x * 0.00389099144;
+  return float4(saturate((1.0 - d) * 100.0), frac(d * 256.0), frac(d * 4096.0), 1);
+}
+
 // ---------------------------------------------------------------------------
 // postfx_visualfxPS (bit-exact transcription). t0 = scene,
 // t1 = packed depth, t3 = quarter-res accumulation buffer.
