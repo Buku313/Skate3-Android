@@ -317,12 +317,84 @@ void PaceGuestFrame() {
 
 void OnFrameEnd(uint8_t* base) {
   PaceGuestFrame();
+  // EMULATED-mode guest frame breakdown (emulated gameplay once regressed
+  // from 140 to 66 fps while native stayed at cap; the native-scene perf
+  // line only prints while the native renderer is active, so emulated
+  // stretches had no perf visibility at all). Logs every
+  // ~600 guest frames while the native scene is OFF: whole-frame time (the
+  // fps), time spent inside BuildFrameScene, and the per-frame draw/upload
+  // hook traffic. If frame_avg is ~15 ms but build/hooks are small, the
+  // cost is in the emulated GPU/CP pipeline, not our guest-thread code.
+  using Clock = std::chrono::steady_clock;
+  static Clock::time_point s_bd_prev{};
+  static uint64_t s_bd_frames = 0;
+  static double s_bd_frame_ns = 0, s_bd_frame_max = 0;
+  static double s_bd_build_ns = 0, s_bd_build_max = 0;
+  static uint64_t s_bd_draws0 = 0;
+  const bool emu_profile = !skate3::native_scene::Enabled();
+  const auto bd_now = Clock::now();
+  if (emu_profile && s_bd_prev.time_since_epoch().count() != 0) {
+    const double dt =
+        std::chrono::duration<double, std::nano>(bd_now - s_bd_prev).count();
+    s_bd_frame_ns += dt;
+    s_bd_frame_max = std::max(s_bd_frame_max, dt);
+  }
+  s_bd_prev = bd_now;
+
   std::lock_guard<std::mutex> lock(g_mutex);
   ++g_frame_index;
   const size_t mesh_count = g_current_frame.size();
 
+  const auto bd_build0 = Clock::now();
   skate3::native_scene::BuildFrameScene(base, g_current_frame.data(),
                                         g_current_frame.size());
+  if (emu_profile) {
+    const double bns = std::chrono::duration<double, std::nano>(Clock::now() -
+                                                                bd_build0)
+                           .count();
+    s_bd_build_ns += bns;
+    s_bd_build_max = std::max(s_bd_build_max, bns);
+    if (++s_bd_frames >= 600) {
+      const uint64_t draws = skate3::native_scene::DrawSequence();
+      // Quantum probe: a measured 1 ms sleep + the kernel's current timer
+      // resolution. frame avg ~15 ms with build ~0 and the GPU at idle
+      // wattage is the signature of every pacing sleep rounding up to the
+      // 15.625 ms default Windows quantum; sleep1ms ~15.6 here proves it,
+      // ~1-2 ms refutes it.
+      const auto sp0 = Clock::now();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      const double sleep_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - sp0).count();
+      double timer_res_ms = -1.0;
+#if defined(_WIN32)
+      {
+        using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+        static const auto query = reinterpret_cast<NtQueryTimerResolutionFn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryTimerResolution"));
+        if (query != nullptr) {
+          ULONG min_res = 0, max_res = 0, cur_res = 0;
+          if (query(&min_res, &max_res, &cur_res) == 0) {
+            timer_res_ms = double(cur_res) / 10000.0;  // 100 ns units
+          }
+        }
+      }
+#endif
+      REXLOG_INFO(
+          "native-render EMULATED breakdown: frame avg={:.2f}/max={:.2f}ms "
+          "build avg={:.3f}/max={:.3f}ms draws/frame={} sleep1ms={:.2f}ms "
+          "timer_res={:.2f}ms (600-frame window)",
+          s_bd_frame_ns / s_bd_frames / 1e6, s_bd_frame_max / 1e6,
+          s_bd_build_ns / s_bd_frames / 1e6, s_bd_build_max / 1e6,
+          (draws - s_bd_draws0) / s_bd_frames, sleep_ms, timer_res_ms);
+      s_bd_frames = 0;
+      s_bd_frame_ns = s_bd_frame_max = s_bd_build_ns = s_bd_build_max = 0;
+      s_bd_draws0 = draws;
+    }
+  } else {
+    s_bd_frames = 0;
+    s_bd_frame_ns = s_bd_frame_max = s_bd_build_ns = s_bd_build_max = 0;
+    s_bd_draws0 = skate3::native_scene::DrawSequence();
+  }
 
   const int32_t log_interval = REXCVAR_GET(skate3_native_render_log_interval);
   if (log_interval > 0 && g_frame_index % static_cast<uint64_t>(log_interval) == 0) {

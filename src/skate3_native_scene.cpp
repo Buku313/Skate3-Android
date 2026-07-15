@@ -3333,8 +3333,13 @@ bool PortraitRttWindowActive() {
     // 56 = pause root, 24 = FMV, 17 = pause challenge map (the game FLAPS
     // [0,56]<->[0,17] ~1/s while the map is open, with 17
     // unclassified every flap re-armed the grace window and held mode 0,
-    // pinning the map screen at 62-94 fps).
-    if (f0 != 0 && f0 != 56 && f0 != 24 && f0 != 17) {
+    // pinning the map screen at 62-94 fps), 59 = skate-reel browser
+    // (measured A/B: the edit-skater flow pushes
+    // [0,56,63]->[0,56,63,15] and legitimately needs the window; the reel
+    // screen pushes [0,56,59] and its panels are VIDEOS served by the
+    // native FMV substitution, not portrait RTTs; the fail-open window
+    // there bought only its costs, 73 fps + 167 ms sync-compile stalls).
+    if (f0 != 0 && f0 != 56 && f0 != 24 && f0 != 17 && f0 != 59) {
       unknown_screen = true;
     }
   }
@@ -3365,7 +3370,7 @@ bool PortraitRttWindowActive() {
       }
       REXLOG_INFO(
           "native-scene: FE stack changed: [{}] (portrait window {}; "
-          "steady-safe = 0/56/24/17)",
+          "steady-safe = 0/56/24/17/59)",
           buf, unknown_screen ? "OPEN - unclassified screen" : "steady");
     }
   }
@@ -4782,17 +4787,15 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     // Shader labels can be swapped in the hook; accept either slot.
     if (is_hblur(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
         is_hblur(g_cur_vs_obj.load(std::memory_order_relaxed))) {
-      // Kernel scale pinned to the ucode-verified steady-state constant: the
-      // recorded blur draw's PS c0.x is exactly 8 (tap pitch 0.0025). The
-      // live bank read at this hook point returned varying/stale values
-      // (e.g. 0.8 vs 8 across reads) and feeding it through per frame
-      // pulsed the blur radius; the popup backdrop shimmered.
-      g_ui_blur = 8.0f;
+      // Kernel scale read LIVE under a plausibility gate (k0 == k1, in
+      // (0, 8]) so the game's own pause-open ramp animates the native blur
+      // like the emulated frame; the old pin-to-8 popped the backdrop to
+      // full blur on the first frame, and its exact-(8,8) gate on the fade
+      // rejected every mid-ramp c1 (the tint then snapped in late). A
+      // failed gate keeps the last values (stale bank mid-rewrite); raw
+      // 1-frame value flaps (the tinted-backdrop flicker) are absorbed by
+      // the render-thread smoothing at the blur pass.
       g_ui_blur_seen = true;
-      // Fade modulate (PS c1, see g_ui_blur_color): genuinely dynamic (the
-      // pause fade ramps in over a few frames), so it must be read live,
-      // gated on the c0 kernel row reading exactly its known (8,8) staging,
-      // which a stale mid-update bank fails. NaN also fails the comparisons.
       const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
       if (ps_bank != 0) {
         const float k0 = LoadGuestF32(base, ps_bank + 0);
@@ -4801,9 +4804,35 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         for (int a = 0; a < 3; ++a) {
           c1[a] = LoadGuestF32(base, ps_bank + 16 + a * 4);
         }
-        if (k0 == 8.0f && k1 == 8.0f && c1[0] >= 0.0f && c1[0] <= 1.0f &&
-            c1[1] >= 0.0f && c1[1] <= 1.0f && c1[2] >= 0.0f && c1[2] <= 1.0f) {
-          std::memcpy(g_ui_blur_color, c1, sizeof(g_ui_blur_color));
+        const bool kernel_ok = k0 == k1 && k0 > 0.0f && k0 <= 8.0f;
+        const bool fade_ok = c1[0] >= 0.0f && c1[0] <= 1.0f && c1[1] >= 0.0f &&
+                             c1[1] <= 1.0f && c1[2] >= 0.0f && c1[2] <= 1.0f;
+        if (kernel_ok) {
+          g_ui_blur = k0;
+          if (fade_ok) {
+            std::memcpy(g_ui_blur_color, c1, sizeof(g_ui_blur_color));
+          }
+        }
+        // Open-ramp tracer (guest render thread only): the first draws
+        // after each blur-ON edge print the RAW kernel/fade so the game's
+        // actual animate-in curve lands in the log (for an exactness pass
+        // if the smoothed approximation reads wrong).
+        static int64_t s_last_draw_ns = 0;
+        static uint32_t s_edge_logged = 0;
+        static uint32_t s_total_logged = 0;
+        const int64_t trace_now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
+        if (trace_now - s_last_draw_ns > 1'000'000'000ll) {
+          s_edge_logged = 0;
+        }
+        s_last_draw_ns = trace_now;
+        if (s_edge_logged < 20 && s_total_logged < 100) {
+          ++s_edge_logged;
+          ++s_total_logged;
+          REXLOG_INFO(
+              "native-scene: blur ramp k=({:.3f},{:.3f}) c1=({:.3f},{:.3f},{:.3f}) {}",
+              k0, k1, c1[0], c1[1], c1[2], kernel_ok ? "accepted" : "held");
         }
       }
     }
@@ -14068,16 +14097,23 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
          PortraitRttWindowActive());
     if (want && !s_mode_forced) {
       s_mode_saved = REXCVAR_GET(native_render_suppress_mode);
-      if (s_mode_saved != 0) {
-        REXCVAR_SET(native_render_suppress_mode, 0);
+      // Mode 3, not 0: the portrait-class RTTs (census 560-1200 during the
+      // window) execute, but the 1152-wide main scene + postfx band stays
+      // suppressed; mode 0 ran the game's whole pipeline at scaled
+      // resolution for the window's duration, dropping the pause menu to
+      // ~60 fps whenever a screen push (or its 3 s transition grace)
+      // opened the window.
+      if (s_mode_saved != 3) {
+        REXCVAR_SET(native_render_suppress_mode, 3);
         REXLOG_INFO(
-            "native-scene: portrait window - suppress mode {} -> 0 (RTT "
-            "passes execute; restored when the window closes)",
+            "native-scene: portrait window - suppress mode {} -> 3 (portrait "
+            "RTT passes execute, scene/postfx band stays suppressed; "
+            "restored when the window closes)",
             s_mode_saved);
       }
       s_mode_forced = true;
     } else if (!want && s_mode_forced) {
-      if (s_mode_saved != 0) {
+      if (s_mode_saved != 3) {
         REXCVAR_SET(native_render_suppress_mode, s_mode_saved);
         REXLOG_INFO(
             "native-scene: portrait window closed - suppress mode {} restored",
@@ -17473,6 +17509,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // 2D draws follow after and stay sharp.
   if (scene.ui_blur > 0.0f && g_r.pso_blur != nullptr && g_r.pso_blur_blit != nullptr &&
       g_r.pso_blur_down != nullptr && g_r.blur_tex[0] != nullptr) {
+    // Temporal smoothing of the captured radius + fade (~50 ms time
+    // constant, render thread): the live bank reads can land mid-rewrite
+    // (1-frame value flaps = the tinted-backdrop flicker), and smoothing
+    // FROM the off state (radius 0, white tint) supplies the pause-open
+    // animate-in even when the game's own ramp frames were missed by the
+    // capture gate. A >0.25 s gap since the last blur frame = a fresh ON
+    // edge (resets the state); at the render rate active frames are ~7 ms
+    // apart so the reset can never fire mid-popup.
+    static float s_blur_r = 0.0f;
+    static float s_blur_tint[3] = {1.0f, 1.0f, 1.0f};
+    static int64_t s_blur_ns = 0;
+    const int64_t blur_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    PerfClock::now().time_since_epoch())
+                                    .count();
+    float blur_dt = s_blur_ns != 0 ? float(blur_now_ns - s_blur_ns) * 1e-9f : 1.0f;
+    if (blur_dt > 0.25f) {
+      s_blur_r = 0.0f;
+      s_blur_tint[0] = s_blur_tint[1] = s_blur_tint[2] = 1.0f;
+      blur_dt = 0.0f;
+    }
+    s_blur_ns = blur_now_ns;
+    const float blur_a = 1.0f - std::exp(-blur_dt / 0.05f);
+    s_blur_r += (scene.ui_blur - s_blur_r) * blur_a;
+    for (int a = 0; a < 3; ++a) {
+      s_blur_tint[a] += (scene.ui_blur_color[a] - s_blur_tint[a]) * blur_a;
+    }
     // The guest output resource can change between frames; re-point the
     // dedicated SRV slot at it each blur frame.
     {
@@ -17535,11 +17597,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     list.D3DSetPipelineState(g_r.pso_blur);
     const float h_consts[8] = {1.0f,
                                0.0f,
-                               scene.ui_blur,
+                               s_blur_r,
                                0.0f,
-                               scene.ui_blur_color[0],
-                               scene.ui_blur_color[1],
-                               scene.ui_blur_color[2],
+                               s_blur_tint[0],
+                               s_blur_tint[1],
+                               s_blur_tint[2],
                                1.0f};
     list.D3DSetGraphicsRoot32BitConstants(0, 8, h_consts, 0);
     srv_table(g_r.blur_srv[0]);
@@ -17551,11 +17613,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     list.D3DOMSetRenderTargets(1, &blur_rtv0, FALSE, nullptr);
     const float v_consts[8] = {0.0f,
                                1.0f,
-                               scene.ui_blur,
+                               s_blur_r,
                                0.0f,
-                               scene.ui_blur_color[0],
-                               scene.ui_blur_color[1],
-                               scene.ui_blur_color[2],
+                               s_blur_tint[0],
+                               s_blur_tint[1],
+                               s_blur_tint[2],
                                1.0f};
     list.D3DSetGraphicsRoot32BitConstants(0, 8, v_consts, 0);
     srv_table(g_r.blur_srv[1]);
