@@ -35,14 +35,16 @@
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_v3_shadow.h"
 #include "native/skate3_native_v3_shadow_mat.h"
+// Offline-compiled SPIR-V for the native shaders (compiled from the HLSL
+// sources with DXC): the Vulkan RHI backend consumes these blobs; the D3D12
+// backend runtime-compiles the embedded HLSL as before.
+#include "native/shaders/spirv/skate3_native_shaders_spirv.h"
 
-#if defined(REX_HAS_D3D12) && REX_HAS_D3D12
-#include <rex/graphics/d3d12/command_processor.h>
-#include <rex/graphics/d3d12/deferred_command_list.h>
+#if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
+#include <rex/graphics/native_rhi.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
-#include <d3dcompiler.h>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -331,6 +333,37 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadows, true, "Skate 3",
                     "movable props onto the world). "
                     "Cascade matrices are captured per frame from the game's own "
                     "material constants.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_palette_alt_guard, true, "Skate 3",
+                    "Publish-side bone-palette alternation guard: a character piece "
+                    "whose served palette returns bit-exact to the previous-but-one "
+                    "frame's palette (A,B,A,B: the capture fixup alternating between "
+                    "two banks) keeps last frame's palette instead. Damps the "
+                    "high-fps hair/garment deformation flicker; real motion is never "
+                    "affected (a genuine pose never round-trips in two rendered "
+                    "frames).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_caster_refresh_all, true, "Skate 3",
+                    "Perspective-bank palette refresh covers ALL caster-sourced "
+                    "skinned captures: skinned-published ROPA garments join the "
+                    "refresh pool (their exclusion left the player's tee/hair riding "
+                    "the ortho caster banks, whose fine animation runs ticks stale in "
+                    "bursts, the high-fps hair-off-the-head wedge / vanishing "
+                    "garment), and the refresh target is picked by palette identity "
+                    "(<1.5 m) across every caster-sourced clone instead of "
+                    "oldest-only (mesh-sharing NPC clones probed the wrong item, the "
+                    "guard refused, and the right clone stayed on its stale caster "
+                    "bank, the NPC blink). false = legacy oldest-only, non-ropa "
+                    "refresh.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_char_rows_inst, true, "Skate 3",
+                    "Per-(mesh,instance) fallback for the character-lighting capture: "
+                    "items whose capture failed to validate this frame reuse their own "
+                    "last validated rows. Covers instanced pieces and the player, which "
+                    "the single-instance mesh fallback and the LW entity cache both "
+                    "miss; without it hair flips between the blended sub-pass and the "
+                    "legacy opaque path on capture-failed frames (a frame-to-frame "
+                    "flicker whose rate scales with fps).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 1024, "Skate 3",
                      "Shadow cascade tile resolution. The game's own atlas is "
@@ -1077,6 +1110,47 @@ struct CharRowsCtx {
   uint32_t entity = 0;
 };
 std::unordered_map<uint32_t, CharRowsCtx> g_char_rows_cache_ctx;
+// (mesh,ctx) -> last VALIDATED rows for EVERY character item with an
+// instance context: the general rescue the two caches above each cover
+// only a slice of: the mesh-keyed cache is gated to single-instance meshes
+// (character pieces also publish caster items of the same mesh, so gameplay
+// pieces rarely qualify) and the ctx cache is gated to LW-mapped entities
+// (the PLAYER is not one). A capture-failed frame without a rescue drops
+// hair out of the blended sub-pass onto the legacy opaque path: a
+// frame-to-frame hair/garment appearance flip (the
+// failure rate scales with guest fps, so it reads as a high-fps
+// flicker). Entity-stamped like CharRowsCtx (0 for non-LW instances) so a
+// recycled ctx never inherits the previous occupant's rows.
+struct CharRowsInst {
+  std::array<float, 60> rows;
+  uint32_t entity = 0;
+};
+std::unordered_map<uint64_t, CharRowsInst> g_char_rows_cache_inst;
+std::atomic<uint64_t> g_char_rows_inst_served{0};
+// Perspective refreshes committed onto skinned-published ROPA pieces (the
+// caster_refresh_all fix; see the fixup's candidate selection).
+std::atomic<uint64_t> g_ropa_caster_refreshed{0};
+// Clone-group pending pairings redirected by palette identity (each count is
+// one prevented twin-palette swap; see the fixup's identity ranking).
+std::atomic<uint64_t> g_pending_pair_fixed{0};
+// Items served authoritative pack palettes this frame / total (see
+// native_palette::ServeAuthoritativePalettes).
+uint32_t g_pal_served_frame = 0;
+std::atomic<uint64_t> g_pal_served_total{0};
+// Route-flip probe: counts hair/character-alpha pieces whose pass route
+// (blended sub-pass vs legacy opaque) changed between consecutive frames;
+// each count is one visible flicker event.
+std::atomic<uint64_t> g_hair_route_flips{0};
+// A,B,A,B alternation probes on the same pieces: served lighting rows,
+// bone palettes and strand-coverage texture content returning EXACTLY to
+// the previous-but-one frame's value (legitimate animation/lighting drift
+// never does).
+std::atomic<uint64_t> g_hair_rows_alternations{0};
+std::atomic<uint64_t> g_hair_bone_alternations{0};
+std::atomic<uint64_t> g_hair_cov_alternations{0};
+std::atomic<uint64_t> g_shadow_alternations{0};
+// Palette A,B,A,B serves repaired by the publish-side alternation guard.
+std::atomic<uint64_t> g_palette_alt_repaired{0};
 // ctx -> last PUBLISHED item of a live LW entity (skinned character
 // families, non-ropa): when a ctx drops out of the submit records for a
 // frame or two while its entity is still alive in the store (observed as
@@ -1511,6 +1585,15 @@ PerfWindow g_pw_shadow;       // dynamic-shadow atlas pass
 PerfWindow g_pw_mesh_decode;  // inline DecodeMesh calls (count = decodes)
 PerfWindow g_pw_tex_decode;   // inline texture-ish decodes (cubes, HUD words)
 PerfWindow g_pw_commit;       // PrewarmCommit batches (count = non-empty runs)
+// RenderScene phase attribution (the sustained "render=13ms, items=0.7ms"
+// Vulkan mystery): everything render= covers that items=/shadow=
+// do not. pre = EnsurePipeline..prewarm+evict+retire before the scene pass;
+// twod = the 2D/HUD overlay replay (incl. inline decodes + video planes);
+// tail = MSAA resolve, outline, pfx chain, photo grab, popup blur, final
+// transitions: RenderScene minus everything else.
+PerfWindow g_pw_pre;
+PerfWindow g_pw_2d;
+PerfWindow g_pw_tail;
 // Camera-update cadence (the "world judders while panning at 320 fps"
 // question): if the guest updates its camera on a fixed sim tick while the
 // render loop free-runs, view_proj repeats for several rendered frames and
@@ -5415,27 +5498,121 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // judder). The refresh entry is only retired by a perspective-bank
   // (z/main-pass) capture.
   auto oldest = range.second;
+  uint32_t pending_n = 0;
   for (auto it = range.first; it != range.second; ++it) {
     if (it->second >= g_frame_dynitems.size() ||
         !g_frame_dynitems[it->second].pending) {
       continue;
     }
+    ++pending_n;
     if (oldest == range.second || it->second < oldest->second) {
       oldest = it;
     }
   }
+  if (pending_n > 1 &&
+      REXCVAR_GET(skate3_native_render_scene_caster_refresh_all)) {
+    // Clone-group IDENTITY pairing. FIFO assumes registration order ==
+    // deferred-draw order; a clone culled from one pass (or a permuted
+    // deferred list) shifts the pairing by one, so each clone captures its
+    // TWIN's palette, and frame parity flips it back: the bit-exact
+    // A,B,A,B bones alternation on clone meshes (fam-5 NPC hair: another
+    // NPC's head joint = the hair blink; all alternating
+    // pieces were multi-ctx clone meshes, src=2 perspective-sourced). Rank
+    // the pending clones by their OWN last published palette (the ctx
+    // cache) against this bank's bone-0 translation; nearest within 1.5 m
+    // wins. First-sight clones (no fresh cache) keep FIFO; their own later
+    // draw still resolves them, and a mispair cannot bit-repeat.
+    const uint32_t pb_sel = BankPaletteBase(base, bank);
+    if (pb_sel != 0) {
+      const float nt[3] = {
+          LoadGuestF32(base, bank + (pb_sel * 4 + 3) * 4),
+          LoadGuestF32(base, bank + ((pb_sel + 1) * 4 + 3) * 4),
+          LoadGuestF32(base, bank + ((pb_sel + 2) * 4 + 3) * 4)};
+      float best_d2 = 2.25f;
+      auto best = range.second;
+      for (auto it = range.first; it != range.second; ++it) {
+        if (it->second >= g_frame_dynitems.size() ||
+            !g_frame_dynitems[it->second].pending) {
+          continue;
+        }
+        const DrawItem& c = g_frame_dynitems[it->second];
+        if (c.ctx == 0 || c.char_family == 0) {
+          continue;
+        }
+        const auto cit = g_bones_cache_ctx.find(c.ctx);
+        if (cit == g_bones_cache_ctx.end() || cit->second.bones.size() < 12 ||
+            g_guest_frame - cit->second.frame > 10) {
+          continue;
+        }
+        const float dx = cit->second.bones[3] - nt[0];
+        const float dy = cit->second.bones[7] - nt[1];
+        const float dz = cit->second.bones[11] - nt[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < best_d2) {
+          best_d2 = d2;
+          best = it;
+        }
+      }
+      if (best != range.second && best != oldest) {
+        g_pending_pair_fixed.fetch_add(1, std::memory_order_relaxed);
+        oldest = best;
+      }
+    }
+  }
   bool caster_refresh = false;
   if (oldest == range.second) {
-    for (auto it = range.first; it != range.second; ++it) {
-      if (it->second >= g_frame_dynitems.size()) {
-        continue;
+    if (REXCVAR_GET(skate3_native_render_scene_caster_refresh_all)) {
+      // Pick the refresh target by PALETTE IDENTITY, across every
+      // caster-sourced skinned candidate, including skinned-published ROPA
+      // garments. Two structural gaps hid here: (1) ropa items were excluded
+      // outright, so the player's tee/hair kept their ortho-bank captures all
+      // frame; the caster banks' fine animation runs ticks stale in bursts
+      // (measured 0.47-0.60 m translation deltas), so those pieces published
+      // poses visibly behind the body (the high-fps hair wedge / vanishing
+      // garment: head-joint pieces 0.3-0.4 m behind the same frame's own
+      // banks while the body matched bit-exact); (2) oldest-only selection
+      // probed the wrong clone for
+      // mesh-sharing NPCs, the <1.5 m guard refused, and the right clone
+      // never refreshed (the NPC blink). Rank by the new bank's bone-0
+      // translation; the commit block below re-guards with the full capture.
+      const uint32_t pb_sel = BankPaletteBase(base, bank);
+      if (pb_sel == 0) {
+        return;
       }
-      const DrawItem& c = g_frame_dynitems[it->second];
-      if (!c.caster_bank || !c.skinned || c.ropa) {
-        continue;
+      const float nt[3] = {
+          LoadGuestF32(base, bank + (pb_sel * 4 + 3) * 4),
+          LoadGuestF32(base, bank + ((pb_sel + 1) * 4 + 3) * 4),
+          LoadGuestF32(base, bank + ((pb_sel + 2) * 4 + 3) * 4)};
+      float best_d2 = 2.25f;  // same 1.5 m identity bound as the commit guard
+      for (auto it = range.first; it != range.second; ++it) {
+        if (it->second >= g_frame_dynitems.size()) {
+          continue;
+        }
+        const DrawItem& c = g_frame_dynitems[it->second];
+        if (!c.caster_bank || !c.skinned || c.bones.size() < 12) {
+          continue;  // rigid-resolved ropa has no palette; world capture owns it
+        }
+        const float dx = c.bones[3] - nt[0];
+        const float dy = c.bones[7] - nt[1];
+        const float dz = c.bones[11] - nt[2];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < best_d2) {
+          best_d2 = d2;
+          oldest = it;
+        }
       }
-      if (oldest == range.second || it->second < oldest->second) {
-        oldest = it;
+    } else {
+      for (auto it = range.first; it != range.second; ++it) {
+        if (it->second >= g_frame_dynitems.size()) {
+          continue;
+        }
+        const DrawItem& c = g_frame_dynitems[it->second];
+        if (!c.caster_bank || !c.skinned || c.ropa) {
+          continue;
+        }
+        if (oldest == range.second || it->second < oldest->second) {
+          oldest = it;
+        }
       }
     }
     if (oldest == range.second) {
@@ -5471,7 +5648,20 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     probe.caster_bank = BankIsOrtho(base, bank);
     probe.pending = false;
     probe.dbg_src = 2;
+    const bool was_ropa_refresh = d.ropa && !probe.caster_bank;
     d = std::move(probe);
+    if (was_ropa_refresh) {
+      // Live verification for the ropa-inclusion fix (tee/hair riding stale
+      // caster banks): counts perspective refreshes landing on ropa pieces.
+      const uint64_t n =
+          g_ropa_caster_refreshed.fetch_add(1, std::memory_order_relaxed);
+      if (n < 4 || (n & 8191u) == 0) {
+        REXLOG_INFO(
+            "native-scene: ropa caster->perspective palette refresh "
+            "mesh={:08X} fam={} (n={})",
+            d.mesh, d.char_family, n);
+      }
+    }
     if (d.char_family != 0 && g_frame_char_refresh.size() < 256) {
       g_frame_char_refresh.emplace(key, oldest->second);
     }
@@ -7698,6 +7888,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // copies but a refused/pending capture -> re-publish with the cached
   // palette (one frame of pose lag instead of a one-frame disappearance).
   if (REXCVAR_GET(skate3_native_render_scene_dynamic_items)) {
+    // v3 Phase 3 palette flip: serve every mapped skinned character item its
+    // instance's own packed m_matrices rows (snapshotted at the game's
+    // Pack/UpdateBoneTransforms exits, the exact bytes the VS upload
+    // consumes; per piece, one sim tick, coherent by construction). Runs
+    // FIRST so the sanity gate below validates the authoritative rows and
+    // the rescue caches learn them; unmapped items keep the bank pipeline.
+    g_pal_served_frame = skate3::native_v3::ServeAuthoritativePalettes(base, scene);
+    g_pal_served_total.fetch_add(g_pal_served_frame, std::memory_order_relaxed);
     // Dense publish-time coherence gate (see PublishedPaletteSane): a
     // 1-frame junk palette that passed the 6-sample capture gates would
     // otherwise draw the map-length-ribbon flash AND poison the rescue
@@ -7957,6 +8155,39 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     } else if (!g_lw_last_items.empty()) {
       g_lw_last_items.clear();
+    }
+  }
+  // Per-INSTANCE character-lighting fallback (see g_char_rows_cache_inst):
+  // the general rescue for capture-failed frames, keyed (mesh,ctx) and
+  // entity-checked. Runs before the legacy single-instance mesh fallback so
+  // instanced pieces (and the player, which is not LW-mapped) hold their
+  // last validated rows, keeping hair in the blended sub-pass instead of
+  // flipping to the legacy opaque path (the high-fps hair/garment flicker).
+  if (REXCVAR_GET(skate3_native_render_scene_char_rows_inst)) {
+    for (DrawItem& item : scene.items) {
+      if (item.char_family == 0 || item.ctx == 0) {
+        continue;
+      }
+      float lw_alpha_unused = 1.0f;
+      uint32_t lw_entity = 0;
+      skate3::native_lw::LookupLwCtx(item.ctx, &lw_alpha_unused, &lw_entity);
+      const uint64_t key = (uint64_t(item.mesh) << 32) | item.ctx;
+      if (item.char_rows[14 * 4 + 1] > 0.0f) {
+        if (g_char_rows_cache_inst.size() > 8192) {
+          g_char_rows_cache_inst.clear();
+        }
+        CharRowsInst& ci = g_char_rows_cache_inst[key];
+        std::memcpy(ci.rows.data(), item.char_rows, sizeof(item.char_rows));
+        ci.entity = lw_entity;
+      } else {
+        const auto iit = g_char_rows_cache_inst.find(key);
+        if (iit != g_char_rows_cache_inst.end() &&
+            iit->second.entity == lw_entity) {
+          std::memcpy(item.char_rows, iit->second.rows.data(),
+                      sizeof(item.char_rows));
+          g_char_rows_inst_served.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
     }
   }
   // Cross-frame character-lighting fallback (see g_char_rows_cache): items
@@ -8463,6 +8694,54 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           item.char_rows[14 * 4 + 0] = std::clamp(alpha, 0.0f, 1.0f);
         }
       }
+    }
+  }
+
+  // Bone-palette alternation guard (the high-fps hair/garment flicker,
+  // probe-confirmed: alt[bones] events on fam 2/4/5 pieces while rows/
+  // coverage/route stayed stable). A served palette that returns BIT-EXACT
+  // to the previous-but-one frame's palette while differing from the last
+  // frame's is never a real pose (the sim holds poses across several
+  // rendered frames at high fps; genuine motion never round-trips in two
+  // rendered frames); it is the capture fixup alternating between two
+  // banks (stale tick / nearby twin). Repair: keep serving the LAST frame's
+  // palette, damping A,B,A,B to a steady pose until the capture settles.
+  if (REXCVAR_GET(skate3_native_render_scene_palette_alt_guard)) {
+    struct PaletteGuard {
+      uint64_t h1 = 0;
+      uint64_t h2 = 0;
+      std::vector<float> last;  // the palette h1 hashes
+    };
+    static std::unordered_map<uint64_t, PaletteGuard> s_pal_guard;  // guest thread
+    for (DrawItem& item : scene.items) {
+      if (item.char_family == 0 || !item.skinned || item.bones.empty() ||
+          item.dbg_src == 10 ||  // LW-substituted palettes are authoritative
+          item.dbg_src == 11) {  // pack-served palettes are authoritative
+        continue;
+      }
+      uint64_t h = 1469598103934665603ull;
+      const uint8_t* pb = reinterpret_cast<const uint8_t*>(item.bones.data());
+      const size_t pn = item.bones.size() * sizeof(float);
+      for (size_t bi = 0; bi < pn; ++bi) {
+        h = (h ^ pb[bi]) * 1099511628211ull;
+      }
+      const uint64_t key = (uint64_t(item.mesh) << 32) | item.ctx;
+      auto [git, gfresh] = s_pal_guard.try_emplace(key);
+      PaletteGuard& pg = git->second;
+      if (!gfresh && h != pg.h1 && h == pg.h2 &&
+          pg.last.size() == item.bones.size()) {
+        std::memcpy(item.bones.data(), pg.last.data(),
+                    item.bones.size() * sizeof(float));
+        g_palette_alt_repaired.fetch_add(1, std::memory_order_relaxed);
+        // h1/last stay: the repaired frame served h1's palette again.
+      } else {
+        pg.h2 = pg.h1;
+        pg.h1 = h;
+        pg.last.assign(item.bones.begin(), item.bones.end());
+      }
+    }
+    if (s_pal_guard.size() > 1024) {
+      s_pal_guard.clear();
     }
   }
 
@@ -9190,7 +9469,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
 
 }  // namespace skate3::native_scene
 
-#if defined(REX_HAS_D3D12) && REX_HAS_D3D12
+#if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
 
 namespace skate3::native_scene {
 namespace {
@@ -9198,12 +9477,28 @@ namespace {
 using rex::graphics::NativeGuestOutputBackend;
 using rex::graphics::NativeGuestOutputRenderContext;
 namespace xenos = rex::graphics::xenos;
+namespace nrhi = rex::graphics::nrhi;
+
+// App-local vertex/index binding records (replacing D3D12_VERTEX_BUFFER_VIEW /
+// D3D12_INDEX_BUFFER_VIEW): the RHI binds (buffer, offset) directly, no GPU
+// virtual addresses.
+struct VbBinding {
+  nrhi::Buffer* buffer = nullptr;
+  uint64_t offset = 0;
+  uint32_t size_bytes = 0;
+  uint32_t stride = 0;
+};
+struct IbBinding {
+  nrhi::Buffer* buffer = nullptr;
+  uint64_t offset = 0;
+  uint32_t size_bytes = 0;
+};
 
 struct MeshBuffers {
-  ID3D12Resource* vb = nullptr;
-  ID3D12Resource* ib = nullptr;
-  D3D12_VERTEX_BUFFER_VIEW vb_view{};
-  D3D12_INDEX_BUFFER_VIEW ib_view{};
+  nrhi::Buffer* vb = nullptr;
+  nrhi::Buffer* ib = nullptr;
+  VbBinding vb_view{};
+  IbBinding ib_view{};
   uint64_t fingerprint = 0;
   // Dynamic-payload decode order (DynDecodeJob::seq): the commit drops
   // results older than the cached entry so multi-worker reordering cannot
@@ -9223,16 +9518,16 @@ struct MeshBuffers {
 };
 
 struct GuestTexture {
-  ID3D12Resource* texture = nullptr;
-  ID3D12Resource* upload = nullptr;  // kept alive; copy recorded in deferred list
+  nrhi::Texture* texture = nullptr;
+  nrhi::Buffer* upload = nullptr;  // kept alive; copy recorded in deferred list
   // In-place re-decode ping-pong partner (UpdateGuestTexture2DInPlace): the
   // GPU may still be copying from the OTHER upload buffer for the previous
   // frame's content change, so hot content alternates buffers instead of
-  // paying two CreateCommittedResource calls per change.
-  ID3D12Resource* upload_b = nullptr;
+  // paying two buffer creations per change.
+  nrhi::Buffer* upload_b = nullptr;
   bool upload_flip = false;
   uint32_t fetch_words[6] = {};      // big-endian words as read for revalidation
-  uint32_t srv_slot = 0;
+  nrhi::TextureView* srv = nullptr;
   // For failed decodes: frame number for periodic retry (payload may stream
   // in after the fetch constant is already valid).
   uint64_t retry_after_frame = 0;
@@ -9273,12 +9568,12 @@ struct GuestTexture {
   // until the next words change replaced it ("decal flash and replace").
   uint32_t probe_addr[64] = {};
   uint8_t probe_count = 0;
-  // SRV recipe (2D textures) so EXTRA views of this resource can be created
-  // into paired descriptor slots (the fam 5/6 masks+normal 2-descriptor
-  // table at t4/t5); descriptors can't be copied out of the shader-visible
-  // heap, so pairs re-create views from the recipe instead.
-  DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
-  UINT srv_mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  // SRV recipe remnants (2D textures): srv_format is the revalidation
+  // compare key and srv_mips gates the single-mip in-place update path.
+  // The paired t4/t5 descriptor re-creation this recipe once fed is gone;
+  // pairs bind their two views directly via SetTexturePair (descriptor
+  // management is backend-internal now).
+  nrhi::Format srv_format = nrhi::Format::kUnknown;
   uint32_t srv_mips = 0;
   bool valid = false;
   // Store LRU clock: last frame this entry was served/touched. Superseded
@@ -9516,48 +9811,48 @@ bool SampleProbeNearBlack(uint8_t* base, const GuestTexture& t) {
 // D3D12 texture cache table). host_swizzle remaps guest data components
 // before the fetch-constant swizzle composes on top.
 struct HostTextureFormat {
-  DXGI_FORMAT resource_format = DXGI_FORMAT_UNKNOWN;
-  DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
+  nrhi::Format resource_format = nrhi::Format::kUnknown;
+  nrhi::Format srv_format = nrhi::Format::kUnknown;
   uint32_t host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
 };
 
 bool GetHostTextureFormat(xenos::TextureFormat format, HostTextureFormat& out) {
   switch (rex::graphics::GetBaseFormat(format)) {
     case xenos::TextureFormat::k_DXT1:
-      out = {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM,
+      out = {nrhi::Format::kBC1_UNORM, nrhi::Format::kBC1_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
       return true;
     case xenos::TextureFormat::k_DXT2_3:
-      out = {DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC2_UNORM,
+      out = {nrhi::Format::kBC2_UNORM, nrhi::Format::kBC2_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
       return true;
     case xenos::TextureFormat::k_DXT4_5:
-      out = {DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM,
+      out = {nrhi::Format::kBC3_UNORM, nrhi::Format::kBC3_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
       return true;
     case xenos::TextureFormat::k_DXT5A:
-      out = {DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_UNORM,
+      out = {nrhi::Format::kBC4_UNORM, nrhi::Format::kBC4_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
       return true;
     case xenos::TextureFormat::k_DXN:
-      out = {DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_UNORM,
+      out = {nrhi::Format::kBC5_UNORM, nrhi::Format::kBC5_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG};
       return true;
     case xenos::TextureFormat::k_8_8_8_8:
-      out = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+      out = {nrhi::Format::kR8G8B8A8_UNORM, nrhi::Format::kR8G8B8A8_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
       return true;
     case xenos::TextureFormat::k_8:
-      out = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UNORM,
+      out = {nrhi::Format::kR8_UNORM, nrhi::Format::kR8_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
       return true;
     case xenos::TextureFormat::k_8_8:
-      out = {DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+      out = {nrhi::Format::kR8G8_UNORM, nrhi::Format::kR8G8_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG};
       return true;
     case xenos::TextureFormat::k_5_6_5:
       // Red/blue swapped CPU-side while uploading.
-      out = {DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM,
+      out = {nrhi::Format::kB5G6R5_UNORM, nrhi::Format::kB5G6R5_UNORM,
              xenos::XE_GPU_TEXTURE_SWIZZLE_RGBB};
       return true;
     default:
@@ -9565,14 +9860,16 @@ bool GetHostTextureFormat(xenos::TextureFormat format, HostTextureFormat& out) {
   }
 }
 
-UINT ComposeSrvSwizzle(uint32_t fetch_swizzle, uint32_t host_swizzle) {
-  uint32_t mapping[4];
+// Compose the fetch-constant swizzle over the host-format component remap
+// into a per-channel view swizzle (Xenos 0..5 = X,Y,Z,W,0,1, the same
+// order as nrhi::Swizzle).
+void ComposeSrvSwizzle(uint32_t fetch_swizzle, uint32_t host_swizzle,
+                       nrhi::Swizzle out[4]) {
   for (uint32_t c = 0; c < 4; ++c) {
     const uint32_t guest = (fetch_swizzle >> (3 * c)) & 7u;
-    mapping[c] = guest >= 4 ? guest : ((host_swizzle >> (3 * guest)) & 7u);
+    const uint32_t v = guest >= 4 ? guest : ((host_swizzle >> (3 * guest)) & 7u);
+    out[c] = nrhi::Swizzle(v);
   }
-  return D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(mapping[0], mapping[1], mapping[2],
-                                                 mapping[3]);
 }
 
 void SwapGuestEndian(uint8_t* data, uint32_t size, xenos::Endian endian) {
@@ -9600,53 +9897,53 @@ void SwapGuestEndian(uint8_t* data, uint32_t size, xenos::Endian endian) {
 }
 
 struct RendererState {
-  ID3D12Device* device = nullptr;
-  ID3D12RootSignature* root_signature = nullptr;
-  ID3D12PipelineState* pso = nullptr;
-  ID3D12PipelineState* pso_cullback = nullptr;  // two_sided_sheet meshes (see MeshBuffers)
-  ID3D12PipelineState* pso_nodepth = nullptr;
+  nrhi::Device* device = nullptr;
+  nrhi::BindingLayout* layout = nullptr;  // main scene binding layout (was the root signature)
+  nrhi::Pipeline* pso = nullptr;
+  nrhi::Pipeline* pso_cullback = nullptr;  // two_sided_sheet meshes (see MeshBuffers)
+  nrhi::Pipeline* pso_nodepth = nullptr;
   // environment.transparent sub-pass: straight alpha blend, depth test on,
   // z-write OFF; items drawn back-to-front after all opaque items.
-  ID3D12PipelineState* pso_transparent = nullptr;
+  nrhi::Pipeline* pso_transparent = nullptr;
   // Entity-fade variant of the transparent PSO: same straight alpha blend
   // but z-write ON. A fading character/vehicle is a solid object at partial
   // opacity; z-write-off blending composites every overlapping piece (skin
   // under clothes, far-side doors/wheels through the body shell) into an
   // x-ray. With depth writes the nearest surface wins and each pixel blends
   // once, matching the game's main-pass fade.
-  ID3D12PipelineState* pso_fade = nullptr;
+  nrhi::Pipeline* pso_fade = nullptr;
   // Hair sub-passes: transparent blend state with cull BACK / cull FRONT
   // (the game's cac_hair/defaulthair two-pass draw order).
-  ID3D12PipelineState* pso_hair_a = nullptr;
-  ID3D12PipelineState* pso_hair_b = nullptr;
-  DXGI_FORMAT rtv_format = DXGI_FORMAT_UNKNOWN;
-  ID3D12DescriptorHeap* rtv_heap = nullptr;  // slot 0 = output, slot 1 = MSAA
-  ID3D12DescriptorHeap* dsv_heap = nullptr;
-  ID3D12Resource* depth = nullptr;
+  nrhi::Pipeline* pso_hair_a = nullptr;
+  nrhi::Pipeline* pso_hair_b = nullptr;
+  nrhi::Format rtv_format = nrhi::Format::kUnknown;
+  nrhi::Texture* depth = nullptr;
   uint32_t depth_width = 0;
   uint32_t depth_height = 0;
-  ID3D12Resource* rtv_resource = nullptr;
+  // Cached guest-output texture identity (context.guest_output) for change
+  // detection: the presenter recreates the output image on resize.
+  nrhi::Texture* rtv_resource = nullptr;
   // MSAA: the scene draws into msaa_color (+ MSAA depth) and a fullscreen
-  // pass averages the samples into the guest output texture (the deferred
-  // command list has no ResolveSubresource).
+  // pass averages the samples into the guest output texture (the RHI command
+  // stream has no resolve copy).
   uint32_t msaa = 1;
-  ID3D12Resource* msaa_color = nullptr;
-  ID3D12PipelineState* resolve_pso = nullptr;
-  uint32_t msaa_srv_slot = 0;
+  nrhi::Texture* msaa_color = nullptr;
+  nrhi::Pipeline* resolve_pso = nullptr;
+  nrhi::TextureView* msaa_srv_slot = nullptr;
   bool msaa_srv_allocated = false;
   // Popup background blur (see kBlurShaderSource): two intermediates at the
-  // game's fixed 1152x640 internal resolution (RTV heap slots 5/6) + an SRV
-  // slot re-pointed at the guest output each blur frame. Steady state for
+  // game's fixed 1152x640 internal resolution + a view of the guest output
+  // (re-created when the output texture changes). Steady state for
   // blur_tex is RENDER_TARGET.
   static constexpr uint32_t kBlurWidth = 1152;
   static constexpr uint32_t kBlurHeight = 640;
-  ID3D12Resource* blur_tex[2] = {nullptr, nullptr};
-  uint32_t blur_srv[2] = {0, 0};
-  uint32_t output_srv_slot = 0;
+  nrhi::Texture* blur_tex[2] = {nullptr, nullptr};
+  nrhi::TextureView* blur_srv[2] = {nullptr, nullptr};
+  nrhi::TextureView* output_srv_slot = nullptr;
   bool output_srv_allocated = false;
-  ID3D12PipelineState* pso_blur = nullptr;
-  ID3D12PipelineState* pso_blur_blit = nullptr;
-  ID3D12PipelineState* pso_blur_down = nullptr;
+  nrhi::Pipeline* pso_blur = nullptr;
+  nrhi::Pipeline* pso_blur_blit = nullptr;
+  nrhi::Pipeline* pso_blur_down = nullptr;
   // Native photo grab (photo_grab_native): the blur downsample pass (whose
   // 1152x640 blur space happens to BE the game's screenshot-target raster)
   // renders the finished frame into blur_tex[0], which is then copied into
@@ -9656,7 +9953,7 @@ struct RendererState {
   // frame was the old path's stall). Row pitch 1152*4 = 4608 is already
   // 256-aligned.
   static constexpr uint32_t kGrabRowPitch = kBlurWidth * 4;
-  ID3D12Resource* grab_readback[2] = {nullptr, nullptr};
+  nrhi::Buffer* grab_readback[2] = {nullptr, nullptr};
   uint8_t* grab_readback_ptr[2] = {nullptr, nullptr};
   uint64_t grab_submission[2] = {0, 0};
   bool grab_pending[2] = {false, false};
@@ -9668,66 +9965,53 @@ struct RendererState {
   // Native FMV: overlay-2D pipeline variant whose PS combines the movie
   // player's three CPU-filled YUV plane textures (ps_yuv2d; substituted for
   // the captured movie quad in the 2D replay, see OnMovieFrame).
-  ID3D12PipelineState* pso_yuv2d = nullptr;
+  nrhi::Pipeline* pso_yuv2d = nullptr;
   // Selection outline (see DrawItem::selected): selected items re-render
-  // into a single-sample R8 mask at OUTPUT resolution (RTV slot 7: a
-  // low-res mask stairstepped the contour centerline at 4K) and a
-  // fullscreen edge-detect pass with fixed UV-fraction tap pitch adds the
-  // blue outline onto the resolved output (postfx_edgedetectstencil
-  // equivalent). Mask steady state is RENDER_TARGET.
-  ID3D12Resource* outline_mask = nullptr;
+  // into a single-sample R8 mask at OUTPUT resolution (a low-res mask
+  // stairstepped the contour centerline at 4K) and a fullscreen edge-detect
+  // pass with fixed UV-fraction tap pitch adds the blue outline onto the
+  // resolved output (postfx_edgedetectstencil equivalent). Mask steady
+  // state is RENDER_TARGET.
+  nrhi::Texture* outline_mask = nullptr;
   uint32_t outline_mask_width = 0;
   uint32_t outline_mask_height = 0;
-  uint32_t outline_mask_srv = 0;
+  nrhi::TextureView* outline_mask_srv = nullptr;
   bool outline_mask_srv_allocated = false;
-  ID3D12PipelineState* pso_outline_mask = nullptr;
-  ID3D12PipelineState* pso_outline_edge = nullptr;
+  nrhi::Pipeline* pso_outline_mask = nullptr;
+  nrhi::Pipeline* pso_outline_edge = nullptr;
   // Photo-editor postfx chain (photo_fx.hlsl: exact ucode ports, see
-  // FrameScene::PhotoFx). Own root signature: root CBV b0 (the pass's 256
-  // captured/baked constant rows) + eight single-SRV tables t0..t7 + three
-  // static samplers. Intermediates at the game's exact half/quarter sizes
-  // (the DOF tap offsets are baked for them); the full-res stages run at
-  // output resolution. pfx_quarter persists across frames (accumulation
+  // FrameScene::PhotoFx). Own binding layout: CBV b0 (the pass's 256
+  // captured/baked constant rows) + eight single-texture tables t0..t7 +
+  // three static samplers. Intermediates at the game's exact half/quarter
+  // sizes (the DOF tap offsets are baked for them); the full-res stages run
+  // at output resolution. pfx_quarter persists across frames (accumulation
   // input). All pfx color targets idle in RENDER_TARGET state.
   static constexpr uint32_t kPfxHalfW = 576, kPfxHalfH = 320;
   static constexpr uint32_t kPfxQuarterW = 288, kPfxQuarterH = 160;
-  ID3D12RootSignature* pfx_root_sig = nullptr;
+  nrhi::BindingLayout* pfx_layout = nullptr;
   // PSO order: depthpack, visualfx, dof_down, dof_mb, dof, uber, fisheye, blit.
-  ID3D12PipelineState* pfx_pso[9] = {};
-  ID3D12Resource* pfx_full[2] = {};   // output-res RGBA8 (visualfx out, uber out)
-  ID3D12Resource* pfx_half[2] = {};   // 576x320 RGBA8
-  ID3D12Resource* pfx_quarter = nullptr;  // 288x160 RGBA8 accumulation
-  ID3D12Resource* pfx_depth = nullptr;    // output-res packed-depth RGBA8
-  ID3D12Resource* pfx_lut = nullptr;      // 32^3 identity grade LUT (RGBA8)
-  ID3D12Resource* pfx_lut_upload = nullptr;
+  nrhi::Pipeline* pfx_pso[9] = {};
+  nrhi::Texture* pfx_full[2] = {};   // output-res RGBA8 (visualfx out, uber out)
+  nrhi::Texture* pfx_half[2] = {};   // 576x320 RGBA8
+  nrhi::Texture* pfx_quarter = nullptr;  // 288x160 RGBA8 accumulation
+  nrhi::Texture* pfx_depth = nullptr;    // output-res packed-depth RGBA8
+  nrhi::Texture* pfx_lut = nullptr;      // 32^3 identity grade LUT (RGBA8)
+  nrhi::Buffer* pfx_lut_upload = nullptr;
   bool pfx_lut_uploaded = false;
-  ID3D12Resource* pfx_cb = nullptr;  // upload heap, persistently mapped
+  nrhi::Buffer* pfx_cb = nullptr;  // upload heap, persistently mapped
   uint8_t* pfx_cb_ptr = nullptr;
-  // Fixed SRV slots: 0/1 = pfx_full, 2/3 = pfx_half, 4 = quarter, 5 =
+  // Fixed SRV views: 0/1 = pfx_full, 2/3 = pfx_half, 4 = quarter, 5 =
   // packed depth, 6 = LUT, 7 = the native MSAA/1x depth resource.
-  uint32_t pfx_srv[8] = {};
+  nrhi::TextureView* pfx_srv[8] = {};
   bool pfx_srv_allocated = false;
   uint32_t pfx_width = 0, pfx_height = 0;
   bool pfx_ready = false;
   bool pfx_failed = false;
-  uint32_t rtv_size = 0;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
-  // Buffers replaced by re-decode, kept alive until the GPU has finished the
-  // submission that last referenced them.
-  std::vector<std::pair<ID3D12Resource*, uint64_t>> retired;
-  // Texture SRV staging: CPU-only heap; slots copied into the command
-  // processor's one-use shader-visible descriptors per draw.
-  ID3D12DescriptorHeap* srv_heap = nullptr;
-  uint32_t srv_size = 0;
-  uint32_t srv_next = 0;
-  // Guest-texture SRV slot recycling: decodes are unbounded over a session
-  // (streaming re-decodes, registration prewarm) and a monotonic allocator
-  // exhausts the 8192-slot heap; every later decode then fails and renders
-  // white. Retired slots wait out their last-referencing submission before
-  // rejoining the free list (the descriptor may still be copied from while
-  // the frame is in flight).
-  std::vector<uint32_t> srv_free;
-  std::vector<std::pair<uint32_t, uint64_t>> retired_srv_slots;
+  // (The old D3D12 bookkeeping, the retired-resource vector, the CPU SRV
+  // staging heap and its slot allocator/recycling lists, is gone: resource
+  // destruction is deferred inside the RHI (Device::DestroyDeferred) and
+  // texture bindings are backend-managed view objects.)
   GuestTexture white;
   // Water environment CUBE maps (t6): separate cache; same guest object
   // addresses decode differently (6 faces, TextureCube SRV).
@@ -9736,8 +10020,13 @@ struct RendererState {
   // Bone palette ring: persistent-mapped upload buffer, one region per
   // in-flight frame.
   static constexpr uint32_t kBoneRegionSize = 1u << 20;
-  static constexpr uint32_t kBoneRegions = 4;
-  ID3D12Resource* bone_ring = nullptr;
+  // 8-deep (was 4): the Vulkan CP was observed letting the GPU lag more
+  // than 3 frames under load - 4-deep regions then recycle while still
+  // referenced (hair shimmer / collapsed garments). If the ring race is
+  // confirmed, the CP-side throttle is the
+  // proper fix and this is defense in depth.
+  static constexpr uint32_t kBoneRegions = 8;
+  nrhi::Buffer* bone_ring = nullptr;
   uint8_t* bone_ring_cpu = nullptr;
   uint32_t bone_ring_offset = 0;
   // ROPA shape-generation ring (per garment mesh): the last decoded vertex
@@ -9753,55 +10042,51 @@ struct RendererState {
   };
   std::unordered_map<uint32_t, std::deque<RopaGen>> ropa_shapes;
   static constexpr uint32_t kRopaRegionSize = 1u << 20;
-  ID3D12Resource* ropa_ring = nullptr;
+  nrhi::Buffer* ropa_ring = nullptr;
   uint8_t* ropa_ring_cpu = nullptr;
   uint32_t ropa_ring_offset = 0;
   // 2D overlay (HUD/APT replay): alpha-blended depth-less pipeline drawing
   // the captured inline vertices from a per-frame upload ring.
-  ID3D12PipelineState* pso_2d = nullptr;
+  nrhi::Pipeline* pso_2d = nullptr;
   // In-world neon splines, drawn inside the MSAA scene pass (depth test on,
   // no z-write): darken = straight alpha, default = additive glow.
-  ID3D12PipelineState* pso_spline_darken = nullptr;
-  ID3D12PipelineState* pso_spline_default = nullptr;
+  nrhi::Pipeline* pso_spline_darken = nullptr;
+  nrhi::Pipeline* pso_spline_default = nullptr;
   // Dynamic CSM shadows: casters render
   // into a 3-tile (depth, coverage) atlas with MIN blend (depth clear 1,
   // "uncoverage" clear 1 -> covered texels write 0), then the game's exact
   // Gaussian-coverage + depth-dilation blur runs per tile (5-tap cascade 0,
   // 3-tap cascade 1, format-convert-only cascade 2) into the atlas the
   // scene pass samples at t5.
-  ID3D12PipelineState* pso_shadow_caster = nullptr;
-  ID3D12PipelineState* pso_shadow_blur = nullptr;
-  ID3D12Resource* shadow_raw = nullptr;    // caster pass target (RTV slot 2)
-  ID3D12Resource* shadow_mid = nullptr;    // hblur output (RTV slot 3)
-  ID3D12Resource* shadow_final = nullptr;  // vblur output, sampled (RTV slot 4)
-  uint32_t shadow_tile = 0;                // per-cascade tile size (atlas = 3*tile x tile)
-  uint32_t shadow_srv_raw = 0;
-  uint32_t shadow_srv_mid = 0;
-  uint32_t shadow_srv_final = 0;
+  nrhi::Pipeline* pso_shadow_caster = nullptr;
+  nrhi::Pipeline* pso_shadow_blur = nullptr;
+  nrhi::Texture* shadow_raw = nullptr;    // caster pass target
+  nrhi::Texture* shadow_mid = nullptr;    // hblur output
+  nrhi::Texture* shadow_final = nullptr;  // vblur output, sampled
+  uint32_t shadow_tile = 0;               // per-cascade tile size (atlas = 3*tile x tile)
+  nrhi::TextureView* shadow_srv_raw = nullptr;
+  nrhi::TextureView* shadow_srv_mid = nullptr;
+  nrhi::TextureView* shadow_srv_final = nullptr;
   // After a shadow pass all three textures sit in PIXEL_SHADER_RESOURCE;
   // the next pass transitions them back to RENDER_TARGET first.
   bool shadow_in_srv_state = false;
-  // Per-frame shadow constant buffer ring (root CBV b1).
-  static constexpr uint32_t kShadowCbRegions = 4;
-  ID3D12Resource* shadow_cb = nullptr;
+  // Per-frame shadow constant buffer ring (CBV b1).
+  static constexpr uint32_t kShadowCbRegions = 8;
+  nrhi::Buffer* shadow_cb = nullptr;
   uint8_t* shadow_cb_cpu = nullptr;
   static constexpr uint32_t kUiRegionSize = 1u << 20;
-  static constexpr uint32_t kUiRegions = 4;
-  ID3D12Resource* ui_ring = nullptr;
+  static constexpr uint32_t kUiRegions = 8;
+  nrhi::Buffer* ui_ring = nullptr;
   uint8_t* ui_ring_cpu = nullptr;
   // Last successfully resolved words-key per streamed-art site
   // (mesh << 1 | slot; slot 0 = diffuse override, 1 = decal override).
   // Serves the site's previous art while a new-mip-words decode is in
   // flight (see resolve_fetch_words). Render thread only.
   std::unordered_map<uint64_t, uint64_t> words_sticky;
-  // Paired material descriptors for the fam 5/6 masks+normal 2-descriptor
-  // table (t4 = spec/ecc/refl masks, t5 = the material's normal map):
-  // (spec_tex << 32 | normal_tex) -> {base heap slot, last refresh frame}.
-  // Both views are (re)created every frame on first use so texture
-  // replacement (content revalidation / prewarm swaps) can never leave a
-  // stale descriptor. Slots come from the monotonic allocator and are never
-  // retired (bounded by the distinct reflective materials seen).
-  std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> mat_pairs;
+  // (The fam 5/6 masks+normal t4/t5 descriptor-pair cache is gone: draws
+  // bind both views directly via cmd->SetTexturePair(5, spec, normal);
+  // pair descriptors are cached inside the backend, so texture replacement
+  // can never leave a stale descriptor.)
   // THE texture content store (console identity
   // semantics): fetch-words key -> decode. One
   // words state = one entry; both states of a streaming flap A<->B simply
@@ -9853,29 +10138,15 @@ struct RendererState {
 
 RendererState g_r;
 
-// Allocate a guest-texture SRV slot, preferring the recycled free list.
-// Fixed/global slots (white, blur chain, MSAA, outline) keep the monotonic
-// allocator; they are never retired.
-bool AllocGuestSrvSlot(uint32_t& slot) {
-  if (!g_r.srv_free.empty()) {
-    slot = g_r.srv_free.back();
-    g_r.srv_free.pop_back();
-    return true;
-  }
-  if (g_r.srv_next >= 8192) {
-    return false;
-  }
-  slot = g_r.srv_next++;
-  return true;
-}
-
-// Retire a guest texture's GPU resources AND its SRV slot; everything waits
-// out `submission` before being freed/recycled.
+// Retire a guest texture's GPU resources AND its view. Destruction is
+// deferred inside the RHI against the CURRENT submission; the `submission`
+// parameter is kept for call-site compatibility and ignored.
 void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
-  if (t.texture) g_r.retired.emplace_back(t.texture, submission);
-  if (t.upload) g_r.retired.emplace_back(t.upload, submission);
-  if (t.upload_b) g_r.retired.emplace_back(t.upload_b, submission);
-  if (t.valid) g_r.retired_srv_slots.emplace_back(t.srv_slot, submission);
+  (void)submission;
+  g_r.device->DestroyDeferred(t.texture);
+  g_r.device->DestroyDeferred(t.upload);
+  g_r.device->DestroyDeferred(t.upload_b);
+  g_r.device->DestroyDeferred(t.srv);
 }
 
 // ---- Content store helpers --------------------------------------------------
@@ -9948,22 +10219,24 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
 
 // ---- Staged texture decode (worker-thread half) ---------------------------
 // The texture decoders normally finish by recording GPU copies into the
-// deferred command list, pushing a barrier and creating the SRV: all
+// frame's command stream, pushing a barrier and creating the SRV, all
 // render-thread-only. When `g_tex_stage_out` is set (decode worker), they
 // stop after filling the upload resource and export what the render-thread
-// commit needs instead. D3D12 resource creation and upload mapping are
-// free-threaded, so everything up to that point is safe off-thread.
+// commit needs instead. RHI resource creation and upload mapping are
+// thread-safe, so everything up to that point is safe off-thread.
 struct StagedMipCopy {
   uint32_t offset, pitch, w, h;  // upload footprint per mip
 };
 struct StagedTexCommit {
-  DXGI_FORMAT copy_format = DXGI_FORMAT_UNKNOWN;
-  DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
-  UINT swizzle_mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  nrhi::Format copy_format = nrhi::Format::kUnknown;
+  nrhi::Format srv_format = nrhi::Format::kUnknown;
+  nrhi::Swizzle swizzle[4] = {nrhi::Swizzle::kX, nrhi::Swizzle::kY,
+                              nrhi::Swizzle::kZ, nrhi::Swizzle::kW};
   uint32_t mip_count = 0;
   // Cube map (environment cubes): mips[] holds face-major (face * levels +
-  // mip) subresource copies, matching D3D12 subresource numbering, and
-  // the SRV is TEXTURECUBE with cube_mip_levels levels. The cube MIP CHAIN
+  // mip) subresource copies, the old D3D12 subresource numbering, which the
+  // commit decomposes back into (face, mip), and the SRV is a kCube view
+  // with cube_mip_levels levels. The cube MIP CHAIN
   // is load-bearing: the game's reflective glass perturbs its reflection
   // vector with a per-pixel normal map, so the hardware cube fetch runs at
   // a DEEP gradient-derived LOD; a mip-0-only cube shows the plaza cube's
@@ -9977,51 +10250,40 @@ struct StagedTexCommit {
 thread_local StagedTexCommit* g_tex_stage_out = nullptr;
 
 // Render-thread half: record the staged upload's copies + barrier, create
-// the SRV, mark the texture live. On SRV-slot exhaustion the texture stays
-// invalid (renders white; slot recycling makes this near-impossible).
+// the SRV, mark the texture live. On view-creation failure the texture stays
+// invalid (renders white; the backend-managed views make this near-impossible).
 void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
                               GuestTexture& gt, const StagedTexCommit& sc) {
-  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
   for (uint32_t m = 0; m < sc.mip_count; ++m) {
     const StagedMipCopy& p = sc.mips[m];
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = gt.texture;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = m;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = gt.upload;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = p.offset;
-    src.PlacedFootprint.Footprint.Format = sc.copy_format;
-    src.PlacedFootprint.Footprint.Width = p.w;
-    src.PlacedFootprint.Footprint.Height = p.h;
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = p.pitch;
-    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    // Cube commits stage face-major (face * levels + mip) entries (the old
+    // D3D12 subresource numbering): decompose into (mip, face).
+    const uint32_t mip = sc.cube ? m % sc.cube_mip_levels : m;
+    const uint32_t face = sc.cube ? m / sc.cube_mip_levels : 0;
+    context.cmd->CopyBufferToTexture(gt.texture, mip, face, gt.upload, p.offset,
+                                     p.pitch, p.w, p.h, 1);
   }
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        gt.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  if (!AllocGuestSrvSlot(gt.srv_slot)) {
+  context.cmd->Barrier(gt.texture, nrhi::ResourceState::kCopyDest,
+                       nrhi::ResourceState::kPixelShaderResource);
+  nrhi::TextureViewDesc vd;
+  vd.format = sc.srv_format;
+  for (uint32_t c = 0; c < 4; ++c) {
+    vd.swizzle[c] = sc.swizzle[c];
+  }
+  if (sc.cube) {
+    vd.dimension = nrhi::ViewDimension::kCube;
+    vd.mip_levels = sc.cube_mip_levels;
+  } else {
+    vd.dimension = nrhi::ViewDimension::k2D;
+    vd.mip_levels = sc.mip_count;
+    gt.srv_format = sc.srv_format;
+    gt.srv_mips = sc.mip_count;
+  }
+  gt.srv = g_r.device->CreateTextureView(gt.texture, vd);
+  if (gt.srv == nullptr) {
     gt.valid = false;
     return;
   }
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-  srv.Format = sc.srv_format;
-  srv.Shader4ComponentMapping = sc.swizzle_mapping;
-  if (sc.cube) {
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-    srv.TextureCube.MipLevels = sc.cube_mip_levels;
-  } else {
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Texture2D.MipLevels = sc.mip_count;
-    gt.srv_format = sc.srv_format;
-    gt.srv_mapping = sc.swizzle_mapping;
-    gt.srv_mips = sc.mip_count;
-  }
-  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-  slot.ptr += size_t(gt.srv_slot) * g_r.srv_size;
-  g_r.device->CreateShaderResourceView(gt.texture, &srv, slot);
   gt.valid = true;
 }
 
@@ -10059,7 +10321,10 @@ std::vector<PrewarmEntry> g_prewarm_retry;  // under g_prewarm_out_mutex
 
 // Shader sources live in src/native/shaders/*.hlsl; the build embeds them
 // into this generated header (cmake/EmbedShaders.cmake) so the exe stays
-// self-contained. Same kFooSource char arrays as before.
+// self-contained. Same kFooSource char arrays as before. (The offline
+// SPIR-V table for the same shaders is included at the top of the file;
+// it declares ::skate3::native_spirv and must not nest inside this
+// namespace.)
 #include "skate3_native_shaders.h"
 
 float HalfToFloat(uint16_t h) {
@@ -10081,24 +10346,11 @@ float HalfToFloat(uint16_t h) {
   return std::bit_cast<float>(sign | ((exp + 112) << 23) | (mant << 13));
 }
 
-ID3D12Resource* CreateUploadBuffer(ID3D12Device* device, size_t size) {
-  D3D12_HEAP_PROPERTIES heap{};
-  heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-  D3D12_RESOURCE_DESC desc{};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  desc.Width = size;
-  desc.Height = 1;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 1;
-  desc.SampleDesc.Count = 1;
-  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  ID3D12Resource* resource = nullptr;
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                             IID_PPV_ARGS(&resource)))) {
-    return nullptr;
-  }
-  return resource;
+nrhi::Buffer* CreateUploadBuffer(nrhi::Device* device, size_t size) {
+  nrhi::BufferDesc desc;
+  desc.size = size;
+  desc.heap = nrhi::HeapKind::kUpload;
+  return device->CreateBuffer(desc);  // nullptr on failure, like the old helper
 }
 
 uint16_t SwapU16(uint16_t v) { return uint16_t((v >> 8) | (v << 8)); }
@@ -10110,6 +10362,11 @@ uint32_t SwapU32(uint32_t v) {
 #endif
 }
 
+// Upload sub-allocation alignment for per-mip footprints (the old
+// D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT; row pitches use
+// nrhi::kRowPitchAlignment = the old D3D12_TEXTURE_DATA_PITCH_ALIGNMENT).
+constexpr uint32_t kUploadPlacementAlignment = 512;
+
 // Decode guest vertices into {float3 position, float2 uv, float2 uv2,
 // unorm4 blend weights, u8x4 blend indices, float3 normal, float2 decal_uv}
 // (56-byte stride). decal_uv = the 3rd/4th halves of a half4 first texcoord
@@ -10119,7 +10376,7 @@ uint32_t SwapU32(uint32_t v) {
 // dynamic cloth decode jobs snapshot on the guest thread and convert on a
 // worker, see DynDecodeJob); when null the payloads are read live from
 // guest memory with the guarded copy.
-bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
+bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
                 MeshBuffers& out, const uint8_t* vb_payload = nullptr,
                 const uint8_t* ib_payload = nullptr) {
   const uint32_t num_verts = item.vb_bytes / item.stride;
@@ -10144,11 +10401,11 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
     }
     ib_payload = ib_scratch.data();
   }
-  ID3D12Resource* vb = CreateUploadBuffer(device, size_t(num_verts) * 56);
-  ID3D12Resource* ib = CreateUploadBuffer(device, size_t(item.ib_count) * 2);
+  nrhi::Buffer* vb = CreateUploadBuffer(device, size_t(num_verts) * 56);
+  nrhi::Buffer* ib = CreateUploadBuffer(device, size_t(item.ib_count) * 2);
   if (!vb || !ib) {
-    if (vb) vb->Release();
-    if (ib) ib->Release();
+    device->DestroyDeferred(vb);
+    device->DestroyDeferred(ib);
     return false;
   }
 
@@ -10172,7 +10429,7 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
   uint32_t garbage = 0;
   int min_bi = 255;
   int max_bi = -1;
-  vb->Map(0, nullptr, reinterpret_cast<void**>(&dst));
+  dst = static_cast<float*>(device->Map(vb));
   for (uint32_t v = 0; v < num_verts; ++v) {
     const uint8_t* p = src_vb + size_t(v) * item.stride + item.pos_offset;
     float x = 0.0f, y = 0.0f, z = 0.0f;
@@ -10200,9 +10457,9 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
         break;
       }
       default:
-        vb->Unmap(0, nullptr);
-        vb->Release();
-        ib->Release();
+        device->Unmap(vb);
+        device->DestroyDeferred(vb);
+        device->DestroyDeferred(ib);
         return false;
     }
     if (!(x == x && y == y && z == z) ||
@@ -10385,7 +10642,7 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
   if (item.ropa) {
     out.ropa_verts.assign(dst, dst + size_t(num_verts) * 14);
   }
-  vb->Unmap(0, nullptr);
+  device->Unmap(vb);
   // Blend indices outside the captured palette read garbage rows and mangle
   // the vertex. Indices are plain bone numbers, bone k = palette rows 3k.
   // (Dyn decode jobs carry no palette: the item's bones ride the scene item,
@@ -10409,7 +10666,7 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
   }
 
   uint16_t* dst_ib = nullptr;
-  ib->Map(0, nullptr, reinterpret_cast<void**>(&dst_ib));
+  dst_ib = static_cast<uint16_t*>(device->Map(ib));
   if (item.cloth_quads) {
     // Quad-list topology with no guest index buffer (live vertex range
     // already exact from the draw args): two triangles per quad.
@@ -10544,19 +10801,19 @@ bool DecodeMesh(ID3D12Device* device, uint8_t* base, const DrawItem& item,
       }
     }
   }
-  ib->Unmap(0, nullptr);
+  device->Unmap(ib);
 
   out.vb = vb;
   out.ib = ib;
-  out.vb_view = {vb->GetGPUVirtualAddress(), num_verts * 56u, 56u};
-  out.ib_view = {ib->GetGPUVirtualAddress(), item.ib_count * 2u, DXGI_FORMAT_R16_UINT};
+  out.vb_view = {vb, 0, num_verts * 56u, 56u};
+  out.ib_view = {ib, 0, item.ib_count * 2u};
   out.two_sided_sheet = two_sided;
   return true;
 }
 
 // Decode a guest texture from its 6 fetch-constant words (host-endian),
 // the v1-verified path: CPU untile block by block through the 0xA0000000
-// physical mirror, endian swap, and create its SRV in the staging heap.
+// physical mirror, endian swap, and create its SRV view.
 // The 3D path reads the words from renderengine::Texture objects; the 2D
 // path passes the device fetch-shadow words directly.
 // BC1/DXT1 block decode (both color modes) into 16 RGBA8 texels.
@@ -10780,37 +11037,31 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
     Plan& p = plans[m];
     p.w = std::max(width >> m, 1u);
     p.h = std::max(height >> m, 1u);
-    p.pitch = (p.w * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-              ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-    p.offset = (upload_size + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
-               ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+    p.pitch = (p.w * 4u + (nrhi::kRowPitchAlignment - 1u)) &
+              ~(nrhi::kRowPitchAlignment - 1u);
+    p.offset = (upload_size + (kUploadPlacementAlignment - 1u)) &
+               ~(kUploadPlacementAlignment - 1u);
     upload_size = p.offset + p.pitch * p.h;
   }
-  ID3D12Device* device = context.d3d12.device;
-  D3D12_HEAP_PROPERTIES heap{};
-  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC desc{};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = width;
-  desc.Height = height;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = UINT16(mip_count);
-  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  desc.SampleDesc.Count = 1;
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&out.texture)))) {
-    out.texture = nullptr;
+  nrhi::Device* device = context.device;
+  nrhi::TextureDesc desc;
+  desc.kind = nrhi::TextureKind::k2D;
+  desc.width = width;
+  desc.height = height;
+  desc.mip_levels = mip_count;
+  desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+  desc.initial_state = nrhi::ResourceState::kCopyDest;
+  out.texture = device->CreateTexture(desc);
+  if (out.texture == nullptr) {
     return false;
   }
   out.upload = CreateUploadBuffer(device, upload_size);
   if (!out.upload) {
-    out.texture->Release();
+    device->DestroyDeferred(out.texture);
     out.texture = nullptr;
     return false;
   }
-  uint8_t* mapping = nullptr;
-  out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+  uint8_t* mapping = static_cast<uint8_t*>(device->Map(out.upload));
   for (uint32_t m = 0; m < mip_count; ++m) {
     const Plan& p = plans[m];
     for (uint32_t y = 0; y < p.h; ++y) {
@@ -10818,59 +11069,39 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
                   size_t(p.w) * 4);
     }
   }
-  out.upload->Unmap(0, nullptr);
+  device->Unmap(out.upload);
 
   if (g_tex_stage_out != nullptr) {
     // Decode worker: export the commit recipe; the render thread records
     // the copies + barrier and creates the SRV (CommitStagedGuestTexture).
     StagedTexCommit& sc = *g_tex_stage_out;
-    sc.copy_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sc.srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sc.swizzle_mapping =
-        ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+    sc.copy_format = nrhi::Format::kR8G8B8A8_UNORM;
+    sc.srv_format = nrhi::Format::kR8G8B8A8_UNORM;
+    ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA, sc.swizzle);
     sc.mip_count = std::min<uint32_t>(mip_count, 16);
     for (uint32_t m = 0; m < sc.mip_count; ++m) {
       sc.mips[m] = {plans[m].offset, plans[m].pitch, plans[m].w, plans[m].h};
     }
   } else {
-    auto* command_processor = context.d3d12.command_processor;
-    auto& list = command_processor->GetDeferredCommandList();
     for (uint32_t m = 0; m < mip_count; ++m) {
       const Plan& p = plans[m];
-      D3D12_TEXTURE_COPY_LOCATION dst{};
-      dst.pResource = out.texture;
-      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      dst.SubresourceIndex = m;
-      D3D12_TEXTURE_COPY_LOCATION src{};
-      src.pResource = out.upload;
-      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-      src.PlacedFootprint.Offset = p.offset;
-      src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      src.PlacedFootprint.Footprint.Width = p.w;
-      src.PlacedFootprint.Footprint.Height = p.h;
-      src.PlacedFootprint.Footprint.Depth = 1;
-      src.PlacedFootprint.Footprint.RowPitch = p.pitch;
-      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      context.cmd->CopyBufferToTexture(out.texture, m, 0, out.upload, p.offset,
+                                       p.pitch, p.w, p.h, 1);
     }
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
 
-    if (!AllocGuestSrvSlot(out.srv_slot)) {
+    nrhi::TextureViewDesc srv;
+    srv.dimension = nrhi::ViewDimension::k2D;
+    srv.format = nrhi::Format::kR8G8B8A8_UNORM;
+    ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA, srv.swizzle);
+    srv.mip_levels = mip_count;
+    out.srv_format = srv.format;
+    out.srv_mips = mip_count;
+    out.srv = device->CreateTextureView(out.texture, srv);
+    if (out.srv == nullptr) {
       return false;
     }
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping =
-        ComposeSrvSwizzle(fetch_swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
-    srv.Texture2D.MipLevels = mip_count;
-    out.srv_format = srv.Format;
-    out.srv_mapping = srv.Shader4ComponentMapping;
-    out.srv_mips = mip_count;
-    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-    slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
-    device->CreateShaderResourceView(out.texture, &srv, slot);
   }
   out.payload_addr = 0xA0000000u | info.memory.base_address;
   out.payload_size = size;
@@ -10882,7 +11113,7 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
   return true;
 }
 
-// Phase attribution for the SLOW-inline-decode log: time inside D3D12
+// Phase attribution for the SLOW-inline-decode log: time inside RHI
 // resource creation / the generated-mips path / the guest scratch copies,
 // reset at each EnsureGuestTextureFromWords entry (per thread: workers and
 // the render thread decode concurrently).
@@ -11089,39 +11320,34 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     MipPlan& p = plans[m];
     p.cols = (mw + block_w - 1) / block_w;
     p.rows = (mh + block_h - 1) / block_h;
-    p.pitch = (p.cols * bytes_per_block + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-              ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-    p.offset = (upload_size + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
-               ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+    p.pitch = (p.cols * bytes_per_block + (nrhi::kRowPitchAlignment - 1u)) &
+              ~(nrhi::kRowPitchAlignment - 1u);
+    p.offset = (upload_size + (kUploadPlacementAlignment - 1u)) &
+               ~(kUploadPlacementAlignment - 1u);
     upload_size = p.offset + p.pitch * p.rows;
   }
 
-  ID3D12Device* device = context.d3d12.device;
-  D3D12_HEAP_PROPERTIES heap{};
-  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC desc{};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = host_width;
-  desc.Height = host_height;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = UINT16(mip_count);
-  desc.Format = host.resource_format;
-  desc.SampleDesc.Count = 1;
+  nrhi::Device* device = context.device;
+  nrhi::TextureDesc desc;
+  desc.kind = nrhi::TextureKind::k2D;
+  desc.width = host_width;
+  desc.height = host_height;
+  desc.mip_levels = mip_count;
+  desc.format = host.resource_format;
+  desc.initial_state = nrhi::ResourceState::kCopyDest;
   const auto create_t0 = PerfClock::now();
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&out.texture)))) {
+  out.texture = device->CreateTexture(desc);
+  if (out.texture == nullptr) {
     return false;
   }
   out.upload = CreateUploadBuffer(device, upload_size);
   g_tex_dec_create_ns += PerfNsSince(create_t0);
   if (!out.upload) {
-    out.texture->Release();
+    device->DestroyDeferred(out.texture);
     out.texture = nullptr;
     return false;
   }
-  uint8_t* mapping = nullptr;
-  out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+  uint8_t* mapping = static_cast<uint8_t*>(device->Map(out.upload));
   const bool swap_rb_565 =
       rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_5_6_5;
   for (uint32_t m = 0; m < mip_count; ++m) {
@@ -11267,7 +11493,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
       std::fclose(f);
     }
   }
-  out.upload->Unmap(0, nullptr);
+  device->Unmap(out.upload);
 
   if (g_tex_stage_out != nullptr) {
     // Decode worker: export the commit recipe; the render thread records
@@ -11275,7 +11501,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     StagedTexCommit& sc = *g_tex_stage_out;
     sc.copy_format = host.resource_format;
     sc.srv_format = host.srv_format;
-    sc.swizzle_mapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
+    ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle, sc.swizzle);
     sc.mip_count = std::min<uint32_t>(mip_count, 16);
     for (uint32_t m = 0; m < sc.mip_count; ++m) {
       sc.mips[m] = {plans[m].offset, plans[m].pitch, std::max(host_width >> m, 1u),
@@ -11283,44 +11509,27 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     }
   } else {
     // Record the upload copies into the deferred command list.
-    auto* command_processor = context.d3d12.command_processor;
-    auto& list = command_processor->GetDeferredCommandList();
     for (uint32_t m = 0; m < mip_count; ++m) {
       const MipPlan& p = plans[m];
-      D3D12_TEXTURE_COPY_LOCATION dst{};
-      dst.pResource = out.texture;
-      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      dst.SubresourceIndex = m;
-      D3D12_TEXTURE_COPY_LOCATION src{};
-      src.pResource = out.upload;
-      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-      src.PlacedFootprint.Offset = p.offset;
-      src.PlacedFootprint.Footprint.Format = host.resource_format;
-      src.PlacedFootprint.Footprint.Width = std::max(host_width >> m, 1u);
-      src.PlacedFootprint.Footprint.Height = std::max(host_height >> m, 1u);
-      src.PlacedFootprint.Footprint.Depth = 1;
-      src.PlacedFootprint.Footprint.RowPitch = p.pitch;
-      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      context.cmd->CopyBufferToTexture(out.texture, m, 0, out.upload, p.offset,
+                                       p.pitch, std::max(host_width >> m, 1u),
+                                       std::max(host_height >> m, 1u), 1);
     }
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
 
-    // SRV in the staging heap with the composed swizzle.
-    if (!AllocGuestSrvSlot(out.srv_slot)) {
+    // SRV view with the composed swizzle.
+    nrhi::TextureViewDesc srv;
+    srv.dimension = nrhi::ViewDimension::k2D;
+    srv.format = host.srv_format;
+    ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle, srv.swizzle);
+    srv.mip_levels = mip_count;
+    out.srv_format = srv.format;
+    out.srv_mips = mip_count;
+    out.srv = device->CreateTextureView(out.texture, srv);
+    if (out.srv == nullptr) {
       return false;
     }
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = host.srv_format;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
-    srv.Texture2D.MipLevels = mip_count;
-    out.srv_format = srv.Format;
-    out.srv_mapping = srv.Shader4ComponentMapping;
-    out.srv_mips = mip_count;
-    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-    slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
-    device->CreateShaderResourceView(out.texture, &srv, slot);
   }
   // Payload sample for content revalidation (see GuestTexture).
   out.payload_addr = 0xA0000000u | info.memory.base_address;
@@ -11341,7 +11550,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
 // In-place re-decode for HOT single-mip 2D content (video planes, animating
 // fullscreen menu/loading art): identical fetch words = identical layout, so
 // the committed texture, upload footprint and SRV slot are all reusable;
-// the retire+recreate path paid two CreateCommittedResource calls per
+// the retire+recreate path paid two GPU resource creations per
 // content change (~90/s during FMV playback, plus every animation step of
 // fullscreen frontend art). Non-pow2 single-mip entries only: pow2 entries
 // may own a real or generated mip chain (the full path handles those).
@@ -11438,15 +11647,14 @@ bool UpdateGuestTexture2DInPlace(const NativeGuestOutputRenderContext& context,
 
   // Upload footprint (single mip at offset 0).
   const uint32_t pitch =
-      (cols * bytes_per_block + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-      ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+      (cols * bytes_per_block + (nrhi::kRowPitchAlignment - 1u)) &
+      ~(nrhi::kRowPitchAlignment - 1u);
   const uint32_t upload_size = pitch * rows;
-  ID3D12Device* device = context.d3d12.device;
-  auto* command_processor = context.d3d12.command_processor;
-  ID3D12Resource*& up = t.upload_flip ? t.upload_b : t.upload;
-  if (up != nullptr && up->GetDesc().Width < upload_size) {
+  nrhi::Device* device = context.device;
+  nrhi::Buffer*& up = t.upload_flip ? t.upload_b : t.upload;
+  if (up != nullptr && up->size() < upload_size) {
     // Never expected (same words = same footprint): recreate defensively.
-    g_r.retired.emplace_back(up, command_processor->GetCurrentSubmission());
+    device->DestroyDeferred(up);
     up = nullptr;
   }
   if (up == nullptr) {
@@ -11455,8 +11663,8 @@ bool UpdateGuestTexture2DInPlace(const NativeGuestOutputRenderContext& context,
       return false;
     }
   }
-  uint8_t* mapping = nullptr;
-  if (FAILED(up->Map(0, nullptr, reinterpret_cast<void**>(&mapping)))) {
+  uint8_t* mapping = static_cast<uint8_t*>(device->Map(up));
+  if (mapping == nullptr) {
     return false;
   }
   const bool swap_rb_565 =
@@ -11522,35 +11730,19 @@ bool UpdateGuestTexture2DInPlace(const NativeGuestOutputRenderContext& context,
     }
     std::memcpy(mapping + size_t(by) * pitch, out_row, row_bytes);
   }
-  up->Unmap(0, nullptr);
+  device->Unmap(up);
 
   // Barriers must land in the deferred list BEFORE the copy: flush both
   // sides explicitly (earlier draws this frame sample the OLD content,
   // later ones the new: same semantics as a retire+recreate mid-frame).
-  auto& list = command_processor->GetDeferredCommandList();
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        t.texture,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                        D3D12_RESOURCE_STATE_COPY_DEST);
-  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-  D3D12_TEXTURE_COPY_LOCATION dst{};
-  dst.pResource = t.texture;
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dst.SubresourceIndex = 0;
-  D3D12_TEXTURE_COPY_LOCATION src{};
-  src.pResource = up;
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint.Offset = 0;
-  src.PlacedFootprint.Footprint.Format = host.resource_format;
-  src.PlacedFootprint.Footprint.Width = cols * block_w;
-  src.PlacedFootprint.Footprint.Height = rows * block_h;
-  src.PlacedFootprint.Footprint.Depth = 1;
-  src.PlacedFootprint.Footprint.RowPitch = pitch;
-  list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        t.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  context.cmd->Barrier(t.texture, nrhi::ResourceState::kPixelShaderResource,
+                       nrhi::ResourceState::kCopyDest);
+  context.cmd->FlushBarriers();
+  context.cmd->CopyBufferToTexture(t.texture, 0, 0, up, 0, pitch, cols * block_w,
+                                   rows * block_h, 1);
+  context.cmd->Barrier(t.texture, nrhi::ResourceState::kCopyDest,
+                       nrhi::ResourceState::kPixelShaderResource);
+  context.cmd->FlushBarriers();
 
   t.upload_flip = !t.upload_flip;
   t.payload_fp = fp;
@@ -11669,11 +11861,11 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
     L.rows = (mh + block_h - 1) / block_h;
     L.w = L.cols * block_w;
     L.h = L.rows * block_h;
-    L.up_pitch = (L.cols * bytes_per_block + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-                 ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    L.up_pitch = (L.cols * bytes_per_block + (nrhi::kRowPitchAlignment - 1u)) &
+                 ~(nrhi::kRowPitchAlignment - 1u);
     L.up_face_bytes =
-        (L.up_pitch * L.rows + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
-        ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+        (L.up_pitch * L.rows + (kUploadPlacementAlignment - 1u)) &
+        ~(kUploadPlacementAlignment - 1u);
     L.scratch_off = scratch_total;
     scratch_total += L.slice_bytes * 6;
   }
@@ -11697,7 +11889,7 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
     // Decode DXT1 mip 0 -> RGBA8 per face, box-filter the full chain to
     // 1x1, upload as an RGBA cube. CPU cost is one-time per cube (runs on
     // the decode workers).
-    ID3D12Device* device = context.d3d12.device;
+    nrhi::Device* device = context.device;
     const uint32_t levels = 1u + uint32_t(std::countr_zero(width));
     struct Level {
       uint32_t w, pitch, face_bytes, upload_off;  // upload_off within a face
@@ -11707,37 +11899,31 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
     for (uint32_t m = 0; m < levels; ++m) {
       Level& L = lvs[m];
       L.w = std::max(width >> m, 1u);
-      L.pitch = (L.w * 4u + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u)) &
-                ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-      L.face_bytes = (L.pitch * L.w + (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u)) &
-                     ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u);
+      L.pitch = (L.w * 4u + (nrhi::kRowPitchAlignment - 1u)) &
+                ~(nrhi::kRowPitchAlignment - 1u);
+      L.face_bytes = (L.pitch * L.w + (kUploadPlacementAlignment - 1u)) &
+                     ~(kUploadPlacementAlignment - 1u);
       L.upload_off = face_upload;
       face_upload += L.face_bytes;
     }
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
-    desc.Height = height;
-    desc.DepthOrArraySize = 6;
-    desc.MipLevels = UINT16(levels);
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                               IID_PPV_ARGS(&out.texture)))) {
-      out.texture = nullptr;
+    nrhi::TextureDesc desc;
+    desc.kind = nrhi::TextureKind::kCube;
+    desc.width = width;
+    desc.height = height;
+    desc.mip_levels = levels;
+    desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+    desc.initial_state = nrhi::ResourceState::kCopyDest;
+    out.texture = device->CreateTexture(desc);
+    if (out.texture == nullptr) {
       return false;
     }
     out.upload = CreateUploadBuffer(device, face_upload * 6);
     if (!out.upload) {
-      out.texture->Release();
+      device->DestroyDeferred(out.texture);
       out.texture = nullptr;
       return false;
     }
-    uint8_t* mapping = nullptr;
-    out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+    uint8_t* mapping = static_cast<uint8_t*>(device->Map(out.upload));
     static thread_local std::vector<uint8_t> rgba;   // level 0 of one face
     static thread_local std::vector<uint8_t> down;   // downsample scratch
     static thread_local std::vector<uint8_t> bc_row; // one untiled block row
@@ -11807,16 +11993,19 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
         w = hw;
       }
     }
-    out.upload->Unmap(0, nullptr);
+    device->Unmap(out.upload);
     REXLOG_INFO("native-scene: cube {:08X} {}x{} DXT1 -> RGBA full chain ({} levels)",
                 tex_ptr, width, height, levels);
-    const UINT swizzle_mapping =
-        ComposeSrvSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
+    nrhi::Swizzle swizzle_mapping[4];
+    ComposeSrvSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
+                      swizzle_mapping);
     if (g_tex_stage_out != nullptr) {
       StagedTexCommit& sc = *g_tex_stage_out;
-      sc.copy_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      sc.srv_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      sc.swizzle_mapping = swizzle_mapping;
+      sc.copy_format = nrhi::Format::kR8G8B8A8_UNORM;
+      sc.srv_format = nrhi::Format::kR8G8B8A8_UNORM;
+      for (uint32_t c = 0; c < 4; ++c) {
+        sc.swizzle[c] = swizzle_mapping[c];
+      }
       sc.cube = true;
       sc.cube_mip_levels = levels;
       sc.mip_count = 6 * levels;
@@ -11833,39 +12022,27 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
       out.valid = false;  // live only after commit
       return true;
     }
-    auto& list = context.d3d12.command_processor->GetDeferredCommandList();
     for (uint32_t face = 0; face < 6; ++face) {
       for (uint32_t m = 0; m < levels; ++m) {
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = out.texture;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = face * levels + m;
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = out.upload;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Offset = size_t(face) * face_upload + lvs[m].upload_off;
-        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        src.PlacedFootprint.Footprint.Width = lvs[m].w;
-        src.PlacedFootprint.Footprint.Height = lvs[m].w;
-        src.PlacedFootprint.Footprint.Depth = 1;
-        src.PlacedFootprint.Footprint.RowPitch = lvs[m].pitch;
-        list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        context.cmd->CopyBufferToTexture(
+            out.texture, m, face, out.upload,
+            size_t(face) * face_upload + lvs[m].upload_off, lvs[m].pitch,
+            lvs[m].w, lvs[m].w, 1);
       }
     }
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (!AllocGuestSrvSlot(out.srv_slot)) {
+    context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
+    nrhi::TextureViewDesc srv;
+    srv.dimension = nrhi::ViewDimension::kCube;
+    srv.format = nrhi::Format::kR8G8B8A8_UNORM;
+    for (uint32_t c = 0; c < 4; ++c) {
+      srv.swizzle[c] = swizzle_mapping[c];
+    }
+    srv.mip_levels = levels;
+    out.srv = device->CreateTextureView(out.texture, srv);
+    if (out.srv == nullptr) {
       return false;
     }
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-    srv.Shader4ComponentMapping = swizzle_mapping;
-    srv.TextureCube.MipLevels = levels;
-    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-    slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
-    device->CreateShaderResourceView(out.texture, &srv, slot);
     out.payload_addr = 0xA0000000u | info.memory.base_address;
     out.payload_size = lv[0].slice_bytes * 6;
     out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
@@ -11878,31 +12055,25 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   for (uint32_t m = 0; m < mip_levels; ++m) {
     face_upload += lv[m].up_face_bytes;
   }
-  ID3D12Device* device = context.d3d12.device;
-  D3D12_HEAP_PROPERTIES heap{};
-  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC desc{};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = host_width;
-  desc.Height = host_height;
-  desc.DepthOrArraySize = 6;
-  desc.MipLevels = UINT16(mip_levels);
-  desc.Format = host.resource_format;
-  desc.SampleDesc.Count = 1;
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&out.texture)))) {
-    out.texture = nullptr;
+  nrhi::Device* device = context.device;
+  nrhi::TextureDesc desc;
+  desc.kind = nrhi::TextureKind::kCube;
+  desc.width = host_width;
+  desc.height = host_height;
+  desc.mip_levels = mip_levels;
+  desc.format = host.resource_format;
+  desc.initial_state = nrhi::ResourceState::kCopyDest;
+  out.texture = device->CreateTexture(desc);
+  if (out.texture == nullptr) {
     return false;
   }
   out.upload = CreateUploadBuffer(device, face_upload * 6);
   if (!out.upload) {
-    out.texture->Release();
+    device->DestroyDeferred(out.texture);
     out.texture = nullptr;
     return false;
   }
-  uint8_t* mapping = nullptr;
-  out.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+  uint8_t* mapping = static_cast<uint8_t*>(device->Map(out.upload));
   const auto upload_offset = [&](uint32_t face, uint32_t m) {
     uint32_t off = face * face_upload;
     for (uint32_t k = 0; k < m; ++k) {
@@ -11942,17 +12113,17 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
       }
     }
   }
-  out.upload->Unmap(0, nullptr);
+  device->Unmap(out.upload);
 
   REXLOG_INFO("native-scene: cube {:08X} {}x{} fmt={} mips={} (of {} avail)", tex_ptr,
               width, height, uint32_t(info.format), mip_levels, info.mip_levels());
   if (g_tex_stage_out != nullptr) {
     // Decode worker: export the commit recipe, face-major (face * levels +
-    // mip) entries matching D3D12 subresource numbering.
+    // mip) entries matching the old D3D12 subresource numbering.
     StagedTexCommit& sc = *g_tex_stage_out;
     sc.copy_format = host.resource_format;
     sc.srv_format = host.srv_format;
-    sc.swizzle_mapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
+    ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle, sc.swizzle);
     sc.cube = true;
     sc.cube_mip_levels = mip_levels;
     sc.mip_count = 6 * mip_levels;
@@ -11970,39 +12141,24 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
     return true;
   }
 
-  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
   for (uint32_t face = 0; face < 6; ++face) {
     for (uint32_t m = 0; m < mip_levels; ++m) {
-      D3D12_TEXTURE_COPY_LOCATION dst{};
-      dst.pResource = out.texture;
-      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      dst.SubresourceIndex = face * mip_levels + m;
-      D3D12_TEXTURE_COPY_LOCATION src{};
-      src.pResource = out.upload;
-      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-      src.PlacedFootprint.Offset = upload_offset(face, m);
-      src.PlacedFootprint.Footprint.Format = host.resource_format;
-      src.PlacedFootprint.Footprint.Width = lv[m].w;
-      src.PlacedFootprint.Footprint.Height = lv[m].h;
-      src.PlacedFootprint.Footprint.Depth = 1;
-      src.PlacedFootprint.Footprint.RowPitch = lv[m].up_pitch;
-      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      context.cmd->CopyBufferToTexture(out.texture, m, face, out.upload,
+                                       upload_offset(face, m), lv[m].up_pitch,
+                                       lv[m].w, lv[m].h, 1);
     }
   }
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        out.texture, D3D12_RESOURCE_STATE_COPY_DEST,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  if (!AllocGuestSrvSlot(out.srv_slot)) {
+  context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
+                       nrhi::ResourceState::kPixelShaderResource);
+  nrhi::TextureViewDesc srv;
+  srv.dimension = nrhi::ViewDimension::kCube;
+  srv.format = host.srv_format;
+  ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle, srv.swizzle);
+  srv.mip_levels = mip_levels;
+  out.srv = device->CreateTextureView(out.texture, srv);
+  if (out.srv == nullptr) {
     return false;
   }
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-  srv.Format = host.srv_format;
-  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-  srv.Shader4ComponentMapping = ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle);
-  srv.TextureCube.MipLevels = mip_levels;
-  D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-  slot.ptr += size_t(out.srv_slot) * g_r.srv_size;
-  device->CreateShaderResourceView(out.texture, &srv, slot);
   out.payload_addr = 0xA0000000u | info.memory.base_address;
   out.payload_size = lv[0].slice_bytes * 6;
   out.payload_fp = SamplePayloadFingerprint(base, out.payload_addr, out.payload_size);
@@ -12012,22 +12168,17 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
 }
 
 // Scene vertex layout (DecodeMesh's 56-byte output): shared by the scene
-// PSO family and the shadow-caster PSO.
-constexpr D3D12_INPUT_ELEMENT_DESC kSceneInputLayout[7] = {
-    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
-     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12,
-     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 20,
-     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    {"BLENDWEIGHT", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 28,
-     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 32,
-     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 36,
-     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-    {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 48,
-     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+// PSO family and the shadow-caster PSO. `location` = the element's
+// declaration order in the scene VS input struct (the Vulkan input
+// location; see nrhi::InputElementDesc).
+constexpr nrhi::InputElementDesc kSceneInputLayout[7] = {
+    {"POSITION", 0, 0, nrhi::Format::kR32G32B32_FLOAT, 0},
+    {"TEXCOORD", 0, 1, nrhi::Format::kR32G32_FLOAT, 12},
+    {"TEXCOORD", 1, 2, nrhi::Format::kR32G32_FLOAT, 20},
+    {"BLENDWEIGHT", 0, 3, nrhi::Format::kR8G8B8A8_UNORM, 28},
+    {"BLENDINDICES", 0, 4, nrhi::Format::kR8G8B8A8_UINT, 32},
+    {"NORMAL", 0, 5, nrhi::Format::kR32G32B32_FLOAT, 36},
+    {"TEXCOORD", 2, 6, nrhi::Format::kR32G32_FLOAT, 48}};
 
 // ---- EnsurePipeline helpers ------------------------------------------------
 // Split from the former ~1,000-line EnsurePipeline: one resource
@@ -12035,98 +12186,90 @@ constexpr D3D12_INPUT_ELEMENT_DESC kSceneInputLayout[7] = {
 // by its own g_r state) and returns false only on a failure that must abort
 // the native path (g_r.failed set where the original did).
 
+// Looks up the offline-compiled SPIR-V for (file, entry, variant); variant is
+// the canonical macro signature ("", "SAMPLES=4", "PFX_MSAA=1"). Returns a
+// fully-populated ShaderDesc; SPIR-V absent only if the table and the compile
+// matrix ever drift (Vulkan pipeline creation then fails loudly, D3D12 is
+// unaffected).
+nrhi::ShaderDesc MakeShaderDesc(nrhi::ShaderStage stage, const char* file,
+                                const char* hlsl_source, const char* entry,
+                                const nrhi::ShaderMacro* macros,
+                                const char* variant) {
+  nrhi::ShaderDesc sd;
+  sd.stage = stage;
+  sd.name = file;
+  sd.hlsl_source = hlsl_source;
+  sd.entry_point = entry;
+  sd.macros = macros;
+  for (size_t i = 0; i < skate3::native_spirv::kNativeSpirvBlobCount; ++i) {
+    const auto& b = skate3::native_spirv::kNativeSpirvBlobs[i];
+    if (std::strcmp(b.file, file) == 0 && std::strcmp(b.entry, entry) == 0 &&
+        std::strcmp(b.variant, variant) == 0) {
+      sd.spirv = b.data;
+      sd.spirv_size_bytes = b.size_bytes;
+      break;
+    }
+  }
+  return sd;
+}
+
 bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
-  if (g_r.root_signature) {
+  if (g_r.layout) {
     return true;
   }
   {
-    D3D12_ROOT_PARAMETER params[10] = {};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.ShaderRegister = 0;
-    // NOTE the 64-DWORD root-signature budget: 52 constants + 6 descriptor
-    // tables (1 each) + 1 root SRV (2) + 2 root CBVs (2 each) = 64, FULL.
-    // Going past 64 makes CreateRootSignature fail (renderer falls back to
-    // emulated). Any further addition must pack into existing rows/tables.
-    params[0].Constants.Num32BitValues = 52;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE srv_range[6] = {};
-    srv_range[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srv_range[0].NumDescriptors = 1;
-    srv_range[0].BaseShaderRegister = 0;
-    srv_range[1] = srv_range[0];
-    srv_range[1].BaseShaderRegister = 1;
-    srv_range[2] = srv_range[0];
-    srv_range[2].BaseShaderRegister = 3;  // macro overlay (t3)
-    srv_range[3] = srv_range[0];
-    srv_range[3].BaseShaderRegister = 4;  // decal art / spec masks (t4)
-    // Second descriptor of the t4 table = the fam 5/6 normal map (t5), a
-    // paired heap slot (see RendererState::mat_pairs). Range growth is free
-    // root-space-wise; draws without a pair leave t5 pointing at whatever
-    // follows their single slot; the shader only samples t5 when
+    nrhi::BindingLayoutDesc ld;
+    // NOTE the 64-DWORD root-signature budget (a D3D12-backend constraint:
+    // the layout maps 1:1 onto a D3D12 root signature there): 52 constants +
+    // 6 descriptor tables (1 each) + 1 root SRV (2) + 2 root CBVs (2 each)
+    // = 64, FULL. Going past 64 makes the D3D12 layout creation fail
+    // (renderer falls back to emulated). Any further addition must pack into
+    // existing rows/tables.
+    ld.param_count = 10;
+    ld.params[0] = {nrhi::BindingParamKind::kConstants, /*b*/ 0, 52,
+                    nrhi::Visibility::kAll};
+    ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[2] = {nrhi::BindingParamKind::kTextureTable, 1, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[3] = {nrhi::BindingParamKind::kBufferSrv, /*t*/ 2, 1,
+                    nrhi::Visibility::kVertex};
+    // Macro overlay (t3).
+    ld.params[4] = {nrhi::BindingParamKind::kTextureTable, 3, 1,
+                    nrhi::Visibility::kPixel};
+    // Decal art / spec masks (t4). Second entry of the table = the fam 5/6
+    // normal map (t5), bound via cmd->SetTexturePair. Draws without a pair
+    // leave t5 at the backend fallback; the shader only samples t5 when
     // overlay.w == 4 (pair bound).
-    srv_range[3].NumDescriptors = 2;
-    srv_range[4] = srv_range[0];
-    srv_range[4].BaseShaderRegister = 7;  // shadow atlas (t7)
-    srv_range[5] = srv_range[0];
-    srv_range[5].BaseShaderRegister = 6;  // water environment cube (t6)
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 1;
-    params[1].DescriptorTable.pDescriptorRanges = &srv_range[0];
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    params[2] = params[1];
-    params[2].DescriptorTable.pDescriptorRanges = &srv_range[1];
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    params[3].Descriptor.ShaderRegister = 2;
-    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    params[4] = params[1];
-    params[4].DescriptorTable.pDescriptorRanges = &srv_range[2];
-    params[5] = params[1];
-    params[5].DescriptorTable.pDescriptorRanges = &srv_range[3];
+    ld.params[5] = {nrhi::BindingParamKind::kTextureTable, 4, 2,
+                    nrhi::Visibility::kPixel};
     // Dynamic-shadow additions: per-frame receiver constants (b1) + the
     // blurred shadow atlas (t5).
-    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[6].Descriptor.ShaderRegister = 1;
-    params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    params[7] = params[1];
-    params[7].DescriptorTable.pDescriptorRanges = &srv_range[4];
+    ld.params[6] = {nrhi::BindingParamKind::kConstantBuffer, /*b*/ 1, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[7] = {nrhi::BindingParamKind::kTextureTable, 7, 1,
+                    nrhi::Visibility::kPixel};
     // Water environment cube (t6): the flowingwater/ocean reflection term.
-    params[8] = params[1];
-    params[8].DescriptorTable.pDescriptorRanges = &srv_range[5];
+    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 6, 1,
+                    nrhi::Visibility::kPixel};
     // Character lighting block (b2): the canonical per-draw rows captured
     // from the guest PS bank (CaptureCharLighting), sliced out of the bone
     // upload ring per character draw.
-    params[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[9].Descriptor.ShaderRegister = 2;
-    params[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
-    samplers[0].Filter = D3D12_FILTER_ANISOTROPIC;
-    samplers[0].MaxAnisotropy = 8;
-    samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
-    samplers[0].ShaderRegister = 0;
-    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    ld.params[9] = {nrhi::BindingParamKind::kConstantBuffer, 2, 1,
+                    nrhi::Visibility::kPixel};
+    ld.static_sampler_count = 2;
+    ld.static_samplers[0] = {/*s*/ 0, nrhi::Filter::kAnisotropic,
+                             nrhi::AddressMode::kWrap, 8};
     // s1: bilinear CLAMP for the 2D overlay. The HUD fetch constants carry
     // clamp_x/clamp_y = 2 (clamp-to-edge), and the clock face is built from
     // MIRRORED quadrant tiles whose outer-edge UVs run past 1.0; wrap
     // sampling pulls the opposite edge of the art in as 1px seam lines
     // (bright rim row across the middle, dark center column at the edges).
-    samplers[1] = samplers[0];
-    samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    samplers[1].MaxAnisotropy = 1;
-    samplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    samplers[1].ShaderRegister = 1;
-    D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 10;
-    desc.pParameters = params;
-    desc.NumStaticSamplers = 2;
-    desc.pStaticSamplers = samplers;
-    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    if (!context.d3d12.create_root_signature(context.d3d12.command_processor_user_data,
-                                             &desc, &g_r.root_signature)) {
+    ld.static_samplers[1] = {1, nrhi::Filter::kLinear,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.allow_input_layout = true;
+    g_r.layout = context.device->CreateBindingLayout(ld);
+    if (g_r.layout == nullptr) {
       REXLOG_ERROR("native-scene: root signature creation failed");
       g_r.failed = true;
       return false;
@@ -12139,54 +12282,43 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
 // variants (cull-back sheets, transparent, entity fade, hair 2-pass,
 // no-depth, outline mask).
 bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   // MSAA level: the requested count, reduced to what the output format
-  // supports (1 disables and renders directly into the guest output).
+  // supports (1 disables and renders directly into the guest output). The
+  // RHI walks the requested count down in powers of two, exactly like the
+  // old CheckFeatureSupport loop.
   const int32_t req = REXCVAR_GET(skate3_native_render_scene_msaa);
   uint32_t msaa = req >= 8 ? 8u : req >= 4 ? 4u : req >= 2 ? 2u : 1u;
-  while (msaa > 1) {
-    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{
-        context.d3d12.guest_output_format, msaa, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, 0};
-    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-                                              &q, sizeof(q))) &&
-        q.NumQualityLevels > 0) {
-      break;
-    }
-    msaa /= 2;
-  }
+  msaa = device->GetSupportedSampleCount(context.guest_output->format(), msaa);
   g_r.msaa = msaa;
 
-  ID3DBlob* vs = nullptr;
-  ID3DBlob* ps = nullptr;
-  ID3DBlob* errors = nullptr;
-  if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene", nullptr,
-                        nullptr, "vs_main", "vs_5_0", 0, 0, &vs, &errors)) ||
-      FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene", nullptr,
-                        nullptr, "ps_main", "ps_5_0", 0, 0, &ps, &errors))) {
-    REXLOG_ERROR("native-scene: shader compile failed: {}",
-                 errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+  nrhi::Shader* vs = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kVertex, "scene.hlsl", kShaderSource,
+                     "vs_main", nullptr, ""));
+  nrhi::Shader* ps = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "scene.hlsl", kShaderSource,
+                     "ps_main", nullptr, ""));
+  if (vs == nullptr || ps == nullptr) {
+    REXLOG_ERROR("native-scene: shader compile failed");
     g_r.failed = true;
     return false;
   }
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
-  pso.pRootSignature = g_r.root_signature;
-  pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-  pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-  pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  pso.SampleMask = UINT_MAX;
-  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  pso.RasterizerState.DepthClipEnable = TRUE;
-  pso.DepthStencilState.DepthEnable = TRUE;
-  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-  pso.InputLayout = {kSceneInputLayout, 7};
-  pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  pso.NumRenderTargets = 1;
-  pso.RTVFormats[0] = context.d3d12.guest_output_format;
-  pso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-  pso.SampleDesc.Count = g_r.msaa;
-  const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso));
+  nrhi::GraphicsPipelineDesc pso;
+  pso.layout = g_r.layout;
+  pso.vs = vs;
+  pso.ps = ps;
+  pso.input_elements = kSceneInputLayout;
+  pso.input_element_count = 7;
+  pso.vertex_stride = 56;
+  pso.cull = nrhi::CullMode::kNone;
+  pso.depth_clip = true;
+  pso.depth.test_enable = true;
+  pso.depth.write_enable = true;
+  pso.depth.func = nrhi::CompareFunc::kLess;
+  pso.rtv_format = context.guest_output->format();
+  pso.dsv_format = nrhi::Format::kD32_FLOAT;
+  pso.sample_count = g_r.msaa;
+  g_r.pso = device->CreateGraphicsPipeline(pso);
   // Culling variant for double-sided sheet props (banners/flags,
   // MeshBuffers::two_sided_sheet). The sheet whose winding-derived world
   // normal faces the camera is the one the game keeps (its lightmap cell
@@ -12195,75 +12327,64 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   // pipeline those triangles are D3D12 BACK faces, so cull FRONT.
   // (CULL_BACK was tried first and kept the wrong sheet; banners rendered
   // the sun-side lightmap cell ~2.4x brighter than emulated.)
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
-  const HRESULT hr_cb =
-      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_cullback));
-  if (FAILED(hr_cb)) {
-    REXLOG_WARN("native-scene: cull-back PSO creation failed {:08X}", uint32_t(hr_cb));
-    g_r.pso_cullback = nullptr;  // sheets fall back to the uncull(ed) PSO
+  pso.cull = nrhi::CullMode::kFront;
+  g_r.pso_cullback = device->CreateGraphicsPipeline(pso);
+  if (g_r.pso_cullback == nullptr) {
+    REXLOG_WARN("native-scene: cull-back PSO creation failed");
+    // sheets fall back to the uncull(ed) PSO
   }
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso.cull = nrhi::CullMode::kNone;
   // Transparent variant: straight alpha blend, depth-tested, no z-write.
-  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-  pso.BlendState.RenderTarget[0].BlendEnable = TRUE;
-  pso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
-  pso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-  pso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-  pso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
-  pso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-  pso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-  const HRESULT hr_t =
-      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_transparent));
+  pso.depth.write_enable = false;
+  pso.blend.enable = true;
+  pso.blend.src = nrhi::BlendFactor::kSrcAlpha;
+  pso.blend.dst = nrhi::BlendFactor::kInvSrcAlpha;
+  pso.blend.op = nrhi::BlendOp::kAdd;
+  pso.blend.src_alpha = nrhi::BlendFactor::kOne;
+  pso.blend.dst_alpha = nrhi::BlendFactor::kInvSrcAlpha;
+  pso.blend.op_alpha = nrhi::BlendOp::kAdd;
+  g_r.pso_transparent = device->CreateGraphicsPipeline(pso);
   // Entity-fade variant: z-write ON (see RendererState::pso_fade). Drawn
   // at the head of the blended sub-pass so glass/hair still composite
   // over the faded body.
-  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-  if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_fade)))) {
-    g_r.pso_fade = nullptr;  // fade items fall back to the z-write-off blend
-  }
-  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+  pso.depth.write_enable = true;
+  g_r.pso_fade = device->CreateGraphicsPipeline(pso);
+  // (nullptr = fade items fall back to the z-write-off blend)
+  pso.depth.write_enable = false;
   // Hair passes: the game draws hair twice with the SAME shader; cull
   // BACK then cull FRONT (cac_hair.xml passes 0/1) so far-side strands
   // never composite over near-side ones (one uncull(ed) blended pass
   // interleaves them per triangle order = crunchy noise). Same blend /
   // z-write-off state as the transparent variant.
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-  if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_a)))) {
-    g_r.pso_hair_a = nullptr;
-  }
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
-  if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_hair_b)))) {
-    g_r.pso_hair_b = nullptr;
-  }
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  pso.BlendState.RenderTarget[0].BlendEnable = FALSE;
-  pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-  pso.DepthStencilState.DepthEnable = FALSE;
-  pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
-  const HRESULT hr2 =
-      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_nodepth));
+  pso.cull = nrhi::CullMode::kBack;
+  g_r.pso_hair_a = device->CreateGraphicsPipeline(pso);
+  pso.cull = nrhi::CullMode::kFront;
+  g_r.pso_hair_b = device->CreateGraphicsPipeline(pso);
+  pso.cull = nrhi::CullMode::kNone;
+  pso.blend = {};
+  pso.depth.write_enable = true;
+  pso.depth.test_enable = false;
+  pso.dsv_format = nrhi::Format::kUnknown;
+  g_r.pso_nodepth = device->CreateGraphicsPipeline(pso);
   // Selection-outline mask: the same scene VS/PS (the tint.a > 0 solid
   // path renders flat 1.0) into the small single-sample R8 target. No
   // depth: the mask is the full silhouette. The guest marking pass is
   // depth-tested, so a partially occluded selection outlines slightly
   // differently, acceptable for the editor UI.
-  pso.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
-  pso.SampleDesc.Count = 1;
-  const HRESULT hr_om =
-      device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pso_outline_mask));
-  if (FAILED(hr_om)) {
-    REXLOG_WARN("native-scene: outline mask PSO creation failed {:08X}",
-                uint32_t(hr_om));
-    g_r.pso_outline_mask = nullptr;  // outline pass disables itself
+  pso.rtv_format = nrhi::Format::kR8_UNORM;
+  pso.sample_count = 1;
+  g_r.pso_outline_mask = device->CreateGraphicsPipeline(pso);
+  if (g_r.pso_outline_mask == nullptr) {
+    REXLOG_WARN("native-scene: outline mask PSO creation failed");
+    // outline pass disables itself
   }
-  pso.RTVFormats[0] = context.d3d12.guest_output_format;
-  pso.SampleDesc.Count = g_r.msaa;
-  vs->Release();
-  ps->Release();
-  if (errors) errors->Release();
-  if (FAILED(hr) || FAILED(hr2) || FAILED(hr_t)) {
-    REXLOG_ERROR("native-scene: PSO creation failed {:08X}/{:08X}/{:08X}", uint32_t(hr),
-                 uint32_t(hr2), uint32_t(hr_t));
+  pso.rtv_format = context.guest_output->format();
+  pso.sample_count = g_r.msaa;
+  device->DestroyDeferred(vs);
+  device->DestroyDeferred(ps);
+  if (g_r.pso == nullptr || g_r.pso_nodepth == nullptr ||
+      g_r.pso_transparent == nullptr) {
+    REXLOG_ERROR("native-scene: PSO creation failed");
     g_r.failed = true;
     return false;
   }
@@ -12272,45 +12393,37 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
 
 // Fullscreen MSAA resolve PSO (no-op below MSAA 2x).
 bool EnsureResolvePso(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   if (g_r.msaa > 1) {
     char samples[8];
     std::snprintf(samples, sizeof(samples), "%u", g_r.msaa);
-    const D3D_SHADER_MACRO macros[] = {{"SAMPLES", samples}, {nullptr, nullptr}};
-    ID3DBlob* rvs = nullptr;
-    ID3DBlob* rps = nullptr;
-    ID3DBlob* rerrors = nullptr;
-    if (FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
-                          "native_resolve", macros, nullptr, "vs_main", "vs_5_0", 0, 0,
-                          &rvs, &rerrors)) ||
-        FAILED(D3DCompile(kResolveShaderSource, sizeof(kResolveShaderSource) - 1,
-                          "native_resolve", macros, nullptr, "ps_main", "ps_5_0", 0, 0,
-                          &rps, &rerrors))) {
-      REXLOG_ERROR(
-          "native-scene: resolve shader compile failed: {}",
-          rerrors ? static_cast<const char*>(rerrors->GetBufferPointer()) : "?");
+    const nrhi::ShaderMacro macros[] = {{"SAMPLES", samples},
+                                        {nullptr, nullptr}};
+    char variant[16];
+    std::snprintf(variant, sizeof(variant), "SAMPLES=%u", g_r.msaa);
+    nrhi::Shader* rvs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "resolve.hlsl",
+                       kResolveShaderSource, "vs_main", macros, variant));
+    nrhi::Shader* rps = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "resolve.hlsl",
+                       kResolveShaderSource, "ps_main", macros, variant));
+    if (rvs == nullptr || rps == nullptr) {
+      REXLOG_ERROR("native-scene: resolve shader compile failed");
       g_r.failed = true;
       return false;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC rp{};
-    rp.pRootSignature = g_r.root_signature;
-    rp.VS = {rvs->GetBufferPointer(), rvs->GetBufferSize()};
-    rp.PS = {rps->GetBufferPointer(), rps->GetBufferSize()};
-    rp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    rp.SampleMask = UINT_MAX;
-    rp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    rp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    rp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    rp.NumRenderTargets = 1;
-    rp.RTVFormats[0] = context.d3d12.guest_output_format;
-    rp.SampleDesc.Count = 1;
-    const HRESULT hr3 =
-        device->CreateGraphicsPipelineState(&rp, IID_PPV_ARGS(&g_r.resolve_pso));
-    rvs->Release();
-    rps->Release();
-    if (rerrors) rerrors->Release();
-    if (FAILED(hr3)) {
-      REXLOG_ERROR("native-scene: resolve PSO creation failed {:08X}", uint32_t(hr3));
+    nrhi::GraphicsPipelineDesc rp;
+    rp.layout = g_r.layout;
+    rp.vs = rvs;
+    rp.ps = rps;
+    rp.cull = nrhi::CullMode::kNone;
+    rp.rtv_format = context.guest_output->format();
+    rp.sample_count = 1;
+    g_r.resolve_pso = device->CreateGraphicsPipeline(rp);
+    device->DestroyDeferred(rvs);
+    device->DestroyDeferred(rps);
+    if (g_r.resolve_pso == nullptr) {
+      REXLOG_ERROR("native-scene: resolve PSO creation failed");
       g_r.failed = true;
       return false;
     }
@@ -12320,62 +12433,50 @@ bool EnsureResolvePso(const NativeGuestOutputRenderContext& context) {
 
 // Popup background blur pipelines; PSO-create failure only disables blur.
 bool EnsureBlurPsos(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   {
     // Popup background blur pipelines (blur_hBlur/vBlur port + basictex
     // replace): fullscreen-triangle passes, no vertex buffer.
-    ID3DBlob* bvs = nullptr;
-    ID3DBlob* bps = nullptr;
-    ID3DBlob* bblit = nullptr;
-    ID3DBlob* bdown = nullptr;
-    ID3DBlob* berr = nullptr;
-    if (FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                          "native_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
-                          &bvs, &berr)) ||
-        FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                          "native_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
-                          &bps, &berr)) ||
-        FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                          "native_blur", nullptr, nullptr, "ps_blit", "ps_5_0", 0, 0,
-                          &bblit, &berr)) ||
-        FAILED(D3DCompile(kBlurShaderSource, sizeof(kBlurShaderSource) - 1,
-                          "native_blur", nullptr, nullptr, "ps_down", "ps_5_0", 0, 0,
-                          &bdown, &berr))) {
-      REXLOG_ERROR("native-scene: blur shader compile failed: {}",
-                   berr ? static_cast<const char*>(berr->GetBufferPointer()) : "?");
+    nrhi::Shader* bvs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "blur.hlsl",
+                       kBlurShaderSource, "vs_main", nullptr, ""));
+    nrhi::Shader* bps = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "blur.hlsl",
+                       kBlurShaderSource, "ps_main", nullptr, ""));
+    nrhi::Shader* bblit = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "blur.hlsl",
+                       kBlurShaderSource, "ps_blit", nullptr, ""));
+    nrhi::Shader* bdown = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "blur.hlsl",
+                       kBlurShaderSource, "ps_down", nullptr, ""));
+    if (bvs == nullptr || bps == nullptr || bblit == nullptr ||
+        bdown == nullptr) {
+      REXLOG_ERROR("native-scene: blur shader compile failed");
       g_r.failed = true;
       return false;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
-    bp.pRootSignature = g_r.root_signature;
-    bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
-    bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
-    bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    bp.SampleMask = UINT_MAX;
-    bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    bp.NumRenderTargets = 1;
-    bp.RTVFormats[0] = context.d3d12.guest_output_format;
-    bp.SampleDesc.Count = 1;
-    if (g_r.pso_blur) g_r.pso_blur->Release();
-    if (g_r.pso_blur_blit) g_r.pso_blur_blit->Release();
-    if (g_r.pso_blur_down) g_r.pso_blur_down->Release();
-    const HRESULT hb1 = device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur));
-    bp.PS = {bblit->GetBufferPointer(), bblit->GetBufferSize()};
-    const HRESULT hb2 =
-        device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_blit));
-    bp.PS = {bdown->GetBufferPointer(), bdown->GetBufferSize()};
-    const HRESULT hb3 =
-        device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_blur_down));
-    bvs->Release();
-    bps->Release();
-    bblit->Release();
-    bdown->Release();
-    if (berr) berr->Release();
-    if (FAILED(hb1) || FAILED(hb2) || FAILED(hb3)) {
-      REXLOG_ERROR("native-scene: blur PSO creation failed {:08X}/{:08X}/{:08X}",
-                   uint32_t(hb1), uint32_t(hb2), uint32_t(hb3));
+    nrhi::GraphicsPipelineDesc bp;
+    bp.layout = g_r.layout;
+    bp.vs = bvs;
+    bp.ps = bps;
+    bp.cull = nrhi::CullMode::kNone;
+    bp.rtv_format = context.guest_output->format();
+    bp.sample_count = 1;
+    if (g_r.pso_blur) device->DestroyDeferred(g_r.pso_blur);
+    if (g_r.pso_blur_blit) device->DestroyDeferred(g_r.pso_blur_blit);
+    if (g_r.pso_blur_down) device->DestroyDeferred(g_r.pso_blur_down);
+    g_r.pso_blur = device->CreateGraphicsPipeline(bp);
+    bp.ps = bblit;
+    g_r.pso_blur_blit = device->CreateGraphicsPipeline(bp);
+    bp.ps = bdown;
+    g_r.pso_blur_down = device->CreateGraphicsPipeline(bp);
+    device->DestroyDeferred(bvs);
+    device->DestroyDeferred(bps);
+    device->DestroyDeferred(bblit);
+    device->DestroyDeferred(bdown);
+    if (g_r.pso_blur == nullptr || g_r.pso_blur_blit == nullptr ||
+        g_r.pso_blur_down == nullptr) {
+      REXLOG_ERROR("native-scene: blur PSO creation failed");
       g_r.pso_blur = nullptr;
       g_r.pso_blur_blit = nullptr;  // blur unavailable; everything else runs
       g_r.pso_blur_down = nullptr;
@@ -12386,51 +12487,42 @@ bool EnsureBlurPsos(const NativeGuestOutputRenderContext& context) {
 
 // Selection-outline edge composite PSO; create failure disables outline.
 bool EnsureOutlineEdgePso(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   {
     // Selection-outline edge composite (postfx_edgedetectstencil port):
     // fullscreen triangle over the resolved output, additive blend.
-    ID3DBlob* ovs = nullptr;
-    ID3DBlob* ops = nullptr;
-    ID3DBlob* oerr = nullptr;
-    if (FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
-                          "native_outline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
-                          &ovs, &oerr)) ||
-        FAILED(D3DCompile(kOutlineShaderSource, sizeof(kOutlineShaderSource) - 1,
-                          "native_outline", nullptr, nullptr, "ps_main", "ps_5_0", 0, 0,
-                          &ops, &oerr))) {
-      REXLOG_ERROR("native-scene: outline shader compile failed: {}",
-                   oerr ? static_cast<const char*>(oerr->GetBufferPointer()) : "?");
+    nrhi::Shader* ovs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "outline.hlsl",
+                       kOutlineShaderSource, "vs_main", nullptr, ""));
+    nrhi::Shader* ops = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "outline.hlsl",
+                       kOutlineShaderSource, "ps_main", nullptr, ""));
+    if (ovs == nullptr || ops == nullptr) {
+      REXLOG_ERROR("native-scene: outline shader compile failed");
       g_r.failed = true;
       return false;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC op{};
-    op.pRootSignature = g_r.root_signature;
-    op.VS = {ovs->GetBufferPointer(), ovs->GetBufferSize()};
-    op.PS = {ops->GetBufferPointer(), ops->GetBufferSize()};
-    op.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    op.BlendState.RenderTarget[0].BlendEnable = TRUE;
-    op.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
-    op.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
-    op.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
-    op.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
-    op.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
-    op.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    op.SampleMask = UINT_MAX;
-    op.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    op.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    op.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    op.NumRenderTargets = 1;
-    op.RTVFormats[0] = context.d3d12.guest_output_format;
-    op.SampleDesc.Count = 1;
-    if (g_r.pso_outline_edge) g_r.pso_outline_edge->Release();
-    const HRESULT ho = device->CreateGraphicsPipelineState(&op, IID_PPV_ARGS(&g_r.pso_outline_edge));
-    ovs->Release();
-    ops->Release();
-    if (oerr) oerr->Release();
-    if (FAILED(ho)) {
-      REXLOG_WARN("native-scene: outline edge PSO creation failed {:08X}", uint32_t(ho));
-      g_r.pso_outline_edge = nullptr;  // outline unavailable; everything else runs
+    nrhi::GraphicsPipelineDesc op;
+    op.layout = g_r.layout;
+    op.vs = ovs;
+    op.ps = ops;
+    op.blend.enable = true;
+    op.blend.src = nrhi::BlendFactor::kOne;
+    op.blend.dst = nrhi::BlendFactor::kOne;
+    op.blend.op = nrhi::BlendOp::kAdd;
+    op.blend.src_alpha = nrhi::BlendFactor::kZero;
+    op.blend.dst_alpha = nrhi::BlendFactor::kOne;
+    op.blend.op_alpha = nrhi::BlendOp::kAdd;
+    op.cull = nrhi::CullMode::kNone;
+    op.rtv_format = context.guest_output->format();
+    op.sample_count = 1;
+    if (g_r.pso_outline_edge) device->DestroyDeferred(g_r.pso_outline_edge);
+    g_r.pso_outline_edge = device->CreateGraphicsPipeline(op);
+    device->DestroyDeferred(ovs);
+    device->DestroyDeferred(ops);
+    if (g_r.pso_outline_edge == nullptr) {
+      REXLOG_WARN("native-scene: outline edge PSO creation failed");
+      // outline unavailable; everything else runs
     }
   }
   return true;
@@ -12438,79 +12530,67 @@ bool EnsureOutlineEdgePso(const NativeGuestOutputRenderContext& context) {
 
 // 2D overlay pipeline.
 bool Ensure2dPso(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   {
     // 2D overlay pipeline: standard alpha blend, no depth, drawn into the
     // resolved guest output (sample count 1).
-    ID3DBlob* uvs = nullptr;
-    ID3DBlob* ups = nullptr;
-    ID3DBlob* uerrors = nullptr;
-    if (FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
-                          nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &uvs,
-                          &uerrors)) ||
-        FAILED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
-                          nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &ups,
-                          &uerrors))) {
-      REXLOG_ERROR("native-scene: 2D shader compile failed: {}",
-                   uerrors ? static_cast<const char*>(uerrors->GetBufferPointer())
-                           : "?");
+    nrhi::Shader* uvs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "overlay2d.hlsl",
+                       kShader2dSource, "vs_main", nullptr, ""));
+    nrhi::Shader* ups = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "overlay2d.hlsl",
+                       kShader2dSource, "ps_main", nullptr, ""));
+    if (uvs == nullptr || ups == nullptr) {
+      REXLOG_ERROR("native-scene: 2D shader compile failed");
       g_r.failed = true;
       return false;
     }
-    D3D12_INPUT_ELEMENT_DESC input2d[3] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC up{};
-    up.pRootSignature = g_r.root_signature;
-    up.VS = {uvs->GetBufferPointer(), uvs->GetBufferSize()};
-    up.PS = {ups->GetBufferPointer(), ups->GetBufferSize()};
-    auto& rt = up.BlendState.RenderTarget[0];
-    rt.BlendEnable = TRUE;
+    static constexpr nrhi::InputElementDesc input2d[3] = {
+        {"POSITION", 0, 0, nrhi::Format::kR32G32B32A32_FLOAT, 0},
+        {"TEXCOORD", 0, 1, nrhi::Format::kR32G32_FLOAT, 16},
+        {"COLOR", 0, 2, nrhi::Format::kR8G8B8A8_UNORM, 24}};
+    nrhi::GraphicsPipelineDesc up;
+    up.layout = g_r.layout;
+    up.vs = uvs;
+    up.ps = ups;
+    up.blend.enable = true;
     // Straight (non-premultiplied) alpha, verified against the decoded
     // HUD clock art: the glass-sheen texture is white RGB at low alpha
     // (premultiplied blending blows it out into an opaque white blob).
-    rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-    rt.BlendOp = D3D12_BLEND_OP_ADD;
-    rt.SrcBlendAlpha = D3D12_BLEND_ONE;
-    rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-    rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    up.SampleMask = UINT_MAX;
-    up.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    up.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    up.InputLayout = {input2d, 3};
-    up.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    up.NumRenderTargets = 1;
-    up.RTVFormats[0] = context.d3d12.guest_output_format;
-    up.SampleDesc.Count = 1;
-    const HRESULT hr4 = device->CreateGraphicsPipelineState(&up, IID_PPV_ARGS(&g_r.pso_2d));
+    up.blend.src = nrhi::BlendFactor::kSrcAlpha;
+    up.blend.dst = nrhi::BlendFactor::kInvSrcAlpha;
+    up.blend.op = nrhi::BlendOp::kAdd;
+    up.blend.src_alpha = nrhi::BlendFactor::kOne;
+    up.blend.dst_alpha = nrhi::BlendFactor::kInvSrcAlpha;
+    up.blend.op_alpha = nrhi::BlendOp::kAdd;
+    up.cull = nrhi::CullMode::kNone;
+    up.input_elements = input2d;
+    up.input_element_count = 3;
+    up.vertex_stride = 28;
+    up.rtv_format = context.guest_output->format();
+    up.sample_count = 1;
+    g_r.pso_2d = device->CreateGraphicsPipeline(up);
     // FMV variant: identical pipeline, ps_yuv2d combine (see the movie-quad
     // substitution in the 2D replay). Failure only loses native FMV; the
     // emulated yield fallback covers it.
-    ID3DBlob* uyuv = nullptr;
-    if (SUCCEEDED(D3DCompile(kShader2dSource, sizeof(kShader2dSource) - 1, "native_2d",
-                             nullptr, nullptr, "ps_yuv2d", "ps_5_0", 0, 0, &uyuv,
-                             nullptr))) {
-      up.PS = {uyuv->GetBufferPointer(), uyuv->GetBufferSize()};
-      if (g_r.pso_yuv2d) g_r.pso_yuv2d->Release();
-      if (FAILED(device->CreateGraphicsPipelineState(&up, IID_PPV_ARGS(&g_r.pso_yuv2d)))) {
+    nrhi::Shader* uyuv = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "overlay2d.hlsl",
+                       kShader2dSource, "ps_yuv2d", nullptr, ""));
+    if (uyuv != nullptr) {
+      up.ps = uyuv;
+      if (g_r.pso_yuv2d) device->DestroyDeferred(g_r.pso_yuv2d);
+      g_r.pso_yuv2d = device->CreateGraphicsPipeline(up);
+      if (g_r.pso_yuv2d == nullptr) {
         REXLOG_WARN("native-scene: FMV 2D PSO creation failed - movies yield");
-        g_r.pso_yuv2d = nullptr;
       }
-      uyuv->Release();
+      device->DestroyDeferred(uyuv);
     } else {
       REXLOG_WARN("native-scene: ps_yuv2d compile failed - movies yield");
     }
-    uvs->Release();
-    ups->Release();
-    if (uerrors) uerrors->Release();
-    if (FAILED(hr4)) {
-      REXLOG_ERROR("native-scene: 2D PSO creation failed {:08X}", uint32_t(hr4));
+    device->DestroyDeferred(uvs);
+    device->DestroyDeferred(ups);
+    if (g_r.pso_2d == nullptr) {
+      REXLOG_ERROR("native-scene: 2D PSO creation failed");
       g_r.failed = true;
       return false;
     }
@@ -12520,81 +12600,65 @@ bool Ensure2dPso(const NativeGuestOutputRenderContext& context) {
 
 // In-world spline pipelines (darken + additive default).
 bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   {
     // In-world spline pipelines: drawn inside the scene pass (MSAA sample
     // count, depth test LESS_EQUAL, no z-write) with the game's own blend
     // states (spline.xml): darken = straight alpha, default = additive.
-    ID3DBlob* svs = nullptr;
-    ID3DBlob* spd = nullptr;
-    ID3DBlob* spk = nullptr;
-    ID3DBlob* serrors = nullptr;
-    if (FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
-                          "native_spline", nullptr, nullptr, "vs_main", "vs_5_0", 0, 0,
-                          &svs, &serrors)) ||
-        FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
-                          "native_spline", nullptr, nullptr, "ps_default", "ps_5_0", 0,
-                          0, &spd, &serrors)) ||
-        FAILED(D3DCompile(kShaderSplineSource, sizeof(kShaderSplineSource) - 1,
-                          "native_spline", nullptr, nullptr, "ps_darken", "ps_5_0", 0,
-                          0, &spk, &serrors))) {
-      REXLOG_ERROR("native-scene: spline shader compile failed: {}",
-                   serrors ? static_cast<const char*>(serrors->GetBufferPointer())
-                           : "?");
+    nrhi::Shader* svs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "spline.hlsl",
+                       kShaderSplineSource, "vs_main", nullptr, ""));
+    nrhi::Shader* spd = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "spline.hlsl",
+                       kShaderSplineSource, "ps_default", nullptr, ""));
+    nrhi::Shader* spk = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "spline.hlsl",
+                       kShaderSplineSource, "ps_darken", nullptr, ""));
+    if (svs == nullptr || spd == nullptr || spk == nullptr) {
+      REXLOG_ERROR("native-scene: spline shader compile failed");
       g_r.failed = true;
       return false;
     }
-    D3D12_INPUT_ELEMENT_DESC input_spline[3] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 1, DXGI_FORMAT_R32_FLOAT, 0, 24,
-         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC sp{};
-    sp.pRootSignature = g_r.root_signature;
-    sp.VS = {svs->GetBufferPointer(), svs->GetBufferSize()};
-    sp.SampleMask = UINT_MAX;
-    sp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    sp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    sp.RasterizerState.DepthClipEnable = TRUE;
-    sp.DepthStencilState.DepthEnable = TRUE;
-    sp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    sp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-    sp.InputLayout = {input_spline, 3};
-    sp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    sp.NumRenderTargets = 1;
-    sp.RTVFormats[0] = context.d3d12.guest_output_format;
-    sp.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    sp.SampleDesc.Count = g_r.msaa;
-    auto& srt = sp.BlendState.RenderTarget[0];
-    srt.BlendEnable = TRUE;
-    srt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    srt.BlendOp = D3D12_BLEND_OP_ADD;
-    srt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    static constexpr nrhi::InputElementDesc input_spline[3] = {
+        {"POSITION", 0, 0, nrhi::Format::kR32G32B32A32_FLOAT, 0},
+        {"TEXCOORD", 0, 1, nrhi::Format::kR32G32_FLOAT, 16},
+        {"TEXCOORD", 1, 2, nrhi::Format::kR32_FLOAT, 24}};
+    nrhi::GraphicsPipelineDesc sp;
+    sp.layout = g_r.layout;
+    sp.vs = svs;
+    sp.cull = nrhi::CullMode::kNone;
+    sp.depth_clip = true;
+    sp.depth.test_enable = true;
+    sp.depth.write_enable = false;
+    sp.depth.func = nrhi::CompareFunc::kLessEqual;
+    sp.input_elements = input_spline;
+    sp.input_element_count = 3;
+    sp.vertex_stride = 28;
+    sp.rtv_format = context.guest_output->format();
+    sp.dsv_format = nrhi::Format::kD32_FLOAT;
+    sp.sample_count = g_r.msaa;
+    sp.blend.enable = true;
+    sp.blend.op = nrhi::BlendOp::kAdd;
+    sp.blend.op_alpha = nrhi::BlendOp::kAdd;
     // darken pass: straight alpha.
-    sp.PS = {spk->GetBufferPointer(), spk->GetBufferSize()};
-    srt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-    srt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-    srt.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
-    srt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-    const HRESULT hr5 =
-        device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_darken));
+    sp.ps = spk;
+    sp.blend.src = nrhi::BlendFactor::kSrcAlpha;
+    sp.blend.dst = nrhi::BlendFactor::kInvSrcAlpha;
+    sp.blend.src_alpha = nrhi::BlendFactor::kSrcAlpha;
+    sp.blend.dst_alpha = nrhi::BlendFactor::kInvSrcAlpha;
+    g_r.pso_spline_darken = device->CreateGraphicsPipeline(sp);
     // default pass: additive glow.
-    sp.PS = {spd->GetBufferPointer(), spd->GetBufferSize()};
-    srt.SrcBlend = D3D12_BLEND_ONE;
-    srt.DestBlend = D3D12_BLEND_ONE;
-    srt.SrcBlendAlpha = D3D12_BLEND_ONE;
-    srt.DestBlendAlpha = D3D12_BLEND_ONE;
-    const HRESULT hr6 =
-        device->CreateGraphicsPipelineState(&sp, IID_PPV_ARGS(&g_r.pso_spline_default));
-    svs->Release();
-    spd->Release();
-    spk->Release();
-    if (serrors) serrors->Release();
-    if (FAILED(hr5) || FAILED(hr6)) {
-      REXLOG_ERROR("native-scene: spline PSO creation failed {:08X}/{:08X}",
-                   uint32_t(hr5), uint32_t(hr6));
+    sp.ps = spd;
+    sp.blend.src = nrhi::BlendFactor::kOne;
+    sp.blend.dst = nrhi::BlendFactor::kOne;
+    sp.blend.src_alpha = nrhi::BlendFactor::kOne;
+    sp.blend.dst_alpha = nrhi::BlendFactor::kOne;
+    g_r.pso_spline_default = device->CreateGraphicsPipeline(sp);
+    device->DestroyDeferred(svs);
+    device->DestroyDeferred(spd);
+    device->DestroyDeferred(spk);
+    if (g_r.pso_spline_darken == nullptr || g_r.pso_spline_default == nullptr) {
+      REXLOG_ERROR("native-scene: spline PSO creation failed");
       g_r.failed = true;
       return false;
     }
@@ -12604,82 +12668,64 @@ bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context) {
 
 // Dynamic-shadow caster + per-tile blur/convert PSOs.
 bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   {
     // Dynamic-shadow pipelines: casters (scene VS with a light-space
     // "view-proj", MIN-blend depth/uncoverage accumulation, no depth
     // buffer, depth clip OFF so casters outside the 12 m height window
     // clamp like the game accepts) + the per-tile blur/convert pass.
-    ID3DBlob* cvs = nullptr;
-    ID3DBlob* cps = nullptr;
-    ID3DBlob* bvs = nullptr;
-    ID3DBlob* bps = nullptr;
-    ID3DBlob* werrors = nullptr;
-    if (FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
-                          nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &cvs, &werrors)) ||
-        FAILED(D3DCompile(kShaderSource, sizeof(kShaderSource) - 1, "native_scene",
-                          nullptr, nullptr, "ps_shadow_caster", "ps_5_0", 0, 0, &cps,
-                          &werrors)) ||
-        FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
-                          "native_shadow_blur", nullptr, nullptr, "vs_main", "vs_5_0", 0,
-                          0, &bvs, &werrors)) ||
-        FAILED(D3DCompile(kShadowBlurSource, sizeof(kShadowBlurSource) - 1,
-                          "native_shadow_blur", nullptr, nullptr, "ps_main", "ps_5_0", 0,
-                          0, &bps, &werrors))) {
-      REXLOG_ERROR("native-scene: shadow shader compile failed: {}",
-                   werrors ? static_cast<const char*>(werrors->GetBufferPointer())
-                           : "?");
+    nrhi::Shader* cvs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "scene.hlsl", kShaderSource,
+                       "vs_main", nullptr, ""));
+    nrhi::Shader* cps = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "scene.hlsl", kShaderSource,
+                       "ps_shadow_caster", nullptr, ""));
+    nrhi::Shader* bvs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "shadow_blur.hlsl",
+                       kShadowBlurSource, "vs_main", nullptr, ""));
+    nrhi::Shader* bps = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "shadow_blur.hlsl",
+                       kShadowBlurSource, "ps_main", nullptr, ""));
+    if (cvs == nullptr || cps == nullptr || bvs == nullptr || bps == nullptr) {
+      REXLOG_ERROR("native-scene: shadow shader compile failed");
       g_r.failed = true;
       return false;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC cp{};
-    cp.pRootSignature = g_r.root_signature;
-    cp.VS = {cvs->GetBufferPointer(), cvs->GetBufferSize()};
-    cp.PS = {cps->GetBufferPointer(), cps->GetBufferSize()};
-    auto& crt = cp.BlendState.RenderTarget[0];
-    crt.BlendEnable = TRUE;
-    crt.SrcBlend = D3D12_BLEND_ONE;
-    crt.DestBlend = D3D12_BLEND_ONE;
-    crt.BlendOp = D3D12_BLEND_OP_MIN;
-    crt.SrcBlendAlpha = D3D12_BLEND_ONE;
-    crt.DestBlendAlpha = D3D12_BLEND_ONE;
-    crt.BlendOpAlpha = D3D12_BLEND_OP_MIN;
-    crt.RenderTargetWriteMask =
-        D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
-    cp.SampleMask = UINT_MAX;
-    cp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    cp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    cp.RasterizerState.DepthClipEnable = FALSE;
-    cp.InputLayout = {kSceneInputLayout, 7};
-    cp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    cp.NumRenderTargets = 1;
-    cp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
-    cp.SampleDesc.Count = 1;
-    const HRESULT hr7 =
-        device->CreateGraphicsPipelineState(&cp, IID_PPV_ARGS(&g_r.pso_shadow_caster));
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
-    bp.pRootSignature = g_r.root_signature;
-    bp.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()};
-    bp.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
-    bp.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    bp.SampleMask = UINT_MAX;
-    bp.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    bp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    bp.RasterizerState.DepthClipEnable = TRUE;
-    bp.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    bp.NumRenderTargets = 1;
-    bp.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
-    bp.SampleDesc.Count = 1;
-    const HRESULT hr8 =
-        device->CreateGraphicsPipelineState(&bp, IID_PPV_ARGS(&g_r.pso_shadow_blur));
-    cvs->Release();
-    cps->Release();
-    bvs->Release();
-    bps->Release();
-    if (werrors) werrors->Release();
-    if (FAILED(hr7) || FAILED(hr8)) {
-      REXLOG_ERROR("native-scene: shadow PSO creation failed {:08X}/{:08X}",
-                   uint32_t(hr7), uint32_t(hr8));
+    nrhi::GraphicsPipelineDesc cp;
+    cp.layout = g_r.layout;
+    cp.vs = cvs;
+    cp.ps = cps;
+    cp.blend.enable = true;
+    cp.blend.src = nrhi::BlendFactor::kOne;
+    cp.blend.dst = nrhi::BlendFactor::kOne;
+    cp.blend.op = nrhi::BlendOp::kMin;
+    cp.blend.src_alpha = nrhi::BlendFactor::kOne;
+    cp.blend.dst_alpha = nrhi::BlendFactor::kOne;
+    cp.blend.op_alpha = nrhi::BlendOp::kMin;
+    cp.blend.write_mask = 0x3;  // RG only
+    cp.cull = nrhi::CullMode::kNone;
+    cp.depth_clip = false;
+    cp.input_elements = kSceneInputLayout;
+    cp.input_element_count = 7;
+    cp.vertex_stride = 56;
+    cp.rtv_format = nrhi::Format::kR16G16_UNORM;
+    cp.sample_count = 1;
+    g_r.pso_shadow_caster = device->CreateGraphicsPipeline(cp);
+    nrhi::GraphicsPipelineDesc bp;
+    bp.layout = g_r.layout;
+    bp.vs = bvs;
+    bp.ps = bps;
+    bp.cull = nrhi::CullMode::kNone;
+    bp.depth_clip = true;
+    bp.rtv_format = nrhi::Format::kR16G16_UNORM;
+    bp.sample_count = 1;
+    g_r.pso_shadow_blur = device->CreateGraphicsPipeline(bp);
+    device->DestroyDeferred(cvs);
+    device->DestroyDeferred(cps);
+    device->DestroyDeferred(bvs);
+    device->DestroyDeferred(bps);
+    if (g_r.pso_shadow_caster == nullptr || g_r.pso_shadow_blur == nullptr) {
+      REXLOG_ERROR("native-scene: shadow PSO creation failed");
       g_r.failed = true;
       return false;
     }
@@ -12687,42 +12733,20 @@ bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
-// Descriptor heaps (RTV/DSV/SRV) + the bone and 2D-vertex upload rings.
+// The bone / ROPA / 2D-vertex upload rings (persistently mapped). The old
+// RTV/DSV/SRV descriptor heaps and their increment-size bookkeeping are gone
+// - render targets bind by texture and sampled views are backend-managed
+// objects. (Name kept for the call sites.)
 bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
-  if (!g_r.rtv_heap) {
-    // Slots 0/1 = guest output / MSAA color; 2+ = APT render-to-texture
-    // targets; 5/6 = blur intermediates; 7 = outline mask; 8..13 = the
-    // photo-editor postfx chain (full x2, half x2, quarter, packed depth).
-    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 16,
-                                    D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
-    if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_r.rtv_heap)))) {
-      g_r.failed = true;
-      return false;
-    }
-    g_r.rtv_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_r.dsv_heap)))) {
-      g_r.failed = true;
-      return false;
-    }
-    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap.NumDescriptors = 8192;
-    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_r.srv_heap)))) {
-      g_r.failed = true;
-      return false;
-    }
-    g_r.srv_size =
-        device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-  }
+  nrhi::Device* device = context.device;
 
   if (!g_r.bone_ring) {
     g_r.bone_ring = CreateUploadBuffer(
         device, size_t(RendererState::kBoneRegionSize) * RendererState::kBoneRegions);
-    if (!g_r.bone_ring ||
-        FAILED(g_r.bone_ring->Map(0, nullptr,
-                                  reinterpret_cast<void**>(&g_r.bone_ring_cpu)))) {
+    g_r.bone_ring_cpu =
+        g_r.bone_ring ? static_cast<uint8_t*>(device->Map(g_r.bone_ring))
+                      : nullptr;
+    if (g_r.bone_ring_cpu == nullptr) {
       g_r.failed = true;
       return false;
     }
@@ -12731,9 +12755,10 @@ bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
   if (!g_r.ropa_ring) {
     g_r.ropa_ring = CreateUploadBuffer(
         device, size_t(RendererState::kRopaRegionSize) * RendererState::kBoneRegions);
-    if (!g_r.ropa_ring ||
-        FAILED(g_r.ropa_ring->Map(0, nullptr,
-                                  reinterpret_cast<void**>(&g_r.ropa_ring_cpu)))) {
+    g_r.ropa_ring_cpu =
+        g_r.ropa_ring ? static_cast<uint8_t*>(device->Map(g_r.ropa_ring))
+                      : nullptr;
+    if (g_r.ropa_ring_cpu == nullptr) {
       g_r.failed = true;
       return false;
     }
@@ -12742,9 +12767,10 @@ bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
   if (!g_r.ui_ring) {
     g_r.ui_ring = CreateUploadBuffer(
         device, size_t(RendererState::kUiRegionSize) * RendererState::kUiRegions);
-    if (!g_r.ui_ring ||
-        FAILED(g_r.ui_ring->Map(0, nullptr,
-                                reinterpret_cast<void**>(&g_r.ui_ring_cpu)))) {
+    g_r.ui_ring_cpu = g_r.ui_ring
+                          ? static_cast<uint8_t*>(device->Map(g_r.ui_ring))
+                          : nullptr;
+    if (g_r.ui_ring_cpu == nullptr) {
       g_r.failed = true;
       return false;
     }
@@ -12764,54 +12790,33 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
   if (g_r.pfx_failed) {
     return false;
   }
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   const auto fail = [&](const char* what) {
     REXLOG_ERROR("native-scene: photo postfx pipeline setup failed ({})", what);
     g_r.pfx_failed = true;
     return false;
   };
-  // Root signature: root CBV b0 + eight single-SRV tables (t0..t7; each can
-  // point anywhere in the SRV heap, the established pattern) + samplers.
-  if (g_r.pfx_root_sig == nullptr) {
-    D3D12_ROOT_PARAMETER params[9] = {};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[0].Descriptor.ShaderRegister = 0;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE ranges[8] = {};
-    const uint32_t regs[8] = {0, 1, 2, 3, 4, 6, 7, 5};
-    for (int i = 0; i < 8; ++i) {
-      ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-      ranges[i].NumDescriptors = 1;
-      ranges[i].BaseShaderRegister = regs[i];
-      params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
-      params[1 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
-      params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    }
-    D3D12_STATIC_SAMPLER_DESC smp[3] = {};
-    smp[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    smp[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    smp[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    smp[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    smp[0].MaxLOD = D3D12_FLOAT32_MAX;
-    smp[0].ShaderRegister = 0;
-    smp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    smp[1] = smp[0];
-    smp[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;  // packed depth
-    smp[1].ShaderRegister = 1;
-    smp[2] = smp[0];
-    smp[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;  // grain
-    smp[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    smp[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    smp[2].ShaderRegister = 2;
-    D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 9;
-    desc.pParameters = params;
-    desc.NumStaticSamplers = 3;
-    desc.pStaticSamplers = smp;
-    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-    if (!context.d3d12.create_root_signature(context.d3d12.command_processor_user_data,
-                                             &desc, &g_r.pfx_root_sig)) {
+  // Binding layout: CBV b0 + ONE eight-texture table t0..t7 + samplers. (The
+  // old eight single-SRV tables would need nine Vulkan descriptor sets,
+  // over the 8-set minimum on Intel/MoltenVK, so the passes gather their
+  // t0..t7 views and bind them with one cmd->SetTextures(1, views, 8).)
+  if (g_r.pfx_layout == nullptr) {
+    nrhi::BindingLayoutDesc ld;
+    ld.param_count = 2;
+    ld.params[0] = {nrhi::BindingParamKind::kConstantBuffer, /*b*/ 0, 1,
+                    nrhi::Visibility::kAll};
+    ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 8,
+                    nrhi::Visibility::kPixel};
+    ld.static_sampler_count = 3;
+    ld.static_samplers[0] = {/*s*/ 0, nrhi::Filter::kLinear,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.static_samplers[1] = {1, nrhi::Filter::kPoint, nrhi::AddressMode::kClamp,
+                             1};  // packed depth
+    ld.static_samplers[2] = {2, nrhi::Filter::kLinear, nrhi::AddressMode::kWrap,
+                             1};  // grain
+    ld.allow_input_layout = false;
+    g_r.pfx_layout = device->CreateBindingLayout(ld);
+    if (g_r.pfx_layout == nullptr) {
       return fail("root signature");
     }
   }
@@ -12819,74 +12824,62 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
   struct Entry {
     const char* vs;
     const char* ps;
-    DXGI_FORMAT rtv;
+    nrhi::Format rtv;
   };
   const Entry entries[9] = {
-      {"vs_raw", "ps_depthpack", DXGI_FORMAT_R8G8B8A8_UNORM},
-      {"vs_offset", "ps_visualfx", DXGI_FORMAT_R8G8B8A8_UNORM},
-      {"vs_offset", "ps_dof_down", DXGI_FORMAT_R8G8B8A8_UNORM},
-      {"vs_offset", "ps_dof_mb", DXGI_FORMAT_R8G8B8A8_UNORM},
-      {"vs_offset", "ps_dof", DXGI_FORMAT_R8G8B8A8_UNORM},
-      {"vs_raw", "ps_uber", DXGI_FORMAT_R8G8B8A8_UNORM},
-      {"vs_scaled", "ps_fisheye", context.d3d12.guest_output_format},
-      {"vs_raw", "ps_blit", DXGI_FORMAT_R8G8B8A8_UNORM},
+      {"vs_raw", "ps_depthpack", nrhi::Format::kR8G8B8A8_UNORM},
+      {"vs_offset", "ps_visualfx", nrhi::Format::kR8G8B8A8_UNORM},
+      {"vs_offset", "ps_dof_down", nrhi::Format::kR8G8B8A8_UNORM},
+      {"vs_offset", "ps_dof_mb", nrhi::Format::kR8G8B8A8_UNORM},
+      {"vs_offset", "ps_dof", nrhi::Format::kR8G8B8A8_UNORM},
+      {"vs_raw", "ps_uber", nrhi::Format::kR8G8B8A8_UNORM},
+      {"vs_scaled", "ps_fisheye", context.guest_output->format()},
+      {"vs_raw", "ps_blit", nrhi::Format::kR8G8B8A8_UNORM},
       // Debug visualizer (photo_native_debug cvar): CoC / packed-depth view
       // drawn over the output instead of the fisheye result.
-      {"vs_raw", "ps_pfx_debug", context.d3d12.guest_output_format},
+      {"vs_raw", "ps_pfx_debug", context.guest_output->format()},
   };
-  const D3D_SHADER_MACRO msaa_defines[] = {{"PFX_MSAA", "1"}, {nullptr, nullptr}};
+  const nrhi::ShaderMacro msaa_defines[] = {{"PFX_MSAA", "1"},
+                                            {nullptr, nullptr}};
   for (int i = 0; i < 9; ++i) {
-    ID3DBlob* vs = nullptr;
-    ID3DBlob* ps = nullptr;
-    ID3DBlob* errors = nullptr;
-    const D3D_SHADER_MACRO* defs = (i == 0 && g_r.msaa > 1) ? msaa_defines : nullptr;
-    if (FAILED(D3DCompile(kPhotoFxShaderSource, sizeof(kPhotoFxShaderSource) - 1,
-                          "photo_fx", defs, nullptr, entries[i].vs, "vs_5_0", 0, 0,
-                          &vs, &errors)) ||
-        FAILED(D3DCompile(kPhotoFxShaderSource, sizeof(kPhotoFxShaderSource) - 1,
-                          "photo_fx", defs, nullptr, entries[i].ps, "ps_5_0", 0, 0,
-                          &ps, &errors))) {
-      REXLOG_ERROR("native-scene: photo postfx shader compile failed ({}): {}",
-                   entries[i].ps,
-                   errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+    const bool msaa_pass = (i == 0 && g_r.msaa > 1);
+    const nrhi::ShaderMacro* defs = msaa_pass ? msaa_defines : nullptr;
+    const char* variant = msaa_pass ? "PFX_MSAA=1" : "";
+    nrhi::Shader* vs = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kVertex, "photo_fx.hlsl",
+                       kPhotoFxShaderSource, entries[i].vs, defs, variant));
+    nrhi::Shader* ps = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "photo_fx.hlsl",
+                       kPhotoFxShaderSource, entries[i].ps, defs, variant));
+    if (vs == nullptr || ps == nullptr) {
+      REXLOG_ERROR("native-scene: photo postfx shader compile failed ({})",
+                   entries[i].ps);
       g_r.pfx_failed = true;
       return false;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
-    pso.pRootSignature = g_r.pfx_root_sig;
-    pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-    pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pso.SampleMask = UINT_MAX;
-    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pso.RasterizerState.DepthClipEnable = TRUE;
-    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.NumRenderTargets = 1;
-    pso.RTVFormats[0] = entries[i].rtv;
-    pso.SampleDesc.Count = 1;
-    const HRESULT hr = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_r.pfx_pso[i]));
-    vs->Release();
-    ps->Release();
-    if (FAILED(hr)) {
+    nrhi::GraphicsPipelineDesc pso;
+    pso.layout = g_r.pfx_layout;
+    pso.vs = vs;
+    pso.ps = ps;
+    pso.cull = nrhi::CullMode::kNone;
+    pso.depth_clip = true;
+    pso.rtv_format = entries[i].rtv;
+    pso.sample_count = 1;
+    g_r.pfx_pso[i] = device->CreateGraphicsPipeline(pso);
+    device->DestroyDeferred(vs);
+    device->DestroyDeferred(ps);
+    if (g_r.pfx_pso[i] == nullptr) {
       return fail(entries[i].ps);
     }
   }
   // Fixed-size intermediates + the identity grade LUT + the CB ring.
   {
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_CLEAR_VALUE clear{};
-    clear.Format = desc.Format;
+    nrhi::TextureDesc desc;
+    desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+    desc.usage = nrhi::kTextureUsageRenderTarget;
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
     struct Fixed {
-      ID3D12Resource** res;
+      nrhi::Texture** res;
       uint32_t w, h;
     };
     const Fixed fixed[3] = {
@@ -12898,11 +12891,10 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
       if (*f.res != nullptr) {
         continue;
       }
-      desc.Width = f.w;
-      desc.Height = f.h;
-      if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                 &clear, IID_PPV_ARGS(f.res)))) {
+      desc.width = f.w;
+      desc.height = f.h;
+      *f.res = device->CreateTexture(desc);
+      if (*f.res == nullptr) {
         return fail("intermediate target");
       }
     }
@@ -12913,17 +12905,15 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
       // u = g*0.96875 + 0.015625, v = r*(-0.96875) + 0.984375 (flipped),
       // w = b*0.96875 + 0.015625, so voxel (ix,iy,iz) stores
       // r = (0.984375 - v)/0.96875, g = (u - 0.015625)/0.96875, b likewise.
-      D3D12_RESOURCE_DESC lut{};
-      lut.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-      lut.Width = 32;
-      lut.Height = 32;
-      lut.DepthOrArraySize = 32;
-      lut.MipLevels = 1;
-      lut.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      lut.SampleDesc.Count = 1;
-      if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &lut,
-                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                 IID_PPV_ARGS(&g_r.pfx_lut)))) {
+      nrhi::TextureDesc lut;
+      lut.kind = nrhi::TextureKind::k3D;
+      lut.width = 32;
+      lut.height = 32;
+      lut.depth = 32;
+      lut.format = nrhi::Format::kR8G8B8A8_UNORM;
+      lut.initial_state = nrhi::ResourceState::kCopyDest;
+      g_r.pfx_lut = device->CreateTexture(lut);
+      if (g_r.pfx_lut == nullptr) {
         return fail("LUT");
       }
       // Upload: 32 rows of 32 texels x 32 slices, 256-byte row pitch.
@@ -12933,8 +12923,8 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
       if (g_r.pfx_lut_upload == nullptr) {
         return fail("LUT upload");
       }
-      uint8_t* p = nullptr;
-      if (FAILED(g_r.pfx_lut_upload->Map(0, nullptr, reinterpret_cast<void**>(&p)))) {
+      uint8_t* p = static_cast<uint8_t*>(device->Map(g_r.pfx_lut_upload));
+      if (p == nullptr) {
         return fail("LUT map");
       }
       for (uint32_t iz = 0; iz < 32; ++iz) {
@@ -12954,54 +12944,40 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
           }
         }
       }
-      g_r.pfx_lut_upload->Unmap(0, nullptr);
+      device->Unmap(g_r.pfx_lut_upload);
     }
     if (g_r.pfx_cb == nullptr) {
       // 8 pass slots x 4 KB x 4 frames in flight.
       // 10 slots per frame region: depth pack + accum feed + 6 passes +
       // accum mode 2 + the debug view.
       g_r.pfx_cb = CreateUploadBuffer(device, 10u * 4096u * 4u);
-      if (g_r.pfx_cb == nullptr ||
-          FAILED(g_r.pfx_cb->Map(0, nullptr,
-                                 reinterpret_cast<void**>(&g_r.pfx_cb_ptr)))) {
+      g_r.pfx_cb_ptr = g_r.pfx_cb
+                           ? static_cast<uint8_t*>(device->Map(g_r.pfx_cb))
+                           : nullptr;
+      if (g_r.pfx_cb_ptr == nullptr) {
         return fail("constant ring");
       }
     }
   }
+  // Fixed-target views (2/3 = halves, 4 = quarter, 6 = LUT; 0/1/5/7, the
+  // output-sized full/depth targets and the native depth resource, are
+  // (re)created by the render block on size change).
   if (!g_r.pfx_srv_allocated) {
-    for (uint32_t& s : g_r.pfx_srv) {
-      s = g_r.srv_next++;
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.pfx_srv[2] = device->CreateTextureView(g_r.pfx_half[0], vd);
+    g_r.pfx_srv[3] = device->CreateTextureView(g_r.pfx_half[1], vd);
+    g_r.pfx_srv[4] = device->CreateTextureView(g_r.pfx_quarter, vd);
+    // LUT SRV (Texture3D).
+    nrhi::TextureViewDesc lv;
+    lv.dimension = nrhi::ViewDimension::k3D;
+    lv.mip_levels = 1;
+    g_r.pfx_srv[6] = device->CreateTextureView(g_r.pfx_lut, lv);
+    if (g_r.pfx_srv[2] == nullptr || g_r.pfx_srv[3] == nullptr ||
+        g_r.pfx_srv[4] == nullptr || g_r.pfx_srv[6] == nullptr) {
+      return fail("fixed-target views");
     }
     g_r.pfx_srv_allocated = true;
-  }
-  // Fixed-target RTVs (heap slots 10/11 = halves, 12 = quarter) + SRVs.
-  {
-    const auto make_views = [&](ID3D12Resource* res, uint32_t rtv_slot,
-                                uint32_t srv_slot) {
-      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      rtv.ptr += size_t(rtv_slot) * g_r.rtv_size;
-      device->CreateRenderTargetView(res, nullptr, rtv);
-      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      srv.Texture2D.MipLevels = 1;
-      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-      slot.ptr += size_t(srv_slot) * g_r.srv_size;
-      device->CreateShaderResourceView(res, &srv, slot);
-    };
-    make_views(g_r.pfx_half[0], 10, g_r.pfx_srv[2]);
-    make_views(g_r.pfx_half[1], 11, g_r.pfx_srv[3]);
-    make_views(g_r.pfx_quarter, 12, g_r.pfx_srv[4]);
-    // LUT SRV (Texture3D).
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture3D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-    slot.ptr += size_t(g_r.pfx_srv[6]) * g_r.srv_size;
-    device->CreateShaderResourceView(g_r.pfx_lut, &srv, slot);
   }
   g_r.pfx_ready = true;
   REXLOG_INFO("native-scene: photo postfx pipeline ready (9 passes, msaa={})",
@@ -13011,53 +12987,42 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
 
 // Shadow atlas targets + the always-bound b1 receiver constant buffer.
 bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   if (!g_r.shadow_raw && REXCVAR_GET(skate3_native_render_scene_shadows)) {
     // Dynamic-shadow atlas chain: raw casters -> hblur intermediate ->
     // blurred final (the texture the scene pass samples). Three fixed-size
     // R16G16_UNORM targets (the game's atlas is fmt 25 = 16_16 fixed point;
     // half-float ulp at the typical ~0.85 depth is ~6 mm of world height,
     // too coarse for board/feet-height casters 1-2 cm off the ground),
-    // 3 tiles of tile x tile each; RTV heap slots 2/3/4.
+    // 3 tiles of tile x tile each.
     g_r.shadow_tile = uint32_t(REXCVAR_GET(skate3_native_render_scene_shadow_tile));
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = g_r.shadow_tile * 3;
-    desc.Height = g_r.shadow_tile;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R16G16_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_CLEAR_VALUE clear{};
-    clear.Format = desc.Format;
-    clear.Color[0] = 1.0f;  // depth: far
-    clear.Color[1] = 1.0f;  // "uncoverage": empty
-    ID3D12Resource** targets[3] = {&g_r.shadow_raw, &g_r.shadow_mid, &g_r.shadow_final};
-    uint32_t* srv_slots[3] = {&g_r.shadow_srv_raw, &g_r.shadow_srv_mid,
-                              &g_r.shadow_srv_final};
+    nrhi::TextureDesc desc;
+    desc.width = g_r.shadow_tile * 3;
+    desc.height = g_r.shadow_tile;
+    desc.format = nrhi::Format::kR16G16_UNORM;
+    desc.usage = nrhi::kTextureUsageRenderTarget;
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
+    desc.clear_color[0] = 1.0f;  // depth: far
+    desc.clear_color[1] = 1.0f;  // "uncoverage": empty
+    nrhi::Texture** targets[3] = {&g_r.shadow_raw, &g_r.shadow_mid,
+                                  &g_r.shadow_final};
+    nrhi::TextureView** views[3] = {&g_r.shadow_srv_raw, &g_r.shadow_srv_mid,
+                                    &g_r.shadow_srv_final};
     for (int t = 0; t < 3; ++t) {
-      if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
-                                                 IID_PPV_ARGS(targets[t])))) {
+      *targets[t] = device->CreateTexture(desc);
+      if (*targets[t] == nullptr) {
         REXLOG_ERROR("native-scene: shadow atlas creation failed");
         g_r.failed = true;
         return false;
       }
-      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      rtv.ptr += size_t(2 + t) * g_r.rtv_size;
-      device->CreateRenderTargetView(*targets[t], nullptr, rtv);
-      *srv_slots[t] = g_r.srv_next++;
-      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format = desc.Format;
-      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      srv.Texture2D.MipLevels = 1;
-      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-      slot.ptr += size_t(*srv_slots[t]) * g_r.srv_size;
-      device->CreateShaderResourceView(*targets[t], &srv, slot);
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      *views[t] = device->CreateTextureView(*targets[t], vd);
+      if (*views[t] == nullptr) {
+        REXLOG_ERROR("native-scene: shadow atlas creation failed");
+        g_r.failed = true;
+        return false;
+      }
     }
     g_r.shadow_in_srv_state = false;
     REXLOG_INFO("native-scene: shadow atlas created ({}x{} tiles)", g_r.shadow_tile,
@@ -13067,9 +13032,10 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     // Always created (even with shadows off): the scene PS declares b1 and
     // a root CBV must be bound; a zeroed block disables the shadow branch.
     g_r.shadow_cb = CreateUploadBuffer(device, 256u * RendererState::kShadowCbRegions);
-    if (!g_r.shadow_cb ||
-        FAILED(g_r.shadow_cb->Map(0, nullptr,
-                                  reinterpret_cast<void**>(&g_r.shadow_cb_cpu)))) {
+    g_r.shadow_cb_cpu =
+        g_r.shadow_cb ? static_cast<uint8_t*>(device->Map(g_r.shadow_cb))
+                      : nullptr;
+    if (g_r.shadow_cb_cpu == nullptr) {
       g_r.failed = true;
       return false;
     }
@@ -13080,51 +13046,42 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
 // Blur intermediates + the output-sized selection-outline mask. Failures
 // only disable their feature, never abort the native path.
 bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   if (g_r.blur_tex[0] == nullptr && g_r.pso_blur != nullptr) {
     // Popup background blur intermediates at the game's fixed 1152x640
     // internal resolution (the bilinear stretch back to the output is what
-    // produces the authentic frosted-glass lattice). RTV heap slots 5/6.
-    D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = RendererState::kBlurWidth;
-    desc.Height = RendererState::kBlurHeight;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = context.d3d12.guest_output_format;
-    desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    // produces the authentic frosted-glass lattice).
+    nrhi::TextureDesc desc;
+    desc.width = RendererState::kBlurWidth;
+    desc.height = RendererState::kBlurHeight;
+    desc.format = context.guest_output->format();
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
     bool ok = true;
     for (int t = 0; t < 2 && ok; ++t) {
-      if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-                                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                 nullptr, IID_PPV_ARGS(&g_r.blur_tex[t])))) {
+      // blur_tex[0] is also the photo-grab readback source (copied into the
+      // grab readback buffers), so it alone needs copy-source usage.
+      desc.usage = nrhi::kTextureUsageRenderTarget |
+                   (t == 0 ? nrhi::kTextureUsageCopySource
+                           : nrhi::kTextureUsageNone);
+      g_r.blur_tex[t] = device->CreateTexture(desc);
+      if (g_r.blur_tex[t] == nullptr) {
         ok = false;
         break;
       }
-      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      rtv.ptr += size_t(5 + t) * g_r.rtv_size;
-      device->CreateRenderTargetView(g_r.blur_tex[t], nullptr, rtv);
-      g_r.blur_srv[t] = g_r.srv_next++;
-      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format = desc.Format;
-      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      srv.Texture2D.MipLevels = 1;
-      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-      slot.ptr += size_t(g_r.blur_srv[t]) * g_r.srv_size;
-      device->CreateShaderResourceView(g_r.blur_tex[t], &srv, slot);
-    }
-    if (ok && !g_r.output_srv_allocated) {
-      g_r.output_srv_slot = g_r.srv_next++;
-      g_r.output_srv_allocated = true;
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.blur_srv[t] = device->CreateTextureView(g_r.blur_tex[t], vd);
+      if (g_r.blur_srv[t] == nullptr) {
+        ok = false;
+        break;
+      }
     }
     if (!ok) {
       REXLOG_ERROR("native-scene: blur intermediate creation failed; blur disabled");
       for (int t = 0; t < 2; ++t) {
-        if (g_r.blur_tex[t]) g_r.blur_tex[t]->Release();
+        if (g_r.blur_srv[t]) device->DestroyDeferred(g_r.blur_srv[t]);
+        g_r.blur_srv[t] = nullptr;
+        if (g_r.blur_tex[t]) device->DestroyDeferred(g_r.blur_tex[t]);
         g_r.blur_tex[t] = nullptr;
       }
       g_r.pso_blur = nullptr;  // leaked PSO acceptable on this cold path
@@ -13138,48 +13095,33 @@ bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context) {
     // Selection-outline mask: single-sample R8 target at output resolution
     // (a 1152x640 mask left the contour centerline visibly stairstepped;
     // the mask's own rasterization aliasing survives any amount of
-    // downstream filtering). RTV slot 7.
+    // downstream filtering).
     if (g_r.outline_mask) {
-      g_r.retired.emplace_back(g_r.outline_mask,
-                               context.d3d12.command_processor->GetCurrentSubmission());
+      device->DestroyDeferred(g_r.outline_mask);
       g_r.outline_mask = nullptr;
     }
-    D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = context.guest_output_width;
-    desc.Height = context.guest_output_height;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_CLEAR_VALUE clear{};
-    clear.Format = desc.Format;
-    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-                                               D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
-                                               IID_PPV_ARGS(&g_r.outline_mask)))) {
+    nrhi::TextureDesc desc;
+    desc.width = context.guest_output_width;
+    desc.height = context.guest_output_height;
+    desc.format = nrhi::Format::kR8_UNORM;
+    desc.usage = nrhi::kTextureUsageRenderTarget;
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
+    g_r.outline_mask = device->CreateTexture(desc);
+    if (g_r.outline_mask == nullptr) {
       REXLOG_ERROR("native-scene: outline mask creation failed; outline disabled");
       g_r.pso_outline_edge = nullptr;
     } else {
       g_r.outline_mask_width = context.guest_output_width;
       g_r.outline_mask_height = context.guest_output_height;
-      D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      rtv.ptr += size_t(7) * g_r.rtv_size;
-      device->CreateRenderTargetView(g_r.outline_mask, nullptr, rtv);
-      if (!g_r.outline_mask_srv_allocated) {
-        g_r.outline_mask_srv = g_r.srv_next++;
-        g_r.outline_mask_srv_allocated = true;
+      // Re-point the mask view at the recreated texture.
+      if (g_r.outline_mask_srv) {
+        device->DestroyDeferred(g_r.outline_mask_srv);
+        g_r.outline_mask_srv = nullptr;
       }
-      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format = desc.Format;
-      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      srv.Texture2D.MipLevels = 1;
-      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-      slot.ptr += size_t(g_r.outline_mask_srv) * g_r.srv_size;
-      device->CreateShaderResourceView(g_r.outline_mask, &srv, slot);
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.outline_mask_srv = device->CreateTextureView(g_r.outline_mask, vd);
+      g_r.outline_mask_srv_allocated = g_r.outline_mask_srv != nullptr;
     }
   }
   return true;
@@ -13187,22 +13129,16 @@ bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context) {
 
 // 1x1 white diffuse fallback + 1x1x6 mid-gray environment-cube fallback.
 bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   if (!g_r.white.valid) {
     // 1x1 white fallback for items without a resolved diffuse texture.
-    D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = 1;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                               IID_PPV_ARGS(&g_r.white.texture)))) {
+    nrhi::TextureDesc desc;
+    desc.width = 1;
+    desc.height = 1;
+    desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+    desc.initial_state = nrhi::ResourceState::kCopyDest;
+    g_r.white.texture = device->CreateTexture(desc);
+    if (g_r.white.texture == nullptr) {
       g_r.failed = true;
       return false;
     }
@@ -13211,54 +13147,33 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
-    uint8_t* mapping = nullptr;
-    g_r.white.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+    uint8_t* mapping = static_cast<uint8_t*>(device->Map(g_r.white.upload));
     std::memset(mapping, 0xFF, 4);
-    g_r.white.upload->Unmap(0, nullptr);
-    auto& list = context.d3d12.command_processor->GetDeferredCommandList();
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = g_r.white.texture;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = g_r.white.upload;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = 1;
-    src.PlacedFootprint.Footprint.Height = 1;
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = 256;
-    list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          g_r.white.texture,
-                                          D3D12_RESOURCE_STATE_COPY_DEST,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    g_r.white.srv_slot = g_r.srv_next++;
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-    slot.ptr += size_t(g_r.white.srv_slot) * g_r.srv_size;
-    device->CreateShaderResourceView(g_r.white.texture, &srv, slot);
+    device->Unmap(g_r.white.upload);
+    context.cmd->CopyBufferToTexture(g_r.white.texture, 0, 0, g_r.white.upload,
+                                     0, 256, 1, 1, 1);
+    context.cmd->Barrier(g_r.white.texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.white.srv = device->CreateTextureView(g_r.white.texture, vd);
+    if (g_r.white.srv == nullptr) {
+      g_r.failed = true;
+      return false;
+    }
     g_r.white.valid = true;
   }
   if (!g_r.white_cube.valid) {
     // 1x1x6 mid-gray fallback cube for the water reflection slot (t6): a
     // TextureCube SRV must always be bound where the shader declares one.
-    D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = 1;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 6;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                               IID_PPV_ARGS(&g_r.white_cube.texture)))) {
+    nrhi::TextureDesc desc;
+    desc.kind = nrhi::TextureKind::kCube;
+    desc.width = 1;
+    desc.height = 1;
+    desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+    desc.initial_state = nrhi::ResourceState::kCopyDest;
+    g_r.white_cube.texture = device->CreateTexture(desc);
+    if (g_r.white_cube.texture == nullptr) {
       g_r.failed = true;
       return false;
     }
@@ -13267,42 +13182,26 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
-    uint8_t* mapping = nullptr;
-    g_r.white_cube.upload->Map(0, nullptr, reinterpret_cast<void**>(&mapping));
+    uint8_t* mapping = static_cast<uint8_t*>(device->Map(g_r.white_cube.upload));
     for (uint32_t f = 0; f < 6; ++f) {
       std::memset(mapping + f * 512, 0x80, 4);
     }
-    g_r.white_cube.upload->Unmap(0, nullptr);
-    auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+    device->Unmap(g_r.white_cube.upload);
     for (uint32_t f = 0; f < 6; ++f) {
-      D3D12_TEXTURE_COPY_LOCATION dst{};
-      dst.pResource = g_r.white_cube.texture;
-      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      dst.SubresourceIndex = f;
-      D3D12_TEXTURE_COPY_LOCATION src{};
-      src.pResource = g_r.white_cube.upload;
-      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-      src.PlacedFootprint.Offset = f * 512;
-      src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      src.PlacedFootprint.Footprint.Width = 1;
-      src.PlacedFootprint.Footprint.Height = 1;
-      src.PlacedFootprint.Footprint.Depth = 1;
-      src.PlacedFootprint.Footprint.RowPitch = 256;
-      list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      context.cmd->CopyBufferToTexture(g_r.white_cube.texture, 0, f,
+                                       g_r.white_cube.upload, f * 512, 256, 1,
+                                       1, 1);
     }
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          g_r.white_cube.texture,
-                                          D3D12_RESOURCE_STATE_COPY_DEST,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    g_r.white_cube.srv_slot = g_r.srv_next++;
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.TextureCube.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-    slot.ptr += size_t(g_r.white_cube.srv_slot) * g_r.srv_size;
-    device->CreateShaderResourceView(g_r.white_cube.texture, &srv, slot);
+    context.cmd->Barrier(g_r.white_cube.texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
+    nrhi::TextureViewDesc vd;
+    vd.dimension = nrhi::ViewDimension::kCube;
+    vd.mip_levels = 1;
+    g_r.white_cube.srv = device->CreateTextureView(g_r.white_cube.texture, vd);
+    if (g_r.white_cube.srv == nullptr) {
+      g_r.failed = true;
+      return false;
+    }
     g_r.white_cube.valid = true;
   }
   return true;
@@ -13310,90 +13209,67 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
 
 // Depth buffer + MSAA color target, rebuilt on output-size change.
 bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
   if (!g_r.depth || g_r.depth_width != width || g_r.depth_height != height) {
     if (g_r.depth) {
-      g_r.depth->Release();
+      g_r.device->DestroyDeferred(g_r.depth);
       g_r.depth = nullptr;
     }
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
-    desc.Height = height;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    // R32_TYPELESS, not D32_FLOAT: the photo-editor postfx depth pack
-    // samples this buffer through an R32_FLOAT SRV, and casting an SRV
-    // over a fully-typed depth resource is undefined in D3D12; on the
-    // playtest driver those reads returned the 1.0 clear value for the
-    // whole frame, which saturated the ported DoF CoC everywhere (the
-    // uniform smear + silhouette halos + scaffold ghosting of the first
-    // native photo-editor session; sim-verified as the cleared-depth
-    // variant V2).
-    desc.Format = DXGI_FORMAT_R32_TYPELESS;
-    desc.SampleDesc.Count = g_r.msaa;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    D3D12_CLEAR_VALUE clear{};
-    clear.Format = DXGI_FORMAT_D32_FLOAT;
-    clear.DepthStencil.Depth = 1.0f;
-    if (FAILED(g_r.device->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
-            IID_PPV_ARGS(&g_r.depth)))) {
+    // kD32_FLOAT here is the backend's R32_TYPELESS + D32 DSV + R32_FLOAT
+    // SRV arrangement, not a fully-typed depth format: the photo-editor
+    // postfx depth pack samples this buffer through an R32_FLOAT SRV, and
+    // casting an SRV over a fully-typed depth resource is undefined in
+    // D3D12; in practice those reads returned the 1.0 clear
+    // value for the whole frame, which saturated the ported DoF CoC
+    // everywhere (a uniform smear + silhouette halos + scaffold ghosting;
+    // sim-verified as the cleared-depth failure mode).
+    nrhi::TextureDesc desc;
+    desc.width = width;
+    desc.height = height;
+    desc.format = nrhi::Format::kD32_FLOAT;
+    desc.sample_count = g_r.msaa;
+    desc.usage = nrhi::kTextureUsageDepthStencil;
+    desc.initial_state = nrhi::ResourceState::kDepthWrite;
+    desc.clear_depth = 1.0f;
+    g_r.depth = g_r.device->CreateTexture(desc);
+    if (g_r.depth == nullptr) {
       g_r.failed = true;
       return false;
     }
     g_r.depth_width = width;
     g_r.depth_height = height;
-    // The typeless resource needs an explicit DSV format.
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
-    dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
-    dsv_desc.ViewDimension = g_r.msaa > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS
-                                          : D3D12_DSV_DIMENSION_TEXTURE2D;
-    device->CreateDepthStencilView(g_r.depth, &dsv_desc,
-                                   g_r.dsv_heap->GetCPUDescriptorHandleForHeapStart());
 
     if (g_r.msaa > 1) {
-      // MSAA color target (RTV heap slot 1) + its Texture2DMS SRV for the
-      // fullscreen resolve pass. Lives in RENDER_TARGET state between frames.
+      // MSAA color target + its Texture2DMS view for the fullscreen resolve
+      // pass. Lives in RENDER_TARGET state between frames.
       if (g_r.msaa_color) {
-        g_r.retired.emplace_back(g_r.msaa_color,
-                                 context.d3d12.command_processor->GetCurrentSubmission());
+        g_r.device->DestroyDeferred(g_r.msaa_color);
         g_r.msaa_color = nullptr;
       }
-      D3D12_RESOURCE_DESC cdesc = desc;
-      cdesc.Format = context.d3d12.guest_output_format;
-      cdesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-      D3D12_CLEAR_VALUE cclear{};
-      cclear.Format = cdesc.Format;
-      cclear.Color[0] = 0.25f;
-      cclear.Color[1] = 0.35f;
-      cclear.Color[2] = 0.55f;
-      cclear.Color[3] = 1.0f;
-      if (FAILED(g_r.device->CreateCommittedResource(
-              &heap, D3D12_HEAP_FLAG_NONE, &cdesc, D3D12_RESOURCE_STATE_RENDER_TARGET,
-              &cclear, IID_PPV_ARGS(&g_r.msaa_color)))) {
+      nrhi::TextureDesc cdesc = desc;
+      cdesc.format = context.guest_output->format();
+      cdesc.usage = nrhi::kTextureUsageRenderTarget;
+      cdesc.initial_state = nrhi::ResourceState::kRenderTarget;
+      cdesc.clear_color[0] = 0.25f;
+      cdesc.clear_color[1] = 0.35f;
+      cdesc.clear_color[2] = 0.55f;
+      cdesc.clear_color[3] = 1.0f;
+      g_r.msaa_color = g_r.device->CreateTexture(cdesc);
+      if (g_r.msaa_color == nullptr) {
         g_r.failed = true;
         return false;
       }
-      D3D12_CPU_DESCRIPTOR_HANDLE msaa_rtv =
-          g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      msaa_rtv.ptr += g_r.rtv_size;
-      device->CreateRenderTargetView(g_r.msaa_color, nullptr, msaa_rtv);
-      if (!g_r.msaa_srv_allocated) {
-        g_r.msaa_srv_slot = g_r.srv_next++;
-        g_r.msaa_srv_allocated = true;
+      // Re-point the resolve pass's view at the recreated texture.
+      if (g_r.msaa_srv_slot) {
+        g_r.device->DestroyDeferred(g_r.msaa_srv_slot);
+        g_r.msaa_srv_slot = nullptr;
       }
-      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format = cdesc.Format;
-      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
-      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-      slot.ptr += size_t(g_r.msaa_srv_slot) * g_r.srv_size;
-      device->CreateShaderResourceView(g_r.msaa_color, &srv, slot);
+      nrhi::TextureViewDesc vd;
+      vd.dimension = nrhi::ViewDimension::k2DMS;
+      g_r.msaa_srv_slot = device->CreateTextureView(g_r.msaa_color, vd);
+      g_r.msaa_srv_allocated = g_r.msaa_srv_slot != nullptr;
     }
   }
   return true;
@@ -13401,14 +13277,14 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
 
 bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   if (g_r.failed) return false;
-  ID3D12Device* device = context.d3d12.device;
+  nrhi::Device* device = context.device;
   g_r.device = device;
 
   if (!EnsureRootSignature(context)) {
     return false;
   }
 
-  if (!g_r.pso || g_r.rtv_format != context.d3d12.guest_output_format) {
+  if (!g_r.pso || g_r.rtv_format != context.guest_output->format()) {
     if (!EnsureScenePsoFamily(context) || !EnsureResolvePso(context) ||
         !EnsureBlurPsos(context) || !EnsureOutlineEdgePso(context) ||
         !Ensure2dPso(context) || !EnsureSplinePsos(context) ||
@@ -13416,7 +13292,7 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       return false;
     }
     REXLOG_INFO("native-scene: pipelines created (MSAA x{})", g_r.msaa);
-    g_r.rtv_format = context.d3d12.guest_output_format;
+    g_r.rtv_format = context.guest_output->format();
   }
 
   if (!EnsureHeapsAndRings(context) || !EnsureShadowResources(context)) {
@@ -13427,10 +13303,20 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     return false;
   }
 
-  if (g_r.rtv_resource != context.d3d12.guest_output_resource) {
-    device->CreateRenderTargetView(context.d3d12.guest_output_resource, nullptr,
-                                   g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart());
-    g_r.rtv_resource = context.d3d12.guest_output_resource;
+  if (g_r.rtv_resource != context.guest_output) {
+    // The presenter recreated the output image (resize). Render-target
+    // binding is by texture now (the old heap-slot-0 RTV is gone); re-point
+    // the cached identity and the sampled view of the output (blur source /
+    // photo passes).
+    if (g_r.output_srv_slot) {
+      device->DestroyDeferred(g_r.output_srv_slot);
+      g_r.output_srv_slot = nullptr;
+    }
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.output_srv_slot = device->CreateTextureView(context.guest_output, vd);
+    g_r.output_srv_allocated = g_r.output_srv_slot != nullptr;
+    g_r.rtv_resource = context.guest_output;
   }
   return true;
 }
@@ -13456,7 +13342,6 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
                        uint64_t frame_number, const DrawItem& item,
                        std::chrono::steady_clock::time_point deadline,
                        WarmCounters& wc) {
-  auto* command_processor = context.d3d12.command_processor;
   const auto within = [&] { return std::chrono::steady_clock::now() < deadline; };
 
   bool need_mesh = false;
@@ -13467,9 +13352,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
              REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
     // Streaming filled/replaced the payload after an earlier (pre)decode.
     if (within()) {
-      const uint64_t submission = command_processor->GetCurrentSubmission();
-      g_r.retired.emplace_back(mit->second.vb, submission);
-      g_r.retired.emplace_back(mit->second.ib, submission);
+      g_r.device->DestroyDeferred(mit->second.vb);
+      g_r.device->DestroyDeferred(mit->second.ib);
       g_r.meshes.erase(mit);
       need_mesh = true;
     } else {
@@ -13514,7 +13398,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       if (!it->second.incomplete && (fp == 0 || fp == it->second.payload_fp)) {
         return;
       }
-      RetireGuestTexture(it->second, command_processor->GetCurrentSubmission());
+      RetireGuestTexture(it->second, context.device->CurrentSubmission());
       g_r.tex_store.erase(it);
     }
     if (!within()) {
@@ -13587,8 +13471,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       ++wc.decodes;
       GuestTexture c{};
       if (!EnsureGuestCubeTexture(context, base, item.water_env, c)) {
-        if (c.upload) c.upload->Release();
-        if (c.texture) c.texture->Release();
+        if (c.upload) g_r.device->DestroyDeferred(c.upload);
+        if (c.texture) g_r.device->DestroyDeferred(c.texture);
         c = GuestTexture{};
         c.valid = false;
       }
@@ -13660,8 +13544,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     tr.words_key = e.wkey;
     tr.ui = e.ui;
     NativeGuestOutputRenderContext stage_ctx{};
-    stage_ctx.backend = NativeGuestOutputBackend::kD3D12;
-    stage_ctx.d3d12.device = g_r.device;
+    stage_ctx.device = g_r.device;
     g_tex_stage_out = &tr.commit;
     tr.valid = EnsureGuestTextureFromWords(stage_ctx, base, e.words, tr.gt);
     g_tex_stage_out = nullptr;
@@ -13682,8 +13565,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     tr.key = e.tex;
     tr.cube = true;
     NativeGuestOutputRenderContext stage_ctx{};
-    stage_ctx.backend = NativeGuestOutputBackend::kD3D12;
-    stage_ctx.d3d12.device = g_r.device;
+    stage_ctx.device = g_r.device;
     g_tex_stage_out = &tr.commit;
     tr.valid = EnsureGuestCubeTexture(stage_ctx, base, e.tex, tr.gt);
     g_tex_stage_out = nullptr;
@@ -13769,11 +13651,10 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     }
     StagedTexResult tr;
     tr.words_key = wkey;
-    // Staged mode uses only context.d3d12.device (copies/barrier/SRV are
+    // Staged mode uses only context.device (copies/barrier/SRV are
     // exported for the commit), so a device-only context suffices.
     NativeGuestOutputRenderContext stage_ctx{};
-    stage_ctx.backend = NativeGuestOutputBackend::kD3D12;
-    stage_ctx.d3d12.device = g_r.device;
+    stage_ctx.device = g_r.device;
     g_tex_stage_out = &tr.commit;
     tr.valid = EnsureGuestTextureFromWords(stage_ctx, base, words, tr.gt);
     g_tex_stage_out = nullptr;
@@ -13881,7 +13762,7 @@ void PrewarmWorkerLoop() {
 
 // Lazily start the decode workers (process-lifetime, parked on the queue's
 // condition variable when idle). Only started once the pipeline exists;
-// the workers create D3D12 resources through g_r.device.
+// the workers create GPU resources through g_r.device (thread-safe).
 void EnsurePrewarmWorkers() {
   if (g_r.device == nullptr ||
       g_prewarm_workers_started.exchange(true, std::memory_order_acq_rel)) {
@@ -13961,7 +13842,6 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
   bool committed_tex = false;
   // For the payload-stability verify below (SEH-guarded sampled reads).
   uint8_t* verify_base = g_guest_base.load(std::memory_order_relaxed);
-  auto* command_processor = context.d3d12.command_processor;
   for (PrewarmResult& r : done) {
     if (r.mesh_valid) {
       auto mit = g_r.meshes.find(r.item.mesh);
@@ -14007,15 +13887,14 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         // landed (multi-worker reordering must not step the cloth
         // backwards): the staged buffers were never referenced by any
         // submission.
-        r.buffers.vb->Release();
-        r.buffers.ib->Release();
+        g_r.device->DestroyDeferred(r.buffers.vb);
+        g_r.device->DestroyDeferred(r.buffers.ib);
       } else {
         if (mit != g_r.meshes.end()) {
           // Stale decode (miss-driven revalidation heal): swap it out. The
           // old buffers may be referenced by the in-flight submission.
-          const uint64_t submission = command_processor->GetCurrentSubmission();
-          g_r.retired.emplace_back(mit->second.vb, submission);
-          g_r.retired.emplace_back(mit->second.ib, submission);
+          g_r.device->DestroyDeferred(mit->second.vb);
+          g_r.device->DestroyDeferred(mit->second.ib);
           g_r.meshes.erase(mit);
         }
         g_r.meshes.emplace(r.item.mesh, r.buffers);
@@ -14038,11 +13917,11 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           t.gt.payload_addr != 0 &&
           SampleProbeFingerprint(verify_base, t.gt) != t.gt.payload_fp) {
         if (t.gt.texture) {
-          t.gt.texture->Release();
+          g_r.device->DestroyDeferred(t.gt.texture);
           t.gt.texture = nullptr;
         }
         if (t.gt.upload) {
-          t.gt.upload->Release();
+          g_r.device->DestroyDeferred(t.gt.upload);
           t.gt.upload = nullptr;
         }
         t.valid = false;
@@ -14055,12 +13934,12 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         // negative-caches like the old inline path did.
         auto cit = g_r.cube_textures.find(t.key);
         if (cit != g_r.cube_textures.end() && cit->second.valid) {
-          if (t.gt.texture) t.gt.texture->Release();
-          if (t.gt.upload) t.gt.upload->Release();
+          if (t.gt.texture) g_r.device->DestroyDeferred(t.gt.texture);
+          if (t.gt.upload) g_r.device->DestroyDeferred(t.gt.upload);
           continue;
         }
         if (cit != g_r.cube_textures.end()) {
-          RetireGuestTexture(cit->second, command_processor->GetCurrentSubmission());
+          RetireGuestTexture(cit->second, context.device->CurrentSubmission());
           g_r.cube_textures.erase(cit);
         }
         if (t.valid) {
@@ -14113,8 +13992,8 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
               // confirmation toward "genuinely uniform content".
               ++wit->second.nb_redecodes;
             }
-            if (t.gt.texture) t.gt.texture->Release();
-            if (t.gt.upload) t.gt.upload->Release();
+            if (t.gt.texture) g_r.device->DestroyDeferred(t.gt.texture);
+            if (t.gt.upload) g_r.device->DestroyDeferred(t.gt.upload);
             continue;
           }
           if (t.valid && wit->second.valid) {
@@ -14143,7 +14022,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
             t.gt.fail_count = wit->second.fail_count;  // keep the backoff arc
           }
           t.gt.last_used_frame = wit->second.last_used_frame;
-          RetireGuestTexture(wit->second, command_processor->GetCurrentSubmission());
+          RetireGuestTexture(wit->second, context.device->CurrentSubmission());
           g_r.tex_store.erase(wit);
         }
         if (t.valid) {
@@ -14173,8 +14052,8 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       }
       // No words key and not a cube: an empty/failed stage slot; release
       // whatever it carries (nothing routes to it).
-      if (t.gt.texture) t.gt.texture->Release();
-      if (t.gt.upload) t.gt.upload->Release();
+      if (t.gt.texture) g_r.device->DestroyDeferred(t.gt.texture);
+      if (t.gt.upload) g_r.device->DestroyDeferred(t.gt.upload);
     }
     g_prewarm_done.fetch_add(1, std::memory_order_relaxed);
   }
@@ -14196,7 +14075,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
     }
   }
   if (committed_tex) {
-    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+    context.cmd->FlushBarriers();
   }
   g_pw_commit.Add(uint64_t(
       std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - commit_t0)
@@ -15123,36 +15002,15 @@ bool YieldForCasEditor(uint8_t* base) {
   return cas_active;
 }
 
-// Frees retired buffers / recycles retired SRV slots whose last
-// referencing submission completed, and services the debug-dialog
-// texture/mesh cache flushes.
+// Services the debug-dialog texture/mesh cache flushes. (The old
+// retired-buffer drain / SRV-slot recycling is gone: deferred destruction
+// is backend-internal now: Device::DestroyDeferred.)
 void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context) {
-  auto* command_processor = context.d3d12.command_processor;
-  // Free retired buffers (and recycle retired SRV slots) whose
-  // last-referencing submission has completed.
-  if (!g_r.retired.empty() || !g_r.retired_srv_slots.empty()) {
-    const uint64_t completed = command_processor->GetCompletedSubmission();
-    std::erase_if(g_r.retired, [completed](const auto& entry) {
-      if (entry.second < completed) {
-        entry.first->Release();
-        return true;
-      }
-      return false;
-    });
-    std::erase_if(g_r.retired_srv_slots, [completed](const auto& entry) {
-      if (entry.second < completed) {
-        g_r.srv_free.push_back(entry.first);
-        return true;
-      }
-      return false;
-    });
-  }
-
   // Debug-dialog cache flushes: retire every cached decode (freed once the
   // GPU is done with the current submission) so hot-toggled decode settings
   // rebuild the world with the new rules this frame.
   if (g_flush_textures.exchange(false, std::memory_order_relaxed)) {
-    const uint64_t submission = command_processor->GetCurrentSubmission();
+    const uint64_t submission = context.device->CurrentSubmission();
     for (auto& [key, t] : g_r.tex_store) {
       RetireGuestTexture(t, submission);
     }
@@ -15164,10 +15022,9 @@ void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context)
     REXLOG_INFO("native-scene: texture cache flushed (debug dialog)");
   }
   if (g_flush_meshes.exchange(false, std::memory_order_relaxed)) {
-    const uint64_t submission = command_processor->GetCurrentSubmission();
     for (auto& [key, m] : g_r.meshes) {
-      if (m.vb) g_r.retired.emplace_back(m.vb, submission);
-      if (m.ib) g_r.retired.emplace_back(m.ib, submission);
+      if (m.vb) g_r.device->DestroyDeferred(m.vb);
+      if (m.ib) g_r.device->DestroyDeferred(m.ib);
     }
     g_r.meshes.clear();
     ClearItemCache();  // decode-affecting toggles should re-walk items too
@@ -15184,7 +15041,7 @@ void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context)
 bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
                        const FrameScene& scene, uint32_t bone_region,
                        int32_t debug_mode, uint32_t* out_draws) {
-  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+  nrhi::Cmd* cmd = context.cmd;
   const float* sh = scene.shadow_rows;
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
@@ -15256,26 +15113,21 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
     }
     if (!casters.empty()) {
       if (g_r.shadow_in_srv_state) {
-        for (ID3D12Resource* res : {g_r.shadow_raw, g_r.shadow_mid, g_r.shadow_final}) {
-          context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                                res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+        for (nrhi::Texture* res : {g_r.shadow_raw, g_r.shadow_mid, g_r.shadow_final}) {
+          cmd->Barrier(res, nrhi::ResourceState::kPixelShaderResource,
+                       nrhi::ResourceState::kRenderTarget);
         }
-        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+        cmd->FlushBarriers();
         g_r.shadow_in_srv_state = false;
       }
       const uint32_t tile = g_r.shadow_tile;
-      D3D12_CPU_DESCRIPTOR_HANDLE raw_rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      raw_rtv.ptr += size_t(2) * g_r.rtv_size;
-      const FLOAT shadow_clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-      list.D3DClearRenderTargetView(raw_rtv, shadow_clear, 0, nullptr);
-      list.D3DOMSetRenderTargets(1, &raw_rtv, FALSE, nullptr);
-      list.D3DSetGraphicsRootSignature(g_r.root_signature);
-      list.D3DSetPipelineState(g_r.pso_shadow_caster);
-      list.SetDescriptorHeaps(g_r.srv_heap, nullptr);
+      const float shadow_clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+      cmd->ClearRenderTarget(g_r.shadow_raw, shadow_clear);
+      cmd->SetRenderTargets(g_r.shadow_raw, nullptr);
+      cmd->SetBindingLayout(g_r.layout);
+      cmd->SetPipeline(g_r.pso_shadow_caster);
       // Unused by the caster shaders, but never leave root CBVs unset.
-      list.D3DSetGraphicsRootConstantBufferView(
-          9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region);
+      cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
       for (int ci = 0; ci < 3; ++ci) {
         // Cascade scale/offset (cascade 0 = identity; PS c1/c2 for 1/2).
         float sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
@@ -15298,10 +15150,10 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
         lightvp[13] = sh[15] * sy + oy;
         lightvp[14] = sh[19];
         lightvp[15] = 1.0f;
-        D3D12_VIEWPORT vp{float(tile) * ci, 0.0f, float(tile), float(tile), 0.0f, 1.0f};
-        list.RSSetViewport(vp);
-        D3D12_RECT rc{LONG(tile) * ci, 0, LONG(tile) * (ci + 1), LONG(tile)};
-        list.RSSetScissorRect(rc);
+        cmd->SetViewport(nrhi::Viewport{float(tile) * ci, 0.0f, float(tile),
+                                        float(tile), 0.0f, 1.0f});
+        cmd->SetScissor(nrhi::Rect{int32_t(tile) * ci, 0,
+                                   int32_t(tile) * (ci + 1), int32_t(tile)});
         for (const Caster& c : casters) {
           auto mit = g_r.meshes.find(c.item->mesh);
           if (mit == g_r.meshes.end()) {
@@ -15322,22 +15174,26 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
             }
           }
           constants[33] = c.bones ? 1.0f : 0.0f;  // tint.g = skinned branch
-          list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
-          list.D3DSetGraphicsRootShaderResourceView(
-              3, g_r.bone_ring->GetGPUVirtualAddress() + bone_region +
-                     (c.bones ? c.bone_offset : 0));
-          list.D3DIASetVertexBuffers(0, 1, &mit->second.vb_view);
-          list.D3DIASetIndexBuffer(&mit->second.ib_view);
+          cmd->SetRootConstants(0, 52, constants, 0);
+          cmd->SetBufferSrv(3, g_r.bone_ring,
+                            bone_region + (c.bones ? c.bone_offset : 0));
+          cmd->SetVertexBuffer(mit->second.vb_view.buffer,
+                               mit->second.vb_view.offset,
+                               mit->second.vb_view.size_bytes,
+                               mit->second.vb_view.stride);
+          cmd->SetIndexBuffer(mit->second.ib_view.buffer,
+                              mit->second.ib_view.offset,
+                              mit->second.ib_view.size_bytes);
           for (const DrawEntry& draw : c.item->draws) {
             if (draw.prim == 4) {
-              list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+              cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
             } else if (draw.prim == 6) {
-              list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+              cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
             } else {
               continue;
             }
-            list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index,
-                                         draw.base_vertex, 0);
+            cmd->DrawIndexed(draw.index_count, draw.start_index,
+                             draw.base_vertex);
             ++shadow_draws;
           }
         }
@@ -15347,25 +15203,23 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       // format-convert only for cascade 2 (weights (1,0,0), 0 taps), plus
       // depth dilation into the penumbra. One fullscreen-triangle draw per
       // tile per direction, taps clamped inside the tile.
-      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                            g_r.shadow_raw, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-      list.D3DSetPipelineState(g_r.pso_shadow_blur);
-      list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      cmd->Barrier(g_r.shadow_raw, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
+      cmd->FlushBarriers();
+      cmd->SetPipeline(g_r.pso_shadow_blur);
+      cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
       const float kernels[3][3] = {{0.292082f, 0.233881f, 0.120078f},
                                    {0.667243f, 0.166379f, 0.0f},
                                    {1.0f, 0.0f, 0.0f}};
       const float ntaps[3] = {2.0f, 1.0f, 0.0f};
-      const auto blur_pass = [&](int ci, bool horizontal, uint32_t src_slot,
-                                 uint32_t dst_rtv_slot, bool src_raw) {
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += size_t(dst_rtv_slot) * g_r.rtv_size;
-        list.D3DOMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        D3D12_VIEWPORT vp{float(tile) * ci, 0.0f, float(tile), float(tile), 0.0f, 1.0f};
-        list.RSSetViewport(vp);
-        D3D12_RECT rc{LONG(tile) * ci, 0, LONG(tile) * (ci + 1), LONG(tile)};
-        list.RSSetScissorRect(rc);
+      const auto blur_pass = [&](int ci, bool horizontal,
+                                 nrhi::TextureView* src, nrhi::Texture* dst,
+                                 bool src_raw) {
+        cmd->SetRenderTargets(dst, nullptr);
+        cmd->SetViewport(nrhi::Viewport{float(tile) * ci, 0.0f, float(tile),
+                                        float(tile), 0.0f, 1.0f});
+        cmd->SetScissor(nrhi::Rect{int32_t(tile) * ci, 0,
+                                   int32_t(tile) * (ci + 1), int32_t(tile)});
         // Blur tap offsets in GAME-map texels (the game's atlas tile is 512;
         // its blur shader steps whole logical texels). At higher native tile
         // resolutions the step scales up so the blur's WORLD reach, the
@@ -15380,27 +15234,22 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
                               kernels[ci][0], kernels[ci][1], kernels[ci][2], 0.0f,
                               float(tile) * ci, float(tile) * (ci + 1) - 1.0f,
                               float(tile) - 1.0f, 0.0f};
-        list.D3DSetGraphicsRoot32BitConstants(0, 12, bc, 0);
-        D3D12_GPU_DESCRIPTOR_HANDLE src = g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-        src.ptr += size_t(src_slot) * g_r.srv_size;
-        context.d3d12.set_graphics_root_descriptor_table(
-            context.d3d12.command_processor_user_data, 1, src);
-        list.D3DDrawInstanced(3, 1, 0, 0);
+        cmd->SetRootConstants(0, 12, bc, 0);
+        cmd->SetTexture(1, src);
+        cmd->Draw(3, 0);
       };
       for (int ci = 0; ci < 3; ++ci) {
-        blur_pass(ci, true, g_r.shadow_srv_raw, 3, true);
+        blur_pass(ci, true, g_r.shadow_srv_raw, g_r.shadow_mid, true);
       }
-      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                            g_r.shadow_mid, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      cmd->Barrier(g_r.shadow_mid, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
+      cmd->FlushBarriers();
       for (int ci = 0; ci < 3; ++ci) {
-        blur_pass(ci, false, g_r.shadow_srv_mid, 4, false);
+        blur_pass(ci, false, g_r.shadow_srv_mid, g_r.shadow_final, false);
       }
-      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                            g_r.shadow_final, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      cmd->Barrier(g_r.shadow_final, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
+      cmd->FlushBarriers();
       g_r.shadow_in_srv_state = true;
       shadow_ready = shadow_draws > 0;
     }
@@ -15414,11 +15263,11 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
   // still bound. The edge composite runs after the resolve, on the
   // single-sample output.
 bool RenderOutlineMask(const NativeGuestOutputRenderContext& context,
-                       const FrameScene& scene, const D3D12_VIEWPORT& viewport,
-                       const D3D12_RECT& scissor, bool msaa_on,
-                       D3D12_CPU_DESCRIPTOR_HANDLE scene_rtv,
-                       D3D12_CPU_DESCRIPTOR_HANDLE dsv, bool use_depth) {
-  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
+                       const FrameScene& scene, const nrhi::Viewport& viewport,
+                       const nrhi::Rect& scissor, bool msaa_on,
+                       nrhi::Texture* scene_color, nrhi::Texture* scene_depth,
+                       bool use_depth) {
+  nrhi::Cmd* cmd = context.cmd;
   bool outline_ready = false;
   if (REXCVAR_GET(skate3_native_render_scene_selection_outline) &&
       g_r.pso_outline_mask != nullptr && g_r.pso_outline_edge != nullptr &&
@@ -15432,19 +15281,16 @@ bool RenderOutlineMask(const NativeGuestOutputRenderContext& context,
       }
     }
     if (!sel.empty()) {
-      D3D12_CPU_DESCRIPTOR_HANDLE mask_rtv =
-          g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      mask_rtv.ptr += size_t(7) * g_r.rtv_size;
-      const FLOAT mask_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-      list.D3DClearRenderTargetView(mask_rtv, mask_clear, 0, nullptr);
-      list.D3DOMSetRenderTargets(1, &mask_rtv, FALSE, nullptr);
-      D3D12_VIEWPORT mask_vp{0.0f, 0.0f, float(g_r.outline_mask_width),
-                             float(g_r.outline_mask_height), 0.0f, 1.0f};
-      list.RSSetViewport(mask_vp);
-      D3D12_RECT mask_sc{0, 0, LONG(g_r.outline_mask_width),
-                         LONG(g_r.outline_mask_height)};
-      list.RSSetScissorRect(mask_sc);
-      list.D3DSetPipelineState(g_r.pso_outline_mask);
+      const float mask_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      cmd->ClearRenderTarget(g_r.outline_mask, mask_clear);
+      cmd->SetRenderTargets(g_r.outline_mask, nullptr);
+      cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f,
+                                      float(g_r.outline_mask_width),
+                                      float(g_r.outline_mask_height), 0.0f,
+                                      1.0f});
+      cmd->SetScissor(nrhi::Rect{0, 0, int32_t(g_r.outline_mask_width),
+                                 int32_t(g_r.outline_mask_height)});
+      cmd->SetPipeline(g_r.pso_outline_mask);
       for (const DrawItem* item : sel) {
         auto mit = g_r.meshes.find(item->mesh);
         if (mit == g_r.meshes.end() || mit->second.fingerprint != item->fingerprint) {
@@ -15467,34 +15313,37 @@ bool RenderOutlineMask(const NativeGuestOutputRenderContext& context,
         // skinning branch off.
         constants[32] = 1.0f;
         constants[35] = 1.0f;
-        list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
-        list.D3DIASetVertexBuffers(0, 1, &mit->second.vb_view);
-        list.D3DIASetIndexBuffer(&mit->second.ib_view);
+        cmd->SetRootConstants(0, 52, constants, 0);
+        cmd->SetVertexBuffer(mit->second.vb_view.buffer,
+                             mit->second.vb_view.offset,
+                             mit->second.vb_view.size_bytes,
+                             mit->second.vb_view.stride);
+        cmd->SetIndexBuffer(mit->second.ib_view.buffer,
+                            mit->second.ib_view.offset,
+                            mit->second.ib_view.size_bytes);
         for (const DrawEntry& draw : item->draws) {
           if (draw.prim == 4) {
-            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
           } else if (draw.prim == 6) {
-            list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
           } else {
             continue;
           }
-          list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index,
-                                       draw.base_vertex, 0);
+          cmd->DrawIndexed(draw.index_count, draw.start_index,
+                           draw.base_vertex);
           outline_ready = true;
         }
       }
       // Restore the pass state the resolve/2D paths rely on (fullscreen
       // viewport; the non-MSAA path keeps rendering into the scene target).
-      list.RSSetViewport(viewport);
-      list.RSSetScissorRect(scissor);
+      cmd->SetViewport(viewport);
+      cmd->SetScissor(scissor);
       if (!msaa_on) {
-        list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, use_depth ? &dsv : nullptr);
+        cmd->SetRenderTargets(scene_color, use_depth ? scene_depth : nullptr);
       }
       if (outline_ready) {
-        context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                              g_r.outline_mask,
-                                              D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmd->Barrier(g_r.outline_mask, nrhi::ResourceState::kRenderTarget,
+                     nrhi::ResourceState::kPixelShaderResource);
       }
     }
   }
@@ -15504,29 +15353,22 @@ bool RenderOutlineMask(const NativeGuestOutputRenderContext& context,
 // Selection-outline composite: additive stencil-edge-detect over the
 // resolved output (before the popup blur, like the game's postfx order).
 void RenderOutlineComposite(const NativeGuestOutputRenderContext& context,
-                            const FrameScene& scene,
-                            D3D12_CPU_DESCRIPTOR_HANDLE output_rtv,
-                            const D3D12_VIEWPORT& viewport,
-                            const D3D12_RECT& scissor) {
-  auto& list = context.d3d12.command_processor->GetDeferredCommandList();
-  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-  list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-  list.RSSetViewport(viewport);
-  list.RSSetScissorRect(scissor);
-  list.D3DSetPipelineState(g_r.pso_outline_edge);
-  list.D3DSetGraphicsRoot32BitConstants(0, 4, scene.outline_color, 0);
-  D3D12_GPU_DESCRIPTOR_HANDLE mask_srv =
-      g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-  mask_srv.ptr += size_t(g_r.outline_mask_srv) * g_r.srv_size;
-  context.d3d12.set_graphics_root_descriptor_table(
-      context.d3d12.command_processor_user_data, 1, mask_srv);
-  list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  list.D3DDrawInstanced(3, 1, 0, 0);
+                            const FrameScene& scene, nrhi::Texture* output,
+                            const nrhi::Viewport& viewport,
+                            const nrhi::Rect& scissor) {
+  nrhi::Cmd* cmd = context.cmd;
+  cmd->FlushBarriers();
+  cmd->SetRenderTargets(output, nullptr);
+  cmd->SetViewport(viewport);
+  cmd->SetScissor(scissor);
+  cmd->SetPipeline(g_r.pso_outline_edge);
+  cmd->SetRootConstants(0, 4, scene.outline_color, 0);
+  cmd->SetTexture(1, g_r.outline_mask_srv);
+  cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+  cmd->Draw(3, 0);
   // Back to the mask's steady state for the next frame.
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        g_r.outline_mask,
-                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
+  cmd->Barrier(g_r.outline_mask, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
 }
 
 // 600-frame perf + telemetry log lines (verbatim from the former tail of
@@ -15545,6 +15387,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
         "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms v3={:.2f}/{:.2f}ms | render={:.2f}/{:.2f}ms "
         "items={:.2f}/{:.2f}ms shadow={:.2f}/{:.2f}ms "
+        "pre={:.2f}/{:.2f}ms tail={:.2f}/{:.2f}ms twod={:.2f}/{:.2f}ms "
         "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
         "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}]",
         guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
@@ -15552,7 +15395,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_pw_build.MaxMs(), g_pw_v3.AvgMs(), g_pw_v3.MaxMs(),
         g_pw_render.AvgMs(), g_pw_render.MaxMs(),
         g_pw_items.AvgMs(), g_pw_items.MaxMs(), g_pw_shadow.AvgMs(),
-        g_pw_shadow.MaxMs(), g_pw_mesh_decode.count.load(std::memory_order_relaxed),
+        g_pw_shadow.MaxMs(), g_pw_pre.AvgMs(), g_pw_pre.MaxMs(),
+        g_pw_tail.AvgMs(), g_pw_tail.MaxMs(), g_pw_2d.AvgMs(), g_pw_2d.MaxMs(),
+        g_pw_mesh_decode.count.load(std::memory_order_relaxed),
         g_pw_mesh_decode.AvgMs(), g_pw_mesh_decode.MaxMs(),
         g_pw_tex_decode.count.load(std::memory_order_relaxed), g_pw_tex_decode.AvgMs(),
         g_pw_tex_decode.MaxMs(), g_pw_commit.AvgMs(), g_pw_commit.MaxMs(),
@@ -15562,8 +15407,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
         g_cam_max_streak.exchange(0, std::memory_order_relaxed));
     for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_v3,
-                          &g_pw_render, &g_pw_items, &g_pw_shadow,
-                          &g_pw_mesh_decode, &g_pw_tex_decode, &g_pw_commit}) {
+                          &g_pw_render, &g_pw_items, &g_pw_shadow, &g_pw_pre,
+                          &g_pw_tail, &g_pw_2d, &g_pw_mesh_decode,
+                          &g_pw_tex_decode, &g_pw_commit}) {
       w->Reset();
     }
   }
@@ -15583,7 +15429,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} reused={} "
         "bones_rescued={}] dynobj[valid={} drawn={}] "
         "lw[ctxs={} ents={} stamp={} fade0={} resc={} fill={} pal={} rows={}] "
-        "refl[pair={} flat={} gate={:#x}]",
+        "refl[pair={} flat={} gate={:#x}] flips={} alt[rows={} bones={} cov={} "
+        "shadow={}] rows_inst={} pal_rep={} cref_ropa={} pair_fix={} pal_srv={}",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(),
@@ -15613,12 +15460,19 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_dynobj_drawn.load(), lw_ctxs, lw_ents, g_lw_stamped.load(),
         g_lw_fade0.load(), g_lw_ctx_rescued.load(), g_lw_gap_filled.load(),
         g_lw_pal_sub.load(), g_lw_rows_served.load(),
-        g_refl_pair.load(), g_refl_flat.load(), g_refl_gate.load());
+        g_refl_pair.load(), g_refl_flat.load(), g_refl_gate.load(),
+        g_hair_route_flips.load(), g_hair_rows_alternations.load(),
+        g_hair_bone_alternations.load(), g_hair_cov_alternations.load(),
+        g_shadow_alternations.load(), g_char_rows_inst_served.load(),
+        g_palette_alt_repaired.load(), g_ropa_caster_refreshed.load(),
+        g_pending_pair_fixed.load(), g_pal_served_total.load());
   }
 }
 
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
-  if (!SceneEnabled() || context.backend != NativeGuestOutputBackend::kD3D12) {
+  if (!SceneEnabled() ||
+      (context.backend != NativeGuestOutputBackend::kD3D12 &&
+       context.backend != NativeGuestOutputBackend::kVulkan)) {
     return false;
   }
   // While the game reports menus / loading (presence context 0x8001 == 0),
@@ -15710,7 +15564,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     return false;
   }
   // Flush any barriers pushed by lazy resource creation (white texture).
-  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  context.cmd->FlushBarriers();
 
   // FMV routing: prefer the native path; video quads in the 2D replay are
   // SUBSTITUTED with the ps_yuv2d combine, matched by their own captured
@@ -15757,8 +15611,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     return false;
   }
 
-  auto* command_processor = context.d3d12.command_processor;
-  auto& list = command_processor->GetDeferredCommandList();
+  nrhi::Cmd* cmd = context.cmd;
 
   ReleaseRetiredAndFlushCaches(context);
 
@@ -15851,7 +15704,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             std::max<uint64_t>(g_settle_until_frame, frame_number + 8);
       }
       if (wc.decodes > 0) {
-        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+        cmd->FlushBarriers();
       }
     }
   }
@@ -15874,7 +15727,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   PrewarmCommit(context, frame_number, /*loading=*/loading_native);
   // Content-store LRU: superseded words states (old mip levels, pre-demote
   // detail sets, one-shot UI art) age out once nothing routes to them.
-  EvictTexStore(frame_number, command_processor->GetCurrentSubmission());
+  EvictTexStore(frame_number, context.device->CurrentSubmission());
 
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
@@ -15884,60 +15737,75 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   shadow_ready =
       RenderShadowAtlas(context, scene, bone_region, debug_mode, &shadow_draws);
   g_pw_shadow.Add(perf_ns_since(shadow_t0));
+  // Scene-level flicker probe: the shadow cascade rows (or validity/readiness)
+  // returning EXACTLY to the previous-but-one frame's state; hair samples the
+  // atlas, so an alternating cascade capture darkens/lightens it per frame.
+  {
+    uint64_t sh_h = 1469598103934665603ull;
+    const uint8_t* sb = reinterpret_cast<const uint8_t*>(scene.shadow_rows);
+    for (size_t bi = 0; bi < sizeof(scene.shadow_rows); ++bi) {
+      sh_h = (sh_h ^ sb[bi]) * 1099511628211ull;
+    }
+    sh_h ^= (scene.shadow_valid ? 2u : 0u) | (shadow_ready ? 4u : 0u);
+    static uint64_t s_sh_h1 = 0, s_sh_h2 = 0;  // render thread
+    if (s_sh_h2 != 0 && sh_h != s_sh_h1 && sh_h == s_sh_h2) {
+      g_shadow_alternations.fetch_add(1, std::memory_order_relaxed);
+      static std::atomic<uint32_t> s_sh_logged{0};
+      const uint32_t sl = s_sh_logged.fetch_add(1, std::memory_order_relaxed);
+      if (sl < 24 || (sl & 1023u) == 0) {
+        REXLOG_INFO(
+            "native-scene: SHADOW ALTERNATION valid={} ready={} draws={} "
+            "row0=({:.3f},{:.3f},{:.3f},{:.3f}) (n={})",
+            scene.shadow_valid ? 1 : 0, shadow_ready ? 1 : 0, shadow_draws,
+            sh[0], sh[1], sh[2], sh[3], sl);
+      }
+    }
+    s_sh_h2 = s_sh_h1;
+    s_sh_h1 = sh_h;
+  }
 
   // The scene draws into the MSAA target when enabled (resolved into the
   // guest output at the end of the pass), or straight into the guest output.
   const bool msaa_on = g_r.msaa > 1 && g_r.msaa_color != nullptr && g_r.resolve_pso != nullptr;
-  const D3D12_CPU_DESCRIPTOR_HANDLE output_rtv =
-      g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-  D3D12_CPU_DESCRIPTOR_HANDLE scene_rtv = output_rtv;
-  if (msaa_on) {
-    scene_rtv.ptr += g_r.rtv_size;
-  } else {
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          context.d3d12.guest_output_resource,
-                                          context.d3d12.guest_output_initial_state,
-                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
-    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  nrhi::Texture* scene_color = msaa_on ? g_r.msaa_color : context.guest_output;
+  if (!msaa_on) {
+    cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->FlushBarriers();
   }
 
   const bool use_depth = debug_mode != 4;
-  const D3D12_CPU_DESCRIPTOR_HANDLE dsv = g_r.dsv_heap->GetCPUDescriptorHandleForHeapStart();
   // Loading frames clear to black (the game's loading UI composes over
   // black); real scenes keep the sky-ish debug clear that shows through
   // undecoded holes.
-  const FLOAT clear_color[4] = {loading_native ? 0.0f : 0.25f,
+  const float clear_color[4] = {loading_native ? 0.0f : 0.25f,
                                 loading_native ? 0.0f : 0.35f,
                                 loading_native ? 0.0f : 0.55f, 1.0f};
-  list.D3DClearRenderTargetView(scene_rtv, clear_color, 0, nullptr);
+  cmd->ClearRenderTarget(scene_color, clear_color);
   if (use_depth) {
-    list.D3DClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, &dsv);
+    cmd->ClearDepth(g_r.depth, 1.0f);
+    cmd->SetRenderTargets(scene_color, g_r.depth);
   } else {
-    list.D3DOMSetRenderTargets(1, &scene_rtv, FALSE, nullptr);
+    cmd->SetRenderTargets(scene_color, nullptr);
   }
 
-  D3D12_VIEWPORT viewport{0.0f,
-                          0.0f,
-                          float(context.guest_output_width),
-                          float(context.guest_output_height),
-                          0.0f,
-                          1.0f};
-  list.RSSetViewport(viewport);
-  D3D12_RECT scissor{0, 0, LONG(context.guest_output_width),
-                     LONG(context.guest_output_height)};
-  list.RSSetScissorRect(scissor);
-  list.D3DSetGraphicsRootSignature(g_r.root_signature);
-  list.D3DSetPipelineState(use_depth ? g_r.pso : g_r.pso_nodepth);
+  const nrhi::Viewport viewport{0.0f,
+                                0.0f,
+                                float(context.guest_output_width),
+                                float(context.guest_output_height),
+                                0.0f,
+                                1.0f};
+  cmd->SetViewport(viewport);
+  const nrhi::Rect scissor{0, 0, int32_t(context.guest_output_width),
+                           int32_t(context.guest_output_height)};
+  cmd->SetScissor(scissor);
+  cmd->SetBindingLayout(g_r.layout);
+  cmd->SetPipeline(use_depth ? g_r.pso : g_r.pso_nodepth);
   // Per-item PSO tracking for the opaque pass: two_sided_sheet meshes swap
   // to the backface-culling variant (see MeshBuffers), everything else uses
   // the pass PSO. Only meaningful while use_depth; the transparent sub-pass
   // sets its own PSO and is not switched per item.
-  ID3D12PipelineState* scene_pso_bound = use_depth ? g_r.pso : g_r.pso_nodepth;
-  // Our own persistent shader-visible SRV heap for the whole pass. These are
-  // the last commands of the submission, so displacing the emulated GPU's
-  // heap binding is safe.
-  list.SetDescriptorHeaps(g_r.srv_heap, nullptr);
+  nrhi::Pipeline* scene_pso_bound = use_depth ? g_r.pso : g_r.pso_nodepth;
 
   // Per-frame dynamic-shadow bindings: receiver constants at b1 (a small
   // per-frame CBV ring: the 52-float root-constant block is full) and the
@@ -16006,17 +15874,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[52] = scene.dynobj_rows[8];  // material multiplier (c14.y)
       cb[53] = scene.dynobj_rows[9];  // static world-shadow floor (c8.w)
     }
-    list.D3DSetGraphicsRootConstantBufferView(
-        6, g_r.shadow_cb->GetGPUVirtualAddress() + cb_offset);
+    cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
     // b2 (character lighting) default: point at the ring base so the root
     // CBV is never left unset; character draws re-point it per item.
-    list.D3DSetGraphicsRootConstantBufferView(
-        9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region);
-    D3D12_GPU_DESCRIPTOR_HANDLE atlas = g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-    atlas.ptr += size_t(shadow_ready ? g_r.shadow_srv_final : g_r.white.srv_slot) *
-                 g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 7, atlas);
+    cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+    cmd->SetTexture(7, shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
   }
 
   uint32_t drawn = 0;
@@ -16195,9 +16057,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
         REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
       if (item.cloth_quads || ropa_inline) {
-        const uint64_t submission = command_processor->GetCurrentSubmission();
-        g_r.retired.emplace_back(it->second.vb, submission);
-        g_r.retired.emplace_back(it->second.ib, submission);
+        g_r.device->DestroyDeferred(it->second.vb);
+        g_r.device->DestroyDeferred(it->second.ib);
         g_r.meshes.erase(it);
         it = g_r.meshes.end();
       } else if (!dynamic_payload) {
@@ -16278,12 +16139,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           item.env_family != 0 && item.env_family != 7 &&
           item.env_family != 9 && item.env_family != 10 &&
           item.env_family != 13;
-      ID3D12PipelineState* want =
+      nrhi::Pipeline* want =
           ((buffers.two_sided_sheet || cull_family) && det3 >= 0.0f)
               ? g_r.pso_cullback
               : g_r.pso;
       if (want != scene_pso_bound) {
-        list.D3DSetPipelineState(want);
+        cmd->SetPipeline(want);
         scene_pso_bound = want;
       }
     }
@@ -16682,8 +16543,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (offset + bytes <= RendererState::kBoneRegionSize) {
         std::memcpy(g_r.bone_ring_cpu + bone_region + offset, item.bones.data(), bytes);
         g_r.bone_ring_offset = offset + bytes;
-        list.D3DSetGraphicsRootShaderResourceView(
-            3, g_r.bone_ring->GetGPUVirtualAddress() + bone_region + offset);
+        cmd->SetBufferSrv(3, g_r.bone_ring, bone_region + offset);
         bones_bound = true;
       }
     }
@@ -16693,7 +16553,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // effectively invisible. Must never happen silently.
         g_rr_no_bones.fetch_add(1, std::memory_order_relaxed);
       }
-      list.D3DSetGraphicsRootShaderResourceView(3, g_r.bone_ring->GetGPUVirtualAddress());
+      cmd->SetBufferSrv(3, g_r.bone_ring, 0);
     }
 
     if (debug_mode >= 2) {
@@ -16728,8 +16588,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         std::memcpy(g_r.bone_ring_cpu + bone_region + offset, item.char_rows,
                     sizeof(item.char_rows));
         g_r.bone_ring_offset = offset + 256u;
-        list.D3DSetGraphicsRootConstantBufferView(
-            9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region + offset);
+        cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region + offset);
         constants[39] = item.char_rows[14 * 4 + 1];
         g_char_drawn.fetch_add(1, std::memory_order_relaxed);
       }
@@ -16815,6 +16674,41 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // character.alpha lenses use the same plumbing (ch_misc.z signals the
       // fam-1/2 branch to take alpha from this texture).
       decal_tex = resolve_texture(item.hair_alpha_tex, 5);
+      // Coverage-serve alternation probe (see g_hair_cov_alternations): the
+      // served texture flipping real<->white-fallback frame to frame is a
+      // hair-flicker mechanism (white = every strand opaque).
+      {
+        struct CovProbe {
+          uint64_t fp1 = 0;
+          uint64_t fp2 = 0;
+        };
+        static std::unordered_map<uint64_t, CovProbe> s_cov;  // render thread
+        const uint64_t ck = (uint64_t(item.mesh) << 32) | item.ctx;
+        const uint64_t fp = decal_tex == &g_r.white
+                                ? 1u
+                                : (decal_tex != nullptr && decal_tex->valid
+                                       ? decal_tex->payload_fp
+                                       : 2u);
+        auto [cit2, cfresh] = s_cov.try_emplace(ck);
+        CovProbe& cp = cit2->second;
+        if (!cfresh && fp != cp.fp1 && fp == cp.fp2) {
+          g_hair_cov_alternations.fetch_add(1, std::memory_order_relaxed);
+          static std::atomic<uint32_t> s_cov_logged{0};
+          const uint32_t cl = s_cov_logged.fetch_add(1, std::memory_order_relaxed);
+          if (cl < 24 || (cl & 1023u) == 0) {
+            REXLOG_INFO(
+                "native-scene: hair COVERAGE ALTERNATION mesh={:08X} "
+                "ctx={:08X} fam={} tex={:08X} fp={:016X} prev={:016X} (n={})",
+                item.mesh, item.ctx, item.char_family, item.hair_alpha_tex, fp,
+                cp.fp1, cl);
+          }
+        }
+        cp.fp2 = cp.fp1;
+        cp.fp1 = fp;
+        if (s_cov.size() > 4096) {
+          s_cov.clear();
+        }
+      }
     }
     // F7 ring: stamp the SERVED content fingerprints (see SceneRingItem);
     // pointer identity cannot see an in-place content swap.
@@ -16890,15 +16784,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     const bool is_decal =
         item.char_family < 4 && item.decal && decal_tex != &g_r.white;
-    // Fam 5/6 masks+normal descriptor pair (t4/t5): the reflective PS
-    // perturbs its reflection/spec with the material's normal map (shader
-    // overlay.w == 4 branch: the fix for the giant flat-normal cube smear
-    // on glass facades). Both views are re-created into the pair's two
-    // consecutive heap slots once per frame, so prewarm/revalidation
-    // texture swaps can never leave a stale descriptor. Until the normal
-    // map decodes, overlay.w stays 3 (flat-normal reflection, the old
-    // behavior).
-    uint32_t pair_base = 0;
+    // Fam 5/6 masks+normal pair (t4/t5): the reflective PS perturbs its
+    // reflection/spec with the material's normal map (shader overlay.w == 4
+    // branch, the fix for the giant flat-normal cube smear on glass
+    // facades). Both views bind together at the draw via SetTexturePair;
+    // pair descriptors are backend-cached, so prewarm/revalidation texture
+    // swaps can never leave a stale descriptor. Until the normal map
+    // decodes, overlay.w stays 3 (flat-normal reflection, the old behavior).
+    const GuestTexture* pair_normal = nullptr;
     bool normal_paired = false;
     if (item.env_family >= 5 && item.env_family <= 6) {
       uint32_t gate = 0;
@@ -16914,36 +16807,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           if (nrm->srv_mips == 0) gate |= 32;
         }
         if (gate == 0) {
-          const uint64_t pkey =
-              (uint64_t(item.spec_tex) << 32) | item.water_normal;
-          auto pit = g_r.mat_pairs.find(pkey);
-          if (pit == g_r.mat_pairs.end() && g_r.srv_next + 2 <= 8192) {
-            pit = g_r.mat_pairs.emplace(pkey, std::make_pair(g_r.srv_next, ~0ull))
-                      .first;
-            g_r.srv_next += 2;
-          }
-          if (pit == g_r.mat_pairs.end()) {
-            gate |= 64;
-          } else {
-            if (pit->second.second != frame_number) {
-              pit->second.second = frame_number;
-              const auto make_view = [&](const GuestTexture* t, uint32_t slot_idx) {
-                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-                srv.Format = t->srv_format;
-                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                srv.Shader4ComponentMapping = t->srv_mapping;
-                srv.Texture2D.MipLevels = t->srv_mips;
-                D3D12_CPU_DESCRIPTOR_HANDLE h =
-                    g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-                h.ptr += size_t(slot_idx) * g_r.srv_size;
-                g_r.device->CreateShaderResourceView(t->texture, &srv, h);
-              };
-              make_view(decal_tex, pit->second.first);
-              make_view(nrm, pit->second.first + 1);
-            }
-            pair_base = pit->second.first;
-            normal_paired = true;
-          }
+          pair_normal = nrm;
+          normal_paired = true;
         }
       }
       if (normal_paired) {
@@ -17087,32 +16952,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[47] = 0.0f;
       constants[49] = scene.sky_sun[5];  // misc.y = scene exposure
     }
-    list.D3DSetGraphicsRoot32BitConstants(0, 52, constants, 0);
+    cmd->SetRootConstants(0, 52, constants, 0);
 
-    const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
-        g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = heap_start;
-    srv_gpu.ptr += size_t(diffuse->srv_slot) * g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 1, srv_gpu);
-    D3D12_GPU_DESCRIPTOR_HANDLE lm_gpu = heap_start;
-    lm_gpu.ptr +=
-        size_t((lightmap != nullptr ? lightmap : &g_r.white)->srv_slot) * g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 2, lm_gpu);
-    D3D12_GPU_DESCRIPTOR_HANDLE macro_gpu = heap_start;
-    macro_gpu.ptr += size_t(macro_tex->srv_slot) * g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 4, macro_gpu);
-    D3D12_GPU_DESCRIPTOR_HANDLE decal_gpu = heap_start;
-    decal_gpu.ptr +=
-        size_t(normal_paired ? pair_base : decal_tex->srv_slot) * g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 5, decal_gpu);
-    D3D12_GPU_DESCRIPTOR_HANDLE cube_gpu = heap_start;
-    cube_gpu.ptr += size_t(cube_tex->srv_slot) * g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 8, cube_gpu);
+    cmd->SetTexture(1, diffuse->srv);
+    cmd->SetTexture(2, (lightmap != nullptr ? lightmap : &g_r.white)->srv);
+    cmd->SetTexture(4, macro_tex->srv);
+    if (normal_paired) {
+      cmd->SetTexturePair(5, decal_tex->srv, pair_normal->srv);
+    } else {
+      cmd->SetTexture(5, decal_tex->srv);
+    }
+    cmd->SetTexture(8, cube_tex->srv);
     // ROPA shape blend (see RendererState::ropa_shapes): combine the shape
     // generations with the kernel weights InterpolateDynamicItems computed
     // (the SAME 8-tap boxcar / pair-lerp the body bones and garment world
@@ -17124,7 +16974,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // 7..13) copy from the newest generation present. Generations missing
     // from the ring (evicted / decode in flight) renormalize over what IS
     // present when at least half the kernel's weight survives.
-    D3D12_VERTEX_BUFFER_VIEW item_vbv = buffers.vb_view;
+    VbBinding item_vbv = buffers.vb_view;
     if (item.ropa && item.shape_count > 0 &&
         REXCVAR_GET(skate3_native_render_scene_ropa_blend)) {
       const std::vector<float>* gv[DrawItem::kShapeGens] = {};
@@ -17141,7 +16991,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // out here; if too much kernel weight is stale, the raw resident VB
       // draws instead (always self-consistent).
       const size_t want_floats =
-          size_t(buffers.vb_view.SizeInBytes) / sizeof(float);
+          size_t(buffers.vb_view.size_bytes) / sizeof(float);
       const auto rit = g_r.ropa_shapes.find(item.mesh);
       if (rit != g_r.ropa_shapes.end()) {
         for (int k = 0; k < item.shape_count; ++k) {
@@ -17169,7 +17019,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           RendererState::kRopaRegionSize;
       const uint32_t bytes = uint32_t(want_floats * sizeof(float));
       if (ng > 0 && total >= 0.5f && newest != nullptr &&
-          buffers.vb_view.StrideInBytes == 56 &&
+          buffers.vb_view.stride == 56 &&
           g_r.ropa_ring_offset + bytes <= RendererState::kRopaRegionSize) {
         float* dst = reinterpret_cast<float*>(g_r.ropa_ring_cpu + region +
                                               g_r.ropa_ring_offset);
@@ -17187,28 +17037,29 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           std::memcpy(dst + v, blend7, sizeof(blend7));
           std::memcpy(dst + v + 7, newest->data() + v + 7, 7 * sizeof(float));
         }
-        item_vbv.BufferLocation = g_r.ropa_ring->GetGPUVirtualAddress() +
-                                  region + g_r.ropa_ring_offset;
-        item_vbv.SizeInBytes = bytes;
-        item_vbv.StrideInBytes = buffers.vb_view.StrideInBytes;
+        item_vbv.buffer = g_r.ropa_ring;
+        item_vbv.offset = region + g_r.ropa_ring_offset;
+        item_vbv.size_bytes = bytes;
+        item_vbv.stride = buffers.vb_view.stride;
         g_r.ropa_ring_offset += (bytes + 255u) & ~255u;
         g_ropa_blend_drawn.fetch_add(1, std::memory_order_relaxed);
       } else {
         g_ropa_blend_miss.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    list.D3DIASetVertexBuffers(0, 1, &item_vbv);
-    list.D3DIASetIndexBuffer(&buffers.ib_view);
+    cmd->SetVertexBuffer(item_vbv.buffer, item_vbv.offset, item_vbv.size_bytes,
+                         item_vbv.stride);
+    cmd->SetIndexBuffer(buffers.ib_view.buffer, buffers.ib_view.offset,
+                        buffers.ib_view.size_bytes);
     for (const DrawEntry& draw : item.draws) {
       if (draw.prim == 4) {
-        list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
       } else if (draw.prim == 6) {
-        list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
       } else {
         continue;
       }
-      list.D3DDrawIndexedInstanced(draw.index_count, 1, draw.start_index, draw.base_vertex,
-                                   0);
+      cmd->DrawIndexed(draw.index_count, draw.start_index, draw.base_vertex);
       ++drawn;
       if (ring_frame != nullptr) {
         const auto rit = ring_map.find(&item);
@@ -17310,6 +17161,88 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // without validated rows ch_misc.z is 0 and the item stays opaque.
     const bool cac_alpha_blend = item.char_alpha && char_capture_ok &&
                                  item.char_rows[14 * 4 + 2] > 0.0f;
+    // Flicker probes: a hair/character-alpha piece whose pass route OR
+    // served rows ALTERNATE between consecutive frames (A,B,A,B) is the
+    // visible hair flicker. Route flips and rows alternations are counted
+    // separately; rows legitimately drift with lighting, so only the
+    // exact return to the previous-but-one value counts as alternation.
+    if (item.char_family >= 4 || item.char_alpha) {
+      struct RouteProbe {
+        uint8_t route = 0;
+        uint64_t rows_h1 = 0;  // last frame's rows hash
+        uint64_t rows_h2 = 0;  // the frame before
+        uint64_t bones_h1 = 0;
+        uint64_t bones_h2 = 0;
+      };
+      static std::unordered_map<uint64_t, RouteProbe> s_probe;  // render thread
+      const uint64_t rk = (uint64_t(item.mesh) << 32) | item.ctx;
+      const uint8_t route = uint8_t((hair_blend || cac_alpha_blend) ? 2 : 1);
+      uint64_t rows_h = 1469598103934665603ull;
+      const uint8_t* rb = reinterpret_cast<const uint8_t*>(item.char_rows);
+      for (size_t bi = 0; bi < sizeof(item.char_rows); ++bi) {
+        rows_h = (rows_h ^ rb[bi]) * 1099511628211ull;
+      }
+      uint64_t bones_h = 1469598103934665603ull;
+      if (!item.bones.empty()) {
+        const uint8_t* bb = reinterpret_cast<const uint8_t*>(item.bones.data());
+        const size_t bn = item.bones.size() * sizeof(float);
+        for (size_t bi = 0; bi < bn; ++bi) {
+          bones_h = (bones_h ^ bb[bi]) * 1099511628211ull;
+        }
+      }
+      auto [rit2, fresh2] = s_probe.try_emplace(rk);
+      RouteProbe& pr = rit2->second;
+      if (!fresh2 && pr.route != route) {
+        g_hair_route_flips.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_flip_logged{0};
+        const uint32_t fl = s_flip_logged.fetch_add(1, std::memory_order_relaxed);
+        if (fl < 24 || (fl & 511u) == 0) {
+          REXLOG_INFO(
+              "native-scene: hair ROUTE FLIP mesh={:08X} ctx={:08X} fam={} "
+              "alpha={} -> route {} rows14=({:.3f},{:.3f},{:.3f}) (n={})",
+              item.mesh, item.ctx, item.char_family, item.char_alpha ? 1 : 0,
+              route, item.char_rows[14 * 4 + 0], item.char_rows[14 * 4 + 1],
+              item.char_rows[14 * 4 + 2], fl);
+        }
+      }
+      if (!fresh2 && rows_h != pr.rows_h1 && rows_h == pr.rows_h2) {
+        g_hair_rows_alternations.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_alt_logged{0};
+        const uint32_t al = s_alt_logged.fetch_add(1, std::memory_order_relaxed);
+        if (al < 24 || (al & 1023u) == 0) {
+          REXLOG_INFO(
+              "native-scene: hair ROWS ALTERNATION mesh={:08X} ctx={:08X} "
+              "fam={} light=({:.3f},{:.3f},{:.3f}) key=({:.3f},{:.3f},{:.3f}) "
+              "expo={:.3f} rows14=({:.3f},{:.3f},{:.3f}) (n={})",
+              item.mesh, item.ctx, item.char_family, item.char_rows[0],
+              item.char_rows[1], item.char_rows[2], item.char_rows[4],
+              item.char_rows[5], item.char_rows[6], item.char_rows[7],
+              item.char_rows[14 * 4 + 0], item.char_rows[14 * 4 + 1],
+              item.char_rows[14 * 4 + 2], al);
+        }
+      }
+      if (!fresh2 && !item.bones.empty() && bones_h != pr.bones_h1 &&
+          bones_h == pr.bones_h2) {
+        g_hair_bone_alternations.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_bone_alt_logged{0};
+        const uint32_t bl = s_bone_alt_logged.fetch_add(1, std::memory_order_relaxed);
+        if (bl < 24 || (bl & 1023u) == 0) {
+          REXLOG_INFO(
+              "native-scene: hair BONES ALTERNATION mesh={:08X} ctx={:08X} "
+              "fam={} bones={} src={} caster_bank={} (n={})",
+              item.mesh, item.ctx, item.char_family, item.bones.size() / 12,
+              item.dbg_src, item.caster_bank ? 1 : 0, bl);
+        }
+      }
+      pr.route = route;
+      pr.rows_h2 = pr.rows_h1;
+      pr.rows_h1 = rows_h;
+      pr.bones_h2 = pr.bones_h1;
+      pr.bones_h1 = bones_h;
+      if (s_probe.size() > 4096) {
+        s_probe.clear();
+      }
+    }
     // Per-entity spawn/distance fade (CharFadeAlpha): the game submits
     // LivingWorld entity draws at alpha 0 through the whole spawn settle
     // (NPCs drop ~1 m to the ground before fading in) and ramps alpha with
@@ -17412,13 +17345,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                        }
                        return view_dist2(*a) > view_dist2(*b);
                      });
-    list.D3DSetPipelineState(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
-    ID3D12PipelineState* blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
+    cmd->SetPipeline(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
+    nrhi::Pipeline* blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
     for (const DrawItem* item : transparent_items) {
       // Mid-fade entity pieces: alpha blend with z-write ON (see pso_fade).
       if (use_depth && g_r.pso_fade != nullptr && char_fade_zwrite(*item)) {
         if (blend_bound != g_r.pso_fade) {
-          list.D3DSetPipelineState(g_r.pso_fade);
+          cmd->SetPipeline(g_r.pso_fade);
           blend_bound = g_r.pso_fade;
         }
         draw_item(*item);
@@ -17430,11 +17363,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // The game's two hair passes: cull BACK then cull FRONT with the
         // same shader: keeps far-side strands from compositing over
         // near-side ones (one uncull(ed) pass reads as crunchy noise).
-        list.D3DSetPipelineState(g_r.pso_hair_a);
+        cmd->SetPipeline(g_r.pso_hair_a);
         draw_item(*item);
-        list.D3DSetPipelineState(g_r.pso_hair_b);
+        cmd->SetPipeline(g_r.pso_hair_b);
         draw_item(*item);
-        list.D3DSetPipelineState(blend_bound);
+        cmd->SetPipeline(blend_bound);
         continue;
       }
       // reflective_trans glass culls like the game (its material family's
@@ -17448,11 +17381,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
                            w[1] * (w[4] * w[10] - w[6] * w[8]) +
                            w[2] * (w[4] * w[9] - w[5] * w[8]);
-        ID3D12PipelineState* want =
+        nrhi::Pipeline* want =
             det3 >= 0.0f ? g_r.pso_hair_b
                          : (use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
         if (want != blend_bound) {
-          list.D3DSetPipelineState(want);
+          cmd->SetPipeline(want);
           blend_bound = want;
         }
         draw_item(*item);
@@ -17460,12 +17393,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       if (blend_bound != (use_depth ? g_r.pso_transparent : g_r.pso_nodepth)) {
         blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
-        list.D3DSetPipelineState(blend_bound);
+        cmd->SetPipeline(blend_bound);
       }
       draw_item(*item);
     }
   }
   g_pw_items.Add(perf_ns_since(items_t0));
+  g_pw_pre.Add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   items_t0 - render_t0)
+                   .count()));
+  const auto mid_t0 = PerfClock::now();
 
   // Guest-texture resolver shared by the spline pass (pre-resolve, in the
   // scene pass) and the HUD pass (post-resolve); both allocate strip/quad
@@ -17540,8 +17477,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             it->second.last_change_frame = frame_number;
             return &it->second;
           }
-          RetireGuestTexture(it->second,
-                             command_processor->GetCurrentSubmission());
+          RetireGuestTexture(it->second, context.device->CurrentSubmission());
           g_r.tex_store.erase(it);
           it = g_r.tex_store.end();  // falls into the inline decode below
         } else {
@@ -17612,7 +17548,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
         }
       }
-      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+      cmd->FlushBarriers();
       gt.last_used_frame = frame_number;
       gt.last_change_frame = frame_number;
       it = g_r.tex_store.emplace(key, gt).first;
@@ -17644,62 +17580,47 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (spline_tex == nullptr) {
         continue;  // big-art decode in flight on the workers; skip a frame
       }
-      const uint32_t srv_slot = spline_tex->srv_slot;
-      list.D3DSetPipelineState(s.pass == 1 ? g_r.pso_spline_darken
-                                           : g_r.pso_spline_default);
+      cmd->SetPipeline(s.pass == 1 ? g_r.pso_spline_darken
+                                   : g_r.pso_spline_default);
       // Root constants: the scene's (smoothed) view_proj rows; the verts
       // are world-space, then i_intensity as staged (c149).
       float spline_consts[20];
       std::memcpy(spline_consts, scene.view_proj, sizeof(float) * 16);
       std::memcpy(spline_consts + 16, s.consts + 149 * 4, sizeof(float) * 4);
-      list.D3DSetGraphicsRoot32BitConstants(0, 20, spline_consts, 0);
-      D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu =
-          g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-      srv_gpu.ptr += size_t(srv_slot) * g_r.srv_size;
-      context.d3d12.set_graphics_root_descriptor_table(
-          context.d3d12.command_processor_user_data, 1, srv_gpu);
-      D3D12_VERTEX_BUFFER_VIEW vbv{
-          g_r.ui_ring->GetGPUVirtualAddress() + ui_region + ui_offset, bytes, 28};
-      list.D3DIASetVertexBuffers(0, 1, &vbv);
-      list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-      list.D3DDrawInstanced(s.count, 1, 0, 0);
+      cmd->SetRootConstants(0, 20, spline_consts, 0);
+      cmd->SetTexture(1, spline_tex->srv);
+      cmd->SetVertexBuffer(g_r.ui_ring, ui_region + ui_offset, bytes, 28);
+      cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
+      cmd->Draw(s.count, 0);
       ui_offset += bytes;
       ++drawn_spline;
     }
   }
 
   const bool outline_ready =
-      RenderOutlineMask(context, scene, viewport, scissor, msaa_on, scene_rtv,
-                        dsv, use_depth);
+      RenderOutlineMask(context, scene, viewport, scissor, msaa_on, scene_color,
+                        g_r.depth, use_depth);
 
   if (msaa_on) {
     // Resolve: average the MSAA samples into the guest output with a
     // fullscreen pass, then restore steady-state resource states.
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          g_r.msaa_color, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          context.d3d12.guest_output_resource,
-                                          context.d3d12.guest_output_initial_state,
-                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
-    context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-    list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-    list.D3DSetPipelineState(g_r.resolve_pso);
-    D3D12_GPU_DESCRIPTOR_HANDLE msaa_srv =
-        g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-    msaa_srv.ptr += size_t(g_r.msaa_srv_slot) * g_r.srv_size;
-    context.d3d12.set_graphics_root_descriptor_table(
-        context.d3d12.command_processor_user_data, 1, msaa_srv);
-    list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list.D3DDrawInstanced(3, 1, 0, 0);
-    context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                          g_r.msaa_color,
-                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmd->Barrier(g_r.msaa_color, nrhi::ResourceState::kRenderTarget,
+                 nrhi::ResourceState::kPixelShaderResource);
+    cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->FlushBarriers();
+    cmd->SetRenderTargets(context.guest_output, nullptr);
+    cmd->SetPipeline(g_r.resolve_pso);
+    cmd->SetTexture(1, g_r.msaa_srv_slot);
+    cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.msaa_color, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
   }
 
   if (outline_ready) {
-    RenderOutlineComposite(context, scene, output_rtv, viewport, scissor);
+    RenderOutlineComposite(context, scene, context.guest_output, viewport,
+                           scissor);
   }
 
   // ---- Photo-editor postfx chain (photo_fx.hlsl: exact ucode ports) ----
@@ -17710,62 +17631,50 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (scene.photo_fx.valid &&
       REXCVAR_GET(skate3_native_render_scene_photo_native) &&
       EnsurePhotoFxPipeline(context)) {
-    ID3D12Device* device = context.d3d12.device;
-    const auto pfx_to_srv = [&](ID3D12Resource* r) {
-      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
-                                            D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const auto pfx_to_srv = [&](nrhi::Texture* r) {
+      cmd->Barrier(r, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
     };
-    const auto pfx_to_rt = [&](ID3D12Resource* r) {
-      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto pfx_to_rt = [&](nrhi::Texture* r) {
+      cmd->Barrier(r, nrhi::ResourceState::kPixelShaderResource,
+                   nrhi::ResourceState::kRenderTarget);
     };
-    const auto pfx_flush = [&] {
-      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-    };
+    const auto pfx_flush = [&] { cmd->FlushBarriers(); };
     // Output-sized targets (visualfx out, uber out, packed depth).
     bool pfx_ok = true;
     if (g_r.pfx_width != context.guest_output_width ||
         g_r.pfx_height != context.guest_output_height || g_r.pfx_full[0] == nullptr) {
-      ID3D12Resource** res[3] = {&g_r.pfx_full[0], &g_r.pfx_full[1], &g_r.pfx_depth};
-      const uint32_t rtv_slots[3] = {8, 9, 13};
-      const uint32_t srv_slots[3] = {g_r.pfx_srv[0], g_r.pfx_srv[1], g_r.pfx_srv[5]};
-      D3D12_HEAP_PROPERTIES heap{};
-      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-      D3D12_RESOURCE_DESC desc{};
-      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-      desc.Width = context.guest_output_width;
-      desc.Height = context.guest_output_height;
-      desc.DepthOrArraySize = 1;
-      desc.MipLevels = 1;
-      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      desc.SampleDesc.Count = 1;
-      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-      D3D12_CLEAR_VALUE clear{};
-      clear.Format = desc.Format;
+      nrhi::Texture** res[3] = {&g_r.pfx_full[0], &g_r.pfx_full[1], &g_r.pfx_depth};
+      nrhi::TextureView** views[3] = {&g_r.pfx_srv[0], &g_r.pfx_srv[1],
+                                      &g_r.pfx_srv[5]};
+      nrhi::TextureDesc desc;
+      desc.width = context.guest_output_width;
+      desc.height = context.guest_output_height;
+      desc.mip_levels = 1;
+      desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+      desc.usage = nrhi::kTextureUsageRenderTarget;
+      desc.initial_state = nrhi::ResourceState::kRenderTarget;
       for (int i = 0; i < 3 && pfx_ok; ++i) {
+        if (*views[i] != nullptr) {
+          g_r.device->DestroyDeferred(*views[i]);
+          *views[i] = nullptr;
+        }
         if (*res[i] != nullptr) {
-          g_r.retired.emplace_back(*res[i], command_processor->GetCurrentSubmission());
+          g_r.device->DestroyDeferred(*res[i]);
           *res[i] = nullptr;
         }
-        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                   D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                   &clear, IID_PPV_ARGS(res[i])))) {
+        *res[i] = context.device->CreateTexture(desc);
+        if (*res[i] == nullptr) {
           pfx_ok = false;
           break;
         }
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += size_t(rtv_slots[i]) * g_r.rtv_size;
-        device->CreateRenderTargetView(*res[i], nullptr, rtv);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = desc.Format;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-        slot.ptr += size_t(srv_slots[i]) * g_r.srv_size;
-        device->CreateShaderResourceView(*res[i], &srv, slot);
+        nrhi::TextureViewDesc vd;
+        vd.mip_levels = 1;
+        *views[i] = context.device->CreateTextureView(*res[i], vd);
+        if (*views[i] == nullptr) {
+          pfx_ok = false;
+          break;
+        }
       }
       if (pfx_ok) {
         g_r.pfx_width = context.guest_output_width;
@@ -17775,62 +17684,45 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (pfx_ok) {
       // Identity grade-LUT upload (once).
       if (!g_r.pfx_lut_uploaded) {
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = g_r.pfx_lut;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = 0;
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = g_r.pfx_lut_upload;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        src.PlacedFootprint.Footprint.Width = 32;
-        src.PlacedFootprint.Footprint.Height = 32;
-        src.PlacedFootprint.Footprint.Depth = 32;
-        src.PlacedFootprint.Footprint.RowPitch = 256;
-        list.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        context.d3d12.push_transition_barrier(
-            context.d3d12.command_processor_user_data, g_r.pfx_lut,
-            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmd->CopyBufferToTexture(g_r.pfx_lut, 0, 0, g_r.pfx_lut_upload, 0, 256,
+                                 32, 32, 32);
+        cmd->Barrier(g_r.pfx_lut, nrhi::ResourceState::kCopyDest,
+                     nrhi::ResourceState::kPixelShaderResource);
         g_r.pfx_lut_uploaded = true;
       }
-      // Native depth SRV (re-created every photo frame; the depth resource
-      // is rebuilt on output resize).
+      // Native depth SRV (re-pointed when the depth texture is rebuilt on
+      // output resize; D32 textures view as R32_FLOAT automatically).
       {
-        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = DXGI_FORMAT_R32_FLOAT;
-        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (g_r.msaa > 1) {
-          sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
-        } else {
-          sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-          sd.Texture2D.MipLevels = 1;
+        static nrhi::Texture* s_pfx_depth_tex = nullptr;
+        if (g_r.pfx_srv[7] == nullptr || s_pfx_depth_tex != g_r.depth) {
+          if (g_r.pfx_srv[7] != nullptr) {
+            g_r.device->DestroyDeferred(g_r.pfx_srv[7]);
+            g_r.pfx_srv[7] = nullptr;
+          }
+          nrhi::TextureViewDesc sd;
+          if (g_r.msaa > 1) {
+            sd.dimension = nrhi::ViewDimension::k2DMS;
+          } else {
+            sd.dimension = nrhi::ViewDimension::k2D;
+            sd.mip_levels = 1;
+          }
+          g_r.pfx_srv[7] = context.device->CreateTextureView(g_r.depth, sd);
+          s_pfx_depth_tex = g_r.depth;
         }
-        D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-        slot.ptr += size_t(g_r.pfx_srv[7]) * g_r.srv_size;
-        device->CreateShaderResourceView(g_r.depth, &sd, slot);
       }
-      // Guest-output SRV (the finished native frame = the chain's scene
-      // input), re-pointed like the blur block does.
-      {
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = context.d3d12.guest_output_format;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-        slot.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
-        device->CreateShaderResourceView(context.d3d12.guest_output_resource, &srv, slot);
-      }
+      // (The guest-output view, the finished native frame = the chain's
+      // scene input, is g_r.output_srv_slot, owned/re-pointed by
+      // EnsurePipeline on output change.)
       // The two static input textures (fetch words captured at the game's
       // own uber/fisheye flushes): the 512x2 vignette gradient + the grain.
       const GuestTexture* vig =
           resolve_2d_texture(scene.photo_fx.vignette_fetch, /*force_inline=*/true);
       const GuestTexture* grain =
           resolve_2d_texture(scene.photo_fx.grain_fetch, /*force_inline=*/true);
-      const uint32_t vig_slot =
-          (vig != nullptr && vig->valid) ? vig->srv_slot : g_r.white.srv_slot;
-      const uint32_t grain_slot =
-          (grain != nullptr && grain->valid) ? grain->srv_slot : g_r.white.srv_slot;
+      nrhi::TextureView* const vig_slot =
+          (vig != nullptr && vig->valid) ? vig->srv : g_r.white.srv;
+      nrhi::TextureView* const grain_slot =
+          (grain != nullptr && grain->valid) ? grain->srv : g_r.white.srv;
 
       // Baked literal rows c250..c255 per pass (the shader asset footers the
       // game loads via PM4 LOAD_ALU_CONSTANT to PS rows 252+; values read
@@ -17883,7 +17775,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       uint32_t cb_slot_next = 0;
       const int32_t pfx_debug =
           REXCVAR_GET(skate3_native_render_scene_photo_native_debug);
-      const auto fill_cb = [&](int pass) -> D3D12_GPU_VIRTUAL_ADDRESS {
+      // Returns the byte OFFSET into g_r.pfx_cb for SetConstantBuffer(0, ...).
+      const auto fill_cb = [&](int pass) -> uint64_t {
         const uint32_t slot = cb_slot_base + (cb_slot_next++);
         uint8_t* dst = g_r.pfx_cb_ptr + size_t(slot) * 4096;
         std::memset(dst, 0, 4096);
@@ -17917,45 +17810,34 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         rows[248 * 4 + 0] = float(context.guest_output_width);
         rows[248 * 4 + 1] = float(context.guest_output_height);
         rows[249 * 4 + 0] = float(pfx_debug);
-        return g_r.pfx_cb->GetGPUVirtualAddress() + size_t(slot) * 4096;
+        return uint64_t(slot) * 4096;
       };
-      const D3D12_GPU_DESCRIPTOR_HANDLE pfx_heap_start =
-          g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-      const auto pfx_bind = [&](uint32_t param, uint32_t slot) {
-        D3D12_GPU_DESCRIPTOR_HANDLE h = pfx_heap_start;
-        h.ptr += size_t(slot) * g_r.srv_size;
-        context.d3d12.set_graphics_root_descriptor_table(
-            context.d3d12.command_processor_user_data, param, h);
+      // One 8-entry texture table (pfx_layout param 1, registers t0..t7);
+      // the argument order keeps the old per-parameter helper's shape (t5
+      // last), the gather re-orders into register order.
+      const auto pfx_bind_all = [&](nrhi::TextureView* t0, nrhi::TextureView* t1,
+                                    nrhi::TextureView* t2, nrhi::TextureView* t3,
+                                    nrhi::TextureView* t4, nrhi::TextureView* t6,
+                                    nrhi::TextureView* t7, nrhi::TextureView* t5) {
+        nrhi::TextureView* views[8] = {t0, t1, t2, t3, t4, t5, t6, t7};
+        cmd->SetTextures(1, views, 8);
       };
-      // Root parameter map: 1=t0 2=t1 3=t2 4=t3 5=t4 6=t6 7=t7 8=t5.
-      const auto pfx_bind_all = [&](uint32_t t0, uint32_t t1, uint32_t t2,
-                                    uint32_t t3, uint32_t t4, uint32_t t6,
-                                    uint32_t t7, uint32_t t5) {
-        pfx_bind(1, t0);
-        pfx_bind(2, t1);
-        pfx_bind(3, t2);
-        pfx_bind(4, t3);
-        pfx_bind(5, t4);
-        pfx_bind(6, t6);
-        pfx_bind(7, t7);
-        pfx_bind(8, t5);
+      nrhi::TextureView* const W = g_r.white.srv;
+      const nrhi::Viewport half_vp{0.0f, 0.0f, float(RendererState::kPfxHalfW),
+                                   float(RendererState::kPfxHalfH), 0.0f, 1.0f};
+      const nrhi::Rect half_sc{0, 0, int32_t(RendererState::kPfxHalfW),
+                               int32_t(RendererState::kPfxHalfH)};
+      const nrhi::Viewport quarter_vp{0.0f, 0.0f,
+                                      float(RendererState::kPfxQuarterW),
+                                      float(RendererState::kPfxQuarterH), 0.0f,
+                                      1.0f};
+      const nrhi::Rect quarter_sc{0, 0, int32_t(RendererState::kPfxQuarterW),
+                                  int32_t(RendererState::kPfxQuarterH)};
+      const auto set_rtv = [&](nrhi::Texture* target) {
+        cmd->SetRenderTargets(target, nullptr);
       };
-      const uint32_t W = g_r.white.srv_slot;
-      D3D12_VIEWPORT half_vp{0.0f, 0.0f, float(RendererState::kPfxHalfW),
-                             float(RendererState::kPfxHalfH), 0.0f, 1.0f};
-      D3D12_RECT half_sc{0, 0, LONG(RendererState::kPfxHalfW),
-                         LONG(RendererState::kPfxHalfH)};
-      D3D12_VIEWPORT quarter_vp{0.0f, 0.0f, float(RendererState::kPfxQuarterW),
-                                float(RendererState::kPfxQuarterH), 0.0f, 1.0f};
-      D3D12_RECT quarter_sc{0, 0, LONG(RendererState::kPfxQuarterW),
-                            LONG(RendererState::kPfxQuarterH)};
-      const auto set_rtv = [&](uint32_t rtv_slot) {
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += size_t(rtv_slot) * g_r.rtv_size;
-        list.D3DOMSetRenderTargets(1, &rtv, FALSE, nullptr);
-      };
-      list.D3DSetGraphicsRootSignature(g_r.pfx_root_sig);
-      list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      cmd->SetBindingLayout(g_r.pfx_layout);
+      cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
       const int32_t accum_mode =
           REXCVAR_GET(skate3_native_render_scene_photo_native_accum);
       // Live capture telemetry (~every 2 s while the chain runs): the rows
@@ -17985,122 +17867,117 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
       // 1) Depth pack: native depth (sample 0) -> the console D24-as-8888
       //    layout at output res.
-      context.d3d12.push_transition_barrier(
-          context.d3d12.command_processor_user_data, g_r.depth,
-          D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      cmd->Barrier(g_r.depth, nrhi::ResourceState::kDepthWrite,
+                   nrhi::ResourceState::kPixelShaderResource);
       pfx_flush();
-      set_rtv(13);
-      list.RSSetViewport(viewport);
-      list.RSSetScissorRect(scissor);
-      list.D3DSetPipelineState(g_r.pfx_pso[0]);
-      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+      set_rtv(g_r.pfx_depth);
+      cmd->SetViewport(viewport);
+      cmd->SetScissor(scissor);
+      cmd->SetPipeline(g_r.pfx_pso[0]);
+      cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(-1));
       pfx_bind_all(W, W, W, W, g_r.pfx_srv[6], W, W, g_r.pfx_srv[7]);
-      list.D3DDrawInstanced(3, 1, 0, 0);
-      context.d3d12.push_transition_barrier(
-          context.d3d12.command_processor_user_data, g_r.depth,
-          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+      cmd->Draw(3, 0);
+      cmd->Barrier(g_r.depth, nrhi::ResourceState::kPixelShaderResource,
+                   nrhi::ResourceState::kDepthWrite);
       pfx_to_srv(g_r.pfx_depth);
       // Scene input -> SRV for the rest of the chain.
-      context.d3d12.push_transition_barrier(
-          context.d3d12.command_processor_user_data, context.d3d12.guest_output_resource,
-          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
       pfx_flush();
 
       // 2) Accumulation input (visualfx t3). Mode 0 = black, 1 = the scene
       //    downsampled (this frame, the editor scene is frozen).
       if (accum_mode == 0) {
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += size_t(12) * g_r.rtv_size;
         const float black[4] = {0, 0, 0, 0};
-        list.D3DClearRenderTargetView(rtv, black, 0, nullptr);
+        cmd->ClearRenderTarget(g_r.pfx_quarter, black);
       } else if (accum_mode == 1) {
-        set_rtv(12);
-        list.RSSetViewport(quarter_vp);
-        list.RSSetScissorRect(quarter_sc);
-        list.D3DSetPipelineState(g_r.pfx_pso[7]);
-        list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+        set_rtv(g_r.pfx_quarter);
+        cmd->SetViewport(quarter_vp);
+        cmd->SetScissor(quarter_sc);
+        cmd->SetPipeline(g_r.pfx_pso[7]);
+        cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(-1));
         pfx_bind_all(g_r.output_srv_slot, W, W, W, g_r.pfx_srv[6], W, W, W);
-        list.D3DDrawInstanced(3, 1, 0, 0);
+        cmd->Draw(3, 0);
       }
       pfx_to_srv(g_r.pfx_quarter);
       pfx_flush();
 
       // 3) visualfx (full res): scene + depth + accumulation -> pfx_full[0].
-      set_rtv(8);
-      list.RSSetViewport(viewport);
-      list.RSSetScissorRect(scissor);
-      list.D3DSetPipelineState(g_r.pfx_pso[1]);
-      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxVisualFx));
+      set_rtv(g_r.pfx_full[0]);
+      cmd->SetViewport(viewport);
+      cmd->SetScissor(scissor);
+      cmd->SetPipeline(g_r.pfx_pso[1]);
+      cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(kPfxVisualFx));
       pfx_bind_all(g_r.output_srv_slot, g_r.pfx_srv[5], W, g_r.pfx_srv[4],
                    g_r.pfx_srv[6], W, W, W);
-      list.D3DDrawInstanced(3, 1, 0, 0);
+      cmd->Draw(3, 0);
       pfx_to_srv(g_r.pfx_full[0]);
       pfx_flush();
 
       // 4) DOF downsample: pfx_full[0] -> pfx_half[0].
-      set_rtv(10);
-      list.RSSetViewport(half_vp);
-      list.RSSetScissorRect(half_sc);
-      list.D3DSetPipelineState(g_r.pfx_pso[2]);
-      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxDofDown));
+      set_rtv(g_r.pfx_half[0]);
+      cmd->SetViewport(half_vp);
+      cmd->SetScissor(half_sc);
+      cmd->SetPipeline(g_r.pfx_pso[2]);
+      cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(kPfxDofDown));
       pfx_bind_all(g_r.pfx_srv[0], W, W, W, g_r.pfx_srv[6], W, W, W);
-      list.D3DDrawInstanced(3, 1, 0, 0);
+      cmd->Draw(3, 0);
       pfx_to_srv(g_r.pfx_half[0]);
       pfx_flush();
 
       // 5) tap9dofMotionBlur: pfx_half[0] + depth -> pfx_half[1].
-      set_rtv(11);
-      list.D3DSetPipelineState(g_r.pfx_pso[3]);
-      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxDofMB));
+      set_rtv(g_r.pfx_half[1]);
+      cmd->SetPipeline(g_r.pfx_pso[3]);
+      cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(kPfxDofMB));
       pfx_bind_all(g_r.pfx_srv[2], g_r.pfx_srv[5], W, W, g_r.pfx_srv[6], W, W, W);
-      list.D3DDrawInstanced(3, 1, 0, 0);
+      cmd->Draw(3, 0);
       pfx_to_srv(g_r.pfx_half[1]);
       pfx_to_rt(g_r.pfx_half[0]);
       pfx_flush();
 
       // 6) tap9dof: pfx_half[1] -> pfx_half[0].
-      set_rtv(10);
-      list.D3DSetPipelineState(g_r.pfx_pso[4]);
-      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxDof));
+      set_rtv(g_r.pfx_half[0]);
+      cmd->SetPipeline(g_r.pfx_pso[4]);
+      cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(kPfxDof));
       pfx_bind_all(g_r.pfx_srv[3], W, W, W, g_r.pfx_srv[6], W, W, W);
-      list.D3DDrawInstanced(3, 1, 0, 0);
+      cmd->Draw(3, 0);
       pfx_to_srv(g_r.pfx_half[0]);
       pfx_flush();
 
       // 7) uber (full res): graded sharp + depth + LUT + grain + blurred
       //    half -> pfx_full[1].
-      set_rtv(9);
-      list.RSSetViewport(viewport);
-      list.RSSetScissorRect(scissor);
-      list.D3DSetPipelineState(g_r.pfx_pso[5]);
-      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxUber));
+      set_rtv(g_r.pfx_full[1]);
+      cmd->SetViewport(viewport);
+      cmd->SetScissor(scissor);
+      cmd->SetPipeline(g_r.pfx_pso[5]);
+      cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(kPfxUber));
       pfx_bind_all(g_r.pfx_srv[0], g_r.pfx_srv[5], W, W, g_r.pfx_srv[6],
                    grain_slot, g_r.pfx_srv[2], W);
-      list.D3DDrawInstanced(3, 1, 0, 0);
+      cmd->Draw(3, 0);
       pfx_to_srv(g_r.pfx_full[1]);
       // The finished chain replaces the output: back to RT for fisheye.
-      context.d3d12.push_transition_barrier(
-          context.d3d12.command_processor_user_data, context.d3d12.guest_output_resource,
-          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      cmd->Barrier(context.guest_output,
+                   nrhi::ResourceState::kPixelShaderResource,
+                   nrhi::ResourceState::kRenderTarget);
       pfx_flush();
 
       // 8) fisheye (to screen): lens warp + vignette gradient + tint.
-      list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-      list.D3DSetPipelineState(g_r.pfx_pso[6]);
-      list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(kPfxFisheye));
+      cmd->SetRenderTargets(context.guest_output, nullptr);
+      cmd->SetPipeline(g_r.pfx_pso[6]);
+      cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(kPfxFisheye));
       pfx_bind_all(g_r.pfx_srv[1], W, vig_slot, W, g_r.pfx_srv[6], W, W, W);
-      list.D3DDrawInstanced(3, 1, 0, 0);
+      cmd->Draw(3, 0);
 
       // 8b) Debug view (photo_native_debug): overwrite the output with the
       //     visualfx CoC map (mode 1) or the packed-depth reconstruction
       //     (mode 2): t0 = visualfx out, t1 = packed depth, both still in
       //     SRV state here.
       if (pfx_debug > 0 && g_r.pfx_pso[8] != nullptr) {
-        list.D3DSetPipelineState(g_r.pfx_pso[8]);
-        list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+        cmd->SetPipeline(g_r.pfx_pso[8]);
+        cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(-1));
         pfx_bind_all(g_r.pfx_srv[0], g_r.pfx_srv[5], W, W, g_r.pfx_srv[6], W,
                      W, W);
-        list.D3DDrawInstanced(3, 1, 0, 0);
+        cmd->Draw(3, 0);
       }
 
       // 9) Accumulation mode 2: next frame's visualfx t3 = the finished
@@ -18108,13 +17985,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (accum_mode == 2) {
         pfx_to_rt(g_r.pfx_quarter);
         pfx_flush();
-        set_rtv(12);
-        list.RSSetViewport(quarter_vp);
-        list.RSSetScissorRect(quarter_sc);
-        list.D3DSetPipelineState(g_r.pfx_pso[7]);
-        list.D3DSetGraphicsRootConstantBufferView(0, fill_cb(-1));
+        set_rtv(g_r.pfx_quarter);
+        cmd->SetViewport(quarter_vp);
+        cmd->SetScissor(quarter_sc);
+        cmd->SetPipeline(g_r.pfx_pso[7]);
+        cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(-1));
         pfx_bind_all(g_r.pfx_srv[1], W, W, W, g_r.pfx_srv[6], W, W, W);
-        list.D3DDrawInstanced(3, 1, 0, 0);
+        cmd->Draw(3, 0);
       }
 
       // Restore steady states (all pfx color targets idle as RENDER_TARGET)
@@ -18128,16 +18005,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       pfx_to_rt(g_r.pfx_depth);
       pfx_flush();
-      list.RSSetViewport(viewport);
-      list.RSSetScissorRect(scissor);
-      list.D3DSetGraphicsRootSignature(g_r.root_signature);
+      cmd->SetViewport(viewport);
+      cmd->SetScissor(scissor);
+      cmd->SetBindingLayout(g_r.layout);
       if (g_r.shadow_cb != nullptr) {
         const uint32_t cb_offset =
             uint32_t(frame_number % RendererState::kShadowCbRegions) * 256u;
-        list.D3DSetGraphicsRootConstantBufferView(
-            6, g_r.shadow_cb->GetGPUVirtualAddress() + cb_offset);
-        list.D3DSetGraphicsRootConstantBufferView(
-            9, g_r.bone_ring->GetGPUVirtualAddress() + bone_region);
+        cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
+        cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
       }
       static bool s_pfx_first = true;
       if (s_pfx_first) {
@@ -18164,30 +18039,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (g_photo_grab_native_armed.load(std::memory_order_relaxed) &&
       g_r.pso_blur_down != nullptr && g_r.blur_tex[0] != nullptr &&
       g_r.output_srv_allocated && !g_r.grab_failed) {
-    auto* grab_cp = context.d3d12.command_processor;
     // Lazy readback-pair creation (persistently mapped; the copy is never
     // waited on same-frame; the old path's per-resolve GPU drain was the
     // editor's multi-second stall class).
     if (g_r.grab_readback[0] == nullptr) {
-      D3D12_HEAP_PROPERTIES heap_props{};
-      heap_props.Type = D3D12_HEAP_TYPE_READBACK;
-      D3D12_RESOURCE_DESC desc{};
-      desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      desc.Width =
-          UINT64(RendererState::kGrabRowPitch) * RendererState::kBlurHeight;
-      desc.Height = 1;
-      desc.DepthOrArraySize = 1;
-      desc.MipLevels = 1;
-      desc.SampleDesc.Count = 1;
-      desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      nrhi::BufferDesc desc;
+      desc.size =
+          uint64_t(RendererState::kGrabRowPitch) * RendererState::kBlurHeight;
+      desc.heap = nrhi::HeapKind::kReadback;
       for (int i = 0; i < 2 && !g_r.grab_failed; ++i) {
-        if (FAILED(g_r.device->CreateCommittedResource(
-                &heap_props, D3D12_HEAP_FLAG_NONE, &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                IID_PPV_ARGS(&g_r.grab_readback[i]))) ||
-            FAILED(g_r.grab_readback[i]->Map(
-                0, nullptr,
-                reinterpret_cast<void**>(&g_r.grab_readback_ptr[i])))) {
+        g_r.grab_readback[i] = g_r.device->CreateBuffer(desc);
+        if (g_r.grab_readback[i] == nullptr ||
+            (g_r.grab_readback_ptr[i] = static_cast<uint8_t*>(
+                 g_r.device->Map(g_r.grab_readback[i]))) == nullptr) {
           g_r.grab_failed = true;
         }
       }
@@ -18200,7 +18064,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (!g_r.grab_failed) {
       // Consume the newest completed buffer; retire older completed ones
       // unwritten so stale content never lands after fresh content.
-      const uint64_t grab_completed = grab_cp->GetCompletedSubmission();
+      const uint64_t grab_completed = context.device->CompletedSubmission();
       int newest = -1;
       for (int i = 0; i < 2; ++i) {
         if (g_r.grab_pending[i] && g_r.grab_submission[i] < grab_completed &&
@@ -18212,6 +18076,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (newest >= 0) {
         static bool s_grab_write_warned = false;
         const auto tile_t0 = PerfClock::now();
+        // Make the GPU's completed copy visible to the CPU read below (no-op
+        // on D3D12; cache invalidate on non-coherent Vulkan memory).
+        g_r.device->InvalidateForRead(
+            g_r.grab_readback[newest], 0,
+            uint64_t(RendererState::kGrabRowPitch) * RendererState::kBlurHeight);
         const bool wrote = GrabTargetValid(base) &&
                            WriteGrabToGuest(base, g_r.grab_readback_ptr[newest]);
         if (wrote) {
@@ -18249,93 +18118,49 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // flight, never wait).
       const uint32_t w = g_r.grab_write_index;
       if (!g_r.grab_pending[w]) {
-        // Re-point the shared output SRV slot at the current output
-        // resource (it can change between frames, same idiom as the blur
-        // block below; if blur also runs this frame it recreates the same
-        // descriptor).
-        {
-          D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-          srv.Format = context.d3d12.guest_output_format;
-          srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-          srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-          srv.Texture2D.MipLevels = 1;
-          D3D12_CPU_DESCRIPTOR_HANDLE slot =
-              g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-          slot.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
-          g_r.device->CreateShaderResourceView(
-              context.d3d12.guest_output_resource, &srv, slot);
-        }
-        context.d3d12.push_transition_barrier(
-            context.d3d12.command_processor_user_data,
-            context.d3d12.guest_output_resource,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-        D3D12_CPU_DESCRIPTOR_HANDLE grab_rtv =
-            g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        grab_rtv.ptr += size_t(5) * g_r.rtv_size;
-        list.D3DOMSetRenderTargets(1, &grab_rtv, FALSE, nullptr);
-        const D3D12_VIEWPORT grab_vp{0.0f,
+        // (The output view g_r.output_srv_slot tracks the current output
+        // texture; EnsurePipeline re-points it on output change.)
+        cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
+                     nrhi::ResourceState::kPixelShaderResource);
+        cmd->FlushBarriers();
+        cmd->SetRenderTargets(g_r.blur_tex[0], nullptr);
+        const nrhi::Viewport grab_vp{0.0f,
                                      0.0f,
                                      float(RendererState::kBlurWidth),
                                      float(RendererState::kBlurHeight),
                                      0.0f,
                                      1.0f};
-        const D3D12_RECT grab_sc{0, 0, LONG(RendererState::kBlurWidth),
-                                 LONG(RendererState::kBlurHeight)};
-        list.RSSetViewport(grab_vp);
-        list.RSSetScissorRect(grab_sc);
-        list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list.D3DSetPipelineState(g_r.pso_blur_down);
+        const nrhi::Rect grab_sc{0, 0, int32_t(RendererState::kBlurWidth),
+                                 int32_t(RendererState::kBlurHeight)};
+        cmd->SetViewport(grab_vp);
+        cmd->SetScissor(grab_sc);
+        cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+        cmd->SetPipeline(g_r.pso_blur_down);
         const float grab_consts[4] = {1.0f / float(context.guest_output_width),
                                       1.0f / float(context.guest_output_height),
                                       0.0f, 0.0f};
-        list.D3DSetGraphicsRoot32BitConstants(0, 4, grab_consts, 0);
-        {
-          D3D12_GPU_DESCRIPTOR_HANDLE h =
-              g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-          h.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
-          context.d3d12.set_graphics_root_descriptor_table(
-              context.d3d12.command_processor_user_data, 1, h);
-        }
-        list.D3DDrawInstanced(3, 1, 0, 0);
+        cmd->SetRootConstants(0, 4, grab_consts, 0);
+        cmd->SetTexture(1, g_r.output_srv_slot);
+        cmd->Draw(3, 0);
         // blur_tex[0] -> the readback buffer; restore steady states.
-        context.d3d12.push_transition_barrier(
-            context.d3d12.command_processor_user_data, g_r.blur_tex[0],
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_COPY_SOURCE);
-        context.d3d12.push_transition_barrier(
-            context.d3d12.command_processor_user_data,
-            context.d3d12.guest_output_resource,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_RENDER_TARGET);
-        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-        D3D12_TEXTURE_COPY_LOCATION grab_src{};
-        grab_src.pResource = g_r.blur_tex[0];
-        grab_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        grab_src.SubresourceIndex = 0;
-        D3D12_TEXTURE_COPY_LOCATION grab_dst{};
-        grab_dst.pResource = g_r.grab_readback[w];
-        grab_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        grab_dst.PlacedFootprint.Offset = 0;
-        grab_dst.PlacedFootprint.Footprint.Format =
-            context.d3d12.guest_output_format;
-        grab_dst.PlacedFootprint.Footprint.Width = RendererState::kBlurWidth;
-        grab_dst.PlacedFootprint.Footprint.Height = RendererState::kBlurHeight;
-        grab_dst.PlacedFootprint.Footprint.Depth = 1;
-        grab_dst.PlacedFootprint.Footprint.RowPitch =
-            RendererState::kGrabRowPitch;
-        list.D3DCopyTextureRegion(&grab_dst, 0, 0, 0, &grab_src, nullptr);
-        context.d3d12.push_transition_barrier(
-            context.d3d12.command_processor_user_data, g_r.blur_tex[0],
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_RENDER_TARGET);
-        context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+        cmd->Barrier(g_r.blur_tex[0], nrhi::ResourceState::kRenderTarget,
+                     nrhi::ResourceState::kCopySource);
+        cmd->Barrier(context.guest_output,
+                     nrhi::ResourceState::kPixelShaderResource,
+                     nrhi::ResourceState::kRenderTarget);
+        cmd->FlushBarriers();
+        cmd->CopyTextureToBuffer(g_r.grab_readback[w], 0,
+                                 RendererState::kGrabRowPitch, g_r.blur_tex[0],
+                                 0, RendererState::kBlurWidth,
+                                 RendererState::kBlurHeight);
+        cmd->Barrier(g_r.blur_tex[0], nrhi::ResourceState::kCopySource,
+                     nrhi::ResourceState::kRenderTarget);
+        cmd->FlushBarriers();
         // Restore the frame's output binding for the passes that follow.
-        list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-        list.RSSetViewport(viewport);
-        list.RSSetScissorRect(scissor);
-        g_r.grab_submission[w] = grab_cp->GetCurrentSubmission();
+        cmd->SetRenderTargets(context.guest_output, nullptr);
+        cmd->SetViewport(viewport);
+        cmd->SetScissor(scissor);
+        g_r.grab_submission[w] = context.device->CurrentSubmission();
         g_r.grab_pending[w] = true;
         g_r.grab_write_index = 1 - w;
       }
@@ -18376,66 +18201,40 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     for (int a = 0; a < 3; ++a) {
       s_blur_tint[a] += (scene.ui_blur_color[a] - s_blur_tint[a]) * blur_a;
     }
-    // The guest output resource can change between frames; re-point the
-    // dedicated SRV slot at it each blur frame.
-    {
-      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format = context.d3d12.guest_output_format;
-      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      srv.Texture2D.MipLevels = 1;
-      D3D12_CPU_DESCRIPTOR_HANDLE slot = g_r.srv_heap->GetCPUDescriptorHandleForHeapStart();
-      slot.ptr += size_t(g_r.output_srv_slot) * g_r.srv_size;
-      g_r.device->CreateShaderResourceView(context.d3d12.guest_output_resource, &srv, slot);
-    }
-    const D3D12_GPU_DESCRIPTOR_HANDLE heap_start =
-        g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-    const auto srv_table = [&](uint32_t slot) {
-      D3D12_GPU_DESCRIPTOR_HANDLE h = heap_start;
-      h.ptr += size_t(slot) * g_r.srv_size;
-      context.d3d12.set_graphics_root_descriptor_table(
-          context.d3d12.command_processor_user_data, 1, h);
+    // (The guest output texture can change between frames; the dedicated
+    // view g_r.output_srv_slot is re-pointed by EnsurePipeline on change.)
+    const nrhi::Viewport blur_vp{0.0f, 0.0f, float(RendererState::kBlurWidth),
+                                 float(RendererState::kBlurHeight), 0.0f, 1.0f};
+    const nrhi::Rect blur_sc{0, 0, int32_t(RendererState::kBlurWidth),
+                             int32_t(RendererState::kBlurHeight)};
+    const auto to_srv = [&](nrhi::Texture* r) {
+      cmd->Barrier(r, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
     };
-    D3D12_VIEWPORT blur_vp{0.0f, 0.0f, float(RendererState::kBlurWidth),
-                           float(RendererState::kBlurHeight), 0.0f, 1.0f};
-    D3D12_RECT blur_sc{0, 0, LONG(RendererState::kBlurWidth),
-                       LONG(RendererState::kBlurHeight)};
-    D3D12_CPU_DESCRIPTOR_HANDLE blur_rtv0 = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    blur_rtv0.ptr += size_t(5) * g_r.rtv_size;
-    D3D12_CPU_DESCRIPTOR_HANDLE blur_rtv1 = g_r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    blur_rtv1.ptr += size_t(6) * g_r.rtv_size;
-    const auto to_srv = [&](ID3D12Resource* r) {
-      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
-                                            D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    const auto to_rt = [&](nrhi::Texture* r) {
+      cmd->Barrier(r, nrhi::ResourceState::kPixelShaderResource,
+                   nrhi::ResourceState::kRenderTarget);
     };
-    const auto to_rt = [&](ID3D12Resource* r) {
-      context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data, r,
-                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
-    };
-    const auto flush = [&] {
-      context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
-    };
-    list.D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const auto flush = [&] { cmd->FlushBarriers(); };
+    cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
     // Downsample (prefiltered): output -> blur_tex[0], the game's 1152x640
     // blur space. The H/V passes then run 1:1 like the original chain.
-    to_srv(context.d3d12.guest_output_resource);
+    to_srv(context.guest_output);
     flush();
-    list.D3DOMSetRenderTargets(1, &blur_rtv0, FALSE, nullptr);
-    list.RSSetViewport(blur_vp);
-    list.RSSetScissorRect(blur_sc);
-    list.D3DSetPipelineState(g_r.pso_blur_down);
+    cmd->SetRenderTargets(g_r.blur_tex[0], nullptr);
+    cmd->SetViewport(blur_vp);
+    cmd->SetScissor(blur_sc);
+    cmd->SetPipeline(g_r.pso_blur_down);
     const float d_consts[4] = {1.0f / float(context.guest_output_width),
                                1.0f / float(context.guest_output_height), 0.0f, 0.0f};
-    list.D3DSetGraphicsRoot32BitConstants(0, 4, d_consts, 0);
-    srv_table(g_r.output_srv_slot);
-    list.D3DDrawInstanced(3, 1, 0, 0);
+    cmd->SetRootConstants(0, 4, d_consts, 0);
+    cmd->SetTexture(1, g_r.output_srv_slot);
+    cmd->Draw(3, 0);
     // H: blur_tex[0] -> blur_tex[1].
     to_srv(g_r.blur_tex[0]);
     flush();
-    list.D3DOMSetRenderTargets(1, &blur_rtv1, FALSE, nullptr);
-    list.D3DSetPipelineState(g_r.pso_blur);
+    cmd->SetRenderTargets(g_r.blur_tex[1], nullptr);
+    cmd->SetPipeline(g_r.pso_blur);
     const float h_consts[8] = {1.0f,
                                0.0f,
                                s_blur_r,
@@ -18444,14 +18243,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                s_blur_tint[1],
                                s_blur_tint[2],
                                1.0f};
-    list.D3DSetGraphicsRoot32BitConstants(0, 8, h_consts, 0);
-    srv_table(g_r.blur_srv[0]);
-    list.D3DDrawInstanced(3, 1, 0, 0);
+    cmd->SetRootConstants(0, 8, h_consts, 0);
+    cmd->SetTexture(1, g_r.blur_srv[0]);
+    cmd->Draw(3, 0);
     // V: blur_tex[1] -> blur_tex[0].
     to_srv(g_r.blur_tex[1]);
     to_rt(g_r.blur_tex[0]);
     flush();
-    list.D3DOMSetRenderTargets(1, &blur_rtv0, FALSE, nullptr);
+    cmd->SetRenderTargets(g_r.blur_tex[0], nullptr);
     const float v_consts[8] = {0.0f,
                                1.0f,
                                s_blur_r,
@@ -18460,19 +18259,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                s_blur_tint[1],
                                s_blur_tint[2],
                                1.0f};
-    list.D3DSetGraphicsRoot32BitConstants(0, 8, v_consts, 0);
-    srv_table(g_r.blur_srv[1]);
-    list.D3DDrawInstanced(3, 1, 0, 0);
+    cmd->SetRootConstants(0, 8, v_consts, 0);
+    cmd->SetTexture(1, g_r.blur_srv[1]);
+    cmd->Draw(3, 0);
     // Replace: blur_tex[0] stretched over the full output (basictex).
     to_srv(g_r.blur_tex[0]);
-    to_rt(context.d3d12.guest_output_resource);
+    to_rt(context.guest_output);
     flush();
-    list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-    list.RSSetViewport(viewport);
-    list.RSSetScissorRect(scissor);
-    list.D3DSetPipelineState(g_r.pso_blur_blit);
-    srv_table(g_r.blur_srv[0]);
-    list.D3DDrawInstanced(3, 1, 0, 0);
+    cmd->SetRenderTargets(context.guest_output, nullptr);
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    cmd->SetPipeline(g_r.pso_blur_blit);
+    cmd->SetTexture(1, g_r.blur_srv[0]);
+    cmd->Draw(3, 0);
     // Restore the intermediates' steady state for the next blur frame.
     to_rt(g_r.blur_tex[0]);
     to_rt(g_r.blur_tex[1]);
@@ -18483,6 +18282,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // constants and textures. In gameplay these draws compose the game's
   // full-screen HUD overlay texture at true screen coordinates; drawing
   // them here IS the composite the (suppressed) emulated pass used to do.
+  const auto twod_t0 = PerfClock::now();
   uint32_t drawn_2d = 0;
   if (REXCVAR_GET(skate3_native_render_scene_2d) && g_r.pso_2d != nullptr &&
       g_r.ui_ring_cpu != nullptr) {
@@ -18492,13 +18292,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       scene_2d = g_scene_2d;
     }
     if (!scene_2d.empty()) {
-      list.D3DSetPipelineState(g_r.pso_2d);
+      cmd->SetPipeline(g_r.pso_2d);
       // One shared draw routine for both the RTT passes and the screen pass.
       // ui_region/ui_offset continue after the spline pass's allocations.
       // yuv != nullptr redirects this draw to the FMV combine: pso_yuv2d
-      // with the three movie plane slots on tables 1/2/5 (t0/t1/t4), the
+      // with the three movie plane views on params 1/2/5 (t0/t1/t4), the
       // quad's own geometry/transform (so windowed movies place exactly).
-      const auto emit_draw = [&](const Draw2d& d, const uint32_t* yuv = nullptr) {
+      const auto emit_draw = [&](const Draw2d& d,
+                                 nrhi::TextureView* const* yuv = nullptr) {
         const uint32_t bytes = uint32_t(d.verts.size());
         if (bytes == 0 || d.stride != 28) {
           return;
@@ -18508,9 +18309,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           return;
         }
         std::memcpy(g_r.ui_ring_cpu + ui_region + ui_offset, d.verts.data(), bytes);
-        uint32_t srv_slot;
+        nrhi::TextureView* srv_view;
         if (yuv != nullptr) {
-          srv_slot = yuv[0];
+          srv_view = yuv[0];
         } else {
           const GuestTexture* t = resolve_2d_texture(d.fetch);
           if (t == nullptr) {
@@ -18518,7 +18319,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             // routing); skip the quad; it lands 1-3 frames later.
             return;
           }
-          srv_slot = t->srv_slot;
+          srv_view = t->srv;
         }
         float constants[40];
         std::memcpy(constants, d.consts, sizeof(d.consts));
@@ -18540,38 +18341,31 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // centers, and the top-left fill rule then drops that row/column
         // - the residual 1px see-through sliver on loading screens. The
         // 1/16 px underhang is far below visible sampling misalignment.
-        constants[38] = viewport.Width > 0.0f ? 0.875f / viewport.Width : 0.0f;
-        constants[39] = viewport.Height > 0.0f ? 0.875f / viewport.Height : 0.0f;
-        list.D3DSetGraphicsRoot32BitConstants(0, 40, constants, 0);
-        const auto srv_table_at = [&](uint32_t param, uint32_t slot) {
-          D3D12_GPU_DESCRIPTOR_HANDLE h =
-              g_r.srv_heap->GetGPUDescriptorHandleForHeapStart();
-          h.ptr += size_t(slot) * g_r.srv_size;
-          context.d3d12.set_graphics_root_descriptor_table(
-              context.d3d12.command_processor_user_data, param, h);
-        };
-        srv_table_at(1, srv_slot);
+        constants[38] = viewport.width > 0.0f ? 0.875f / viewport.width : 0.0f;
+        constants[39] = viewport.height > 0.0f ? 0.875f / viewport.height : 0.0f;
+        cmd->SetRootConstants(0, 40, constants, 0);
+        cmd->SetTexture(1, srv_view);
         if (yuv != nullptr) {
-          list.D3DSetPipelineState(g_r.pso_yuv2d);
-          srv_table_at(2, yuv[1]);
-          srv_table_at(5, yuv[2]);
+          cmd->SetPipeline(g_r.pso_yuv2d);
+          cmd->SetTexture(2, yuv[1]);
+          cmd->SetTexture(5, yuv[2]);
         }
-        D3D12_VERTEX_BUFFER_VIEW vbv{
-            g_r.ui_ring->GetGPUVirtualAddress() + ui_region + ui_offset, bytes, d.stride};
-        list.D3DIASetVertexBuffers(0, 1, &vbv);
-        list.D3DIASetPrimitiveTopology(d.prim == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
-                                                   : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        list.D3DDrawInstanced(d.count, 1, 0, 0);
+        cmd->SetVertexBuffer(g_r.ui_ring, ui_region + ui_offset, bytes,
+                             d.stride);
+        cmd->SetPrimitiveTopology(d.prim == 5
+                                      ? nrhi::PrimitiveTopology::kTriangleStrip
+                                      : nrhi::PrimitiveTopology::kTriangleList);
+        cmd->Draw(d.count, 0);
         if (yuv != nullptr) {
-          list.D3DSetPipelineState(g_r.pso_2d);
+          cmd->SetPipeline(g_r.pso_2d);
         }
         ui_offset += bytes;
         ++drawn_2d;
       };
 
-      list.D3DOMSetRenderTargets(1, &output_rtv, FALSE, nullptr);
-      list.RSSetViewport(viewport);
-      list.RSSetScissorRect(scissor);
+      cmd->SetRenderTargets(context.guest_output, nullptr);
+      cmd->SetViewport(viewport);
+      cmd->SetScissor(scissor);
       // Native FMV substitution, self-contained: a video quad's console
       // shader binds Y at the DRAW's fetch slot 0 and the U/V planes at
       // slots 1/2: three valid distinct textures with the chroma at
@@ -18605,7 +18399,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       struct TripleCacheEntry {
         uint32_t y_addr;
         bool ok;
-        uint32_t slots[3];
+        nrhi::TextureView* slots[3];
       };
       TripleCacheEntry triple_cache[kMaxMovies];
       int triple_count = 0;
@@ -18615,9 +18409,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // Resolved lazily; the capped log tracks whether it is still ever
       // needed; if it stays silent across sessions, this path and the
       // OnMovieFrame publish machinery behind it can be retired.
-      uint32_t fallback_slots[3] = {};
+      nrhi::TextureView* fallback_slots[3] = {};
       int fallback_state = 0;  // 0 = unresolved, 1 = ok, -1 = unavailable
-      const auto fallback_yuv = [&]() -> const uint32_t* {
+      const auto fallback_yuv = [&]() -> nrhi::TextureView* const* {
         if (fallback_state == 0) {
           fallback_state = -1;
           const MoviePlanes* best = nullptr;
@@ -18637,7 +18431,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               const GuestTexture* t =
                   resolve_2d_texture(best->words[p], /*force_inline=*/true);
               ok = t != &g_r.white && t->texture != nullptr;
-              fallback_slots[p] = t->srv_slot;
+              fallback_slots[p] = t->srv;
             }
             if (ok) {
               fallback_state = 1;
@@ -18648,7 +18442,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       };
       bool movie_drawn = false;
       for (const Draw2d& d : scene_2d) {
-        const uint32_t* yuv = nullptr;
+        nrhi::TextureView* const* yuv = nullptr;
         // Video-quad detection runs regardless of movie_sub: a quad whose
         // own fetch slots form a YUV triple must NEVER draw through ps_main
         // - that renders the raw Y plane (greyscale luma, or the PREVIOUS
@@ -18690,7 +18484,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                 e->ok = t != nullptr && t != &g_r.white && t->texture != nullptr &&
                         t->last_change_frame >= s_movie_session_frame;
                 decode_failed |= t == &g_r.white;
-                e->slots[p] = e->ok ? t->srv_slot : 0;
+                e->slots[p] = e->ok ? t->srv : nullptr;
               }
               if (decode_failed) {
                 static std::atomic<uint32_t> s_triple_failed{0};
@@ -18750,12 +18544,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
-  context.d3d12.push_transition_barrier(context.d3d12.command_processor_user_data,
-                                        context.d3d12.guest_output_resource,
-                                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                        context.d3d12.guest_output_initial_state);
-  context.d3d12.submit_barriers(context.d3d12.command_processor_user_data);
+  cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kGuestOutput);
+  cmd->FlushBarriers();
 
+  g_pw_2d.Add(perf_ns_since(twod_t0));
+  g_pw_tail.Add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    twod_t0 - mid_t0)
+                    .count()));
   g_pw_render.Add(perf_ns_since(render_t0));
   const uint64_t frames = g_frames_rendered.fetch_add(1) + 1;
   MaybeDumpSceneRing();
@@ -18777,10 +18573,10 @@ void Install() {
 
 }  // namespace skate3::native_scene
 
-#else  // !REX_HAS_D3D12
+#else  // !(REX_HAS_D3D12 || REX_HAS_VULKAN)
 
 namespace skate3::native_scene {
 void Install() {}
 }  // namespace skate3::native_scene
 
-#endif  // REX_HAS_D3D12
+#endif  // REX_HAS_D3D12 || REX_HAS_VULKAN

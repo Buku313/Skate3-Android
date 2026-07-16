@@ -12,6 +12,14 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <pthread.h>
+#include <signal.h>
+
+#include <csetjmp>
+#include <mutex>
+
+#include <rex/exception_handler.h>
 #endif
 
 namespace skate3::native_scene {
@@ -54,8 +62,56 @@ __declspec(noinline) bool GuestTryCopy(void* dst, const void* src, size_t size) 
   }
 }
 #else
+// POSIX guard with the same clean-failure semantics as the SEH path: a
+// handler registered in the runtime's exception chain (SIGSEGV/SIGBUS both
+// arrive as Code::kAccessViolation) siglongjmps back here when the fault
+// happened inside the guarded copy on this thread; unrelated faults are
+// declined so the runtime's own handlers (write watches, null traps) keep
+// working. The previous raw std::memcpy crashed the first macOS
+// native-render session (SIGBUS in _platform_memmove under
+// OnRenderModeSceneExit: streaming decommitted the captured range between
+// capture and decode, exactly the case the Windows guard exists for).
+namespace {
+thread_local volatile bool tl_in_guest_copy = false;
+thread_local sigjmp_buf tl_guest_copy_jmp;
+
+bool GuestCopyFaultHandler(rex::arch::Exception* ex, void* /*data*/) {
+  if (!tl_in_guest_copy ||
+      ex->code() != rex::arch::Exception::Code::kAccessViolation) {
+    return false;  // not ours - keep dispatching down the chain
+  }
+  tl_in_guest_copy = false;
+  // Unwinds the signal frame directly; the kernel-blocked signal is
+  // unblocked by the sigsetjmp fault branch (savemask=0 keeps the hot path
+  // free of a per-call sigprocmask syscall).
+  siglongjmp(tl_guest_copy_jmp, 1);
+}
+
+void EnsureGuestCopyHandler() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    rex::arch::ExceptionHandler::Install(GuestCopyFaultHandler, nullptr);
+  });
+}
+}  // namespace
+
 bool GuestTryCopy(void* dst, const void* src, size_t size) {
+  EnsureGuestCopyHandler();
+  if (sigsetjmp(tl_guest_copy_jmp, 0) != 0) {
+    // Faulted mid-copy and jumped out of the signal handler: the signal is
+    // still in this thread's blocked mask (handler entry blocked it, the
+    // longjmp skipped the normal return that would restore it). Rare path -
+    // the syscall is fine here.
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGSEGV);
+    sigaddset(&set, SIGBUS);
+    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+    return false;
+  }
+  tl_in_guest_copy = true;
   std::memcpy(dst, src, size);
+  tl_in_guest_copy = false;
   return true;
 }
 #endif

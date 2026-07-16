@@ -765,9 +765,11 @@ extern "C" REX_FUNC(sub_827E5B30) {
 extern "C" REX_FUNC(sub_827A52C8) {
   const uint32_t parts = ctx.r3.u32;
   const uint32_t count = ctx.r4.u32;
+  const uint32_t src_palette = ctx.r5.u32;
+  const uint32_t out_mat = ctx.r7.u32;
   __imp__sub_827A52C8(ctx, base);
   if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnBoneTransforms(base, parts, count);
+    skate3::native_v3::OnBoneTransforms(base, parts, count, src_palette, out_mat);
   }
 }
 
