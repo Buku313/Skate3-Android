@@ -707,7 +707,13 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // so it never affects cursor or focus handling.
   render_mode_indicator_ = std::make_unique<skate3::RenderModeIndicator>(drawer);
   rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings", [this] {
-    ToggleSimpleSettings();
+    // Escape backs out of the settings screen level by level (rows ->
+    // category rail -> closed); when the screen is closed it opens it.
+    if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
+      simple_settings_dialog_->NavigateBack();
+    } else {
+      ToggleSimpleSettings();
+    }
   });
   rex::ui::RegisterBind("bind_skate3_menu_alt", "F1", "Skate 3 settings alternate", [this] {
     ToggleSimpleSettings();
@@ -876,10 +882,27 @@ void Skate3BaseApp::ToggleSimpleSettings() {
     });
   };
   auto restart_game = [this]() { RestartGame(); };
+  // Raw pad poll for menu navigation: bypasses the is_active gate that
+  // zeroes guest-facing input while the settings screen is open.
+  auto poll_gamepad = [this]() {
+    rex::ui::SimpleSettingsGamepad pad;
+    auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system());
+    if (input_system) {
+      rex::input::X_INPUT_GAMEPAD state;
+      if (input_system->GetUiGamepadState(&state)) {
+        pad.connected = true;
+        pad.buttons = state.buttons;
+        pad.thumb_lx = state.thumb_lx;
+        pad.thumb_ly = state.thumb_ly;
+      }
+    }
+    return pad;
+  };
   simple_settings_dialog_ =
       std::make_unique<rex::ui::SimpleSettingsDialog>(
           imgui_drawer(), user_settings_path_, std::move(load_profiles), std::move(save_profile),
-          std::move(close_settings), std::move(close_game), std::move(restart_game));
+          std::move(close_settings), std::move(close_game), std::move(restart_game),
+          std::move(poll_gamepad));
   ApplySettingsCursorMode();
   simple_settings_dialog_->Show();
 }

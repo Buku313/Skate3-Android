@@ -70,7 +70,7 @@ The builds include an experimental true ultrawide aspect ratio mode at 21:9. You
 
 - Standard Xbox controls using an Xbox controller are the preferred and main input method. DualShock and others are untested, but are likely to work with Steam Input through XInput.
 - Keyboard controls can be enabled in the game settings menu.
-- Press Escape on keyboard or (Back + Start) on the controller to open the game settings menu.
+- Press Escape on keyboard or (LB + RB + Start) on the controller to open the game settings menu.
 
 ### Keyboard Keybinds
 
