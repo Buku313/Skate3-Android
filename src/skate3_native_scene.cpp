@@ -9272,9 +9272,26 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // Read-only: the ident[] stats line is the evidence for flipping any
   // serve over to the direct fields.
   {
+    const bool serve_ent_fade =
+        REXCVAR_GET(skate3_native_render_scene_entity_fade);
     for (DrawItem& item : scene.items) {
       if (item.char_family == 0 || item.ctx == 0) {
         continue;
+      }
+      // Skater-family fade from the entity's own opacity (+496): the
+      // value the game binds as the shader's alpha parameter. Same serving
+      // contract as the LW store (lw_alpha preferred by CharFadeAlpha;
+      // families whose shader composes the fade keep their captured rows
+      // bounded by it). LW-mapped items were already stamped above.
+      float ent_alpha = 1.0f;
+      if (serve_ent_fade && item.lw_alpha < 0.0f &&
+          skate3::native_entity::ReadSkaterFade(base, item.ctx, &ent_alpha)) {
+        item.lw_alpha = std::clamp(ent_alpha, 0.0f, 1.0f);
+        if (item.char_rows[14 * 4 + 1] > 0.0f &&
+            (item.char_family == 1 || item.char_family == 2 ||
+             item.char_family == 3 || item.char_family == 6)) {
+          item.char_rows[14 * 4 + 0] = item.lw_alpha;
+        }
       }
       skate3::native_entity::ObserveCharItem(base, item.ctx,
                                              item.char_family,

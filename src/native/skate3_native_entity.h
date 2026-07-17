@@ -113,6 +113,13 @@ void ObserveCharItem(uint8_t* base, uint32_t ctx, uint32_t family,
 bool ServeRopaWorld(uint8_t* base, uint32_t ctx, uint32_t vb_obj,
                     float out_rows[12]);
 
+// Fade serve (skater-family classes only; LivingWorld entities are
+// served by the LW store): the entity's live opacity at +496, the exact
+// value BindConstants points the shader's alpha parameter at. Returns
+// false for unmapped ctxs, non-skater classes, or an out-of-range read
+// (teardown), leaving the caller's captured-row fade untouched.
+bool ReadSkaterFade(uint8_t* base, uint32_t ctx, float* out_alpha);
+
 // True when the ctx maps to an entity whose garment table no longer
 // claims vb_obj as a live cloth target; the game DROPPED the garment
 // (m_numClothModels back to 0, VB objects freed, memory recycled). The

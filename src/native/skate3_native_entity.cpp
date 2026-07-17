@@ -40,6 +40,15 @@ REXCVAR_DEFINE_BOOL(
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_entity_fade_serve, true, "Skate 3",
+    "Serve skater-family character fade from the entity's own opacity "
+    "field (+496, the exact value the game binds as the shader's alpha "
+    "parameter) instead of the captured alpha row. Fixes spawn fade-ins "
+    "rendered opaque when the row capture lags or fails. LivingWorld "
+    "entities keep the LW store's fade. Off = captured-row fade.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_entity_ropa_world_primary, true, "Skate 3",
     "Serve the ROPA garment world from the owner entity's m_MatLtoWTrans "
     "on ACCEPTED bank captures too (bank value kept as fallback and as a "
@@ -479,6 +488,29 @@ bool ReadEntityWorldRows(uint8_t* base, uint32_t ctx, float out_rows[12]) {
   CtxInfo info;
   return LookupCtx(ctx, &info) &&
          ReadWorldRowsChecked(base, info.entity, out_rows);
+}
+
+bool ReadSkaterFade(uint8_t* base, uint32_t ctx, float* out_alpha) {
+  if (!REXCVAR_GET(skate3_native_render_scene_entity_fade_serve)) {
+    return false;
+  }
+  CtxInfo info;
+  if (!LookupCtx(ctx, &info)) {
+    return false;
+  }
+  const bool skater_family =
+      info.cls == EntClass::kSkater || info.cls == EntClass::kColorized ||
+      info.cls == EntClass::kCac || info.cls == EntClass::kSkaterAux;
+  if (!skater_family) {
+    return false;
+  }
+  float alpha = 0.0f;
+  if (!LoadF32Block(base, info.entity + kEntOpacitySkater, &alpha, 1) ||
+      !(alpha >= -0.01f && alpha <= 1.01f)) {
+    return false;
+  }
+  *out_alpha = alpha;
+  return true;
 }
 
 uint32_t ServeInstancePalette(uint8_t* base, uint32_t ctx, float* out,
