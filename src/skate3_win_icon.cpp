@@ -141,22 +141,70 @@ struct GrpIconDir {
 };
 #pragma pack(pop)
 
+// The renamed-aside original exe (still the locked running image) cannot be
+// deleted from this process. Hand it to a detached waiter that deletes it
+// the moment this process exits (clean exit or crash), so a freshly
+// deployed exe does not leave a .pre-icon copy sitting next to it between
+// runs. The next-run cleanup in EnsureExeIconResource stays as the backstop
+// if the helper never gets to run.
+void SpawnPreIconDeleter(const std::filesystem::path& pre) {
+  // PowerShell single-quoted literal: double any embedded single quotes.
+  std::wstring esc;
+  for (wchar_t c : pre.wstring()) {
+    esc += c;
+    if (c == L'\'') {
+      esc += c;
+    }
+  }
+  std::wstring cmd =
+      L"powershell.exe -NoProfile -WindowStyle Hidden -Command "
+      L"\"Wait-Process -Id " +
+      std::to_wstring(GetCurrentProcessId()) +
+      L" -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '" + esc +
+      L"' -Force -ErrorAction SilentlyContinue\"";
+  std::vector<wchar_t> mutable_cmd(cmd.begin(), cmd.end());
+  mutable_cmd.push_back(L'\0');
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE,
+                     CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  }
+}
+
 // One-time self-patch: write RT_ICON entries + a MAINICON RT_GROUP_ICON into
 // the exe file. The running image is write-locked but RENAMABLE: patch a
 // copy, then swap it into place. The renamed original stays locked until
-// exit and is deleted by the NEXT (already-patched) run.
+// exit; a detached helper deletes it at process exit (next run = backstop).
 void EnsureExeIconResource(const std::vector<uint8_t>& png) {
   wchar_t exe_w[MAX_PATH];
   if (GetModuleFileNameW(nullptr, exe_w, MAX_PATH) == 0) {
     return;
   }
   const std::filesystem::path exe(exe_w);
-  const std::filesystem::path pre = exe.wstring() + L".pre-icon";
+  const std::filesystem::path pre_local = exe.wstring() + L".pre-icon";
+  wchar_t temp_dir[MAX_PATH];
+  const bool have_temp = GetTempPathW(MAX_PATH, temp_dir) != 0;
   if (FindResourceW(GetModuleHandleW(nullptr), L"MAINICON",
                     reinterpret_cast<LPCWSTR>(RT_GROUP_ICON)) != nullptr) {
-    // Already patched (or a build that ships an icon): just clean up any
-    // leftover pre-patch original from the run that performed the swap.
-    DeleteFileW(pre.c_str());
+    // Already patched (or a build that ships an icon): backstop-sweep any
+    // leftover pre-patch original the exit-time deleter didn't get to:
+    // the exe-adjacent legacy name and the temp-dir parking spots (a
+    // still-running other instance's parked file just fails the delete).
+    DeleteFileW(pre_local.c_str());
+    if (have_temp) {
+      WIN32_FIND_DATAW fd;
+      const std::wstring pattern = std::wstring(temp_dir) + L"skate3-pre-icon-*.old";
+      HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+      if (find != INVALID_HANDLE_VALUE) {
+        do {
+          DeleteFileW((std::wstring(temp_dir) + fd.cFileName).c_str());
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+      }
+    }
     return;
   }
 
@@ -235,20 +283,34 @@ void EnsureExeIconResource(const std::vector<uint8_t>& png) {
     return;
   }
   // Swap: rename the (locked but renamable) running exe aside, move the
-  // patched copy into place. On the second step failing, restore.
+  // patched copy into place. On the second step failing, restore. Parking
+  // spot: %TEMP% (a locked image can be renamed anywhere on the same
+  // volume, metadata-only op), so no duplicate ever shows up next to the
+  // exe; falls back to exe-adjacent when temp is on another volume.
+  std::filesystem::path pre =
+      have_temp ? std::filesystem::path(std::wstring(temp_dir) +
+                                        L"skate3-pre-icon-" +
+                                        std::to_wstring(GetCurrentProcessId()) +
+                                        L".old")
+                : pre_local;
   if (!MoveFileExW(exe.c_str(), pre.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-    REXLOG_INFO("win-icon: could not move running exe aside ({}); skipping",
-                GetLastError());
-    DeleteFileW(temp.c_str());
-    return;
+    pre = pre_local;
+    if (!MoveFileExW(exe.c_str(), pre.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+      REXLOG_INFO("win-icon: could not move running exe aside ({}); skipping",
+                  GetLastError());
+      DeleteFileW(temp.c_str());
+      return;
+    }
   }
   if (!MoveFileW(temp.c_str(), exe.c_str())) {
     MoveFileW(pre.c_str(), exe.c_str());
     return;
   }
+  SetFileAttributesW(pre.c_str(), FILE_ATTRIBUTE_HIDDEN);
+  SpawnPreIconDeleter(pre);
   REXLOG_INFO(
       "win-icon: Explorer icon patched into {} from the game's own art "
-      "(one-time; {} removed on next launch)",
+      "(one-time; {} removed when this process exits)",
       exe.filename().string(), pre.filename().string());
 }
 
