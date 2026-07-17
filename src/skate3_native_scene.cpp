@@ -82,6 +82,38 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 4, "Skate 3",
                      "fix texture aliasing.")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao, true, "Skate 3",
+                    "Screen-space ambient occlusion (GTAO) in the native renderer: soft "
+                    "contact shading where surfaces meet (under ledges, rails, vehicles, "
+                    "the skater). A post pass over the resolved scene depth, an "
+                    "enhancement beyond the original game's shading.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_ssao_radius, 0.8, "Skate 3",
+                      "SSAO sample radius in world units. Larger radii darken bigger "
+                      "cavities but read as wide soft pools around characters; small "
+                      "radii keep it to contact shading.")
+    .range(0.1, 8.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_ssao_luma_protect, 1.2, "Skate 3",
+                      "How strongly bright (sun-lit) surfaces resist SSAO darkening, "
+                      "a post-tonemap approximation of ambient-only occlusion (direct "
+                      "sunlight is not occluded by nearby geometry). 0 = AO applies "
+                      "uniformly regardless of lighting.")
+    .range(0.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_ssao_intensity, 1.4, "Skate 3",
+                      "SSAO strength: exponent on the linear visibility term (0 = "
+                      "invisible, 1 = physical, >1 = accentuated).")
+    .range(0.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao_full_res, false, "Skate 3",
+                    "Evaluate SSAO at full output resolution instead of half. Roughly "
+                    "4x the GPU cost for a subtle sharpening of the smallest contact "
+                    "shadows; the depth-aware blur hides most of the difference.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao_debug, false, "Skate 3",
+                    "Replace the frame with the SSAO visibility term (tuning aid).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_2d, true, "Skate 3",
                     "Replay the game's 2D/APT (Flash HUD) draws as a native overlay pass "
                     "on top of the 3D scene")
@@ -8424,6 +8456,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   for (int i = 0; i < 16; ++i) {
     scene.view_proj[i] = LoadGuestF32(base, viewcam + kViewCamViewProj + i * 4);
   }
+  // The raw projection (+0x60) rides along for the depth-based post passes
+  // (SSAO linearize/unproject). Camera smoothing below replaces only the
+  // view; the projection is whatever the game rendered this frame with.
+  for (int i = 0; i < 16; ++i) {
+    scene.proj[i] = LoadGuestF32(base, viewcam + 0x60 + i * 4);
+  }
   // RAW guest view*proj, the pose the game culled its submissions with,
   // kept for the off-screen retention frustum tests below (smoothing
   // replaces scene.view_proj with the re-timed pose).
@@ -10159,6 +10197,36 @@ struct RendererState {
   uint32_t pfx_width = 0, pfx_height = 0;
   bool pfx_ready = false;
   bool pfx_failed = false;
+  // Screen-space ambient occlusion (ssao.hlsl: GTAO over the resolved
+  // scene; see ApplySsaoPass). Own binding layout: root constants b0 + two
+  // single-texture tables t0/t1 + point/linear clamp samplers. Full-res
+  // intermediates: linearized view-Z (R32F) + two AO ping-pong planes
+  // (R8), idle in RENDER_TARGET state. PSOs rebuild when the MSAA level
+  // (depth SRV dimension / linearize variant) or the output format
+  // (composite target) changes.
+  nrhi::BindingLayout* ao_layout = nullptr;
+  nrhi::Pipeline* pso_ao_linearize = nullptr;
+  nrhi::Pipeline* pso_ao_gtao = nullptr;
+  nrhi::Pipeline* pso_ao_blur = nullptr;
+  nrhi::Pipeline* pso_ao_luma = nullptr;
+  nrhi::Pipeline* pso_ao_composite = nullptr;
+  nrhi::Pipeline* pso_ao_debug = nullptr;
+  nrhi::Texture* ao_lin_depth = nullptr;
+  nrhi::Texture* ao_tex[2] = {};
+  // Scene luminance at the AO raster: the sun-lit protection mask input
+  // (bright pixels resist AO and skip the march entirely).
+  nrhi::Texture* ao_luma = nullptr;
+  nrhi::TextureView* ao_lin_srv = nullptr;
+  nrhi::TextureView* ao_srv[2] = {};
+  nrhi::TextureView* ao_luma_srv = nullptr;
+  // View of the scene depth buffer, re-pointed when depth is rebuilt.
+  nrhi::TextureView* ao_depth_srv = nullptr;
+  nrhi::Texture* ao_depth_srv_of = nullptr;
+  uint32_t ao_width = 0, ao_height = 0;          // AO raster (half or full res)
+  uint32_t ao_lin_width = 0, ao_lin_height = 0;  // linear depth (always full)
+  uint32_t ao_msaa = 0;
+  nrhi::Format ao_rtv_format = nrhi::Format::kUnknown;
+  bool ao_failed = false;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // (The old D3D12 bookkeeping, the retired-resource vector, the CPU SRV
   // staging heap and its slot allocator/recycling lists, is gone: resource
@@ -13513,6 +13581,342 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
       g_r.msaa_srv_allocated = g_r.msaa_srv_slot != nullptr;
     }
   }
+  return true;
+}
+
+// ---- Screen-space ambient occlusion (ssao.hlsl: GTAO) --------------------
+// Layout + PSOs, built lazily on the first enabled frame and rebuilt when
+// the MSAA level (linearize shader variant) or the output format (composite
+// target) changes. Failure disables the effect only.
+bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context) {
+  if (g_r.ao_failed) {
+    return false;
+  }
+  if (g_r.pso_ao_linearize != nullptr && g_r.ao_msaa == g_r.msaa &&
+      g_r.ao_rtv_format == context.guest_output->format()) {
+    return true;
+  }
+  nrhi::Device* device = context.device;
+  const auto fail = [&](const char* what) {
+    REXLOG_ERROR("native-scene: ssao pipeline setup failed ({})", what);
+    g_r.ao_failed = true;
+    return false;
+  };
+  if (g_r.ao_layout == nullptr) {
+    nrhi::BindingLayoutDesc ld;
+    ld.param_count = 3;
+    ld.params[0] = {nrhi::BindingParamKind::kConstants, /*b*/ 0, 16,
+                    nrhi::Visibility::kAll};
+    ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[2] = {nrhi::BindingParamKind::kTextureTable, 1, 1,
+                    nrhi::Visibility::kPixel};
+    ld.static_sampler_count = 2;
+    ld.static_samplers[0] = {/*s*/ 0, nrhi::Filter::kPoint,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.static_samplers[1] = {1, nrhi::Filter::kLinear,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.allow_input_layout = false;
+    g_r.ao_layout = device->CreateBindingLayout(ld);
+    if (g_r.ao_layout == nullptr) {
+      return fail("binding layout");
+    }
+  }
+  nrhi::Pipeline** psos[6] = {&g_r.pso_ao_linearize, &g_r.pso_ao_gtao,
+                              &g_r.pso_ao_blur, &g_r.pso_ao_luma,
+                              &g_r.pso_ao_composite, &g_r.pso_ao_debug};
+  for (nrhi::Pipeline** p : psos) {
+    if (*p != nullptr) {
+      device->DestroyDeferred(*p);
+      *p = nullptr;
+    }
+  }
+  const bool msaa = g_r.msaa > 1;
+  const nrhi::ShaderMacro msaa_defs[] = {{"AO_MSAA", "1"}, {nullptr, nullptr}};
+  nrhi::Shader* vs = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kVertex, "ssao.hlsl",
+                     kSsaoShaderSource, "vs_main", nullptr, ""));
+  const char* ps_entries[6] = {"ps_linearize", "ps_gtao", "ps_blur",
+                               "ps_luma", "ps_composite", "ps_debug"};
+  nrhi::Shader* ps[6] = {};
+  bool ok = vs != nullptr;
+  for (int i = 0; i < 6; ++i) {
+    const bool msaa_entry = i == 0 && msaa;
+    ps[i] = device->CreateShader(MakeShaderDesc(
+        nrhi::ShaderStage::kPixel, "ssao.hlsl", kSsaoShaderSource,
+        ps_entries[i], msaa_entry ? msaa_defs : nullptr,
+        msaa_entry ? "AO_MSAA=1" : ""));
+    ok = ok && ps[i] != nullptr;
+  }
+  if (!ok) {
+    device->DestroyDeferred(vs);
+    for (nrhi::Shader* s : ps) {
+      device->DestroyDeferred(s);
+    }
+    return fail("shader compile");
+  }
+  nrhi::GraphicsPipelineDesc pso;
+  pso.layout = g_r.ao_layout;
+  pso.vs = vs;
+  pso.cull = nrhi::CullMode::kNone;
+  pso.sample_count = 1;
+  pso.ps = ps[0];
+  pso.rtv_format = nrhi::Format::kR32_FLOAT;
+  g_r.pso_ao_linearize = device->CreateGraphicsPipeline(pso);
+  pso.ps = ps[1];
+  pso.rtv_format = nrhi::Format::kR8_UNORM;
+  g_r.pso_ao_gtao = device->CreateGraphicsPipeline(pso);
+  pso.ps = ps[2];
+  g_r.pso_ao_blur = device->CreateGraphicsPipeline(pso);
+  pso.ps = ps[3];
+  g_r.pso_ao_luma = device->CreateGraphicsPipeline(pso);
+  // Composite: dst.rgb * src.a; the AO plane carries the finished
+  // multiplier, and the RGB-only write mask keeps the output's 2-bit alpha
+  // untouched.
+  pso.ps = ps[4];
+  pso.rtv_format = context.guest_output->format();
+  pso.blend.enable = true;
+  pso.blend.src = nrhi::BlendFactor::kZero;
+  pso.blend.dst = nrhi::BlendFactor::kSrcAlpha;
+  pso.blend.op = nrhi::BlendOp::kAdd;
+  pso.blend.src_alpha = nrhi::BlendFactor::kZero;
+  pso.blend.dst_alpha = nrhi::BlendFactor::kOne;
+  pso.blend.op_alpha = nrhi::BlendOp::kAdd;
+  pso.blend.write_mask = 0x7;
+  g_r.pso_ao_composite = device->CreateGraphicsPipeline(pso);
+  pso.blend = {};
+  pso.ps = ps[5];
+  g_r.pso_ao_debug = device->CreateGraphicsPipeline(pso);
+  device->DestroyDeferred(vs);
+  for (nrhi::Shader* s : ps) {
+    device->DestroyDeferred(s);
+  }
+  if (g_r.pso_ao_linearize == nullptr || g_r.pso_ao_gtao == nullptr ||
+      g_r.pso_ao_blur == nullptr || g_r.pso_ao_luma == nullptr ||
+      g_r.pso_ao_composite == nullptr || g_r.pso_ao_debug == nullptr) {
+    return fail("pso");
+  }
+  g_r.ao_msaa = g_r.msaa;
+  g_r.ao_rtv_format = context.guest_output->format();
+  REXLOG_INFO("native-scene: ssao pipeline created (MSAA x{})", g_r.msaa);
+  return true;
+}
+
+// GTAO chain over the resolved scene (see ssao.hlsl): linearize depth,
+// horizon-based AO, depth-aware separable blur, multiply-composite onto the
+// guest output (which must be in RENDER_TARGET state). Returns true when it
+// drew; binding layout/state was changed and the caller restores the main
+// pass's bindings.
+bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
+                   nrhi::Cmd* cmd, const FrameScene& scene,
+                   const nrhi::Viewport& viewport, const nrhi::Rect& scissor) {
+  // The published projection must be the live perspective matrix (row-vector
+  // m23 == 1; all zeros until the first publish).
+  const float* pr = scene.proj;
+  if (pr[11] != 1.0f || pr[0] == 0.0f || pr[5] == 0.0f || pr[14] == 0.0f) {
+    return false;
+  }
+  if (!EnsureSsaoPipeline(context)) {
+    return false;
+  }
+  if (g_r.output_srv_slot == nullptr) {
+    return false;  // composite samples the guest output through this view
+  }
+  nrhi::Device* device = context.device;
+  const uint32_t width = context.guest_output_width;
+  const uint32_t height = context.guest_output_height;
+  // AO raster: half the output resolution by default: for a low-frequency
+  // term the depth-aware blur + bilinear upsample hide it, at 1/4 the march
+  // cost (full-res GTAO at 4K x 300+ uncapped fps pegged the GPU). The
+  // linearized depth stays full res: the march samples it at arbitrary UVs
+  // either way, and it keeps silhouette depth exact.
+  const bool ao_full =
+      REXCVAR_GET(skate3_native_render_scene_ssao_full_res);
+  const uint32_t aw = ao_full ? width : std::max(1u, (width + 1) / 2);
+  const uint32_t ah = ao_full ? height : std::max(1u, (height + 1) / 2);
+  // Intermediates (steady state RENDER_TARGET), rebuilt on either size.
+  if (g_r.ao_width != aw || g_r.ao_height != ah ||
+      g_r.ao_lin_width != width || g_r.ao_lin_height != height ||
+      g_r.ao_lin_depth == nullptr || g_r.ao_luma == nullptr) {
+    nrhi::Texture** res[4] = {&g_r.ao_lin_depth, &g_r.ao_tex[0],
+                              &g_r.ao_tex[1], &g_r.ao_luma};
+    nrhi::TextureView** views[4] = {&g_r.ao_lin_srv, &g_r.ao_srv[0],
+                                    &g_r.ao_srv[1], &g_r.ao_luma_srv};
+    for (int i = 0; i < 4; ++i) {
+      if (*views[i] != nullptr) {
+        device->DestroyDeferred(*views[i]);
+        *views[i] = nullptr;
+      }
+      if (*res[i] != nullptr) {
+        device->DestroyDeferred(*res[i]);
+        *res[i] = nullptr;
+      }
+      nrhi::TextureDesc desc;
+      desc.width = i == 0 ? width : aw;
+      desc.height = i == 0 ? height : ah;
+      desc.mip_levels = 1;
+      desc.format =
+          i == 0 ? nrhi::Format::kR32_FLOAT : nrhi::Format::kR8_UNORM;
+      desc.usage = nrhi::kTextureUsageRenderTarget;
+      desc.initial_state = nrhi::ResourceState::kRenderTarget;
+      *res[i] = device->CreateTexture(desc);
+      if (*res[i] == nullptr) {
+        g_r.ao_failed = true;
+        return false;
+      }
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      *views[i] = device->CreateTextureView(*res[i], vd);
+      if (*views[i] == nullptr) {
+        g_r.ao_failed = true;
+        return false;
+      }
+    }
+    g_r.ao_width = aw;
+    g_r.ao_height = ah;
+    g_r.ao_lin_width = width;
+    g_r.ao_lin_height = height;
+  }
+  // Scene-depth SRV, re-pointed when the depth buffer is rebuilt (resize /
+  // MSAA change). D32 textures view as R32_FLOAT automatically.
+  if (g_r.ao_depth_srv == nullptr || g_r.ao_depth_srv_of != g_r.depth) {
+    if (g_r.ao_depth_srv != nullptr) {
+      device->DestroyDeferred(g_r.ao_depth_srv);
+      g_r.ao_depth_srv = nullptr;
+    }
+    nrhi::TextureViewDesc sd;
+    if (g_r.msaa > 1) {
+      sd.dimension = nrhi::ViewDimension::k2DMS;
+    } else {
+      sd.dimension = nrhi::ViewDimension::k2D;
+      sd.mip_levels = 1;
+    }
+    g_r.ao_depth_srv = device->CreateTextureView(g_r.depth, sd);
+    if (g_r.ao_depth_srv == nullptr) {
+      g_r.ao_failed = true;
+      return false;
+    }
+    g_r.ao_depth_srv_of = g_r.depth;
+  }
+
+  // b0 rows (see ssao.hlsl cbuffer C): size, projection, tuning, blur axis.
+  // size = the AO raster the march/blur passes run at; every shader use is
+  // UV-relative, so half res needs no shader-side changes.
+  float c[16];
+  c[0] = float(aw);
+  c[1] = float(ah);
+  c[2] = 1.0f / float(aw);
+  c[3] = 1.0f / float(ah);
+  c[4] = std::fabs(pr[0]);  // |m00|: the guest projection's x scale is
+                            // negative; AO is mirror-invariant
+  c[5] = std::fabs(pr[5]);  // |m11|
+  c[6] = pr[10];            // m22
+  c[7] = pr[14];            // m32
+  c[8] = float(REXCVAR_GET(skate3_native_render_scene_ssao_radius));
+  c[9] = float(REXCVAR_GET(skate3_native_render_scene_ssao_intensity));
+  // Distance fade 150..250 view units: fog owns the far field and the
+  // horizon-search precision degrades with depth anyway.
+  c[10] = 150.0f;
+  c[11] = 1.0f / 100.0f;
+  c[12] = 1.0f;  // blur axis (horizontal first)
+  c[13] = 0.0f;
+  c[14] = float(REXCVAR_GET(skate3_native_render_scene_ssao_luma_protect));
+  c[15] = 0.0f;
+
+  const nrhi::Viewport ao_vp{0.0f, 0.0f, float(aw), float(ah), 0.0f, 1.0f};
+  const nrhi::Rect ao_sc{0, 0, int32_t(aw), int32_t(ah)};
+
+  cmd->SetBindingLayout(g_r.ao_layout);
+  cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+  cmd->SetViewport(viewport);
+  cmd->SetScissor(scissor);
+  cmd->SetRootConstants(0, 16, c, 0);
+
+  // 1) Scene depth -> linear view Z (sample 0 when MSAA). Full res.
+  cmd->Barrier(g_r.depth, nrhi::ResourceState::kDepthWrite,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  cmd->SetRenderTargets(g_r.ao_lin_depth, nullptr);
+  cmd->SetPipeline(g_r.pso_ao_linearize);
+  cmd->SetTexture(1, g_r.ao_depth_srv);
+  cmd->Draw(3, 0);
+  cmd->Barrier(g_r.depth, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kDepthWrite);
+  cmd->Barrier(g_r.ao_lin_depth, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+
+  // 1b) Scene luminance -> ao_luma (AO raster): the sun-lit protection
+  //     mask. The guest output pauses as a sampled source for one draw.
+  cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  cmd->SetViewport(ao_vp);
+  cmd->SetScissor(ao_sc);
+  cmd->SetRenderTargets(g_r.ao_luma, nullptr);
+  cmd->SetPipeline(g_r.pso_ao_luma);
+  cmd->SetTexture(1, g_r.output_srv_slot);
+  cmd->Draw(3, 0);
+  cmd->Barrier(g_r.ao_luma, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->Barrier(context.guest_output, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
+
+  // 2) GTAO -> ao_tex[0], at the AO raster size.
+  cmd->SetRenderTargets(g_r.ao_tex[0], nullptr);
+  cmd->SetPipeline(g_r.pso_ao_gtao);
+  cmd->SetTexture(1, g_r.ao_lin_srv);
+  cmd->SetTexture(2, g_r.ao_luma_srv);
+  cmd->Draw(3, 0);
+  cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+
+  // 3) Depth-aware blur, horizontal -> ao_tex[1].
+  cmd->SetRenderTargets(g_r.ao_tex[1], nullptr);
+  cmd->SetPipeline(g_r.pso_ao_blur);
+  cmd->SetTexture(1, g_r.ao_srv[0]);
+  cmd->SetTexture(2, g_r.ao_lin_srv);
+  cmd->Draw(3, 0);
+  cmd->Barrier(g_r.ao_tex[1], nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
+
+  // 4) Vertical -> ao_tex[0].
+  const float dir_v[2] = {0.0f, 1.0f};
+  cmd->SetRootConstants(0, 2, dir_v, 12);
+  cmd->SetRenderTargets(g_r.ao_tex[0], nullptr);
+  cmd->SetTexture(1, g_r.ao_srv[1]);
+  cmd->SetTexture(2, g_r.ao_lin_srv);
+  cmd->Draw(3, 0);
+  cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+
+  // 5) Composite onto the guest output (full res; s1 bilinearly upsamples
+  //    the finished multiplier plane). Debug replaces the frame with it.
+  cmd->SetViewport(viewport);
+  cmd->SetScissor(scissor);
+  cmd->SetRenderTargets(context.guest_output, nullptr);
+  cmd->SetPipeline(REXCVAR_GET(skate3_native_render_scene_ssao_debug)
+                       ? g_r.pso_ao_debug
+                       : g_r.pso_ao_composite);
+  cmd->SetTexture(1, g_r.ao_srv[0]);
+  cmd->Draw(3, 0);
+
+  // Restore intermediate steady states.
+  cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->Barrier(g_r.ao_tex[1], nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->Barrier(g_r.ao_lin_depth, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->Barrier(g_r.ao_luma, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
   return true;
 }
 
@@ -18193,6 +18597,27 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (outline_ready) {
     RenderOutlineComposite(context, scene, context.guest_output, viewport,
                            scissor);
+  }
+
+  // ---- Screen-space ambient occlusion (ssao.hlsl: GTAO) ----
+  // Multiplies the resolved scene by a horizon-based visibility term before
+  // any downstream consumer (photo chain, 2D overlay, blur). Runs after the
+  // outline composite, which relies on the main layout latched from the
+  // scene pass.
+  if (use_depth && !loading_native &&
+      REXCVAR_GET(skate3_native_render_scene_ssao) &&
+      ApplySsaoPass(context, cmd, scene, viewport, scissor)) {
+    // The AO chain switched binding layouts; restore the main-pass root
+    // bindings the later passes latch (same restore as the photo chain's).
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    cmd->SetBindingLayout(g_r.layout);
+    if (g_r.shadow_cb != nullptr) {
+      const uint32_t cb_offset =
+          uint32_t(frame_number % RendererState::kShadowCbRegions) * 256u;
+      cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
+      cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+    }
   }
 
   // ---- Photo-editor postfx chain (photo_fx.hlsl: exact ucode ports) ----

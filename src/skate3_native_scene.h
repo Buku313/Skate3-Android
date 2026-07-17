@@ -264,6 +264,11 @@ struct FrameScene {
   uint64_t generation = 0;
   float view_proj[16] = {};
   float cam_pos[3] = {};
+  // Raw guest projection matrix (viewcam +0x60, row-vector, m23 = 1),
+  // published alongside view_proj. Consumed by depth-based post passes
+  // (SSAO linearize/unproject via m00/m11/m22/m32). Zeros until the first
+  // publish; camera smoothing replaces only the view, never this.
+  float proj[16] = {};
   // Global distance-fog parameter rows, captured once per frame from the
   // first main-pass draw's VS constant bank (main-pass layout: c4 = camera,
   // the validation key; c5 = fog ramp scale/bias/exponent, c6 = linear-space
