@@ -34,14 +34,28 @@ VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float fade : TEXCOORD1
 // Getting this wrong is visible: a linear 1/a over-brightens the low-alpha
 // glow fringe (fuzzy, blown-out edges) and a linear darken alpha weakens the
 // backdrop dimming that makes the neon read as solid.
+// HDR=1: the scene target holds the tone chain's pre-tonemap input (see
+// scene.hlsl ToneOut), so the gamma-authored spline colors encode through
+// the chain's exact inverse before blending; the host tonemap pass then
+// restores them (and the neon glow feeds bloom).
+float3 SplineOut(float3 c) {
+#ifdef HDR
+  float3 tm = c * c * (2.0 / (1.41 * 1.41));
+  float3 lo = 1.0 - sqrt(saturate(1.0 - tm));
+  float3 hi = 4.0 * tm - 3.0;
+  return lerp(lo, hi, step(1.0, tm));  // per-channel select (fxc + dxc)
+#else
+  return c;
+#endif
+}
 float4 ps_default(VSOut i) : SV_Target {
   float4 c = tex.Sample(smp, i.uv);
   float3 sq = c.rgb * c.rgb * (intensity.x * i.fade / max(c.a, 1.0 / 255.0));
-  return float4(sqrt(abs(sq)), 1.0);
+  return float4(SplineOut(sqrt(abs(sq))), 1.0);
 }
 float4 ps_darken(VSOut i) : SV_Target {
   float4 c = tex.Sample(smp, i.uv);
   float3 rgb = sqrt(abs(c.rgb * c.rgb * intensity.y));
   float a = sqrt(abs(c.a * intensity.y * i.fade));
-  return float4(rgb, a);
+  return float4(SplineOut(rgb), a);
 }

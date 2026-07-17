@@ -117,9 +117,17 @@ float Ign(float2 p) {
 
 // Half-res scene luminance for the sun-lit protection mask (low-frequency
 // by nature, so the AO raster resolution is plenty; bilinear at the 2x
-// reduction is an exact 2x2 box).
+// reduction is an exact 2x2 box). Under HDR=1 the scene plane holds the
+// pre-tonemap linear value; apply the scene tone chain first so the
+// protection thresholds keep their display-space meaning.
 float ps_luma(VSOut i) : SV_Target {
   float3 scene = tex0c.SampleLevel(smp_linear, i.uv, 0).rgb;
+#ifdef HDR
+  float3 x = max(scene, 0.0);
+  float3 t1 = saturate(1.0 - x);
+  float3 tm = max(x * 0.25 + 0.75, 1.0) - t1 * t1;
+  scene = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
+#endif
   return dot(scene, float3(0.299f, 0.587f, 0.114f));
 }
 
@@ -207,9 +215,16 @@ float ps_gtao(VSOut i) : SV_Target {
   vis = saturate(vis / float(AO_SLICES));
   // Bake the full multiplier here so the blur smooths the finished term and
   // the composite is a plain blend: intensity exponent on the linear
-  // visibility, the extra 0.5 converting the multiply into the target's
-  // gamma-2 encoding, then the protection and distance fades toward 1.
+  // visibility, then the protection and distance fades toward 1. The
+  // classic target is gamma-2-encoded, so the exponent halves to express a
+  // linear-space multiply there; the HDR target is pre-tonemap linear
+  // (near-proportional to display-linear below the tonemapper's knee) and
+  // takes the exponent directly.
+#ifdef HDR
+  float a = pow(vis, p0.y);
+#else
   float a = pow(vis, p0.y * 0.5f);
+#endif
   a = lerp(a, 1.0f, protect);
   return lerp(a, 1.0f, fade);
 }

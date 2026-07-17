@@ -270,9 +270,43 @@ void KdAxes(float4 tanb, float3 wn, float3 tt_s, float3 bb_s,
     kt = cross(kb, wn) * ((tanb.w > 0.6 ? 1.0 : -1.0) * sh_v2.x);
   }
 }
+// ---- Output encode --------------------------------------------------------
+// Every exact branch ends in the same chain: x = the post-fog,
+// post-exposure linear value ("xe"), then
+//   tonemap = max(x*0.25 + 0.75, 1) - sat(1 - x)^2
+//   out     = sat(sqrt(0.5 * tonemap) * 1.41)      (the uber's 1.41 fold)
+// Under HDR=1 the branch returns xe itself into the float scene
+// intermediate and the host post pass (hdr.hlsl ps_tonemap) applies the
+// chain exactly once, which is what lets real bloom inject energy
+// pre-tonemap. `reduced` = environmentdiffuse's cheap curve 1 - sat(1-x)^2;
+// it equals the full curve evaluated at min(x, 1) (the two only differ past
+// the x = 1 saturation point), so the HDR encode is a clamp.
+float4 ToneOut(float3 xe, float a, bool reduced) {
+#ifdef HDR
+  float3 x = max(xe, 0.0);
+  return float4(reduced ? min(x, 1.0) : x, a);
+#else
+  float3 t1 = saturate(1.0 - xe);
+  float3 tm = reduced ? 1.0 - t1 * t1 : max(xe * 0.25 + 0.75, 1.0) - t1 * t1;
+  return float4(saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41), a);
+#endif
+}
+// Passthrough for values authored in the FINAL gamma space (the legacy
+// empirical branches, water, debug visualizations): under HDR they encode
+// as the tone chain's exact inverse, so the host tonemap restores them.
+float3 PassGamma(float3 c) {
+#ifdef HDR
+  float3 tm = c * c * (2.0 / (1.41 * 1.41));
+  float3 lo = 1.0 - sqrt(saturate(1.0 - tm));
+  float3 hi = 4.0 * tm - 3.0;
+  return lerp(lo, hi, step(1.0, tm));  // per-channel select (fxc + dxc)
+#else
+  return c;
+#endif
+}
 float4 ps_main(VSOut i) : SV_Target {
   if (tint.a > 0.0) {
-    return tint;
+    return float4(PassGamma(tint.rgb), tint.a);
   }
   float4 albedo = diffuse.Sample(smp, i.uv);
   // Alpha-tested foliage/fences; opaque formats sample alpha = 1. Character
@@ -316,10 +350,7 @@ float4 ps_main(VSOut i) : SV_Target {
     float4 sun = decal_art.Sample(smp_clamp, float2(sinA / overlay.x, 0.5 / 16.0));
     lin += sun.rgb * sun.rgb / saturate(sun.a + 0.01);
     float3 xe = lin * overlay.y * misc.y;
-    float3 t1 = saturate(1.0 - xe);
-    float3 tm = max(xe * 0.25 + 0.75, 1.0) - t1 * t1;
-    float3 cc = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
-    return float4(cc, 1.0);
+    return ToneOut(xe, 1.0, false);
   }
   // dynamicobject.fx props (cam_pos.w = -(20 + variant): -21 default,
   // -22 alphatest). Rigid movable objects (dispensers, dumpsters, benches,
@@ -452,9 +483,7 @@ float4 ps_main(VSOut i) : SV_Target {
     float3 fog_rgb = sh_fogc.rgb * f1;
     float fog_a = (1.0 + sh_fogc.a * f1) * dyn_misc.x;  // x material multiplier
     float3 xe = (lin * fog_a + fog_rgb) * dyn_sun.w;
-    float3 t1 = saturate(1.0 - xe);
-    float3 tm = max(xe * 0.25 + 0.75, 1.0) - t1 * t1;
-    return float4(saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41), 1.0);
+    return ToneOut(xe, 1.0, false);
   }
   // Character families: the game's own lighting in LINEAR space (diffuse is
   // gamma -> square it), then the exact tone chain from the disassembly and
@@ -587,10 +616,7 @@ float4 ps_main(VSOut i) : SV_Target {
     }
     // Exact tone chain: sqrt(0.5 * (max(x*E/4 + 0.75, 1) - sat(1 - x*E)^2)).
     float E = max(ch_key.w, 0.01);
-    float3 t1 = saturate(1.0 - lin * E);
-    float3 tm = max(lin * 0.25 * E + 0.75, 1.0) - t1 * t1;
-    float3 cc = saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
-    return float4(cc, out_a);
+    return ToneOut(lin * E, out_a, false);
   }
   // Exact world-material families (cam_pos.w = -family): hand-ported from
   // the game's own pixel shaders and verified per-pixel against them with
@@ -698,15 +724,15 @@ float4 ps_main(VSOut i) : SV_Target {
       // Debug taps live on fams 5/6/13 only; on fams 1-4 misc.z carries
       // the v2 material bind flags instead (family-gated below).
       if (fam > 4.5 && abs(misc.z - 7.0) < 0.5) {
-        return float4(lmg, 1.0);
+        return float4(PassGamma(lmg), 1.0);
       }
       if (fam > 4.5 && abs(misc.z - 8.0) < 0.5) {
-        return float4(frac(i.uv2 * 16.0), 0.0, 1.0);
+        return float4(PassGamma(float3(frac(i.uv2 * 16.0), 0.0)), 1.0);
       }
       // Mode 9: lightmap-resolve status; RED = a real lightmap is bound
       // (tint.r set by the C++ resolve), BLUE = white fallback in t1.
       if (fam > 4.5 && abs(misc.z - 9.0) < 0.5) {
-        return float4(tint.r, 0.0, 1.0 - tint.r, 1.0);
+        return float4(PassGamma(float3(tint.r, 0.0, 1.0 - tint.r)), 1.0);
       }
       // tint.r == 0 = the real lightmap has not resolved yet (first-sight
       // decode in flight; t1 = the white fallback). Min-clamping the
@@ -906,11 +932,7 @@ float4 ps_main(VSOut i) : SV_Target {
     // Fog -> exposure -> tonemap -> sqrt, then the postfx uber's measured
     // 1.41 scene multiplier (same as the character branch).
     float3 xe = (lin * fog_a + fog_rgb) * expo;
-    float3 t1e = saturate(1.0 - xe);
-    float3 tme = reduced_tone ? 1.0 - t1e * t1e
-                              : max(xe * 0.25 + 0.75, 1.0) - t1e * t1e;
-    float3 cce = saturate(sqrt(max(tme * 0.5, 0.0)) * 1.41);
-    return float4(cce, out_a);
+    return ToneOut(xe, out_a, reduced_tone);
   }
   // environment.decal surfaces: the paint/graffiti art (t4) is composited
   // over the base diffuse by ITS alpha, opaque output; these meshes ARE
@@ -1059,7 +1081,7 @@ float4 ps_main(VSOut i) : SV_Target {
                    fade * mat_tint.rgb, 0.0));
     // Opaque: the game's murk hides the canal bed entirely (and our bed
     // shading is untrustworthy under water: striped lightmap unwraps).
-    return float4(col, 1.0);
+    return float4(PassGamma(col), 1.0);
   }
   if (misc.x > 0.0) {
     // transparentenvironment.fx (Skate 2 source; disassembled Skate 3 PS
@@ -1076,9 +1098,9 @@ float4 ps_main(VSOut i) : SV_Target {
     }
     lit = sqrt(max(lit * lit * saturate(1.0 + fade * mat_tint.w) +
                    fade * mat_tint.rgb, 0.0));
-    return float4(lit, albedo.a * albedo.a);
+    return float4(PassGamma(lit), albedo.a * albedo.a);
   }
-  return float4(lit, 1.0);
+  return float4(PassGamma(lit), 1.0);
 }
 // Shadow caster pass: vs_main runs with mvp = (world *) lightVP built from
 // the captured receiver rows, so SV_Position.z IS the light-space depth

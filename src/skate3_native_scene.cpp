@@ -135,6 +135,49 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao_full_res, false, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao_debug, false, "Skate 3",
                     "Replace the frame with the SSAO visibility term (tuning aid).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr, true, "Skate 3",
+                    "Render the 3D scene into a float (HDR) intermediate and apply the "
+                    "game's shared tone chain once in a host post pass, the basis for "
+                    "real bloom (and later HDR effects). With bloom off the output is "
+                    "equivalent to the classic in-material tonemap. Off = the classic "
+                    "path, for A/B parity checks.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_bloom, true, "Skate 3",
+                    "Real bloom from the HDR scene: a downsample/upsample pyramid driven "
+                    "by pre-tonemap brightness (night lamps, neon, the sun and sky "
+                    "glow). Requires the HDR intermediate.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_threshold, 0.9, "Skate 3",
+                      "Bloom brightness threshold in pre-tonemap units (1.0 = the tone "
+                      "curve's saturation point; 0.85 corresponds to ~97% display "
+                      "white). Sunlit surfaces sit around 0.5-0.65 pre-tonemap; "
+                      "thresholds that reach them veil the whole daytime frame in "
+                      "glow; near-clipped lamp cores, neon, sky glare and the sun "
+                      "stay above 0.85.")
+    .range(0.0, 8.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_knee, 0.08, "Skate 3",
+                      "Bloom soft-knee width around the threshold (0 = hard cutoff).")
+    .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_intensity, 0.06, "Skate 3",
+                      "Bloom strength: the pyramid's contribution added to the "
+                      "pre-tonemap scene (0 = off; the pyramid accumulates ~5 levels, "
+                      "so small values are already visible around bright lights).")
+    .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr_packed, true, "Skate 3",
+                    "Use the packed R11G11B10 float format for the HDR scene targets "
+                    "instead of RGBA16F: halves the scene-pass color bandwidth (most "
+                    "of the HDR cost at high resolution + MSAA) at slightly lower "
+                    "precision in very dark gradients.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_hdr_debug, 0, "Skate 3",
+                     "HDR post debug: 0 = off, 1 = show the bloom term only, 2 = show "
+                     "the raw pre-tonemap scene (clamped), 3 = show the fused SSAO "
+                     "multiplier plane.")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_2d, true, "Skate 3",
                     "Replay the game's 2D/APT (Flash HUD) draws as a native overlay pass "
                     "on top of the 3D scene")
@@ -10232,7 +10275,46 @@ struct RendererState {
   uint32_t ao_lin_width = 0, ao_lin_height = 0;  // linear depth (always full)
   uint32_t ao_msaa = 0;
   nrhi::Format ao_rtv_format = nrhi::Format::kUnknown;
+  bool ao_hdr = false;  // luma/gtao/composite built for the HDR target
   bool ao_failed = false;
+  // Fused-AO handoff (HDR path): the AO pass leaves the finished multiplier
+  // plane (ao_tex[0]) in PIXEL_SHADER_RESOURCE state for ps_tonemap to
+  // consume at t2 (replacing the classic full-res composite draw);
+  // ApplyHdrPost restores it to RENDER_TARGET and clears the flag.
+  bool ao_plane_in_psr = false;
+  // HDR pipeline (hdr.hlsl): the scene renders pre-tonemap linear into a
+  // float intermediate (the MSAA color target and/or hdr_resolved), a bloom
+  // pyramid extracts real HDR energy, and ps_tonemap applies the game's
+  // shared tone chain once into the gamma guest output. Binding layout =
+  // the SSAO shape (root constants b0 + two single-texture tables +
+  // point/linear clamp samplers). All targets idle in RENDER_TARGET state.
+  bool hdr_active = false;  // latched per pipeline build (PSO formats/variants)
+  bool hdr_failed = false;  // float targets unavailable -> classic path
+  // Latched scene float format (RGBA16F or the packed R11G11B10 option);
+  // every HDR-path PSO/target creation reads this, never the cvar.
+  nrhi::Format hdr_scene_format = nrhi::Format::kR16G16B16A16_FLOAT;
+  nrhi::BindingLayout* hdr_layout = nullptr;
+  nrhi::Pipeline* pso_bloom_first = nullptr;  // mip-0 extract (threshold+Karis)
+  nrhi::Pipeline* pso_bloom_down = nullptr;
+  nrhi::Pipeline* pso_bloom_up = nullptr;     // additive ONE/ONE tent upsample
+  nrhi::Pipeline* pso_tonemap = nullptr;
+  nrhi::Format hdr_pso_out_format = nrhi::Format::kUnknown;
+  // 1x float scene plane: the MSAA resolve destination (or the scene target
+  // itself when MSAA is off); the AO composite, bloom extract and tonemap
+  // all consume/write it.
+  nrhi::Texture* hdr_resolved = nullptr;
+  nrhi::TextureView* hdr_srv = nullptr;
+  static constexpr uint32_t kBloomMaxLevels = 6;
+  nrhi::Texture* bloom_tex[kBloomMaxLevels] = {};
+  nrhi::TextureView* bloom_srv[kBloomMaxLevels] = {};
+  uint32_t bloom_w[kBloomMaxLevels] = {};
+  uint32_t bloom_h[kBloomMaxLevels] = {};
+  uint32_t bloom_levels = 0;
+  uint32_t bloom_base_w = 0, bloom_base_h = 0;  // output size the chain fits
+  bool targets_hdr = false;  // output-sized targets built for the HDR path
+  // Scene float format the output-sized targets were built with (kUnknown
+  // when classic); packed-format toggles rebuild them.
+  nrhi::Format targets_scene_fmt = nrhi::Format::kUnknown;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // (The old D3D12 bookkeeping, the retired-resource vector, the CPU SRV
   // staging heap and its slot allocator/recycling lists, is gone: resource
@@ -12608,21 +12690,44 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
 // no-depth, outline mask).
 bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
-  // MSAA level: the requested count, reduced to what the output format
-  // supports (1 disables and renders directly into the guest output). The
+  // Scene color format: the float HDR intermediate when the HDR post chain
+  // is active (the tonemap pass then writes the gamma guest output),
+  // otherwise the guest output itself.
+  const nrhi::Format scene_fmt = g_r.hdr_active
+                                     ? g_r.hdr_scene_format
+                                     : context.guest_output->format();
+  // MSAA level: the requested count, reduced to what the scene color format
+  // supports (1 disables and renders directly into the 1x target). The
   // RHI walks the requested count down in powers of two, exactly like the
   // old CheckFeatureSupport loop.
   const int32_t req = REXCVAR_GET(skate3_native_render_scene_msaa);
   uint32_t msaa = req >= 8 ? 8u : req >= 4 ? 4u : req >= 2 ? 2u : 1u;
-  msaa = device->GetSupportedSampleCount(context.guest_output->format(), msaa);
+  msaa = device->GetSupportedSampleCount(scene_fmt, msaa);
   g_r.msaa = msaa;
 
+  // The family rebuilds on HDR toggles / output-format changes: retire the
+  // previous pipelines (in-flight frames keep them alive via the deferred
+  // destruction queue).
+  for (nrhi::Pipeline** p :
+       {&g_r.pso, &g_r.pso_cullback, &g_r.pso_transparent, &g_r.pso_fade,
+        &g_r.pso_hair_a, &g_r.pso_hair_b, &g_r.pso_nodepth,
+        &g_r.pso_outline_mask}) {
+    if (*p != nullptr) {
+      device->DestroyDeferred(*p);
+      *p = nullptr;
+    }
+  }
+
+  // HDR=1 switches the pixel shader's output encode to pre-tonemap linear
+  // (see scene.hlsl ToneOut/PassGamma).
+  const nrhi::ShaderMacro hdr_defs[] = {{"HDR", "1"}, {nullptr, nullptr}};
   nrhi::Shader* vs = device->CreateShader(
       MakeShaderDesc(nrhi::ShaderStage::kVertex, "scene.hlsl", kShaderSource,
                      "vs_main", nullptr, ""));
   nrhi::Shader* ps = device->CreateShader(
       MakeShaderDesc(nrhi::ShaderStage::kPixel, "scene.hlsl", kShaderSource,
-                     "ps_main", nullptr, ""));
+                     "ps_main", g_r.hdr_active ? hdr_defs : nullptr,
+                     g_r.hdr_active ? "HDR=1" : ""));
   if (vs == nullptr || ps == nullptr) {
     REXLOG_ERROR("native-scene: shader compile failed");
     g_r.failed = true;
@@ -12640,7 +12745,7 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   pso.depth.test_enable = true;
   pso.depth.write_enable = true;
   pso.depth.func = nrhi::CompareFunc::kLess;
-  pso.rtv_format = context.guest_output->format();
+  pso.rtv_format = scene_fmt;
   pso.dsv_format = nrhi::Format::kD32_FLOAT;
   pso.sample_count = g_r.msaa;
   g_r.pso = device->CreateGraphicsPipeline(pso);
@@ -12703,7 +12808,7 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
     REXLOG_WARN("native-scene: outline mask PSO creation failed");
     // outline pass disables itself
   }
-  pso.rtv_format = context.guest_output->format();
+  pso.rtv_format = scene_fmt;
   pso.sample_count = g_r.msaa;
   device->DestroyDeferred(vs);
   device->DestroyDeferred(ps);
@@ -12719,6 +12824,10 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
 // Fullscreen MSAA resolve PSO (no-op below MSAA 2x).
 bool EnsureResolvePso(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
+  if (g_r.resolve_pso != nullptr) {
+    device->DestroyDeferred(g_r.resolve_pso);
+    g_r.resolve_pso = nullptr;
+  }
   if (g_r.msaa > 1) {
     char samples[8];
     std::snprintf(samples, sizeof(samples), "%u", g_r.msaa);
@@ -12742,7 +12851,10 @@ bool EnsureResolvePso(const NativeGuestOutputRenderContext& context) {
     rp.vs = rvs;
     rp.ps = rps;
     rp.cull = nrhi::CullMode::kNone;
-    rp.rtv_format = context.guest_output->format();
+    // Under HDR the resolve averages the float MSAA scene into the 1x float
+    // plane (hdr_resolved); classic resolves straight into the guest output.
+    rp.rtv_format = g_r.hdr_active ? g_r.hdr_scene_format
+                                   : context.guest_output->format();
     rp.sample_count = 1;
     g_r.resolve_pso = device->CreateGraphicsPipeline(rp);
     device->DestroyDeferred(rvs);
@@ -12938,15 +13050,26 @@ bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context) {
     // In-world spline pipelines: drawn inside the scene pass (MSAA sample
     // count, depth test LESS_EQUAL, no z-write) with the game's own blend
     // states (spline.xml): darken = straight alpha, default = additive.
+    // Under HDR the pixel shaders encode through the tone chain's inverse
+    // (SplineOut) so the host tonemap restores the authored look.
+    for (nrhi::Pipeline** p : {&g_r.pso_spline_darken, &g_r.pso_spline_default}) {
+      if (*p != nullptr) {
+        device->DestroyDeferred(*p);
+        *p = nullptr;
+      }
+    }
+    const nrhi::ShaderMacro hdr_defs[] = {{"HDR", "1"}, {nullptr, nullptr}};
+    const nrhi::ShaderMacro* sp_defs = g_r.hdr_active ? hdr_defs : nullptr;
+    const char* sp_variant = g_r.hdr_active ? "HDR=1" : "";
     nrhi::Shader* svs = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kVertex, "spline.hlsl",
                        kShaderSplineSource, "vs_main", nullptr, ""));
     nrhi::Shader* spd = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kPixel, "spline.hlsl",
-                       kShaderSplineSource, "ps_default", nullptr, ""));
+                       kShaderSplineSource, "ps_default", sp_defs, sp_variant));
     nrhi::Shader* spk = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kPixel, "spline.hlsl",
-                       kShaderSplineSource, "ps_darken", nullptr, ""));
+                       kShaderSplineSource, "ps_darken", sp_defs, sp_variant));
     if (svs == nullptr || spd == nullptr || spk == nullptr) {
       REXLOG_ERROR("native-scene: spline shader compile failed");
       g_r.failed = true;
@@ -12967,7 +13090,8 @@ bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context) {
     sp.input_elements = input_spline;
     sp.input_element_count = 3;
     sp.vertex_stride = 28;
-    sp.rtv_format = context.guest_output->format();
+    sp.rtv_format = g_r.hdr_active ? g_r.hdr_scene_format
+                                   : context.guest_output->format();
     sp.dsv_format = nrhi::Format::kD32_FLOAT;
     sp.sample_count = g_r.msaa;
     sp.blend.enable = true;
@@ -13640,7 +13764,11 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
-  if (!g_r.depth || g_r.depth_width != width || g_r.depth_height != height) {
+  const nrhi::Format want_scene_fmt =
+      g_r.hdr_active ? g_r.hdr_scene_format : nrhi::Format::kUnknown;
+  if (!g_r.depth || g_r.depth_width != width || g_r.depth_height != height ||
+      g_r.targets_hdr != g_r.hdr_active ||
+      g_r.targets_scene_fmt != want_scene_fmt) {
     if (g_r.depth) {
       g_r.device->DestroyDeferred(g_r.depth);
       g_r.depth = nullptr;
@@ -13671,13 +13799,15 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
 
     if (g_r.msaa > 1) {
       // MSAA color target + its Texture2DMS view for the fullscreen resolve
-      // pass. Lives in RENDER_TARGET state between frames.
+      // pass. Lives in RENDER_TARGET state between frames. Float under HDR
+      // (the scene writes pre-tonemap linear).
       if (g_r.msaa_color) {
         g_r.device->DestroyDeferred(g_r.msaa_color);
         g_r.msaa_color = nullptr;
       }
       nrhi::TextureDesc cdesc = desc;
-      cdesc.format = context.guest_output->format();
+      cdesc.format = g_r.hdr_active ? g_r.hdr_scene_format
+                                    : context.guest_output->format();
       cdesc.usage = nrhi::kTextureUsageRenderTarget;
       cdesc.initial_state = nrhi::ResourceState::kRenderTarget;
       cdesc.clear_color[0] = 0.25f;
@@ -13686,6 +13816,16 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
       cdesc.clear_color[3] = 1.0f;
       g_r.msaa_color = g_r.device->CreateTexture(cdesc);
       if (g_r.msaa_color == nullptr) {
+        if (g_r.hdr_active) {
+          // Float MSAA target unavailable: drop to the classic path instead
+          // of killing the native renderer (rebuilt next frame).
+          REXLOG_WARN(
+              "native-scene: HDR MSAA color target creation failed, "
+              "falling back to the classic tonemap path");
+          g_r.hdr_failed = true;
+          g_r.depth_width = 0;
+          return false;
+        }
         g_r.failed = true;
         return false;
       }
@@ -13699,6 +13839,44 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
       g_r.msaa_srv_slot = device->CreateTextureView(g_r.msaa_color, vd);
       g_r.msaa_srv_allocated = g_r.msaa_srv_slot != nullptr;
     }
+
+    // 1x float scene plane for the HDR post chain: the MSAA resolve
+    // destination, or the scene target itself when MSAA is off. Idles in
+    // RENDER_TARGET state; the bloom/tonemap passes sample it through
+    // hdr_srv.
+    if (g_r.hdr_srv != nullptr) {
+      g_r.device->DestroyDeferred(g_r.hdr_srv);
+      g_r.hdr_srv = nullptr;
+    }
+    if (g_r.hdr_resolved != nullptr) {
+      g_r.device->DestroyDeferred(g_r.hdr_resolved);
+      g_r.hdr_resolved = nullptr;
+    }
+    if (g_r.hdr_active) {
+      nrhi::TextureDesc hdesc;
+      hdesc.width = width;
+      hdesc.height = height;
+      hdesc.mip_levels = 1;
+      hdesc.format = g_r.hdr_scene_format;
+      hdesc.usage = nrhi::kTextureUsageRenderTarget;
+      hdesc.initial_state = nrhi::ResourceState::kRenderTarget;
+      g_r.hdr_resolved = g_r.device->CreateTexture(hdesc);
+      if (g_r.hdr_resolved != nullptr) {
+        nrhi::TextureViewDesc vd;
+        vd.mip_levels = 1;
+        g_r.hdr_srv = g_r.device->CreateTextureView(g_r.hdr_resolved, vd);
+      }
+      if (g_r.hdr_resolved == nullptr || g_r.hdr_srv == nullptr) {
+        REXLOG_WARN(
+            "native-scene: HDR scene plane creation failed, falling back "
+            "to the classic tonemap path");
+        g_r.hdr_failed = true;
+        g_r.depth_width = 0;
+        return false;
+      }
+    }
+    g_r.targets_hdr = g_r.hdr_active;
+    g_r.targets_scene_fmt = want_scene_fmt;
   }
   return true;
 }
@@ -13711,8 +13889,13 @@ bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context) {
   if (g_r.ao_failed) {
     return false;
   }
+  // Composite target: the float HDR plane (pre-tonemap multiply) or the
+  // gamma guest output (classic).
+  const nrhi::Format ao_out_fmt = g_r.hdr_active
+                                      ? g_r.hdr_scene_format
+                                      : context.guest_output->format();
   if (g_r.pso_ao_linearize != nullptr && g_r.ao_msaa == g_r.msaa &&
-      g_r.ao_rtv_format == context.guest_output->format()) {
+      g_r.ao_rtv_format == ao_out_fmt && g_r.ao_hdr == g_r.hdr_active) {
     return true;
   }
   nrhi::Device* device = context.device;
@@ -13752,6 +13935,9 @@ bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context) {
   }
   const bool msaa = g_r.msaa > 1;
   const nrhi::ShaderMacro msaa_defs[] = {{"AO_MSAA", "1"}, {nullptr, nullptr}};
+  // HDR=1 on the luma pass (tonemap the pre-tonemap scene before the
+  // protection luma) and the march (linear-space intensity exponent).
+  const nrhi::ShaderMacro hdr_defs[] = {{"HDR", "1"}, {nullptr, nullptr}};
   nrhi::Shader* vs = device->CreateShader(
       MakeShaderDesc(nrhi::ShaderStage::kVertex, "ssao.hlsl",
                      kSsaoShaderSource, "vs_main", nullptr, ""));
@@ -13761,10 +13947,12 @@ bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context) {
   bool ok = vs != nullptr;
   for (int i = 0; i < 6; ++i) {
     const bool msaa_entry = i == 0 && msaa;
+    const bool hdr_entry = (i == 1 || i == 3) && g_r.hdr_active;
     ps[i] = device->CreateShader(MakeShaderDesc(
         nrhi::ShaderStage::kPixel, "ssao.hlsl", kSsaoShaderSource,
-        ps_entries[i], msaa_entry ? msaa_defs : nullptr,
-        msaa_entry ? "AO_MSAA=1" : ""));
+        ps_entries[i],
+        msaa_entry ? msaa_defs : (hdr_entry ? hdr_defs : nullptr),
+        msaa_entry ? "AO_MSAA=1" : (hdr_entry ? "HDR=1" : "")));
     ok = ok && ps[i] != nullptr;
   }
   if (!ok) {
@@ -13790,10 +13978,10 @@ bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context) {
   pso.ps = ps[3];
   g_r.pso_ao_luma = device->CreateGraphicsPipeline(pso);
   // Composite: dst.rgb * src.a; the AO plane carries the finished
-  // multiplier, and the RGB-only write mask keeps the output's 2-bit alpha
+  // multiplier, and the RGB-only write mask keeps the output's alpha
   // untouched.
   pso.ps = ps[4];
-  pso.rtv_format = context.guest_output->format();
+  pso.rtv_format = ao_out_fmt;
   pso.blend.enable = true;
   pso.blend.src = nrhi::BlendFactor::kZero;
   pso.blend.dst = nrhi::BlendFactor::kSrcAlpha;
@@ -13816,8 +14004,10 @@ bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context) {
     return fail("pso");
   }
   g_r.ao_msaa = g_r.msaa;
-  g_r.ao_rtv_format = context.guest_output->format();
-  REXLOG_INFO("native-scene: ssao pipeline created (MSAA x{})", g_r.msaa);
+  g_r.ao_rtv_format = ao_out_fmt;
+  g_r.ao_hdr = g_r.hdr_active;
+  REXLOG_INFO("native-scene: ssao pipeline created (MSAA x{}, {})", g_r.msaa,
+              g_r.hdr_active ? "HDR" : "classic");
   return true;
 }
 
@@ -13838,8 +14028,16 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
   if (!EnsureSsaoPipeline(context)) {
     return false;
   }
-  if (g_r.output_srv_slot == nullptr) {
-    return false;  // composite samples the guest output through this view
+  // The luma pass samples the scene through this view; the composite writes
+  // the same plane (HDR: the float scene plane pre-tonemap, classic: the
+  // guest output).
+  const bool hdr = g_r.hdr_active && g_r.hdr_resolved != nullptr;
+  nrhi::Texture* const scene_plane =
+      hdr ? g_r.hdr_resolved : context.guest_output;
+  nrhi::TextureView* const scene_srv =
+      hdr ? g_r.hdr_srv : g_r.output_srv_slot;
+  if (scene_srv == nullptr) {
+    return false;
   }
   nrhi::Device* device = context.device;
   const uint32_t width = context.guest_output_width;
@@ -13966,19 +14164,19 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
   cmd->FlushBarriers();
 
   // 1b) Scene luminance -> ao_luma (AO raster): the sun-lit protection
-  //     mask. The guest output pauses as a sampled source for one draw.
-  cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
+  //     mask. The scene plane pauses as a sampled source for one draw.
+  cmd->Barrier(scene_plane, nrhi::ResourceState::kRenderTarget,
                nrhi::ResourceState::kPixelShaderResource);
   cmd->FlushBarriers();
   cmd->SetViewport(ao_vp);
   cmd->SetScissor(ao_sc);
   cmd->SetRenderTargets(g_r.ao_luma, nullptr);
   cmd->SetPipeline(g_r.pso_ao_luma);
-  cmd->SetTexture(1, g_r.output_srv_slot);
+  cmd->SetTexture(1, scene_srv);
   cmd->Draw(3, 0);
   cmd->Barrier(g_r.ao_luma, nrhi::ResourceState::kRenderTarget,
                nrhi::ResourceState::kPixelShaderResource);
-  cmd->Barrier(context.guest_output, nrhi::ResourceState::kPixelShaderResource,
+  cmd->Barrier(scene_plane, nrhi::ResourceState::kPixelShaderResource,
                nrhi::ResourceState::kRenderTarget);
   cmd->FlushBarriers();
 
@@ -14015,20 +14213,28 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
                nrhi::ResourceState::kPixelShaderResource);
   cmd->FlushBarriers();
 
-  // 5) Composite onto the guest output (full res; s1 bilinearly upsamples
-  //    the finished multiplier plane). Debug replaces the frame with it.
-  cmd->SetViewport(viewport);
-  cmd->SetScissor(scissor);
-  cmd->SetRenderTargets(context.guest_output, nullptr);
-  cmd->SetPipeline(REXCVAR_GET(skate3_native_render_scene_ssao_debug)
-                       ? g_r.pso_ao_debug
-                       : g_r.pso_ao_composite);
-  cmd->SetTexture(1, g_r.ao_srv[0]);
-  cmd->Draw(3, 0);
+  // 5) Consume the finished multiplier plane. Classic: a full-res composite
+  //    (or debug replace) draw onto the scene plane, s1 bilinearly
+  //    upsampling. HDR: no draw at all: ps_tonemap samples the plane at t2
+  //    and multiplies pre-tonemap (identical math, one less full-res pass);
+  //    the plane stays in PIXEL_SHADER_RESOURCE for ApplyHdrPost, which
+  //    restores it.
+  if (hdr) {
+    g_r.ao_plane_in_psr = true;
+  } else {
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    cmd->SetRenderTargets(scene_plane, nullptr);
+    cmd->SetPipeline(REXCVAR_GET(skate3_native_render_scene_ssao_debug)
+                         ? g_r.pso_ao_debug
+                         : g_r.pso_ao_composite);
+    cmd->SetTexture(1, g_r.ao_srv[0]);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+  }
 
   // Restore intermediate steady states.
-  cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kPixelShaderResource,
-               nrhi::ResourceState::kRenderTarget);
   cmd->Barrier(g_r.ao_tex[1], nrhi::ResourceState::kPixelShaderResource,
                nrhi::ResourceState::kRenderTarget);
   cmd->Barrier(g_r.ao_lin_depth, nrhi::ResourceState::kPixelShaderResource,
@@ -14037,6 +14243,309 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
                nrhi::ResourceState::kRenderTarget);
   cmd->FlushBarriers();
   return true;
+}
+
+// ---- HDR post chain (hdr.hlsl: bloom pyramid + the extracted tonemap) ----
+// Layout + PSOs, built when the HDR path activates and rebuilt when the
+// guest output format (the tonemap target) changes. Failure falls back to
+// the classic in-material tonemap instead of killing the native renderer.
+bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
+  if (!g_r.hdr_active || g_r.hdr_failed) {
+    return false;
+  }
+  if (g_r.pso_tonemap != nullptr &&
+      g_r.hdr_pso_out_format == context.guest_output->format()) {
+    return true;
+  }
+  nrhi::Device* device = context.device;
+  const auto fail = [&](const char* what) {
+    REXLOG_WARN(
+        "native-scene: HDR pipeline setup failed ({}), falling back to the "
+        "classic tonemap path",
+        what);
+    g_r.hdr_failed = true;
+    return false;
+  };
+  if (g_r.hdr_layout == nullptr) {
+    // The SSAO layout shape plus a third single-texture table (t2 = the
+    // fused AO multiplier plane): root constants b0 + three single-texture
+    // tables + point/linear clamp samplers (hdr.hlsl's frozen Vulkan plan).
+    nrhi::BindingLayoutDesc ld;
+    ld.param_count = 4;
+    ld.params[0] = {nrhi::BindingParamKind::kConstants, /*b*/ 0, 16,
+                    nrhi::Visibility::kAll};
+    ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[2] = {nrhi::BindingParamKind::kTextureTable, 1, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[3] = {nrhi::BindingParamKind::kTextureTable, 2, 1,
+                    nrhi::Visibility::kPixel};
+    ld.static_sampler_count = 2;
+    ld.static_samplers[0] = {/*s*/ 0, nrhi::Filter::kPoint,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.static_samplers[1] = {1, nrhi::Filter::kLinear,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.allow_input_layout = false;
+    g_r.hdr_layout = device->CreateBindingLayout(ld);
+    if (g_r.hdr_layout == nullptr) {
+      return fail("binding layout");
+    }
+  }
+  for (nrhi::Pipeline** p : {&g_r.pso_bloom_first, &g_r.pso_bloom_down,
+                             &g_r.pso_bloom_up, &g_r.pso_tonemap}) {
+    if (*p != nullptr) {
+      device->DestroyDeferred(*p);
+      *p = nullptr;
+    }
+  }
+  const nrhi::ShaderMacro first_defs[] = {{"BLOOM_FIRST", "1"},
+                                          {nullptr, nullptr}};
+  nrhi::Shader* vs = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kVertex, "hdr.hlsl", kHdrShaderSource,
+                     "vs_main", nullptr, ""));
+  nrhi::Shader* ps_first = device->CreateShader(MakeShaderDesc(
+      nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
+      "ps_bloom_down", first_defs, "BLOOM_FIRST=1"));
+  nrhi::Shader* ps_down = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
+                     "ps_bloom_down", nullptr, ""));
+  nrhi::Shader* ps_up = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
+                     "ps_bloom_up", nullptr, ""));
+  nrhi::Shader* ps_tone = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
+                     "ps_tonemap", nullptr, ""));
+  const bool shaders_ok = vs != nullptr && ps_first != nullptr &&
+                          ps_down != nullptr && ps_up != nullptr &&
+                          ps_tone != nullptr;
+  if (!shaders_ok) {
+    for (nrhi::Shader* s : {vs, ps_first, ps_down, ps_up, ps_tone}) {
+      device->DestroyDeferred(s);
+    }
+    return fail("shader compile");
+  }
+  nrhi::GraphicsPipelineDesc pso;
+  pso.layout = g_r.hdr_layout;
+  pso.vs = vs;
+  pso.cull = nrhi::CullMode::kNone;
+  pso.sample_count = 1;
+  pso.rtv_format = nrhi::Format::kR16G16B16A16_FLOAT;
+  pso.ps = ps_first;
+  g_r.pso_bloom_first = device->CreateGraphicsPipeline(pso);
+  pso.ps = ps_down;
+  g_r.pso_bloom_down = device->CreateGraphicsPipeline(pso);
+  // Progressive upsample: additive ONE/ONE onto the next-larger level.
+  pso.ps = ps_up;
+  pso.blend.enable = true;
+  pso.blend.src = nrhi::BlendFactor::kOne;
+  pso.blend.dst = nrhi::BlendFactor::kOne;
+  pso.blend.op = nrhi::BlendOp::kAdd;
+  pso.blend.src_alpha = nrhi::BlendFactor::kOne;
+  pso.blend.dst_alpha = nrhi::BlendFactor::kOne;
+  pso.blend.op_alpha = nrhi::BlendOp::kAdd;
+  g_r.pso_bloom_up = device->CreateGraphicsPipeline(pso);
+  pso.blend = {};
+  pso.ps = ps_tone;
+  pso.rtv_format = context.guest_output->format();
+  g_r.pso_tonemap = device->CreateGraphicsPipeline(pso);
+  for (nrhi::Shader* s : {vs, ps_first, ps_down, ps_up, ps_tone}) {
+    device->DestroyDeferred(s);
+  }
+  if (g_r.pso_bloom_first == nullptr || g_r.pso_bloom_down == nullptr ||
+      g_r.pso_bloom_up == nullptr || g_r.pso_tonemap == nullptr) {
+    return fail("pso");
+  }
+  g_r.hdr_pso_out_format = context.guest_output->format();
+  REXLOG_INFO("native-scene: HDR post pipeline created");
+  return true;
+}
+
+// Bloom pyramid + tonemap over the float scene plane into the guest output.
+// Runs after the AO composite (bloom sees the occluded scene). Transitions
+// the guest output kGuestOutput -> kRenderTarget (the state every later
+// consumer expects); the caller restores the main binding layout after.
+void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
+                  nrhi::Cmd* cmd, const nrhi::Viewport& viewport,
+                  const nrhi::Rect& scissor, bool loading_native) {
+  nrhi::Device* device = context.device;
+  const uint32_t width = context.guest_output_width;
+  const uint32_t height = context.guest_output_height;
+  // Bloom chain intermediates: QUARTER res halving down to the level cap or
+  // an 8-px floor, RGBA16F, steady state RENDER_TARGET. Quarter start =
+  // 1/4 the pyramid cost of a half-res chain; the extraction pass widens
+  // its 13-tap spread (p1.x = 2) so the 4x reduction still integrates the
+  // whole source block. Creation failure only loses bloom (the tonemap
+  // still runs).
+  if (g_r.bloom_base_w != width || g_r.bloom_base_h != height ||
+      (g_r.bloom_levels > 0 && g_r.bloom_tex[0] == nullptr)) {
+    for (uint32_t i = 0; i < RendererState::kBloomMaxLevels; ++i) {
+      if (g_r.bloom_srv[i] != nullptr) {
+        device->DestroyDeferred(g_r.bloom_srv[i]);
+        g_r.bloom_srv[i] = nullptr;
+      }
+      if (g_r.bloom_tex[i] != nullptr) {
+        device->DestroyDeferred(g_r.bloom_tex[i]);
+        g_r.bloom_tex[i] = nullptr;
+      }
+    }
+    g_r.bloom_levels = 0;
+    uint32_t w = std::max(1u, (width + 1) / 2);
+    uint32_t h = std::max(1u, (height + 1) / 2);
+    for (uint32_t i = 0; i < RendererState::kBloomMaxLevels; ++i) {
+      w = std::max(1u, (w + 1) / 2);
+      h = std::max(1u, (h + 1) / 2);
+      if (w < 8 || h < 8) {
+        break;
+      }
+      nrhi::TextureDesc desc;
+      desc.width = w;
+      desc.height = h;
+      desc.mip_levels = 1;
+      desc.format = nrhi::Format::kR16G16B16A16_FLOAT;
+      desc.usage = nrhi::kTextureUsageRenderTarget;
+      desc.initial_state = nrhi::ResourceState::kRenderTarget;
+      g_r.bloom_tex[i] = device->CreateTexture(desc);
+      if (g_r.bloom_tex[i] == nullptr) {
+        break;
+      }
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.bloom_srv[i] = device->CreateTextureView(g_r.bloom_tex[i], vd);
+      if (g_r.bloom_srv[i] == nullptr) {
+        device->DestroyDeferred(g_r.bloom_tex[i]);
+        g_r.bloom_tex[i] = nullptr;
+        break;
+      }
+      g_r.bloom_w[i] = w;
+      g_r.bloom_h[i] = h;
+      ++g_r.bloom_levels;
+    }
+    g_r.bloom_base_w = width;
+    g_r.bloom_base_h = height;
+    if (g_r.bloom_levels == 0) {
+      REXLOG_WARN("native-scene: bloom chain allocation failed (bloom off)");
+    }
+  }
+  const bool bloom = REXCVAR_GET(skate3_native_render_scene_bloom) &&
+                     !loading_native && g_r.bloom_levels > 0 &&
+                     g_r.pso_bloom_first != nullptr &&
+                     g_r.pso_bloom_down != nullptr &&
+                     g_r.pso_bloom_up != nullptr;
+
+  cmd->SetBindingLayout(g_r.hdr_layout);
+  cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+  // The scene plane is the sampled source for the whole chain.
+  cmd->Barrier(g_r.hdr_resolved, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+
+  float c[16];
+  const auto set_consts = [&](uint32_t dw, uint32_t dh, uint32_t sw,
+                              uint32_t sh, float intensity, float tap_scale) {
+    c[0] = float(dw);
+    c[1] = float(dh);
+    c[2] = 1.0f / float(dw);
+    c[3] = 1.0f / float(dh);
+    c[4] = float(sw);
+    c[5] = float(sh);
+    c[6] = 1.0f / float(sw);
+    c[7] = 1.0f / float(sh);
+    c[8] = float(REXCVAR_GET(skate3_native_render_scene_bloom_threshold));
+    c[9] = float(REXCVAR_GET(skate3_native_render_scene_bloom_knee));
+    c[10] = intensity;
+    // Debug view (ps_tonemap p0.w); the classic ssao_debug cvar maps onto
+    // the fused AO view when the plane rode along this frame.
+    c[11] = float(REXCVAR_GET(skate3_native_render_scene_hdr_debug));
+    if (c[11] == 0.0f && g_r.ao_plane_in_psr &&
+        REXCVAR_GET(skate3_native_render_scene_ssao_debug)) {
+      c[11] = 3.0f;
+    }
+    c[12] = tap_scale;
+    c[13] = c[14] = c[15] = 0.0f;
+    cmd->SetRootConstants(0, 16, c, 0);
+  };
+
+  if (bloom) {
+    // Downsample chain (level 0 extracts with threshold + Karis weighting;
+    // its 4x reduction doubles the tap spread to cover the source block).
+    for (uint32_t i = 0; i < g_r.bloom_levels; ++i) {
+      const uint32_t sw = i == 0 ? width : g_r.bloom_w[i - 1];
+      const uint32_t sh = i == 0 ? height : g_r.bloom_h[i - 1];
+      set_consts(g_r.bloom_w[i], g_r.bloom_h[i], sw, sh, 0.0f,
+                 i == 0 ? 2.0f : 1.0f);
+      const nrhi::Viewport vp{0.0f, 0.0f, float(g_r.bloom_w[i]),
+                              float(g_r.bloom_h[i]), 0.0f, 1.0f};
+      const nrhi::Rect sc{0, 0, int32_t(g_r.bloom_w[i]),
+                          int32_t(g_r.bloom_h[i])};
+      cmd->SetViewport(vp);
+      cmd->SetScissor(sc);
+      cmd->SetRenderTargets(g_r.bloom_tex[i], nullptr);
+      cmd->SetPipeline(i == 0 ? g_r.pso_bloom_first : g_r.pso_bloom_down);
+      cmd->SetTexture(1, i == 0 ? g_r.hdr_srv : g_r.bloom_srv[i - 1]);
+      cmd->Draw(3, 0);
+      cmd->Barrier(g_r.bloom_tex[i], nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
+      cmd->FlushBarriers();
+    }
+    // Progressive tent upsample, additive onto each larger level.
+    for (int32_t i = int32_t(g_r.bloom_levels) - 2; i >= 0; --i) {
+      cmd->Barrier(g_r.bloom_tex[i], nrhi::ResourceState::kPixelShaderResource,
+                   nrhi::ResourceState::kRenderTarget);
+      cmd->FlushBarriers();
+      set_consts(g_r.bloom_w[i], g_r.bloom_h[i], g_r.bloom_w[i + 1],
+                 g_r.bloom_h[i + 1], 0.0f, 1.0f);
+      const nrhi::Viewport vp{0.0f, 0.0f, float(g_r.bloom_w[i]),
+                              float(g_r.bloom_h[i]), 0.0f, 1.0f};
+      const nrhi::Rect sc{0, 0, int32_t(g_r.bloom_w[i]),
+                          int32_t(g_r.bloom_h[i])};
+      cmd->SetViewport(vp);
+      cmd->SetScissor(sc);
+      cmd->SetRenderTargets(g_r.bloom_tex[i], nullptr);
+      cmd->SetPipeline(g_r.pso_bloom_up);
+      cmd->SetTexture(1, g_r.bloom_srv[i + 1]);
+      cmd->Draw(3, 0);
+      cmd->Barrier(g_r.bloom_tex[i], nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
+      cmd->FlushBarriers();
+    }
+  }
+
+  // Tonemap into the guest output (the single application of the game's
+  // shared tone chain; bloom energy joins pre-tonemap).
+  cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
+  set_consts(width, height, width, height,
+             bloom ? float(REXCVAR_GET(
+                         skate3_native_render_scene_bloom_intensity))
+                   : 0.0f,
+             1.0f);
+  cmd->SetViewport(viewport);
+  cmd->SetScissor(scissor);
+  cmd->SetRenderTargets(context.guest_output, nullptr);
+  cmd->SetPipeline(g_r.pso_tonemap);
+  cmd->SetTexture(1, g_r.hdr_srv);
+  cmd->SetTexture(2, bloom ? g_r.bloom_srv[0] : g_r.white.srv);
+  // t2 = the fused AO multiplier plane (white = no AO this frame).
+  cmd->SetTexture(3, g_r.ao_plane_in_psr ? g_r.ao_srv[0] : g_r.white.srv);
+  cmd->Draw(3, 0);
+
+  // Restore steady states.
+  cmd->Barrier(g_r.hdr_resolved, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  if (g_r.ao_plane_in_psr) {
+    cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+    g_r.ao_plane_in_psr = false;
+  }
+  if (bloom) {
+    for (uint32_t i = 0; i < g_r.bloom_levels; ++i) {
+      cmd->Barrier(g_r.bloom_tex[i],
+                   nrhi::ResourceState::kPixelShaderResource,
+                   nrhi::ResourceState::kRenderTarget);
+    }
+  }
+  cmd->FlushBarriers();
 }
 
 bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
@@ -14048,14 +14557,29 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     return false;
   }
 
-  if (!g_r.pso || g_r.rtv_format != context.guest_output->format()) {
+  // HDR path decision, latched for the whole pipeline family (scene/spline
+  // PSO formats + shader variants, resolve target, AO composite target,
+  // output-sized targets). Hot cvar toggles rebuild everything below;
+  // hdr_failed pins the classic path after a float-target failure.
+  const bool hdr_want =
+      REXCVAR_GET(skate3_native_render_scene_hdr) && !g_r.hdr_failed;
+  const nrhi::Format hdr_fmt_want =
+      REXCVAR_GET(skate3_native_render_scene_hdr_packed)
+          ? nrhi::Format::kR11G11B10_FLOAT
+          : nrhi::Format::kR16G16B16A16_FLOAT;
+  if (!g_r.pso || g_r.rtv_format != context.guest_output->format() ||
+      g_r.hdr_active != hdr_want ||
+      (hdr_want && g_r.hdr_scene_format != hdr_fmt_want)) {
+    g_r.hdr_active = hdr_want;
+    g_r.hdr_scene_format = hdr_fmt_want;
     if (!EnsureScenePsoFamily(context) || !EnsureResolvePso(context) ||
         !EnsureBlurPsos(context) || !EnsureOutlineEdgePso(context) ||
         !Ensure2dPso(context) || !EnsureSplinePsos(context) ||
         !EnsureShadowPsos(context)) {
       return false;
     }
-    REXLOG_INFO("native-scene: pipelines created (MSAA x{})", g_r.msaa);
+    REXLOG_INFO("native-scene: pipelines created (MSAA x{}, {})", g_r.msaa,
+                g_r.hdr_active ? "HDR" : "classic");
     g_r.rtv_format = context.guest_output->format();
   }
 
@@ -14064,6 +14588,11 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   }
   EnsureBlurOutlineTargets(context);
   if (!EnsureFallbackTextures(context) || !EnsureOutputSizedTargets(context)) {
+    return false;
+  }
+  if (g_r.hdr_active && !EnsureHdrPipeline(context)) {
+    // hdr_failed is set: the next frame rebuilds the classic path. Abort
+    // this frame (the scene PSOs already target the float format).
     return false;
   }
 
@@ -16979,11 +17508,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     s_sh_h1 = sh_h;
   }
 
-  // The scene draws into the MSAA target when enabled (resolved into the
-  // guest output at the end of the pass), or straight into the guest output.
+  // The scene draws into the MSAA target when enabled (resolved into the 1x
+  // scene plane at the end of the pass), or straight into the 1x plane. The
+  // 1x plane is the float HDR intermediate when the HDR post chain is live
+  // (ps_tonemap then writes the guest output), else the guest output itself.
+  const bool hdr_on = g_r.hdr_active && g_r.hdr_resolved != nullptr &&
+                      g_r.hdr_srv != nullptr && g_r.pso_tonemap != nullptr;
   const bool msaa_on = g_r.msaa > 1 && g_r.msaa_color != nullptr && g_r.resolve_pso != nullptr;
-  nrhi::Texture* scene_color = msaa_on ? g_r.msaa_color : context.guest_output;
-  if (!msaa_on) {
+  nrhi::Texture* scene_color =
+      msaa_on ? g_r.msaa_color
+              : (hdr_on ? g_r.hdr_resolved : context.guest_output);
+  if (!msaa_on && !hdr_on) {
     cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
                  nrhi::ResourceState::kRenderTarget);
     cmd->FlushBarriers();
@@ -16993,9 +17528,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // Loading frames clear to black (the game's loading UI composes over
   // black); real scenes keep the sky-ish debug clear that shows through
   // undecoded holes.
-  const float clear_color[4] = {loading_native ? 0.0f : 0.25f,
-                                loading_native ? 0.0f : 0.35f,
-                                loading_native ? 0.0f : 0.55f, 1.0f};
+  float clear_color[4] = {loading_native ? 0.0f : 0.25f,
+                          loading_native ? 0.0f : 0.35f,
+                          loading_native ? 0.0f : 0.55f, 1.0f};
+  if (hdr_on) {
+    // The clear is authored in the final gamma space; the HDR plane holds
+    // pre-tonemap values, so encode through the tone chain's inverse (the
+    // same transform as scene.hlsl PassGamma) so undecoded holes keep the
+    // same debug color after the tonemap pass.
+    for (int k = 0; k < 3; ++k) {
+      const float tm =
+          clear_color[k] * clear_color[k] * (2.0f / (1.41f * 1.41f));
+      clear_color[k] = tm > 1.0f
+                           ? tm * 4.0f - 3.0f
+                           : 1.0f - std::sqrt(std::max(1.0f - tm, 0.0f));
+    }
+  }
   cmd->ClearRenderTarget(scene_color, clear_color);
   if (use_depth) {
     cmd->ClearDepth(g_r.depth, 1.0f);
@@ -18897,14 +19445,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                         g_r.depth, use_depth);
 
   if (msaa_on) {
-    // Resolve: average the MSAA samples into the guest output with a
-    // fullscreen pass, then restore steady-state resource states.
+    // Resolve: average the MSAA samples into the 1x scene plane (the float
+    // HDR plane, or the guest output on the classic path) with a fullscreen
+    // pass, then restore steady-state resource states.
     cmd->Barrier(g_r.msaa_color, nrhi::ResourceState::kRenderTarget,
                  nrhi::ResourceState::kPixelShaderResource);
-    cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
-                 nrhi::ResourceState::kRenderTarget);
+    if (!hdr_on) {
+      cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
+                   nrhi::ResourceState::kRenderTarget);
+    }
     cmd->FlushBarriers();
-    cmd->SetRenderTargets(context.guest_output, nullptr);
+    cmd->SetRenderTargets(hdr_on ? g_r.hdr_resolved : context.guest_output,
+                          nullptr);
     cmd->SetPipeline(g_r.resolve_pso);
     cmd->SetTexture(1, g_r.msaa_srv_slot);
     cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
@@ -18913,21 +19465,40 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                  nrhi::ResourceState::kRenderTarget);
   }
 
-  if (outline_ready) {
+  // Classic path: the outline composites straight onto the resolved guest
+  // output. Under HDR it runs after the tonemap below (a gamma-space
+  // screen overlay, not scene lighting).
+  if (outline_ready && !hdr_on) {
     RenderOutlineComposite(context, scene, context.guest_output, viewport,
                            scissor);
   }
 
   // ---- Screen-space ambient occlusion (ssao.hlsl: GTAO) ----
   // Multiplies the resolved scene by a horizon-based visibility term before
-  // any downstream consumer (photo chain, 2D overlay, blur). Runs after the
-  // outline composite, which relies on the main layout latched from the
-  // scene pass.
+  // any downstream consumer (bloom/tonemap under HDR, photo chain, 2D
+  // overlay, blur). Runs after the outline composite, which relies on the
+  // main layout latched from the scene pass.
+  bool post_ran = false;
   if (use_depth && !loading_native &&
       REXCVAR_GET(skate3_native_render_scene_ssao) &&
       ApplySsaoPass(context, cmd, scene, viewport, scissor)) {
-    // The AO chain switched binding layouts; restore the main-pass root
-    // bindings the later passes latch (same restore as the photo chain's).
+    post_ran = true;
+  }
+
+  // ---- HDR post (hdr.hlsl: bloom pyramid + the extracted tonemap) ----
+  // Bloom reads the AO-composited float scene; ps_tonemap applies the
+  // game's shared tone chain once into the guest output, which every later
+  // consumer (photo chain, 2D overlay, blur, grab) reads exactly as on the
+  // classic path.
+  if (hdr_on) {
+    ApplyHdrPost(context, cmd, viewport, scissor, loading_native);
+    post_ran = true;
+  }
+
+  if (post_ran) {
+    // The AO/HDR chains switched binding layouts; restore the main-pass
+    // root bindings the later passes latch (same restore as the photo
+    // chain's).
     cmd->SetViewport(viewport);
     cmd->SetScissor(scissor);
     cmd->SetBindingLayout(g_r.layout);
@@ -18938,6 +19509,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
       cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
     }
+  }
+
+  if (outline_ready && hdr_on) {
+    RenderOutlineComposite(context, scene, context.guest_output, viewport,
+                           scissor);
   }
 
   // ---- Photo-editor postfx chain (photo_fx.hlsl: exact ucode ports) ----
