@@ -82,6 +82,19 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 4, "Skate 3",
                      "fix texture aliasing.")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_world_v2_tan_sign, 1.0, "Skate 3",
+                      "World-shading v2: polarity relating the stored frame's "
+                      "cross(binormal, normal) x handedness to the game's tangent "
+                      "(+1/-1). Calibrated against the emulated reference; flips the "
+                      "kd sun-direction response if wrong.")
+    .range(-1.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_v2, true, "Skate 3",
+                    "World-shading v2: per-pixel normal/detail/spec maps on the exact "
+                    "environment families (the game's own GetTangentLight kd + phong "
+                    "terms; v1 folded them to the flat-map constants). Off = the v1 "
+                    "flat response, for A/B comparison.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao, true, "Skate 3",
                     "Screen-space ambient occlusion (GTAO) in the native renderer: soft "
                     "contact shading where surfaces meet (under ledges, rails, vehicles, "
@@ -2568,6 +2581,14 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           // the animated.tree "noise" tint map, bound at t4 on families
           // that carry no decal art (see DrawItem::spec_tex).
           slot = &item.spec_tex;
+        } else if (std::memcmp(text, "detailNormalUVScale", 20) == 0) {
+          // Shader-constant channel (the game's VS c8.x, typically 8): the
+          // detail normal map's UV multiplier, consumed by the v2 kd term.
+          const float f = std::bit_cast<float>(chan_u32(i, 0x10));
+          if (f > 0.0f && f < 1e6f) {
+            item.detail_scale = f;
+          }
+          continue;
         } else if (std::memcmp(text, "macroOverlayUVScale", 20) == 0 ||
                    std::memcmp(text, "macroOverlayOpacity", 20) == 0) {
           // Shader-constant channel: the float lives in the first guid word.
@@ -10817,7 +10838,27 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
       n3[1] = ny / 32767.0f;
       const float d = 1.0f - n3[0] * n3[0] - n3[1] * n3[1];
       n3[2] = (sy > 0 ? 1.0f : -1.0f) * std::sqrt(d > 0.0f ? d : 0.0f);
-      (void)sx;  // sign.x = tangent handedness, unused until normal maps
+      // World-shading v2: the STORED tangent frame. These static meshes
+      // never skin, so the blend-weight bytes are free: pack the mesh's
+      // k_10_11_11 binormal (unorm-mapped) plus the unwrap sign.x tangent
+      // handedness into them. The shader reconstructs T = cross(B, N) x
+      // handedness; authoring decides per UV island whether the frame
+      // follows a mirror, which derivative frames cannot know (the wooden
+      // ramp panels banded light/dark per island without this).
+      if (!item.skinned && item.normal_fmt == 16) {
+        float b3[3];
+        unpack_10_11_11(item.normal_offset, b3);
+        const auto pk = [](float f) {
+          return uint32_t(std::lround((f * 0.5f + 0.5f) * 255.0f)) & 0xFFu;
+        };
+        // w byte is a three-state presence sentinel: 0 = no stored frame
+        // (meshes that skip this pack leave the word zero), 100 = negative
+        // handedness, 200 = positive.
+        const uint32_t packed = pk(b3[0]) | (pk(b3[1]) << 8) |
+                                (pk(b3[2]) << 16) |
+                                ((sx > 0 ? 200u : 100u) << 24);
+        std::memcpy(&dst[v * 14 + 7], &packed, 4);
+      }
     } else if (item.normal_fmt == 16) {
       // (Vehicle meshes: the game's VS derives cross(tangent, binormal)
       // instead, but the stored usage-3 normal MATCHES it on every vertex
@@ -12476,14 +12517,18 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
     // overlay.w == 4 (pair bound).
     ld.params[5] = {nrhi::BindingParamKind::kTextureTable, 4, 2,
                     nrhi::Visibility::kPixel};
-    // Dynamic-shadow additions: per-frame receiver constants (b1) + the
-    // blurred shadow atlas (t5).
+    // Dynamic-shadow additions: per-frame receiver constants (b1).
     ld.params[6] = {nrhi::BindingParamKind::kConstantBuffer, /*b*/ 1, 1,
                     nrhi::Visibility::kPixel};
-    ld.params[7] = {nrhi::BindingParamKind::kTextureTable, 7, 1,
+    // Environment cube (t6) + blurred shadow atlas (t7) as ONE two-entry
+    // table (bound together via SetTexturePair); merging them freed the
+    // root-signature DWORD the v2 material table below needs.
+    ld.params[7] = {nrhi::BindingParamKind::kTextureTable, 6, 2,
                     nrhi::Visibility::kPixel};
-    // Water environment cube (t6): the flowingwater/ocean reflection term.
-    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 6, 1,
+    // World-shading v2 material maps: the detail normal map (t8) + the
+    // decal families' spec/ecc masks (t9), bound as a pair on draws whose
+    // misc.z flags enable them.
+    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 2,
                     nrhi::Visibility::kPixel};
     // Character lighting block (b2): the canonical per-draw rows captured
     // from the guest PS bank (CaptureCharLighting), sliced out of the bone
@@ -14294,8 +14339,14 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   if (REXCVAR_GET(skate3_native_render_scene_macro)) {
     warm_texture(item.macro_tex);
   }
-  if (item.water || item.char_family >= 6) {
+  if (item.water || item.char_family >= 6 ||
+      (item.env_family >= 1 && item.env_family <= 6)) {
+    // v2: fams 1-4 sample their base normal map per-pixel too.
     warm_texture(item.water_normal);
+  }
+  if (item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) {
+    // v2 detail normal map (t8; fam 2 carries no base+detail pair).
+    warm_texture(item.detail_tex);
   }
   if (item.decal && REXCVAR_GET(skate3_native_render_scene_decals)) {
     warm_texture(item.decal_art);
@@ -14304,8 +14355,9 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   if (item.char_family >= 4 && item.char_family <= 5) {
     warm_texture(item.hair_alpha_tex);
   }
-  if ((item.env_family != 0 && !item.decal && item.env_family != 10) ||
-      item.unlit) {  // unlit = sky: spec_tex is the 1D sun gradient
+  if ((item.env_family != 0 && item.env_family != 10) || item.unlit) {
+    // unlit = sky: spec_tex is the 1D sun gradient. Decal fams (3/4) now
+    // consume their spec masks too (v2, t9).
     warm_texture(item.spec_tex);
   }
   // Environment cube (negative-cached like the draw path).
@@ -14518,8 +14570,14 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   if (REXCVAR_GET(skate3_native_render_scene_macro)) {
     stage_texture(item.macro_tex);
   }
-  if (item.water || item.char_family >= 6) {
+  if (item.water || item.char_family >= 6 ||
+      (item.env_family >= 1 && item.env_family <= 6)) {
+    // v2: fams 1-4 sample their base normal map per-pixel too.
     stage_texture(item.water_normal);
+  }
+  if (item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) {
+    // v2 detail normal map (t8; fam 2 carries no base+detail pair).
+    stage_texture(item.detail_tex);
   }
   if (item.decal && REXCVAR_GET(skate3_native_render_scene_decals)) {
     stage_texture(item.decal_art);
@@ -14527,8 +14585,9 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   if (item.char_family >= 4 && item.char_family <= 5) {
     stage_texture(item.hair_alpha_tex);
   }
-  if ((item.env_family != 0 && !item.decal && item.env_family != 10) ||
-      item.unlit) {  // unlit = sky: spec_tex is the 1D sun gradient
+  if ((item.env_family != 0 && item.env_family != 10) || item.unlit) {
+    // unlit = sky: spec_tex is the 1D sun gradient. Decal fams (3/4) now
+    // consume their spec masks too (v2, t9).
     stage_texture(item.spec_tex);
   }
 
@@ -16837,6 +16896,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[39] = scene.family_rows[3];  // proxyworld scale (proxy PS c3.y)
       std::memcpy(cb + 40, scene.fog_color, 4 * sizeof(float));
     }
+    // World-shading v2 row (sh_v2, cb[60..63]): x = stored-tangent
+    // polarity.
+    cb[60] =
+        float(REXCVAR_GET(skate3_native_render_scene_world_v2_tan_sign));
     // dynamicobject.fx frame rows (dyn_sun/dyn_amb/dyn_misc at cb[44..55]).
     if (scene.dynobj_valid) {
       cb[44] = scene.dynobj_rows[0];  // sun dir (PS c9)
@@ -16854,7 +16917,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // b2 (character lighting) default: point at the ring base so the root
     // CBV is never left unset; character draws re-point it per item.
     cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
-    cmd->SetTexture(7, shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
+    // t6/t7 ride one table: default = white cube + this frame's atlas
+    // (draw_item re-pairs with the item's real cube when one resolves).
+    cmd->SetTexturePair(7, g_r.white_cube.srv,
+                        shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
   }
 
   uint32_t drawn = 0;
@@ -17794,16 +17860,60 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_refl_gate.store(gate, std::memory_order_relaxed);
       }
     }
+    // World-shading v2 (fams 1-4): the material's real per-pixel maps. The
+    // base normal map rides the free t5 pair slot (t4 holds the spec masks
+    // or the decal art there), the detail normal map + the decal families'
+    // spec/ecc masks ride the t8/t9 pair. misc.z carries the bind flags
+    // (1 = normal, 2 = detail, 4 = spec2), misc.w the detailNormalUVScale
+    // channel constant; both slots are spare on opaque fams 1-4 (fog only
+    // uses them on transparent/water items, F12 only on fams 5/6/13).
+    const GuestTexture* v2_detail = nullptr;
+    const GuestTexture* v2_spec2 = nullptr;
+    uint32_t v2_flags = 0;
+    if (item.env_family >= 1 && item.env_family <= 4 && !item.transparent &&
+        !item.water && debug_mode == 0 && scene.shadow_valid &&
+        REXCVAR_GET(skate3_native_render_scene_world_v2)) {
+      if (item.water_normal != 0) {
+        const GuestTexture* nrm = resolve_texture(item.water_normal, 3);
+        if (nrm != &g_r.white && nrm->valid && nrm->srv_mips != 0) {
+          pair_normal = nrm;
+          normal_paired = true;  // t5 pair bind; overlay.w stays 0..3 here
+          v2_flags |= 1;
+        }
+      }
+      // Fam 2 (environmentsimple) carries a plain normal map with no
+      // base+detail pair; its vnd is the raw 2t-1 (shader-side).
+      if ((v2_flags & 1u) != 0 && item.env_family != 2 &&
+          item.detail_tex != 0 && item.detail_scale > 0.0f) {
+        const GuestTexture* det = resolve_texture(item.detail_tex, 7);
+        if (det != &g_r.white && det->valid && det->srv_mips != 0) {
+          v2_detail = det;
+          v2_flags |= 2;
+        }
+      }
+      if (item.decal && item.spec_tex != 0) {
+        const GuestTexture* sp = resolve_texture(item.spec_tex, 6);
+        if (sp != &g_r.white && sp->valid && sp->srv_mips != 0) {
+          v2_spec2 = sp;
+          v2_flags |= 4;
+        }
+      }
+    }
     constants[44] = item.macro_scale;
     constants[45] = item.macro_opacity;
     constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
     // overlay.w: 1 = single-placement decal (art clamps), 2 = tileable
     // decal (art wraps; clamping a many-period uv range stretched the
     // border texels into the giant cliff-face streaks), 3 = spec masks
-    // bound (exact env families).
-    constants[47] = is_decal ? (item.decal_tileable ? 2.0f : 1.0f)
-                             : (spec_bound ? (normal_paired ? 4.0f : 3.0f)
-                                           : 0.0f);
+    // bound (exact env families). The 4-encode (t5 normal pair driving the
+    // reflective trim path) is fams 5/6 only; fams 1-4 signal their
+    // normal map through the misc.z flags instead.
+    constants[47] =
+        is_decal ? (item.decal_tileable ? 2.0f : 1.0f)
+                 : (spec_bound ? ((normal_paired && item.env_family >= 5)
+                                      ? 4.0f
+                                      : 3.0f)
+                               : 0.0f);
     if (item.water) {
       // overlay.x = ripple scroll time, overlay.y = real environment cube
       // bound at t6, overlay.z = ripple normal map resolved (in the macro
@@ -17833,6 +17943,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[50] = scene.fog_ramp[1];
       constants[51] = scene.fog_ramp[2];
       std::memcpy(constants + 40, scene.fog_color, 4 * sizeof(float));
+    } else if (v2_flags != 0) {
+      // misc.z = the v2 material bind flags, misc.w = detailNormalUVScale
+      // (fams 1-4 opaque; see the v2 block above).
+      constants[50] = float(v2_flags);
+      constants[51] = item.detail_scale;
     } else if ((item.env_family >= 5 && item.env_family <= 6) ||
                item.env_family == 13) {
       // misc.y = cube LOD bias for the reflective families: the guest's
@@ -17938,7 +18053,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     } else {
       cmd->SetTexture(5, decal_tex->srv);
     }
-    cmd->SetTexture(8, cube_tex->srv);
+    // t6 (cube) shares its table with t7 (shadow atlas); re-pair both.
+    cmd->SetTexturePair(7, cube_tex->srv,
+                        shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
+    // World-shading v2 material pair (t8 detail + t9 decal spec).
+    if (v2_flags != 0) {
+      cmd->SetTexturePair(8, (v2_detail != nullptr ? v2_detail : &g_r.white)->srv,
+                          (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv);
+    }
     // ROPA shape blend (see RendererState::ropa_shapes): combine the shape
     // generations with the kernel weights InterpolateDynamicItems computed
     // (the SAME 8-tap boxcar / pair-lerp the body bones and garment world

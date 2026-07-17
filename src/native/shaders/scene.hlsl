@@ -58,6 +58,10 @@ cbuffer S : register(b1) {
   // (cacstamp_skin_nisPS port; see SampleCsmShadow). sh_misc.zw carry the
   // atlas dimensions for the point-snapped taps.
   float4 sh_char;
+  // World-shading v2: x = stored-tangent polarity (the sign relating
+  // cross(binormal, normal) x handedness to the game's tangent; +-1,
+  // cvar-tunable against the emulated reference), yzw spare.
+  float4 sh_v2;
 };
 // Character-family lighting (defaultcharacter.fx and friends): canonical
 // per-draw rows captured from the guest PIXEL constant bank at palette
@@ -84,6 +88,12 @@ Texture2D<float4> decal_art : register(t4);
 Texture2D<float4> normal_map : register(t5);
 Texture2D<float2> shadow_atlas : register(t7);
 TextureCube<float4> env_cube : register(t6);
+// World-shading v2 material maps (the t8/t9 pair table): the environment
+// families' detail normal map (t8, sampled at uv * misc.w) and the decal
+// families' spec/ecc masks (t9). Sampled only when the misc.z bind flags
+// say so (fams 1-4; see the env branch).
+Texture2D<float4> detail_map : register(t8);
+Texture2D<float4> spec2_map : register(t9);
 // Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
 // applied with explicit dots (StructuredBuffer<float4x4> default packing is
 // column-major and would silently transpose the matrices).
@@ -101,6 +111,11 @@ struct VSOut {
   float2 uv2 : TEXCOORD2;
   float3 nrm : TEXCOORD3;
   float2 uv3 : TEXCOORD4;
+  // Stored tangent frame (world-shading v2): xyz = the mesh's authored
+  // binormal (world-rotated; zero when the mesh carries none), w = the
+  // tangent handedness sign. Rides the static meshes' otherwise-unused
+  // blend-weight bytes (see DecodeMesh).
+  float4 tanb : TEXCOORD5;
 };
 VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1,
               float4 bw : BLENDWEIGHT0, uint4 bi : BLENDINDICES0,
@@ -134,6 +149,13 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
   o.uv2 = uv2;
   o.nrm = n;
   o.uv3 = uv3;
+  // Stored binormal + handedness from the blend-weight bytes (statics
+  // only; skinned items use those bytes for actual weights). w passes
+  // RAW: ~0 = no stored frame, ~0.39 = negative handedness, ~0.78 =
+  // positive (the DecodeMesh sentinel bytes 0/100/200).
+  float3 sb = bw.xyz * 2.0 - 1.0;
+  o.tanb = tint.g > 0.0 ? float4(0.0, 0.0, 0.0, 0.0)
+                        : float4(mul(sb, (float3x3)world), bw.w);
   return o;
 }
 // Native CSM atlas sample at a world position: finest covering cascade,
@@ -542,16 +564,17 @@ float4 ps_main(VSOut i) : SV_Target {
       float3 lmg = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
       // F12 isolation mode 7: visualize the RAW lightmap sample; mode 8:
       // visualize the lightmap unwrap coordinate (frac(uv2*16) in rg).
-      // Debug-only taps on fams 5/6/13 (misc.z is 0 on the other fams).
-      if (abs(misc.z - 7.0) < 0.5) {
+      // Debug taps live on fams 5/6/13 only; on fams 1-4 misc.z carries
+      // the v2 material bind flags instead (family-gated below).
+      if (fam > 4.5 && abs(misc.z - 7.0) < 0.5) {
         return float4(lmg, 1.0);
       }
-      if (abs(misc.z - 8.0) < 0.5) {
+      if (fam > 4.5 && abs(misc.z - 8.0) < 0.5) {
         return float4(frac(i.uv2 * 16.0), 0.0, 1.0);
       }
       // Mode 9: lightmap-resolve status; RED = a real lightmap is bound
       // (tint.r set by the C++ resolve), BLUE = white fallback in t1.
-      if (abs(misc.z - 9.0) < 0.5) {
+      if (fam > 4.5 && abs(misc.z - 9.0) < 0.5) {
         return float4(tint.r, 0.0, 1.0 - tint.r, 1.0);
       }
       // tint.r == 0 = the real lightmap has not resolved yet (first-sight
@@ -560,21 +583,94 @@ float4 ps_main(VSOut i) : SV_Target {
       // patches for the decode window (the ramp-stencil "black square
       // flash"); serve unshadowed brightness until the real page lands.
       float3 lml = tint.r > 0.0 ? min(lmg * lmg, s + sh_color.rgb) : lmg * lmg;
-      // GetTangentLight with the neutral (flat) normal map:
-      // 0.39 * 2.39562 exactly. Fam 13 has no kd term at all; its body is
-      // D^2 * lml * ALPHA, premultiplied once in the shader on top of the
-      // a^2 blend factor (verified 0.0-error vs the ucode).
-      lin = fam > 12.5 ? lml * dcol * albedo.a : lml * 0.93429 * dcol;
-      if (overlay.w > 2.5) {
-        // spec/ecc/refmask at t4: phong vs the FIXED literal light
-        // (-0.14, 0.5, 0.9), power 10 + 290*ecc, tint (2.1, 1.8, 1.5),
-        // scaled by the clamped lightmap green and the spec mask.
-        float4 masks = decal_art.Sample(smp, i.uv);
-        float3 wn = dot(i.nrm, i.nrm) > 0.01
-                        ? normalize(i.nrm)
-                        : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
-        // misc.z = 3 (F12 reflection isolation): force the flat normal.
-        if (overlay.w > 3.5 && abs(misc.z - 3.0) > 0.5) {
+      // GetTangentLight (world-shading v2). vnd is the tangent-space mapped
+      // normal from the material's base normal map (t5) + detail map (t8 at
+      // uv * misc.w): xy = 2*base + 2*detail - 2, z = 2*base.z - 1.
+      // baseenvironment/decal normalize vnd for the kd dot; default-
+      // environment (plain normal map, no detail pair) uses it raw. Fams
+      // 1-4 carry bind flags in misc.z (1 = base normal at t5, 2 = detail
+      // at t8, 4 = spec2ch at t9); fams 5/6 derive vnd from the reflective
+      // path's nt below. Without a normal map the exact flat-map fold
+      // 0.39 * 2.39562 = 0.93429 applies (the v1 constant).
+      uint v2f = fam < 4.5 ? (uint)(misc.z + 0.5) : 0u;
+      float kd = 0.93429;
+      float3 wn = dot(i.nrm, i.nrm) > 0.01
+                      ? normalize(i.nrm)
+                      : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+      float3 vnd_raw = float3(0.0, 0.0, 1.0);  // wn mapping (max-z clamped)
+      float3 vnd = float3(0.0, 0.0, 1.0);      // kd dot (family-normalized)
+      bool have_vnd = false;
+      if ((v2f & 1u) != 0u) {
+        float3 nmv = normal_map.Sample(smp, i.uv).rgb;
+        float2 dxy = (v2f & 2u) != 0u
+                         ? detail_map.Sample(smp, i.uv * misc.w).rg
+                         : float2(0.5, 0.5);
+        vnd_raw = float3(nmv.xy * 2.0 + dxy * 2.0 - 2.0, nmv.z * 2.0 - 1.0);
+        vnd = (fam < 1.5 || fam > 2.5) ? normalize(vnd_raw) : vnd_raw;
+        have_vnd = true;
+      }
+      // Tangent frames shared by kd and the reflective normal mapping.
+      // Two variants of the same construction:
+      //  - tt_s/bb_s = the RAW screen-space UV-gradient frame. Exact for
+      //    the kd SIGN terms under ANY UV orientation; bowl/ramp walls
+      //    map their texture rotated relative to world-up, and mirrored
+      //    islands flip dP/dU exactly like the stored tangent does.
+      //  - tt/bb = analytic world-up axes carrying the screen frame's
+      //    signs; degree-accurate where the mapping IS world-up aligned
+      //    (building facades, calibrated for the glass reflections).
+      //    Transferring signs onto misaligned axes is METASTABLE when the
+      //    UV grid sits ~90 deg off world-up: the transfer dots cross zero
+      //    along a curved wall and kd banded light/dark around the bowl
+      //    transition (seen in a matched F11 capture pair), which is why
+      //    kd and the fam 1-4 normal mapping use the screen frame instead.
+      float3 tt = float3(1.0, 0.0, 0.0), bb = float3(0.0, 1.0, 0.0);
+      float3 tt_s = tt, bb_s = bb;
+      if (have_vnd || (overlay.w > 3.5 && abs(misc.z - 3.0) > 0.5)) {
+        float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
+        float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
+        float3 dp2p = cross(dp2, wn), dp1p = cross(wn, dp1);
+        tt = dp2p * du1.x + dp1p * du2.x;
+        bb = dp2p * du1.y + dp1p * du2.y;
+        tt *= -rsqrt(max(dot(tt, tt), 1e-12));
+        bb *= rsqrt(max(dot(bb, bb), 1e-12));
+        tt_s = tt;
+        bb_s = bb;
+        float3 bb2 = float3(0.0, 1.0, 0.0) - wn * wn.y;
+        float lb2 = length(bb2);
+        if (lb2 > 0.05) {
+          bb2 /= lb2;
+          float3 tt2 = cross(bb2, wn);
+          tt = tt2 * (dot(tt2, tt) >= 0.0 ? 1.0 : -1.0);
+          bb = bb2 * (dot(bb2, bb) >= 0.0 ? 1.0 : -1.0);
+        }
+      }
+      // kd axes: prefer the mesh's STORED frame (binormal + handedness in
+      // i.tanb, T = cross(B, N) x handedness x calibration polarity);
+      // authoring decides per UV island whether the frame follows a
+      // mirror, which no derivative frame can know (per-island brightness
+      // steps on the wooden ramp panels / faint bowl striping). Screen
+      // frame is the fallback for meshes without one.
+      float3 kt = tt_s, kb = bb_s;
+      if (i.tanb.w > 0.1) {
+        kb = normalize(i.tanb.xyz);
+        kt = cross(kb, wn) *
+             ((i.tanb.w > 0.6 ? 1.0 : -1.0) * sh_v2.x);
+      }
+      if (have_vnd) {
+        // The mapped world normal feeds the spec mirror below; matte spec
+        // is broad-lobed, so exact axis precision matters less than the
+        // per-island signs (the analytic substitution exists for
+        // mirror-sharp glass).
+        wn = normalize(vnd_raw.x * kt + vnd_raw.y * kb +
+                       wn * max(vnd_raw.z, 0.05));
+        kd = (vnd.x * 0.58 * sign(dot(kt, sh_sun.xyz)) +
+              vnd.y * 0.62 * sign(dot(kb, sh_sun.xyz)) +
+              vnd.z * 0.39) * 2.39562;
+      }
+      // misc.z = 3 (F12 reflection isolation): force the flat normal.
+      // Only the reflective families (5/6/13) ever carry overlay.w == 4;
+      // fams 1-4 signal their normal map through the misc.z flags above.
+      if (overlay.w > 3.5 && abs(misc.z - 3.0) > 0.5) {
           // Per-pixel normal map (t5, paired descriptor): the real PS
           // (baseenvironmentreflective_defaultPS) reflects off the
           // normal-mapped normal: tangent normal = 2*(n + detail - 1) on
@@ -608,46 +704,29 @@ float4 ps_main(VSOut i) : SV_Target {
           float2 trim = float2(misc.x - trim_yi * 1000.0 - 500.0, trim_yi - 500.0) *
                         0.001;
           float3 nt = float3(nmv.xy * 2.0 - 1.0 + trim, nmv.z * 2.0 - 1.0);
-          float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
-          float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
-          float3 dp2p = cross(dp2, wn), dp1p = cross(wn, dp1);
-          float3 tt = dp2p * du1.x + dp1p * du2.x;
-          float3 bb = dp2p * du1.y + dp1p * du2.y;
-          // Signs/lengths calibrated against the mesh's REAL stored TBN
-          // (10_11_11 tangent @ +24, s16 normal xy @ +20, handedness in the
-          // unwrap sign bits, decoded mesh-wide):
-          // stored T == +dP/dU on 100% of tris (this formula's tt comes out
-          // as -dP/dU -> negate), stored B == this bb direction (dot 0.999),
-          // and the game's rows are UNIT so each axis normalizes SEPARATELY
-          // - the shared max-normalizer both halved and (with the flip)
-          // mirrored the horizontal tilt, which pushed the reflection
-          // DEEPER into the dark cube region instead of off it (first
-          // deploy looked unchanged). With these signs the reconstruction
-          // matches the ucode's mapped normal to 4 decimals at the traced
-          // pixel. An inward geometric wn flips all three terms together;
-          // reflect() is invariant to that.
-          tt *= -rsqrt(max(dot(tt, tt), 1e-12));
-          bb *= rsqrt(max(dot(bb, bb), 1e-12));
-          // The mesh's STORED TBN (what the game's VS interpolates) is the
-          // world-up frame, not the exact UV-gradient frame: B = up
-          // projected into the surface, T = cross(B, N), verified on the
-          // decoded window vertices (B = (0, 0.999, 0), T = horizontal).
-          // The screen-space frame lands ~3 deg off it (authored TBN vs UV
-          // gradients), which rotates reflections by degrees, visible as
-          // parallax against the emulated frame. Use the analytic axes and
-          // keep only the screen-space frame's SIGNS (mirrored UV islands
-          // flip the tangent; derivatives track that, the analytic frame
-          // cannot). Near-horizontal surfaces keep the screen frame.
-          float3 bb2 = float3(0.0, 1.0, 0.0) - wn * wn.y;
-          float lb2 = length(bb2);
-          if (lb2 > 0.05) {
-            bb2 /= lb2;
-            float3 tt2 = cross(bb2, wn);
-            tt = tt2 * (dot(tt2, tt) >= 0.0 ? 1.0 : -1.0);
-            bb = bb2 * (dot(bb2, bb) >= 0.0 ? 1.0 : -1.0);
-          }
+          // (Frame construction hoisted above; the calibration notes ride
+          // with it; tt/bb here are the shared axes.)
           wn = normalize(nt.x * tt + nt.y * bb + wn * max(nt.z, 0.05));
-        }
+          // v2: the reflective families share the kd term; fam 5
+          // (reflective) is a base-family material and normalizes vnd for
+          // the dot like baseenvironment; fam 6 (reflective_simple) uses
+          // it raw like the other _simple family. kt/kb = the shared kd
+          // axes computed above (stored frame when the mesh carries one),
+          // built from the pre-mapping geometric normal.
+          float3 v56 = fam < 5.5 ? normalize(nt) : nt;
+          kd = (v56.x * 0.58 * sign(dot(kt, sh_sun.xyz)) +
+                v56.y * 0.62 * sign(dot(kb, sh_sun.xyz)) +
+                v56.z * 0.39) * 2.39562;
+      }
+      // Fam 13 has no kd term at all; its body is D^2 * lml * ALPHA,
+      // premultiplied once in the shader on top of the a^2 blend factor
+      // (verified 0.0-error vs the ucode).
+      lin = fam > 12.5 ? lml * dcol * albedo.a : lml * kd * dcol;
+      if (overlay.w > 2.5) {
+        // spec/ecc/refmask at t4: phong vs the FIXED literal light
+        // (-0.14, 0.5, 0.9), power 10 + 290*ecc, tint (2.1, 1.8, 1.5),
+        // scaled by the clamped lightmap green and the spec mask.
+        float4 masks = decal_art.Sample(smp, i.uv);
         float3 vd = -normalize(i.rpos);
         float3 Ls = float3(-0.14, 0.5, 0.9);
         float3 refl = Ls - 2.0 * wn * dot(wn, Ls);
@@ -685,6 +764,18 @@ float4 ps_main(VSOut i) : SV_Target {
             lin = cube * cube;
           }
         }
+      }
+      // v2 decal-family spec (spec/ecc at t9): the same phong-vs-fixed-
+      // light term as the base families; the decal art occupies t4 on
+      // fams 3/4, so their masks ride the second pair table.
+      if ((v2f & 4u) != 0u) {
+        float2 m2 = spec2_map.Sample(smp, i.uv).rg;
+        float3 vd2 = -normalize(i.rpos);
+        float3 Ls2 = float3(-0.14, 0.5, 0.9);
+        float3 refl2 = Ls2 - 2.0 * wn * dot(wn, Ls2);
+        float ks2 =
+            pow(max(saturate(dot(vd2, -refl2)), 1e-6), 10.0 + 290.0 * m2.y);
+        lin += ks2 * float3(2.1, 1.8, 1.5) * lml.g * m2.x;
       }
       if (fam > 12.5) {
         // Fam 13 blend factor: the PS outputs a^2 (straight-alpha blend on
