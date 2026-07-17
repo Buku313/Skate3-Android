@@ -50,6 +50,8 @@
 #endif
 #endif
 
+REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene, false, "Skate 3",
                     "Render the game scene natively from the hooked MeshContext stream, "
                     "replacing the emulated GPU output (requires skate3_native_render). "
@@ -381,14 +383,17 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_char_rows_inst, true, "Skate 3",
                     "legacy opaque path on capture-failed frames (a frame-to-frame "
                     "flicker whose rate scales with fps).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 1024, "Skate 3",
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 0, "Skate 3",
                      "Shadow cascade tile resolution. The game's own atlas is "
-                     "three 512 tiles; the blur offsets scale with this value so "
-                     "the penumbra WIDTH stays console-equal at any resolution "
-                     "(like the emulated GPU: scaled raster, logical-texel blur). "
-                     "1024 = fine silhouettes at the game's softness; 512 = "
-                     "console-exact but visibly blocky edges up close.")
-    .range(256, 4096)
+                     "three 512 tiles; the blur steps raster texels (the game's "
+                     "tfetch offsets, which the emulated GPU applies in scaled "
+                     "texels), so higher values sharpen both the silhouette and "
+                     "the penumbra like the emulated baseline. 512 = the softer "
+                     "original-console look, blocky up close. 0 = auto: 512 x "
+                     "the render resolution scale (the Resolution Scale "
+                     "setting), matching the emulated renderer's shadow "
+                     "crispness at any render resolution.")
+    .range(0, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_caster_parity, true,
                     "Skate 3",
@@ -10217,6 +10222,19 @@ struct RendererState {
   // After a shadow pass all three textures sit in PIXEL_SHADER_RESOURCE;
   // the next pass transitions them back to RENDER_TARGET first.
   bool shadow_in_srv_state = false;
+  // Shadow-atlas readback, taken on kShadowDumpFrames CONSECUTIVE frames
+  // once per F11 recording session: the raw and blurred planes (R16G16)
+  // land in the snapshot dir for offline analysis; the guest's own atlas
+  // resolve never reaches CPU memory, so this is the only view of what
+  // receivers actually sample. Consecutive frames make temporal-stability
+  // diffs possible (silhouette buzz vs animation).
+  static constexpr uint32_t kShadowDumpFrames = 4;
+  nrhi::Buffer* shadow_dump_buf[kShadowDumpFrames] = {};
+  uint8_t* shadow_dump_ptr[kShadowDumpFrames] = {};
+  uint64_t shadow_dump_submission[kShadowDumpFrames] = {};
+  uint32_t shadow_dump_enqueued = 0;
+  uint32_t shadow_dump_written = 0;
+  bool shadow_dump_done = false;
   // Per-frame shadow constant buffer ring (CBV b1).
   static constexpr uint32_t kShadowCbRegions = 8;
   nrhi::Buffer* shadow_cb = nullptr;
@@ -13150,7 +13168,22 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     // half-float ulp at the typical ~0.85 depth is ~6 mm of world height,
     // too coarse for board/feet-height casters 1-2 cm off the ground),
     // 3 tiles of tile x tile each.
-    g_r.shadow_tile = uint32_t(REXCVAR_GET(skate3_native_render_scene_shadow_tile));
+    const int32_t tile_cfg = REXCVAR_GET(skate3_native_render_scene_shadow_tile);
+    if (tile_cfg > 0) {
+      g_r.shadow_tile = uint32_t(tile_cfg);
+    } else {
+      // Auto: the game's 512 tiles at the RENDER resolution scale.
+      // guest_output is the scaled frontbuffer (720p x the draw resolution
+      // scale, independent of window/monitor size), so deriving from its
+      // height follows the Resolution Scale setting, including any
+      // device-limit clamping the texture cache applied, and gives the
+      // same effective shadow raster the emulated GPU renders at that
+      // scale. Resolved once at atlas creation (the cvar is
+      // restart-scoped).
+      const uint32_t scale =
+          std::max(1u, (context.guest_output_height + 719u) / 720u);
+      g_r.shadow_tile = std::min(512u * scale, 4096u);
+    }
     nrhi::TextureDesc desc;
     desc.width = g_r.shadow_tile * 3;
     desc.height = g_r.shadow_tile;
@@ -13180,8 +13213,9 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
       }
     }
     g_r.shadow_in_srv_state = false;
-    REXLOG_INFO("native-scene: shadow atlas created ({}x{} tiles)", g_r.shadow_tile,
-                g_r.shadow_tile);
+    REXLOG_INFO("native-scene: shadow atlas created ({}x{} tiles{})",
+                g_r.shadow_tile, g_r.shadow_tile,
+                tile_cfg > 0 ? "" : ", auto");
   }
   if (!g_r.shadow_cb) {
     // Always created (even with shadows off): the scene PS declares b1 and
@@ -15467,6 +15501,41 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
   const float* sh = scene.shadow_rows;
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
+  // Atlas-readback bookkeeping: write completed dumps to disk in frame
+  // order; re-arm once the recording session that requested them ends.
+  if (!g_recording.load(std::memory_order_relaxed) &&
+      g_r.shadow_dump_written == g_r.shadow_dump_enqueued) {
+    g_r.shadow_dump_done = false;
+    g_r.shadow_dump_enqueued = 0;
+    g_r.shadow_dump_written = 0;
+  }
+  while (g_r.shadow_dump_written < g_r.shadow_dump_enqueued &&
+         context.device->CompletedSubmission() >
+             g_r.shadow_dump_submission[g_r.shadow_dump_written]) {
+    const uint32_t k = g_r.shadow_dump_written;
+    const uint32_t tile_px = g_r.shadow_tile;
+    const uint32_t pitch = tile_px * 3u * 4u;
+    const uint64_t plane = uint64_t(pitch) * tile_px;
+    context.device->InvalidateForRead(g_r.shadow_dump_buf[k], 0, plane * 2);
+    std::string dir = REXCVAR_GET(skate3_native_render_snapshot_dir);
+    if (dir.empty()) {
+      dir = "native_render_snapshots";
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path path =
+        std::filesystem::path(dir) /
+        ("shadow_atlas_" + std::to_string(uint64_t(std::time(nullptr))) + "_f" +
+         std::to_string(k) + "_" + std::to_string(tile_px * 3) + "x" +
+         std::to_string(tile_px) + "_rg16.bin");
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(g_r.shadow_dump_ptr[k]),
+              std::streamsize(plane * 2));
+    REXLOG_INFO(
+        "native-scene: shadow atlas frame {} dumped (raw+blurred planes) -> {}",
+        k, path.string());
+    ++g_r.shadow_dump_written;
+  }
   if (REXCVAR_GET(skate3_native_render_scene_shadows) && scene.shadow_valid &&
       g_r.shadow_raw != nullptr && g_r.pso_shadow_caster != nullptr &&
       g_r.pso_shadow_blur != nullptr && debug_mode == 0) {
@@ -15642,16 +15711,15 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
                                         float(tile), 0.0f, 1.0f});
         cmd->SetScissor(nrhi::Rect{int32_t(tile) * ci, 0,
                                    int32_t(tile) * (ci + 1), int32_t(tile)});
-        // Blur tap offsets in GAME-map texels (the game's atlas tile is 512;
-        // its blur shader steps whole logical texels). At higher native tile
-        // resolutions the step scales up so the blur's WORLD reach, the
-        // penumbra width every receiver sees, stays console-equal: 512 tiles
-        // rendered the exact width but visibly blocky silhouettes;
-        // 1024 with unscaled 1-texel steps
-        // halved the game's softness. Matches the emulated GPU, which
-        // resolution-scales the raster while the blur offsets stay logical.
-        const float step = std::max(1.0f, float(tile) / 512.0f);
-        const float bc[12] = {horizontal ? step : 0.0f, horizontal ? 0.0f : step,
+        // Blur tap offsets step RASTER texels, matching the emulated GPU:
+        // the game's blur PS taps via tfetch integer offsets (OffsetX/Y
+        // -2..+2), which a resolution-scaled
+        // raster applies in physical texels, so the penumbra NARROWS as the
+        // tile grows (the emulated baseline is sharper than original
+        // hardware; 512 reproduces the softer original-360 look). Scaling
+        // the step by tile/512 to hold a console-width penumbra was tried
+        // and made receivers visibly blurrier than the emulated reference.
+        const float bc[12] = {horizontal ? 1.0f : 0.0f, horizontal ? 0.0f : 1.0f,
                               ntaps[ci], src_raw ? 1.0f : 0.0f,
                               kernels[ci][0], kernels[ci][1], kernels[ci][2], 0.0f,
                               float(tile) * ci, float(tile) * (ci + 1) - 1.0f,
@@ -15674,6 +15742,52 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       cmd->FlushBarriers();
       g_r.shadow_in_srv_state = true;
       shadow_ready = shadow_draws > 0;
+      // Atlas readback on kShadowDumpFrames consecutive frames per
+      // recording session (see the completion handler at function entry):
+      // per frame, raw plane at offset 0, blurred plane after it. Each
+      // frame gets its own readback buffer so no frame waits on a copy.
+      if (g_recording.load(std::memory_order_relaxed) &&
+          !g_r.shadow_dump_done &&
+          g_r.shadow_dump_enqueued < RendererState::kShadowDumpFrames) {
+        const uint32_t k = g_r.shadow_dump_enqueued;
+        const uint32_t pitch = tile * 3u * 4u;
+        const uint64_t plane = uint64_t(pitch) * tile;
+        if (g_r.shadow_dump_buf[k] == nullptr) {
+          nrhi::BufferDesc desc;
+          desc.size = plane * 2;
+          desc.heap = nrhi::HeapKind::kReadback;
+          g_r.shadow_dump_buf[k] = context.device->CreateBuffer(desc);
+          g_r.shadow_dump_ptr[k] =
+              g_r.shadow_dump_buf[k] != nullptr
+                  ? static_cast<uint8_t*>(
+                        context.device->Map(g_r.shadow_dump_buf[k]))
+                  : nullptr;
+        }
+        if (g_r.shadow_dump_ptr[k] != nullptr) {
+          cmd->Barrier(g_r.shadow_raw, nrhi::ResourceState::kPixelShaderResource,
+                       nrhi::ResourceState::kCopySource);
+          cmd->Barrier(g_r.shadow_final,
+                       nrhi::ResourceState::kPixelShaderResource,
+                       nrhi::ResourceState::kCopySource);
+          cmd->FlushBarriers();
+          cmd->CopyTextureToBuffer(g_r.shadow_dump_buf[k], 0, pitch,
+                                   g_r.shadow_raw, 0, tile * 3, tile);
+          cmd->CopyTextureToBuffer(g_r.shadow_dump_buf[k], plane, pitch,
+                                   g_r.shadow_final, 0, tile * 3, tile);
+          cmd->Barrier(g_r.shadow_raw, nrhi::ResourceState::kCopySource,
+                       nrhi::ResourceState::kPixelShaderResource);
+          cmd->Barrier(g_r.shadow_final, nrhi::ResourceState::kCopySource,
+                       nrhi::ResourceState::kPixelShaderResource);
+          cmd->FlushBarriers();
+          g_r.shadow_dump_submission[k] = context.device->CurrentSubmission();
+          ++g_r.shadow_dump_enqueued;
+          if (g_r.shadow_dump_enqueued == RendererState::kShadowDumpFrames) {
+            g_r.shadow_dump_done = true;
+          }
+        } else {
+          g_r.shadow_dump_done = true;  // allocation failed; don't retry
+        }
+      }
     }
   }
   *out_draws = shadow_draws;
