@@ -133,6 +133,11 @@ void ApplyDemoPathProfileOverride() {
       !rex::cvar::Query<bool>("skate3_demo_path_probe")) {
     return;
   }
+  if (rex::cvar::Query<bool>("skate3_demo_path_signed_in")) {
+    // Closer-to-real-use runs: keep the user's profile and save so the boot
+    // flow resumes their career instead of a signed-out session.
+    return;
+  }
 
   rex::cvar::SetFlagByName("user_profile_signed_in", "false");
   rex::cvar::SetFlagByName("user_live_signed_in", "false");

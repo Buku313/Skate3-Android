@@ -3,10 +3,17 @@
 #include "generated/skate3_init.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include <rex/cvar.h>
+#include <rex/graphics/ultrawide_debug.h>
 #include <rex/input/input.h>
 #include <rex/kernel/xam/input_injection.h>
 #include <rex/logging.h>
@@ -21,6 +28,22 @@ REXCVAR_DEFINE_BOOL(skate3_demo_path, false, "Skate 3",
                     "Probe and automate the boot path to gameplay");
 REXCVAR_DEFINE_BOOL(skate3_demo_path_probe, false, "Skate 3",
                     "Log Skate 3 boot/frontend states used by the demo path");
+REXCVAR_DEFINE_BOOL(skate3_demo_path_signed_in, false, "Skate 3",
+                    "Demo path: keep the real signed-in profile (and its save) instead of "
+                    "forcing a signed-out boot");
+REXCVAR_DEFINE_STRING(skate3_demo_path_gameplay_inputs, "", "Skate 3",
+                      "Demo path: comma-separated pad inputs injected once after gameplay "
+                      "settles (tokens: a b x y start back lb rb lt rt up down left right l3 "
+                      "r3; a ':ms' suffix overrides the delay AFTER that input, e.g. rt:1500). "
+                      "Map switch to PCU Library: "
+                      "start,a,rt:1500,rt:1500,down,down,a,down,down,down,down,down,a,a");
+REXCVAR_DEFINE_INT32(skate3_demo_path_input_settle_ms, 2500, "Skate 3",
+                     "Demo path: wait this long after gameplay is reached before injecting "
+                     "skate3_demo_path_gameplay_inputs")
+    .range(0, 60000);
+REXCVAR_DEFINE_INT32(skate3_demo_path_input_delay_ms, 600, "Skate 3",
+                     "Demo path: delay between injected gameplay inputs")
+    .range(50, 10000);
 
 namespace skate3::demo_path {
 namespace {
@@ -182,6 +205,150 @@ extern "C" REX_FUNC(Skate3DemoPath_LanguageSelectUpdateHook) {
   sub_82639400(ctx, base);
 }
 
+// Scripted post-gameplay input sequence (e.g. driving the pause-menu map
+// switch that reproduces the sticky-slow-GPU state). Runs on its own thread
+// with real-time pacing: waits for the gameplay presence context, lets the
+// scene settle, then injects one pad input at a time.
+struct GameplayInputToken {
+  const char* name;
+  uint16_t buttons;
+  uint8_t left_trigger;
+  uint8_t right_trigger;
+};
+
+constexpr GameplayInputToken kGameplayInputTokens[] = {
+    {"a", rex::input::X_INPUT_GAMEPAD_A, 0, 0},
+    {"b", rex::input::X_INPUT_GAMEPAD_B, 0, 0},
+    {"x", rex::input::X_INPUT_GAMEPAD_X, 0, 0},
+    {"y", rex::input::X_INPUT_GAMEPAD_Y, 0, 0},
+    {"start", rex::input::X_INPUT_GAMEPAD_START, 0, 0},
+    {"back", rex::input::X_INPUT_GAMEPAD_BACK, 0, 0},
+    {"lb", rex::input::X_INPUT_GAMEPAD_LEFT_SHOULDER, 0, 0},
+    {"rb", rex::input::X_INPUT_GAMEPAD_RIGHT_SHOULDER, 0, 0},
+    {"lt", 0, 255, 0},
+    {"rt", 0, 0, 255},
+    {"up", rex::input::X_INPUT_GAMEPAD_DPAD_UP, 0, 0},
+    {"down", rex::input::X_INPUT_GAMEPAD_DPAD_DOWN, 0, 0},
+    {"left", rex::input::X_INPUT_GAMEPAD_DPAD_LEFT, 0, 0},
+    {"right", rex::input::X_INPUT_GAMEPAD_DPAD_RIGHT, 0, 0},
+    {"l3", rex::input::X_INPUT_GAMEPAD_LEFT_THUMB, 0, 0},
+    {"r3", rex::input::X_INPUT_GAMEPAD_RIGHT_THUMB, 0, 0},
+};
+
+const GameplayInputToken* FindGameplayInputToken(const std::string& name) {
+  for (const GameplayInputToken& token : kGameplayInputTokens) {
+    if (name == token.name) {
+      return &token;
+    }
+  }
+  return nullptr;
+}
+
+std::atomic<bool> g_input_worker_quit{false};
+std::thread g_input_worker;
+
+void JoinGameplayInputWorker() {
+  g_input_worker_quit.store(true, std::memory_order_relaxed);
+  if (g_input_worker.joinable()) {
+    g_input_worker.join();
+  }
+}
+
+bool InterruptibleSleepMs(int64_t total_ms) {
+  constexpr int64_t kSliceMs = 100;
+  while (total_ms > 0) {
+    if (g_input_worker_quit.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    int64_t slice = total_ms < kSliceMs ? total_ms : kSliceMs;
+    std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+    total_ms -= slice;
+  }
+  return !g_input_worker_quit.load(std::memory_order_relaxed);
+}
+
+void StartGameplayInputWorkerIfNeeded() {
+  if (!AutomationEnabled()) {
+    return;
+  }
+  const std::string sequence = REXCVAR_GET(skate3_demo_path_gameplay_inputs);
+  if (sequence.empty()) {
+    return;
+  }
+
+  const int32_t settle_ms = REXCVAR_GET(skate3_demo_path_input_settle_ms);
+  const int32_t default_delay_ms = REXCVAR_GET(skate3_demo_path_input_delay_ms);
+
+  struct SequenceEntry {
+    const GameplayInputToken* token;
+    int32_t delay_after_ms;
+  };
+  std::vector<SequenceEntry> tokens;
+  std::stringstream stream(sequence);
+  std::string raw_token;
+  while (std::getline(stream, raw_token, ',')) {
+    // Allow spaces around tokens.
+    size_t begin = raw_token.find_first_not_of(" \t");
+    size_t end = raw_token.find_last_not_of(" \t");
+    if (begin == std::string::npos) {
+      continue;
+    }
+    std::string name = raw_token.substr(begin, end - begin + 1);
+    // Optional ':ms' suffix overriding the delay after this input (slower UI
+    // transitions - the map-menu RT tabs - need more time to register).
+    int32_t delay_after_ms = default_delay_ms;
+    if (size_t colon = name.find(':'); colon != std::string::npos) {
+      delay_after_ms = std::atoi(name.c_str() + colon + 1);
+      if (delay_after_ms <= 0) {
+        REXLOG_WARN("Skate 3 demo path: bad delay in gameplay input token '{}' - sequence "
+                    "disabled",
+                    name);
+        return;
+      }
+      name.resize(colon);
+    }
+    const GameplayInputToken* token = FindGameplayInputToken(name);
+    if (!token) {
+      REXLOG_WARN("Skate 3 demo path: unknown gameplay input token '{}' - sequence disabled",
+                  name);
+      return;
+    }
+    tokens.push_back({token, delay_after_ms});
+  }
+  if (tokens.empty()) {
+    return;
+  }
+  g_input_worker = std::thread([tokens, settle_ms] {
+    // Wait for the gameplay presence context (0x8001 == 1).
+    while (rex::graphics::ultrawide_debug::Skate3GameplayContextValue() != 1) {
+      if (!InterruptibleSleepMs(100)) {
+        return;
+      }
+    }
+    REXLOG_INFO("Skate 3 demo path: gameplay reached; injecting {} inputs after {} ms settle",
+                tokens.size(), settle_ms);
+    if (!InterruptibleSleepMs(settle_ms)) {
+      return;
+    }
+    for (size_t i = 0; i < tokens.size(); ++i) {
+      const GameplayInputToken* token = tokens[i].token;
+      // ~8 polls at the game's 60 Hz input tick = a ~130 ms press. Triggers
+      // are analog and debounced more heavily by the game's menus - hold them
+      // for a human-tap-length ~270 ms.
+      const bool is_trigger = token->left_trigger != 0 || token->right_trigger != 0;
+      rex::kernel::xam::QueueSyntheticInput(token->buttons, token->left_trigger,
+                                            token->right_trigger, is_trigger ? 16 : 8);
+      REXLOG_INFO("Skate 3 demo path: injected gameplay input {}/{} '{}' (delay {} ms)", i + 1,
+                  tokens.size(), token->name, tokens[i].delay_after_ms);
+      if (!InterruptibleSleepMs(tokens[i].delay_after_ms)) {
+        return;
+      }
+    }
+    REXLOG_INFO("Skate 3 demo path: gameplay input sequence complete");
+  });
+  std::atexit(JoinGameplayInputWorker);
+}
+
 }  // namespace
 
 void InstallHooks(rex::runtime::FunctionDispatcher* dispatcher) {
@@ -194,6 +361,7 @@ void InstallHooks(rex::runtime::FunctionDispatcher* dispatcher) {
   dispatcher->SetFunction(0x826FE1D8, &Skate3DemoPath_ShowPressStartModeHook);
   dispatcher->SetFunction(0x82639400, &Skate3DemoPath_LanguageSelectUpdateHook);
   REXLOG_INFO("Skate 3 demo path: frontend probe hooks installed");
+  StartGameplayInputWorkerIfNeeded();
 }
 
 bool ShouldForceIntroMovieComplete() {
