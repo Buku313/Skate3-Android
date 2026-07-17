@@ -1,5 +1,6 @@
 #include "skate3_native_render.h"
 
+#include "native/skate3_native_entity.h"
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_v3_shadow.h"
 #include "skate3_native_scene.h"
@@ -472,6 +473,11 @@ void OnFrameEnd(uint8_t* base) {
       g_immediate = true;
       g_collect_counter = 0;
       skate3::native_scene::StartRecording(1);
+      // Simultaneous screenshot: the recorded scene/draw data alone cannot
+      // prove what was on screen (render-stage state is not captured);
+      // the paired PNG anchors every diagnostic to the visible frame.
+      skate3::screenshot::CaptureWindow(skate3::screenshot::RememberedWindow(),
+                                        "f10");
       REXLOG_INFO("native-render snapshot: F10, immediate single-frame capture at frame {}",
                   g_frame_index);
     }
@@ -500,6 +506,8 @@ void OnFrameEnd(uint8_t* base) {
             g_immediate = true;
             g_collect_counter = 0;
             skate3::native_scene::StartRecording(1);
+            skate3::screenshot::CaptureWindow(
+                skate3::screenshot::RememberedWindow(), "rbx");
             REXLOG_INFO(
                 "native-render snapshot: RB+X, immediate single-frame capture "
                 "at frame {}",
@@ -790,32 +798,138 @@ extern "C" REX_FUNC(sub_82594488) {
 
 // Sk8::SkaterPresEntity::StartJobs: post-call, the per-garment ROPA CPU/GPU
 // mode fields and deformed-VB double buffer are the frame's live values.
+// Bracketed as a pack owner: UpdateBoneTransforms calls inside stamp their
+// snapshots with this entity.
 extern "C" REX_FUNC(sub_827825B0) {
   const uint32_t skater = ctx.r3.u32;
+  const uint32_t prev_owner = skate3::native_v3::ExchangePackOwner(skater);
   __imp__sub_827825B0(ctx, base);
+  skate3::native_v3::ExchangePackOwner(prev_owner);
   if (skate3::native_render::Enabled()) {
     skate3::native_v3::OnRopaStartJobs(base, skater);
   }
 }
 
+// Sk8::SkaterPresEntity::DoubleBuffer(garment index): runs once per
+// garment per COMPLETED cloth sim tick (the job's output memcpy + buffer
+// flip). The identity store's deformed-VB freshness signal: garment-table
+// fields persist after the sim stops, so this is the only per-tick proof
+// the garment is really CPU-simulated right now.
+extern "C" REX_FUNC(sub_82783038) {
+  const uint32_t skater = ctx.r3.u32;
+  const uint32_t index = ctx.r4.u32;
+  __imp__sub_82783038(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_entity::OnRopaDoubleBuffer(base, skater, index);
+  }
+}
+
+// Sk8::SkaterPresEntity::EndJobs: calls PackAndMultiplyMatricesForUpload
+// per instance with the tick's final locomotion (the body pose of record).
+// Bracketed as a pack owner so those snapshots carry the entity.
+extern "C" REX_FUNC(sub_82782818) {
+  const uint32_t prev_owner =
+      skate3::native_v3::ExchangePackOwner(ctx.r3.u32);
+  __imp__sub_82782818(ctx, base);
+  skate3::native_v3::ExchangePackOwner(prev_owner);
+}
+
+// Skater-family virtual UBT+Pack driver (vtable slot +16): the remaining
+// palette-write path (UpdateBoneTransforms + PackAndMultiply outside the
+// StartJobs/EndJobs pair). Bracketed as a pack owner.
+extern "C" REX_FUNC(sub_82785778) {
+  const uint32_t prev_owner =
+      skate3::native_v3::ExchangePackOwner(ctx.r3.u32);
+  __imp__sub_82785778(ctx, base);
+  skate3::native_v3::ExchangePackOwner(prev_owner);
+}
+
 // Sk8::RenderPresentation::AddEntityToRenderViews / RmvEntityFrmRenderViews
 // - r3 is the RenderPresentation instance itself: the direct capture source
 // for the RP pointer (the 0x83063C38/0x83063C60 scene globals read ZERO at
-// runtime; the chain assumption did not hold live).
+// runtime; the chain assumption did not hold live). r4 is the
+// PresentationEntity being (de)registered: the identity store's
+// scene-membership/lifetime signal (native/skate3_native_entity.h).
 extern "C" REX_FUNC(sub_827A6C50) {
   const uint32_t rp = ctx.r3.u32;
+  const uint32_t entity = ctx.r4.u32;
   if (skate3::native_render::Enabled()) {
     skate3::native_v3::OnRenderPresentation(base, rp);
+    skate3::native_entity::OnEntityViewAdd(entity);
   }
   __imp__sub_827A6C50(ctx, base);
 }
 
 extern "C" REX_FUNC(sub_827A6CE8) {
   const uint32_t rp = ctx.r3.u32;
+  const uint32_t entity = ctx.r4.u32;
   if (skate3::native_render::Enabled()) {
     skate3::native_v3::OnRenderPresentation(base, rp);
+    skate3::native_entity::OnEntityViewRemove(entity);
   }
   __imp__sub_827A6CE8(ctx, base);
+}
+
+// Sk8::PresentationEntity::BindConstants (base override): post-call, every
+// MeshContext of the entity's current LOD has just received its constant
+// param POINTERS (world hash 0x7DDF552B -> &entity+416, etc.; the game
+// binds by pointer and dereferences at draw). Every subclass bind calls
+// this base, so the exit sees every renderable presentation entity with
+// its full ctx set: the ctx -> entity identity write point.
+extern "C" REX_FUNC(sub_827A6658) {
+  const uint32_t entity = ctx.r3.u32;
+  __imp__sub_827A6658(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_entity::OnBindConstants(base, entity);
+  }
+}
+
+// Derived BindConstants overrides: class tags for the identity store. The
+// most-derived override returns last (each calls its parent first), so the
+// last tag to land is the entity's concrete class.
+extern "C" REX_FUNC(sub_82783D68) {  // Sk8::SkaterPresEntity
+  const uint32_t entity = ctx.r3.u32;
+  __imp__sub_82783D68(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_entity::OnBindClass(
+        entity, skate3::native_entity::EntClass::kSkater);
+  }
+}
+
+extern "C" REX_FUNC(sub_82785260) {  // ColorizedSkaterPresEntity
+  const uint32_t entity = ctx.r3.u32;
+  __imp__sub_82785260(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_entity::OnBindClass(
+        entity, skate3::native_entity::EntClass::kColorized);
+  }
+}
+
+extern "C" REX_FUNC(sub_82793F70) {  // CACPresEntity (untransposed world)
+  const uint32_t entity = ctx.r3.u32;
+  __imp__sub_82793F70(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_entity::OnBindClass(
+        entity, skate3::native_entity::EntClass::kCac);
+  }
+}
+
+extern "C" REX_FUNC(sub_82785528) {  // unnamed skater-layout class
+  const uint32_t entity = ctx.r3.u32;
+  __imp__sub_82785528(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_entity::OnBindClass(
+        entity, skate3::native_entity::EntClass::kSkaterAux);
+  }
+}
+
+extern "C" REX_FUNC(sub_827C1720) {  // cLivingWorldPresEntity
+  const uint32_t entity = ctx.r3.u32;
+  __imp__sub_827C1720(ctx, base);
+  if (skate3::native_render::Enabled()) {
+    skate3::native_entity::OnBindClass(
+        entity, skate3::native_entity::EntClass::kLivingWorld);
+  }
 }
 
 // pegasus::tRModelData::Fixup(void* model, rw::core::arena::ArenaIterator*)

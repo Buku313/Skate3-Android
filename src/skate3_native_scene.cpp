@@ -31,6 +31,7 @@
 #include <rex/logging.h>
 
 #include "native/skate3_native_diag.h"
+#include "native/skate3_native_entity.h"
 #include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_v3_shadow.h"
@@ -769,6 +770,8 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_mips, true, "Skate 3",
 // toggle refuses to flip the scene on without it: the hooks that feed the
 // scene are only installed when it was set at boot.
 REXCVAR_DECLARE(bool, skate3_native_render);
+// Defined in native/skate3_native_entity.cpp (the identity store module).
+REXCVAR_DECLARE(bool, skate3_native_render_scene_entity_ropa_world_primary);
 // Defined in native/skate3_native_lw.cpp (the LW entity store module).
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_palette);
 // SDK-level emulated-draw suppression (rexglue native_guest_renderer.cpp):
@@ -1210,6 +1213,20 @@ struct CharRowsInst {
   uint32_t entity = 0;
 };
 std::unordered_map<uint64_t, CharRowsInst> g_char_rows_cache_inst;
+// Entity-keyed lighting rows for ROPA garments only: the sim on/off switch
+// swaps between a garment's two renderables (cloth-target vs original
+// model, different mesh AND ctx), so the (mesh,ctx) caches never carry
+// rows across the switch and the freshly resolved model rendered dark/flat
+// until its own capture validated. Both models map to the same owning
+// entity in the identity store, and they are the same garment; sharing
+// rows across the pair is exact. Garment-to-garment only; body pieces keep
+// their per-piece caches.
+struct CharRowsEnt {
+  std::array<float, 60> rows;
+  uint8_t fam = 0;  // donor family: the row layout is family-specific
+};
+std::unordered_map<uint32_t, CharRowsEnt> g_char_rows_cache_ent;
+std::atomic<uint64_t> g_char_rows_ent_served{0};
 std::atomic<uint64_t> g_char_rows_inst_served{0};
 // Perspective refreshes committed onto skinned-published ROPA pieces (the
 // caster_refresh_all fix; see the fixup's candidate selection).
@@ -1267,6 +1284,12 @@ struct RopaResolvedState {
   bool skinned = false;
   float world[16] = {};
   std::vector<float> bones;
+  // Publish frame of the cached state: the rescues below exist to bridge
+  // 1-3 frame capture gaps, and re-publishing an unbounded-age state pins a
+  // ghost of the garment at a stale pose for as long as captures keep
+  // failing (the frozen-in-the-air garment behind a skater whose capture
+  // path was refusing every frame).
+  uint64_t frame = 0;
 };
 std::unordered_map<uint32_t, RopaResolvedState> g_ropa_state_cache;
 std::atomic<uint64_t> g_ropa_rescued{0};
@@ -1576,6 +1599,11 @@ std::atomic<uint64_t> g_ropa_blend_miss{0};
 // when no previous state existed) because the GPU-resident decode still
 // pairs with the other mode; see g_ropa_resident.
 std::atomic<uint64_t> g_ropa_hold{0};
+// Published ropa garments vetoed by the detached-garment gate (transform
+// more than ~2 m from every character bone in the frame: a wrong joint's
+// or wrong instance's transform that the spread gates cannot reject; the
+// veto log names the producing path via dbg_src).
+std::atomic<uint64_t> g_ropa_detached{0};
 // Ropa garments PUBLISHED with a caster-cascade (ortho) bank's palette:
 // the ~40 ms-stale rows behind the garment-offset-from-body symptom. The
 // same-mode graft in the dyn_slot merge should keep this at ~0 whenever a
@@ -1807,6 +1835,26 @@ uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
     }
     return !(f[2] > -1e7f && f[2] < 1e7f);
   };
+  // The sim-ACTIVE variant of the ropa flag row reads (~0, JUNK, ~0, JUNK):
+  // x is written 0.0 (sim owns the garment) with uninitialized memory in the
+  // unwritten lanes (observed ~7e20 on the trick-guide demo skater's tee,
+  // c7/c4). The junk lanes fail every range check
+  // above, leaving the bank UNCLASSIFIABLE in the true main-pass state
+  // (return 0; the capture never resolved and the garment stayed pending),
+  // while the post-shadow state matched bone_at(7) mid-palette instead and
+  // handed the rigid-matrix read the shadow block's (0,0,0,1) tail row at
+  // c191. An out-of-range lane under x ~ 0 and z ~ 0 is the same structural
+  // proof as the junk-z inactive variant: a real bone row is never junk.
+  const auto ropa_active_flag_row_at = [&](uint32_t reg) -> bool {
+    float f[4];
+    for (int i = 0; i < 4; ++i) {
+      f[i] = LoadGuestF32(base, bank + (reg * 4 + uint32_t(i)) * 4);
+    }
+    if (!(std::fabs(f[0]) <= 1e-3f && std::fabs(f[2]) <= 1e-3f)) {
+      return false;
+    }
+    return !(f[1] > -1e7f && f[1] < 1e7f) || !(f[3] > -1e7f && f[3] < 1e7f);
+  };
   // DETERMINISTIC main-pass detection first: that layout keeps the CAMERA
   // POSITION at c4 (palette at c7, or c8 behind a parameter row). Matching
   // c4 against the frame camera pins the layout without any scoring; the
@@ -1821,18 +1869,28 @@ uint32_t BankPaletteBase(uint8_t* base, uint32_t bank) {
     const float dz = LoadGuestF32(base, bank + 18 * 4) - g_fog_cam[2];
     if (dx * dx + dy * dy + dz * dz < 25.0f &&
         (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
-      if ((param_row_at(7) || ropa_flag_row_at(7)) && bone_at(8)) return 8;
+      if ((param_row_at(7) || ropa_flag_row_at(7) ||
+           ropa_active_flag_row_at(7)) &&
+          bone_at(8)) {
+        return 8;
+      }
       if (bone_at(7)) return 7;
       return 0;
     }
   }
   if (bone_at(4)) return 4;
-  // The ropa junk-z flag check must run BEFORE bone_at(7): on a pre-pass
+  // The ropa junk-lane flag checks must run BEFORE bone_at(7): on a pre-pass
   // ropa bank (flag c4, palette c5) rows c7.. are mid-palette bone rows and
   // bone_at(7) matches them, the one-bone-late class.
-  if ((param_row_at(4) || ropa_flag_row_at(4)) && bone_at(5)) return 5;
+  if ((param_row_at(4) || ropa_flag_row_at(4) || ropa_active_flag_row_at(4)) &&
+      bone_at(5)) {
+    return 5;
+  }
   if (bone_at(7)) return 7;
-  if ((param_row_at(7) || ropa_flag_row_at(7)) && bone_at(8)) return 8;
+  if ((param_row_at(7) || ropa_flag_row_at(7) || ropa_active_flag_row_at(7)) &&
+      bone_at(8)) {
+    return 8;
+  }
   return 0;
 }
 
@@ -4461,18 +4519,36 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
         if (rigid_score < 8) {
           g_ropa_relaxed.fetch_add(1, std::memory_order_relaxed);
         }
+        // Primary entity-world serve: the accepted bank block is a
+        // dereference of the owner entity's m_MatLtoWTrans, so the entity
+        // field is value-identical here (bit-compare tripwire counts any
+        // drift as wprim divergence) and stays correct through bank states
+        // the acceptance can't see. Bank rows remain the fallback.
+        const float* src_rows = rows;
+        float ent_rows[12];
+        if (REXCVAR_GET(skate3_native_render_scene_entity_ropa_world_primary) &&
+            skate3::native_entity::ServeRopaWorld(base, item.ctx, item.vb_obj,
+                                                  ent_rows)) {
+          skate3::native_entity::NoteAcceptedWorldCompare(rows, ent_rows);
+          src_rows = ent_rows;
+        }
         // Column-vector [R | t] rows -> item.world (row-vector, t in row 3).
         for (int i = 0; i < 3; ++i) {
           for (int j = 0; j < 3; ++j) {
-            item.world[i * 4 + j] = rows[j * 4 + i];
+            item.world[i * 4 + j] = src_rows[j * 4 + i];
           }
           item.world[i * 4 + 3] = 0.0f;
-          item.world[12 + i] = rows[i * 4 + 3];
+          item.world[12 + i] = src_rows[i * 4 + 3];
         }
         item.world[15] = 1.0f;
         item.skinned = false;
         item.bones.clear();
         g_ropa_rigid.fetch_add(1, std::memory_order_relaxed);
+        // Identity-store observer: the accepted bank block should be a
+        // dereference of the owner entity's bound world pointer (+416
+        // transposed for skater-class binds, +352 raw for CAC); the
+        // ident[] w416/w352 telemetry proves or refutes that live.
+        skate3::native_entity::ObserveRopaWorld(base, item.ctx, rows);
         if (item.hair) {
           CaptureHairTint(base, item);
         }
@@ -4481,8 +4557,28 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
       }
       // Implausible or off-clip matrix: the bank belongs to another mesh
       // (the submit-exit capture runs after whatever draw happened to be
-      // inline). Refuse it; the caller keeps the item pending and the
-      // post-draw fixup re-captures from this mesh's own draw.
+      // inline). Before refusing, try the identity store: the accepted
+      // bank block is a bit-exact dereference of the owner entity's
+      // m_MatLtoWTrans (+416), so
+      // the entity field serves the same matrix through every bank state
+      // the pass sequence can leave behind (post-shadow tail clobber,
+      // foreign bank, torn state). Geometry only; the PS lighting rows
+      // stay on their caches, since the bank is not proven ours here.
+      float ent_rows[12];
+      if (skate3::native_entity::ServeRopaWorld(base, item.ctx, item.vb_obj,
+                                                ent_rows)) {
+        for (int i = 0; i < 3; ++i) {
+          for (int j = 0; j < 3; ++j) {
+            item.world[i * 4 + j] = ent_rows[j * 4 + i];
+          }
+          item.world[i * 4 + 3] = 0.0f;
+          item.world[12 + i] = ent_rows[i * 4 + 3];
+        }
+        item.world[15] = 1.0f;
+        item.skinned = false;
+        item.bones.clear();
+        return true;
+      }
       g_ropa_stale.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
@@ -7315,6 +7411,53 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         std::memcpy(item.world, wacc, sizeof(wacc));
         rigid_world_boxcar = filter_w > 0.0005 && h.count >= 4;
       }
+      // Post-interpolation identity anchor (ropa garments): the published
+      // world and the guest draws are proven bit-exact against the owner
+      // entity, so a rendered world grossly diverged from the entity here
+      // can only be ring corruption (mispaired claim / stale pose blended
+      // in). Motion smoothing legitimately offsets by centimeters; the
+      // thresholds (2.5 m translation, ~60 deg rotation) only catch the
+      // detached/perpendicular class. Repair = the entity's live matrix
+      // (raw for one frame beats a detached garment), and the log names
+      // the ring state for diagnosis.
+      if (item.ropa) {
+        float ent_rows[12];
+        if (skate3::native_entity::ReadEntityWorldRows(base, item.ctx,
+                                                       ent_rows)) {
+          const float dx = item.world[12] - ent_rows[3];
+          const float dy = item.world[13] - ent_rows[7];
+          const float dz = item.world[14] - ent_rows[11];
+          float rot = 0.0f;
+          for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+              const float d = item.world[i * 4 + j] - ent_rows[j * 4 + i];
+              rot += d * d;
+            }
+          }
+          if (dx * dx + dy * dy + dz * dz > 2.5f * 2.5f || rot > 1.5f) {
+            static std::atomic<uint32_t> s_fix{0};
+            const uint32_t ln = s_fix.fetch_add(1, std::memory_order_relaxed);
+            if (ln < 16 || (ln & 255u) == 0) {
+              REXLOG_INFO(
+                  "native-scene: ropa interp DETACH repaired mesh={:08X} "
+                  "ctx={:08X} dt=({:.2f},{:.2f},{:.2f}) rot2={:.2f} ba={:.2f} "
+                  "ring[n={} q0t=({:.1f},{:.1f},{:.1f}) "
+                  "q1t=({:.1f},{:.1f},{:.1f})] (n={})",
+                  item.mesh, item.ctx, dx, dy, dz, rot, ba, h.count, q0.w[12],
+                  q0.w[13], q0.w[14], q1.w[12], q1.w[13], q1.w[14], ln);
+            }
+            for (int i = 0; i < 3; ++i) {
+              for (int j = 0; j < 3; ++j) {
+                item.world[i * 4 + j] = ent_rows[j * 4 + i];
+              }
+              item.world[i * 4 + 3] = 0.0f;
+              item.world[12 + i] = ent_rows[i * 4 + 3];
+            }
+            item.world[15] = 1.0f;
+            rigid_world_boxcar = false;
+          }
+        }
+      }
     }
     // ROPA shape pairing: express the EXACT temporal kernel the garment's
     // world (and the body's bones) were just evaluated with as weights over
@@ -8187,7 +8330,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (item.ropa) {
         const auto cit = g_ropa_state_cache.find(item.mesh);
         if (cit != g_ropa_state_cache.end() && cit->second.skinned &&
-            cit->second.bones.size() == item.bones.size()) {
+            cit->second.bones.size() == item.bones.size() &&
+            g_guest_frame - cit->second.frame <= 30) {
           item.bones = cit->second.bones;
           item.dbg_src = 6;
           healed = true;
@@ -8222,6 +8366,85 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         // published the ribbon with draws intact (log 1284/1285: the
         // fam=6/fam=1 spread 183-405 bind-local palettes, bone0_t=(0,0,-.5),
         // were re-captured every frame by the src=2 fixup).
+        item.bones.clear();
+      }
+    }
+    // Detached-garment gate: a ropa garment whose transform sits meters
+    // from EVERY character bone in the frame is wearing another joint's or
+    // another instance's transform (wrong-sibling pack pick, one-bone-late
+    // palette, frozen bank block). Each of those sources yields a coherent,
+    // sane-spread palette that the spread gates above cannot reject; the
+    // shirt renders rotated/offset beside the body while tracking it. No
+    // legitimate frame has a garment more than ~2 m from every character,
+    // so veto the draws (a blink, and the caster pass shares the item) and
+    // log the source path for diagnosis.
+    {
+      // Anchors = every live bone translation of the frame's character
+      // pieces (bone 0 alone is not enough: a tee's bone 0 is the HEAD
+      // joint while a body piece's bone 0 can be a foot, nearly 2 m apart
+      // on one legitimate character).
+      static std::vector<std::array<float, 3>> anchors;  // guest thread only
+      anchors.clear();
+      for (const DrawItem& it : scene.items) {
+        if (!it.skinned || it.ropa || it.pending || it.char_family == 0 ||
+            it.bones.size() < 12 || it.draws.empty()) {
+          continue;
+        }
+        for (size_t b = 0; b + 12 <= it.bones.size() && anchors.size() < 2048;
+             b += 12) {
+          const float tx = it.bones[b + 3];
+          const float ty = it.bones[b + 7];
+          const float tz = it.bones[b + 11];
+          if (tx == 0.0f && ty == 0.0f && tz == 0.0f) {
+            continue;  // zeroed tail rows carry no position
+          }
+          anchors.push_back({tx, ty, tz});
+        }
+      }
+      const int n_anchors = int(anchors.size());
+      for (DrawItem& item : scene.items) {
+        if (n_anchors == 0) {
+          break;
+        }
+        if (!item.ropa || item.pending || item.draws.empty()) {
+          continue;
+        }
+        float p[3];
+        if (item.skinned && item.bones.size() >= 12) {
+          p[0] = item.bones[3];
+          p[1] = item.bones[7];
+          p[2] = item.bones[11];
+        } else if (!item.skinned) {
+          p[0] = item.world[12];
+          p[1] = item.world[13];
+          p[2] = item.world[14];
+        } else {
+          continue;
+        }
+        float best_sq = 1e30f;
+        for (int a = 0; a < n_anchors && best_sq > 4.0f; ++a) {
+          const float dx = p[0] - anchors[size_t(a)][0];
+          const float dy = p[1] - anchors[size_t(a)][1];
+          const float dz = p[2] - anchors[size_t(a)][2];
+          const float d = dx * dx + dy * dy + dz * dz;
+          best_sq = d < best_sq ? d : best_sq;
+        }
+        if (best_sq <= 4.0f) {
+          continue;
+        }
+        g_ropa_detached.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_detach_logged{0};
+        const uint32_t ln = s_detach_logged.fetch_add(1, std::memory_order_relaxed);
+        if (ln < 24 || (ln & 511u) == 0) {
+          REXLOG_INFO(
+              "native-scene: DETACHED ropa garment vetoed mesh={:08X} "
+              "ctx={:08X} src={} skinned={} caster={} pos=({:.1f},{:.1f},{:.1f}) "
+              "nearest_char={:.2f}m (n={})",
+              item.mesh, item.ctx, item.dbg_src, item.skinned ? 1 : 0,
+              item.caster_bank ? 1 : 0, p[0], p[1], p[2], std::sqrt(best_sq),
+              ln);
+        }
+        item.draws.clear();
         item.bones.clear();
       }
     }
@@ -8261,6 +8484,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           c.skinned = now_skinned;
           std::memcpy(c.world, item.world, sizeof(c.world));
           c.bones = item.bones;
+          c.frame = g_guest_frame;
         }
       } else if (item.skinned && !item.bones.empty() && !item.caster_bank &&
                  g_bones_cache.size() < 512) {
@@ -8347,8 +8571,48 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (pub_count.find(mesh) != pub_count.end()) {
         continue;  // a live copy published; nothing to rescue
       }
+      // Dropped-garment gate: when the owning entity's garment table no
+      // longer claims this VB (the game removed the cloth model; its
+      // pieces render skinned with the body now), the cached rigid state
+      // is a ghost: the retained drape tracks the live character as a
+      // floating garment. Suppress instead of rescuing.
+      if (skate3::native_entity::RopaGarmentDropped(base, cand->ctx,
+                                                    cand->vb_obj)) {
+        // The game renders a dropped garment SKINNED with the body (its
+        // sim-inactive path); the cached rigid state is a ghost. Resolve
+        // with the owning instance's own live packed palette; when that
+        // fails, suppress (invisible beats floating).
+        float rows[96 * 12];
+        const uint32_t n = skate3::native_entity::ServeInstancePalette(
+            base, cand->ctx, rows, 96);
+        static std::atomic<uint32_t> s_drop_logged{0};
+        const uint32_t ln =
+            s_drop_logged.fetch_add(1, std::memory_order_relaxed);
+        if (ln < 16 || (ln & 511u) == 0) {
+          REXLOG_INFO(
+              "native-scene: ropa rescue DROPPED-GARMENT {} mesh={:08X} "
+              "ctx={:08X} vb={:08X} rows={} (n={})",
+              n ? "resolved SKINNED" : "suppressed", cand->mesh, cand->ctx,
+              cand->vb_obj, n, ln);
+        }
+        if (n != 0) {
+          scene.items.push_back(*cand);
+          DrawItem& resolved = scene.items.back();
+          resolved.skinned = true;
+          resolved.bones.assign(rows, rows + size_t(n) * 12);
+          resolved.pending = false;
+          resolved.caster_bank = false;
+          resolved.dbg_src = 4;
+          if (resolved.ctx != 0) {
+            dyn_slot.try_emplace(resolved.ctx, scene.items.size() - 1);
+          }
+          g_ropa_rescued.fetch_add(1, std::memory_order_relaxed);
+        }
+        continue;
+      }
       const auto rit = g_ropa_state_cache.find(mesh);
-      if (rit == g_ropa_state_cache.end()) {
+      if (rit == g_ropa_state_cache.end() ||
+          g_guest_frame - rit->second.frame > 30) {
         continue;
       }
       scene.items.push_back(*cand);
@@ -8438,6 +8702,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         CharRowsInst& ci = g_char_rows_cache_inst[key];
         std::memcpy(ci.rows.data(), item.char_rows, sizeof(item.char_rows));
         ci.entity = lw_entity;
+        if (item.ropa) {
+          skate3::native_entity::CtxInfo ident;
+          if (skate3::native_entity::LookupCtx(item.ctx, &ident)) {
+            if (g_char_rows_cache_ent.size() > 4096) {
+              g_char_rows_cache_ent.clear();
+            }
+            CharRowsEnt& ce = g_char_rows_cache_ent[ident.entity];
+            std::memcpy(ce.rows.data(), item.char_rows,
+                        sizeof(item.char_rows));
+            ce.fam = uint8_t(item.char_family);
+          }
+        }
       } else {
         const auto iit = g_char_rows_cache_inst.find(key);
         if (iit != g_char_rows_cache_inst.end() &&
@@ -8445,6 +8721,33 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           std::memcpy(item.char_rows, iit->second.rows.data(),
                       sizeof(item.char_rows));
           g_char_rows_inst_served.fetch_add(1, std::memory_order_relaxed);
+        } else if (item.ropa) {
+          // Sim-switch bridge: rows from the garment's sibling renderable
+          // via the common owning entity (see g_char_rows_cache_ent). The
+          // row layout is family-specific, so a cross-family serve routes
+          // the receiver through the donor family's shading path too.
+          skate3::native_entity::CtxInfo ident;
+          if (skate3::native_entity::LookupCtx(item.ctx, &ident)) {
+            const auto eit = g_char_rows_cache_ent.find(ident.entity);
+            if (eit != g_char_rows_cache_ent.end()) {
+              std::memcpy(item.char_rows, eit->second.rows.data(),
+                          sizeof(item.char_rows));
+              if (eit->second.fam != 0 &&
+                  eit->second.fam != item.char_family) {
+                static std::atomic<uint32_t> s_fam_logged{0};
+                const uint32_t ln =
+                    s_fam_logged.fetch_add(1, std::memory_order_relaxed);
+                if (ln < 8 || (ln & 1023u) == 0) {
+                  REXLOG_INFO(
+                      "native-scene: rows bridge cross-family serve "
+                      "mesh={:08X} fam {}->{} (n={})",
+                      item.mesh, item.char_family, eit->second.fam, ln);
+                }
+                item.char_family = eit->second.fam;
+              }
+              g_char_rows_ent_served.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
         }
       }
     }
@@ -8960,6 +9263,25 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         }
       }
     }
+  }
+
+  // Presentation-entity identity store observer
+  // (native/skate3_native_entity.h): per-item coverage of the
+  // ctx -> entity map built from the game's BindConstants walks, and the
+  // skater-family entity+496 opacity vs the alpha the routing decided on.
+  // Read-only: the ident[] stats line is the evidence for flipping any
+  // serve over to the direct fields.
+  {
+    for (DrawItem& item : scene.items) {
+      if (item.char_family == 0 || item.ctx == 0) {
+        continue;
+      }
+      skate3::native_entity::ObserveCharItem(base, item.ctx,
+                                             item.char_family,
+                                             item.lw_entity != 0,
+                                             CharFadeAlpha(item));
+    }
+    skate3::native_entity::EmitStats();
   }
 
   // Bone-palette alternation guard (the high-fps hair/garment flicker,
@@ -10352,6 +10674,12 @@ struct RendererState {
   // bone ring).
   struct RopaGen {
     uint64_t seq = 0;
+    // Host time at commit: the blend refuses to mix generations recorded
+    // across a sim-sleep gap (a garment whose cloth sim slept keeps its
+    // last drapes in the ring; blending one of those, recorded when the
+    // character stood elsewhere / faced differently, against the fresh
+    // drape renders the garment rotated/offset from the body).
+    double t = 0.0;
     std::vector<float> verts;  // num_verts x 14 floats (scene VS layout)
   };
   std::unordered_map<uint32_t, std::deque<RopaGen>> ropa_shapes;
@@ -14938,7 +15266,12 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       if (r.item.ropa && r.buffers.dyn_seq != 0 && !superseded &&
           !r.buffers.ropa_verts.empty()) {
         auto& ring = g_r.ropa_shapes[r.item.mesh];
-        ring.push_back({r.buffers.dyn_seq, std::move(r.buffers.ropa_verts)});
+        const double now_s =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        ring.push_back(
+            {r.buffers.dyn_seq, now_s, std::move(r.buffers.ropa_verts)});
         // 16 generations = ~114 ms at a 140 Hz guest: the 8-tap boxcar
         // kernel reaches filter_w/2 (~25 ms) past the play clock (itself
         // ~2 guest periods behind), plus decode-latency slack.
@@ -16716,7 +17049,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} askip={} astale={} textures={}] cached_meshes={} textures={} "
-        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={} blend={} blendmiss={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
+        "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} flip={} mismatch={} relax={} hold={} caster={} incoh={} stretch={} detach={} blend={} blendmiss={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
@@ -16736,7 +17069,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
         g_ropa_flip.load(), g_ropa_mismatch.load(), g_ropa_relaxed.load(),
         g_ropa_hold.load(), g_ropa_caster.load(), g_pub_incoherent.load(),
-        g_stretch_veto.load(),
+        g_stretch_veto.load(), g_ropa_detached.load(),
         g_ropa_blend_drawn.load(), g_ropa_blend_miss.load(), g_dyn_gap.load(),
         g_skinned_items.load(),
         g_skinned_skipped.load(), g_capture_foreign_bank.load(),
@@ -18425,7 +18758,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       const size_t want_floats =
           size_t(buffers.vb_view.size_bytes) / sizeof(float);
       const auto rit = g_r.ropa_shapes.find(item.mesh);
-      if (rit != g_r.ropa_shapes.end()) {
+      if (rit != g_r.ropa_shapes.end() && !rit->second.empty()) {
+        // Sim-sleep gate: generations grossly older than the ring's newest
+        // were recorded before a cloth-sim sleep (continuous streams span
+        // ~114 ms end to end). Blending one against the fresh drape draws
+        // the garment where/how the character USED to stand, the
+        // detached/perpendicular class. Dropped generations shed their
+        // kernel weight; if too much weight is stale the raw resident VB
+        // draws instead (self-consistent current shape).
+        const double ring_newest_t = rit->second.back().t;
         for (int k = 0; k < item.shape_count; ++k) {
           for (const RendererState::RopaGen& g : rit->second) {
             if (g.seq != item.shape_seq[k]) {
@@ -18433,6 +18774,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             }
             if (g.verts.size() != want_floats) {
               break;  // stale-size generation (re-stream/outfit swap)
+            }
+            if (ring_newest_t - g.t > 0.35) {
+              static std::atomic<uint32_t> s_stale{0};
+              const uint32_t ln =
+                  s_stale.fetch_add(1, std::memory_order_relaxed);
+              if (ln < 16 || (ln & 1023u) == 0) {
+                REXLOG_INFO(
+                    "native-scene: ropa shape STALE gen dropped mesh={:08X} "
+                    "age={:.2f}s seq_gap={} (n={})",
+                    item.mesh, ring_newest_t - g.t,
+                    rit->second.back().seq - g.seq, ln);
+              }
+              break;
             }
             gv[ng] = &g.verts;
             gw[ng] = item.shape_w[k];

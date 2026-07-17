@@ -228,6 +228,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_fov.cpp
     src/skate3_iso_installer.cpp
     src/native/skate3_native_diagnostics.cpp
+    src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
     src/native/skate3_native_lw.cpp
     src/native/skate3_native_v3_shadow.cpp

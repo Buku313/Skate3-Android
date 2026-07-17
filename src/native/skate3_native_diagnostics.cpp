@@ -127,7 +127,16 @@ void WriteRecording(const char* dir, const char* stem) {
           << (d.skinned ? 1 : 0) << ",\"pending\":" << (d.pending ? 1 : 0)
           << ",\"decal\":" << (d.decal ? 1 : 0)
           << ",\"transparent\":" << (d.transparent ? 1 : 0)
-          << ",\"selected\":" << (d.selected ? 1 : 0) << ",\"world\":[";
+          << ",\"selected\":" << (d.selected ? 1 : 0)
+          // Provenance: which pipeline path produced this item (dbg_src
+          // codes in skate3_native_scene.h) and the identity keys the
+          // offline analyzers join on.
+          << ",\"ctx\":\"" << std::hex << d.ctx << std::dec
+          << "\",\"dbg_src\":" << int(d.dbg_src)
+          << ",\"ropa\":" << (d.ropa ? 1 : 0)
+          << ",\"fam\":" << int(d.char_family)
+          << ",\"caster\":" << (d.caster_bank ? 1 : 0)
+          << ",\"retained\":" << (d.retained ? 1 : 0) << ",\"world\":[";
       for (int i = 0; i < 16; ++i) out << (i ? "," : "") << d.world[i];
       out << "],\"draws\":[";
       for (size_t i = 0; i < d.draws.size(); ++i) {
