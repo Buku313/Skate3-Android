@@ -282,6 +282,7 @@ set(SKATE3_NATIVE_SHADER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/photo_fx.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ssao.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/hdr.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ssr.hlsl
 )
 set(SKATE3_NATIVE_SHADER_HEADER
     ${CMAKE_CURRENT_BINARY_DIR}/include/skate3_native_shaders.h)

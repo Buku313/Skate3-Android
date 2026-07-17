@@ -135,6 +135,42 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao_full_res, false, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao_debug, false, "Skate 3",
                     "Replace the frame with the SSAO visibility term (tuning aid).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssr, false, "Skate 3",
+                    "Screen-space reflections on reflective glass and water: "
+                    "on-screen scenery reflected in real time where the original "
+                    "game shows only a static environment cube. Rays that miss "
+                    "(off-screen content, screen edges) fade back to the cube "
+                    "term. Requires the HDR scene intermediate. EXPERIMENTAL: "
+                    "off by default pending image-quality calibration (residual "
+                    "smearing/noise on some surfaces).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_ssr_steps, 48, "Skate 3",
+                     "SSR screen-space march taps per ray (half-res pass). More "
+                     "taps resolve thinner reflected geometry at proportional "
+                     "GPU cost.")
+    .range(8, 64)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_ssr_thickness, 1.0, "Skate 3",
+                      "SSR depth thickness (view units): how deep behind a "
+                      "visible surface a marching ray still counts as a hit. "
+                      "Too small and rays tunnel through thin ledges/rails; too "
+                      "large and reflections smear under overhangs.")
+    .range(0.05, 8.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_ssr_intensity, 1.0, "Skate 3",
+                      "SSR composite strength over the material's cube "
+                      "reflection term (0 = effectively off).")
+    .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_ssr_debug, 0, "Skate 3",
+                     "SSR debug view: 1 = raw ray color + confidence, 2 = "
+                     "reflection G-buffer normals, 3 = reflectivity (red) x "
+                     "depth visibility (green), 4 = ray autopsy (green = "
+                     "visibility reject, blue = degenerate, cyan = off-screen, "
+                     "magenta = near plane, yellow = out of steps, red = "
+                     "too-thick crossings, white = hit x confidence).")
+    .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr, true, "Skate 3",
                     "Render the 3D scene into a float (HDR) intermediate and apply the "
                     "game's shared tone chain once in a host post pass, the basis for "
@@ -10315,6 +10351,45 @@ struct RendererState {
   // Scene float format the output-sized targets were built with (kUnknown
   // when classic); packed-format toggles rebuild them.
   nrhi::Format targets_scene_fmt = nrhi::Format::kUnknown;
+  // Screen-space reflections (ssr.hlsl + scene.hlsl ps_refl_gbuf): a
+  // half-res reflection G-buffer re-rendered from the frame's reflective
+  // items (env fams 5/6/13 + water), a half-res screen-space march over the
+  // full-res linear depth sampling the pre-tonemap HDR plane, and a
+  // src-alpha composite back onto it between the AO pass and the HDR post
+  // (so reflections tonemap/bloom like directly-visible scenery). HDR path
+  // only. Post binding layout = the SSAO shape with 32 root floats + three
+  // single-texture tables; the G-buffer pass runs under the MAIN layout
+  // (scene VS + per-item constants). All intermediates idle in
+  // RENDER_TARGET state.
+  nrhi::BindingLayout* ssr_layout = nullptr;
+  nrhi::Pipeline* pso_ssr_gbuf = nullptr;       // scene-VS geometry pass
+  nrhi::Pipeline* pso_ssr_linearize = nullptr;  // fallback when SSAO idle
+  nrhi::Pipeline* pso_ssr_march = nullptr;
+  nrhi::Pipeline* pso_ssr_composite = nullptr;
+  nrhi::Texture* ssr_gbuf = nullptr;  // half res RGBA16F reflection G-buffer
+  // Half-res depth for the G-buffer pass (test+write LESS): reflective
+  // items overlap themselves in screen space (a curved glass tower's far
+  // side shares texels with its near side inside ONE mesh), so without a
+  // depth test draw/triangle order decides which surface owns a texel and
+  // whole visible panes fail the march's scene-depth match. Idles in
+  // DEPTH_WRITE state.
+  nrhi::Texture* ssr_gbuf_depth = nullptr;
+  nrhi::Texture* ssr_tex = nullptr;   // half res RGBA16F march output
+  nrhi::Texture* ssr_lin_depth = nullptr;  // full res R32F (own linearize)
+  nrhi::TextureView* ssr_gbuf_srv = nullptr;
+  nrhi::TextureView* ssr_srv = nullptr;
+  nrhi::TextureView* ssr_lin_srv = nullptr;
+  // Scene-depth SRV for the own linearize, re-pointed on depth rebuilds.
+  nrhi::TextureView* ssr_depth_srv = nullptr;
+  nrhi::Texture* ssr_depth_srv_of = nullptr;
+  uint32_t ssr_width = 0, ssr_height = 0;  // half-res raster
+  uint32_t ssr_lin_width = 0, ssr_lin_height = 0;
+  uint32_t ssr_msaa = 0;  // linearize-variant PSO latch
+  nrhi::Format ssr_scene_fmt = nrhi::Format::kUnknown;  // composite target
+  bool ssr_failed = false;
+  // Per-frame handoff: the G-buffer pass drew and left ssr_gbuf in
+  // PIXEL_SHADER_RESOURCE for ApplySsrPass (which consumes + restores it).
+  bool ssr_gbuf_ready = false;
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // (The old D3D12 bookkeeping, the retired-resource vector, the CPU SRV
   // staging heap and its slot allocator/recycling lists, is gone: resource
@@ -14245,6 +14320,406 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
   return true;
 }
 
+// ---- Screen-space reflections (ssr.hlsl + scene.hlsl ps_refl_gbuf) --------
+// Layout + PSOs, built lazily on the first SSR frame and rebuilt when the
+// MSAA level (linearize variant) or the scene float format (composite
+// target) changes. Failure disables the effect only, never g_r.failed.
+bool EnsureSsrPipeline(const NativeGuestOutputRenderContext& context) {
+  if (g_r.ssr_failed || !g_r.hdr_active) {
+    return false;
+  }
+  if (g_r.pso_ssr_march != nullptr && g_r.ssr_msaa == g_r.msaa &&
+      g_r.ssr_scene_fmt == g_r.hdr_scene_format) {
+    return true;
+  }
+  nrhi::Device* device = context.device;
+  const auto fail = [&](const char* what) {
+    REXLOG_ERROR("native-scene: ssr pipeline setup failed ({})", what);
+    g_r.ssr_failed = true;
+    return false;
+  };
+  if (g_r.ssr_layout == nullptr) {
+    // The SSAO layout shape with a wider constant block (the march needs
+    // the world->view rotation rows): root constants b0 (32 floats) + three
+    // single-texture tables + point/linear clamp samplers.
+    nrhi::BindingLayoutDesc ld;
+    ld.param_count = 4;
+    ld.params[0] = {nrhi::BindingParamKind::kConstants, /*b*/ 0, 32,
+                    nrhi::Visibility::kAll};
+    ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[2] = {nrhi::BindingParamKind::kTextureTable, 1, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[3] = {nrhi::BindingParamKind::kTextureTable, 2, 1,
+                    nrhi::Visibility::kPixel};
+    ld.static_sampler_count = 2;
+    ld.static_samplers[0] = {/*s*/ 0, nrhi::Filter::kPoint,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.static_samplers[1] = {1, nrhi::Filter::kLinear,
+                             nrhi::AddressMode::kClamp, 1};
+    ld.allow_input_layout = false;
+    g_r.ssr_layout = device->CreateBindingLayout(ld);
+    if (g_r.ssr_layout == nullptr) {
+      return fail("binding layout");
+    }
+  }
+  for (nrhi::Pipeline** p : {&g_r.pso_ssr_gbuf, &g_r.pso_ssr_linearize,
+                             &g_r.pso_ssr_march, &g_r.pso_ssr_composite}) {
+    if (*p != nullptr) {
+      device->DestroyDeferred(*p);
+      *p = nullptr;
+    }
+  }
+  const bool msaa = g_r.msaa > 1;
+  const nrhi::ShaderMacro msaa_defs[] = {{"SSR_MSAA", "1"},
+                                         {nullptr, nullptr}};
+  nrhi::Shader* scene_vs = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kVertex, "scene.hlsl", kShaderSource,
+                     "vs_main", nullptr, ""));
+  nrhi::Shader* ps_gbuf = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "scene.hlsl", kShaderSource,
+                     "ps_refl_gbuf", nullptr, ""));
+  nrhi::Shader* vs = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kVertex, "ssr.hlsl", kSsrShaderSource,
+                     "vs_main", nullptr, ""));
+  nrhi::Shader* ps_lin = device->CreateShader(MakeShaderDesc(
+      nrhi::ShaderStage::kPixel, "ssr.hlsl", kSsrShaderSource, "ps_linearize",
+      msaa ? msaa_defs : nullptr, msaa ? "SSR_MSAA=1" : ""));
+  nrhi::Shader* ps_march = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "ssr.hlsl", kSsrShaderSource,
+                     "ps_march", nullptr, ""));
+  nrhi::Shader* ps_comp = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "ssr.hlsl", kSsrShaderSource,
+                     "ps_composite", nullptr, ""));
+  const bool shaders_ok = scene_vs != nullptr && ps_gbuf != nullptr &&
+                          vs != nullptr && ps_lin != nullptr &&
+                          ps_march != nullptr && ps_comp != nullptr;
+  if (!shaders_ok) {
+    for (nrhi::Shader* s :
+         {scene_vs, ps_gbuf, vs, ps_lin, ps_march, ps_comp}) {
+      device->DestroyDeferred(s);
+    }
+    return fail("shader compile");
+  }
+  // Reflection G-buffer pass: the scene VS + input layout under the MAIN
+  // binding layout (the caller re-stages each reflective item's main-pass
+  // root constants / textures), half-res single-sample float target with
+  // its OWN half-res depth (test+write: the MSAA scene depth cannot pair
+  // with a 1x RTV) so the nearest reflective surface owns each texel;
+  // occlusion by non-reflective geometry is then resolved in the march by
+  // comparing the stored G-buffer depth against the scene linear depth.
+  {
+    nrhi::GraphicsPipelineDesc pso;
+    pso.layout = g_r.layout;
+    pso.vs = scene_vs;
+    pso.ps = ps_gbuf;
+    pso.input_elements = kSceneInputLayout;
+    pso.input_element_count = 7;
+    pso.vertex_stride = 56;
+    pso.cull = nrhi::CullMode::kNone;
+    pso.sample_count = 1;
+    pso.depth_clip = true;
+    pso.depth.test_enable = true;
+    pso.depth.write_enable = true;
+    pso.depth.func = nrhi::CompareFunc::kLess;
+    pso.dsv_format = nrhi::Format::kD32_FLOAT;
+    pso.rtv_format = nrhi::Format::kR16G16B16A16_FLOAT;
+    g_r.pso_ssr_gbuf = device->CreateGraphicsPipeline(pso);
+  }
+  nrhi::GraphicsPipelineDesc pso;
+  pso.layout = g_r.ssr_layout;
+  pso.vs = vs;
+  pso.cull = nrhi::CullMode::kNone;
+  pso.sample_count = 1;
+  pso.ps = ps_lin;
+  pso.rtv_format = nrhi::Format::kR32_FLOAT;
+  g_r.pso_ssr_linearize = device->CreateGraphicsPipeline(pso);
+  pso.ps = ps_march;
+  pso.rtv_format = nrhi::Format::kR16G16B16A16_FLOAT;
+  g_r.pso_ssr_march = device->CreateGraphicsPipeline(pso);
+  // Composite: straight src-alpha blend onto the float scene plane (the
+  // shader outputs confidence x reflectivity x intensity in alpha), RGB
+  // write mask: the plane's alpha stays untouched.
+  pso.ps = ps_comp;
+  pso.rtv_format = g_r.hdr_scene_format;
+  pso.blend.enable = true;
+  pso.blend.src = nrhi::BlendFactor::kSrcAlpha;
+  pso.blend.dst = nrhi::BlendFactor::kInvSrcAlpha;
+  pso.blend.op = nrhi::BlendOp::kAdd;
+  pso.blend.src_alpha = nrhi::BlendFactor::kZero;
+  pso.blend.dst_alpha = nrhi::BlendFactor::kOne;
+  pso.blend.op_alpha = nrhi::BlendOp::kAdd;
+  pso.blend.write_mask = 0x7;
+  g_r.pso_ssr_composite = device->CreateGraphicsPipeline(pso);
+  for (nrhi::Shader* s : {scene_vs, ps_gbuf, vs, ps_lin, ps_march, ps_comp}) {
+    device->DestroyDeferred(s);
+  }
+  if (g_r.pso_ssr_gbuf == nullptr || g_r.pso_ssr_linearize == nullptr ||
+      g_r.pso_ssr_march == nullptr || g_r.pso_ssr_composite == nullptr) {
+    return fail("pso");
+  }
+  g_r.ssr_msaa = g_r.msaa;
+  g_r.ssr_scene_fmt = g_r.hdr_scene_format;
+  REXLOG_INFO("native-scene: ssr pipeline created (MSAA x{})", g_r.msaa);
+  return true;
+}
+
+// Half-res SSR intermediates (reflection G-buffer + march output), steady
+// state RENDER_TARGET, rebuilt on resize.
+bool EnsureSsrTargets(const NativeGuestOutputRenderContext& context) {
+  const uint32_t sw = std::max(1u, (context.guest_output_width + 1) / 2);
+  const uint32_t sh = std::max(1u, (context.guest_output_height + 1) / 2);
+  if (g_r.ssr_width == sw && g_r.ssr_height == sh && g_r.ssr_gbuf != nullptr &&
+      g_r.ssr_tex != nullptr) {
+    return true;
+  }
+  nrhi::Device* device = context.device;
+  if (g_r.ssr_gbuf_depth != nullptr) {
+    device->DestroyDeferred(g_r.ssr_gbuf_depth);
+    g_r.ssr_gbuf_depth = nullptr;
+  }
+  {
+    nrhi::TextureDesc dd;
+    dd.width = sw;
+    dd.height = sh;
+    dd.format = nrhi::Format::kD32_FLOAT;
+    dd.usage = nrhi::kTextureUsageDepthStencil;
+    dd.initial_state = nrhi::ResourceState::kDepthWrite;
+    dd.clear_depth = 1.0f;
+    g_r.ssr_gbuf_depth = device->CreateTexture(dd);
+    if (g_r.ssr_gbuf_depth == nullptr) {
+      g_r.ssr_failed = true;
+      return false;
+    }
+  }
+  nrhi::Texture** res[2] = {&g_r.ssr_gbuf, &g_r.ssr_tex};
+  nrhi::TextureView** views[2] = {&g_r.ssr_gbuf_srv, &g_r.ssr_srv};
+  for (int i = 0; i < 2; ++i) {
+    if (*views[i] != nullptr) {
+      device->DestroyDeferred(*views[i]);
+      *views[i] = nullptr;
+    }
+    if (*res[i] != nullptr) {
+      device->DestroyDeferred(*res[i]);
+      *res[i] = nullptr;
+    }
+    nrhi::TextureDesc desc;
+    desc.width = sw;
+    desc.height = sh;
+    desc.mip_levels = 1;
+    desc.format = nrhi::Format::kR16G16B16A16_FLOAT;
+    desc.usage = nrhi::kTextureUsageRenderTarget;
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
+    *res[i] = device->CreateTexture(desc);
+    if (*res[i] == nullptr) {
+      g_r.ssr_failed = true;
+      return false;
+    }
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    *views[i] = device->CreateTextureView(*res[i], vd);
+    if (*views[i] == nullptr) {
+      g_r.ssr_failed = true;
+      return false;
+    }
+  }
+  g_r.ssr_width = sw;
+  g_r.ssr_height = sh;
+  return true;
+}
+
+// SSR march + composite (see ssr.hlsl): consumes the reflection G-buffer
+// the in-pass draw left in PIXEL_SHADER_RESOURCE, marches the full-res
+// linear depth (reusing the SSAO linearize plane when AO ran this frame)
+// while sampling the pre-tonemap HDR plane, and blends the result back onto
+// it. Returns true when it drew; the binding layout changed and the
+// caller's post_ran block restores the main-pass bindings.
+bool ApplySsrPass(const NativeGuestOutputRenderContext& context,
+                  nrhi::Cmd* cmd, const FrameScene& scene,
+                  const nrhi::Viewport& viewport, const nrhi::Rect& scissor,
+                  bool lin_depth_ready) {
+  if (!g_r.ssr_gbuf_ready) {
+    return false;
+  }
+  // Consume the handoff up front: every exit below must leave the G-buffer
+  // back in its RENDER_TARGET steady state.
+  g_r.ssr_gbuf_ready = false;
+  nrhi::Device* device = context.device;
+  const uint32_t width = context.guest_output_width;
+  const uint32_t height = context.guest_output_height;
+  const auto bail = [&] {
+    cmd->Barrier(g_r.ssr_gbuf, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->FlushBarriers();
+    return false;
+  };
+  // Full-res linear view-Z: the SSAO plane when AO linearized this frame
+  // (it idles back in RENDER_TARGET after the AO pass), else the own
+  // linearize below.
+  lin_depth_ready = lin_depth_ready && g_r.ao_lin_depth != nullptr &&
+                    g_r.ao_lin_srv != nullptr && g_r.ao_lin_width == width &&
+                    g_r.ao_lin_height == height;
+  if (!lin_depth_ready) {
+    if (g_r.ssr_lin_depth == nullptr || g_r.ssr_lin_width != width ||
+        g_r.ssr_lin_height != height) {
+      if (g_r.ssr_lin_srv != nullptr) {
+        device->DestroyDeferred(g_r.ssr_lin_srv);
+        g_r.ssr_lin_srv = nullptr;
+      }
+      if (g_r.ssr_lin_depth != nullptr) {
+        device->DestroyDeferred(g_r.ssr_lin_depth);
+        g_r.ssr_lin_depth = nullptr;
+      }
+      nrhi::TextureDesc desc;
+      desc.width = width;
+      desc.height = height;
+      desc.mip_levels = 1;
+      desc.format = nrhi::Format::kR32_FLOAT;
+      desc.usage = nrhi::kTextureUsageRenderTarget;
+      desc.initial_state = nrhi::ResourceState::kRenderTarget;
+      g_r.ssr_lin_depth = device->CreateTexture(desc);
+      if (g_r.ssr_lin_depth == nullptr) {
+        g_r.ssr_failed = true;
+        return bail();
+      }
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.ssr_lin_srv = device->CreateTextureView(g_r.ssr_lin_depth, vd);
+      if (g_r.ssr_lin_srv == nullptr) {
+        g_r.ssr_failed = true;
+        return bail();
+      }
+      g_r.ssr_lin_width = width;
+      g_r.ssr_lin_height = height;
+    }
+    // Scene-depth SRV, re-pointed when the depth buffer is rebuilt.
+    if (g_r.ssr_depth_srv == nullptr || g_r.ssr_depth_srv_of != g_r.depth) {
+      if (g_r.ssr_depth_srv != nullptr) {
+        device->DestroyDeferred(g_r.ssr_depth_srv);
+        g_r.ssr_depth_srv = nullptr;
+      }
+      nrhi::TextureViewDesc sd;
+      if (g_r.msaa > 1) {
+        sd.dimension = nrhi::ViewDimension::k2DMS;
+      } else {
+        sd.dimension = nrhi::ViewDimension::k2D;
+        sd.mip_levels = 1;
+      }
+      g_r.ssr_depth_srv = device->CreateTextureView(g_r.depth, sd);
+      if (g_r.ssr_depth_srv == nullptr) {
+        g_r.ssr_failed = true;
+        return bail();
+      }
+      g_r.ssr_depth_srv_of = g_r.depth;
+    }
+  }
+  nrhi::Texture* const lin_tex =
+      lin_depth_ready ? g_r.ao_lin_depth : g_r.ssr_lin_depth;
+  nrhi::TextureView* const lin_srv =
+      lin_depth_ready ? g_r.ao_lin_srv : g_r.ssr_lin_srv;
+
+  // b0 rows (see ssr.hlsl cbuffer C): dest size, projection, the world ->
+  // "AO view space" rotation, tuning. view = view_proj * proj^-1 (row-
+  // vector); the projection's per-axis signs fold into the rotation so
+  // normals land in the same mirrored space ViewPos reconstructs positions
+  // in; reflection directions are mirror-SENSITIVE, unlike every AO term.
+  const float* pr = scene.proj;
+  float c[32] = {};
+  c[0] = float(g_r.ssr_width);
+  c[1] = float(g_r.ssr_height);
+  c[2] = 1.0f / float(g_r.ssr_width);
+  c[3] = 1.0f / float(g_r.ssr_height);
+  c[4] = std::fabs(pr[0]);
+  c[5] = std::fabs(pr[5]);
+  c[6] = pr[10];
+  c[7] = pr[14];
+  const float sxs = pr[0] < 0.0f ? -1.0f : 1.0f;
+  const float sys = pr[5] < 0.0f ? -1.0f : 1.0f;
+  const float inv00 = 1.0f / pr[0];
+  const float inv11 = 1.0f / pr[5];
+  for (int r = 0; r < 3; ++r) {
+    // proj^-1 columns: x/y scale by 1/m00 / 1/m11, view z = clip w (the
+    // view_proj row's w column); the AO-space axis signs multiply in.
+    c[8 + r * 4 + 0] = scene.view_proj[r * 4 + 0] * inv00 * sxs;
+    c[8 + r * 4 + 1] = scene.view_proj[r * 4 + 1] * inv11 * sys;
+    c[8 + r * 4 + 2] = scene.view_proj[r * 4 + 3];
+  }
+  c[20] = float(REXCVAR_GET(skate3_native_render_scene_ssr_steps));
+  c[21] = float(REXCVAR_GET(skate3_native_render_scene_ssr_thickness));
+  c[22] = float(REXCVAR_GET(skate3_native_render_scene_ssr_intensity));
+  c[23] = float(REXCVAR_GET(skate3_native_render_scene_ssr_debug));
+  c[24] = 250.0f;  // max ray distance (view units; the screen clip governs)
+
+  cmd->SetBindingLayout(g_r.ssr_layout);
+  cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+  cmd->SetRootConstants(0, 32, c, 0);
+
+  // 1) Own linearize when AO did not produce the plane this frame.
+  if (!lin_depth_ready) {
+    cmd->Barrier(g_r.depth, nrhi::ResourceState::kDepthWrite,
+                 nrhi::ResourceState::kPixelShaderResource);
+    cmd->FlushBarriers();
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    cmd->SetRenderTargets(g_r.ssr_lin_depth, nullptr);
+    cmd->SetPipeline(g_r.pso_ssr_linearize);
+    cmd->SetTexture(1, g_r.ssr_depth_srv);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.depth, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kDepthWrite);
+  }
+  cmd->Barrier(lin_tex, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+
+  // 2) March (half res): the HDR plane pauses as a sampled source.
+  cmd->Barrier(g_r.hdr_resolved, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  const nrhi::Viewport ssr_vp{0.0f, 0.0f, float(g_r.ssr_width),
+                              float(g_r.ssr_height), 0.0f, 1.0f};
+  const nrhi::Rect ssr_sc{0, 0, int32_t(g_r.ssr_width),
+                          int32_t(g_r.ssr_height)};
+  cmd->SetViewport(ssr_vp);
+  cmd->SetScissor(ssr_sc);
+  cmd->SetRenderTargets(g_r.ssr_tex, nullptr);
+  cmd->SetPipeline(g_r.pso_ssr_march);
+  cmd->SetTexture(1, g_r.ssr_gbuf_srv);
+  cmd->SetTexture(2, lin_srv);
+  cmd->SetTexture(3, g_r.hdr_srv);
+  cmd->Draw(3, 0);
+  cmd->Barrier(g_r.ssr_tex, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->Barrier(g_r.hdr_resolved, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
+
+  // 3) Composite (full res, src-alpha blend onto the HDR plane). Dest-size
+  // constants switch to the full raster; the rest carries over.
+  c[0] = float(width);
+  c[1] = float(height);
+  c[2] = 1.0f / float(width);
+  c[3] = 1.0f / float(height);
+  cmd->SetRootConstants(0, 4, c, 0);
+  cmd->SetViewport(viewport);
+  cmd->SetScissor(scissor);
+  cmd->SetRenderTargets(g_r.hdr_resolved, nullptr);
+  cmd->SetPipeline(g_r.pso_ssr_composite);
+  cmd->SetTexture(1, g_r.ssr_srv);
+  cmd->SetTexture(2, g_r.ssr_gbuf_srv);
+  cmd->SetTexture(3, lin_srv);
+  cmd->Draw(3, 0);
+
+  // Restore intermediate steady states.
+  cmd->Barrier(g_r.ssr_tex, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->Barrier(lin_tex, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->Barrier(g_r.ssr_gbuf, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
+  return true;
+}
+
 // ---- HDR post chain (hdr.hlsl: bloom pyramid + the extracted tonemap) ----
 // Layout + PSOs, built when the HDR path activates and rebuilt when the
 // guest output format (the tonemap target) changes. Failure falls back to
@@ -17801,6 +18276,28 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     return nullptr;
   };
 
+  // ---- SSR reflective-item capture (see ApplySsrPass) ----
+  // draw_item records each reflective item's fully-staged draw state
+  // (constants + resolved texture views) so the reflection G-buffer pass
+  // after the scene pass re-renders exactly what the main pass drew.
+  struct SsrGbufItem {
+    float constants[52];
+    nrhi::TextureView* t3;  // macro slot (water ripple normal map)
+    nrhi::TextureView* t4;  // spec/reflection masks
+    nrhi::TextureView* t5;  // fam 5/6 normal map (white when unpaired)
+    uint32_t mesh;
+    uint64_t fingerprint;
+    const DrawItem* item;
+  };
+  std::vector<SsrGbufItem> ssr_items;
+  const bool ssr_on =
+      hdr_on && use_depth && debug_mode == 0 && !loading_native &&
+      !g_r.ssr_failed && REXCVAR_GET(skate3_native_render_scene_ssr) &&
+      // The published projection must be the live perspective matrix (same
+      // gate as the SSAO pass).
+      scene.proj[11] == 1.0f && scene.proj[0] != 0.0f &&
+      scene.proj[5] != 0.0f && scene.proj[14] != 0.0f;
+
   const auto draw_item = [&](const DrawItem& item) {
     // NO per-frame inline decodes here. Static content (world geometry,
     // props) loads/heals on the decode workers via the miss queue; a
@@ -18786,6 +19283,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[47] = 0.0f;
       constants[49] = scene.sky_sun[5];  // misc.y = scene exposure
     }
+    // SSR: record reflective items, env fams 5/6/13 on their exact branch
+    // with live spec masks (the reflection mask rides t4.z), plus water,
+    // for the reflection G-buffer pass after the scene pass.
+    if (ssr_on && !item.skinned &&
+        (item.water ||
+         ((item.env_family == 5 || item.env_family == 6 ||
+           item.env_family == 13) &&
+          constants[39] < -4.5f && constants[47] > 2.5f))) {
+      SsrGbufItem si;
+      std::memcpy(si.constants, constants, sizeof(constants));
+      si.t3 = macro_tex->srv;
+      si.t4 = decal_tex->srv;
+      si.t5 = normal_paired ? pair_normal->srv : g_r.white.srv;
+      si.mesh = item.mesh;
+      si.fingerprint = item.fingerprint;
+      si.item = &item;
+      ssr_items.push_back(si);
+    }
     cmd->SetRootConstants(0, 52, constants, 0);
 
     cmd->SetTexture(1, diffuse->srv);
@@ -19444,6 +19959,74 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       RenderOutlineMask(context, scene, viewport, scissor, msaa_on, scene_color,
                         g_r.depth, use_depth);
 
+  // ---- SSR reflection G-buffer (scene.hlsl ps_refl_gbuf) ----
+  // Re-render the frame's reflective items (captured with their main-pass
+  // constants/textures by draw_item) into the half-res G-buffer while the
+  // main binding layout is still live. The march/composite consume it after
+  // the resolve + AO passes (ApplySsrPass); it hands off in
+  // PIXEL_SHADER_RESOURCE state via ssr_gbuf_ready.
+  g_r.ssr_gbuf_ready = false;
+  if (!ssr_items.empty() && EnsureSsrPipeline(context) &&
+      EnsureSsrTargets(context)) {
+    // Front-to-back for early-z; the pass's own depth buffer resolves
+    // overlap (a curved facade's far side shares texels with its near side
+    // within one mesh; no draw order can fix that).
+    std::stable_sort(ssr_items.begin(), ssr_items.end(),
+                     [&](const SsrGbufItem& a, const SsrGbufItem& b) {
+                       return view_dist2(*a.item) < view_dist2(*b.item);
+                     });
+    const float gbuf_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cmd->ClearRenderTarget(g_r.ssr_gbuf, gbuf_clear);
+    cmd->ClearDepth(g_r.ssr_gbuf_depth, 1.0f);
+    cmd->SetRenderTargets(g_r.ssr_gbuf, g_r.ssr_gbuf_depth);
+    cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f, float(g_r.ssr_width),
+                                    float(g_r.ssr_height), 0.0f, 1.0f});
+    cmd->SetScissor(
+        nrhi::Rect{0, 0, int32_t(g_r.ssr_width), int32_t(g_r.ssr_height)});
+    cmd->SetPipeline(g_r.pso_ssr_gbuf);
+    uint32_t gbuf_draws = 0;
+    for (const SsrGbufItem& si : ssr_items) {
+      auto mit = g_r.meshes.find(si.mesh);
+      if (mit == g_r.meshes.end() ||
+          mit->second.fingerprint != si.fingerprint) {
+        continue;  // decode swapped since the main-pass draw; next frame
+      }
+      cmd->SetRootConstants(0, 52, si.constants, 0);
+      cmd->SetTexture(4, si.t3);
+      cmd->SetTexturePair(5, si.t4, si.t5);
+      cmd->SetVertexBuffer(mit->second.vb_view.buffer,
+                           mit->second.vb_view.offset,
+                           mit->second.vb_view.size_bytes,
+                           mit->second.vb_view.stride);
+      cmd->SetIndexBuffer(mit->second.ib_view.buffer,
+                          mit->second.ib_view.offset,
+                          mit->second.ib_view.size_bytes);
+      for (const DrawEntry& draw : si.item->draws) {
+        if (draw.prim == 4) {
+          cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+        } else if (draw.prim == 6) {
+          cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
+        } else {
+          continue;
+        }
+        cmd->DrawIndexed(draw.index_count, draw.start_index,
+                         draw.base_vertex);
+        ++gbuf_draws;
+      }
+    }
+    // Restore the pass state the resolve/post paths rely on.
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    if (!msaa_on) {
+      cmd->SetRenderTargets(scene_color, use_depth ? g_r.depth : nullptr);
+    }
+    if (gbuf_draws > 0) {
+      cmd->Barrier(g_r.ssr_gbuf, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
+      g_r.ssr_gbuf_ready = true;
+    }
+  }
+
   if (msaa_on) {
     // Resolve: average the MSAA samples into the 1x scene plane (the float
     // HDR plane, or the guest output on the classic path) with a fullscreen
@@ -19479,9 +20062,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // overlay, blur). Runs after the outline composite, which relies on the
   // main layout latched from the scene pass.
   bool post_ran = false;
+  bool ssao_ran = false;
   if (use_depth && !loading_native &&
       REXCVAR_GET(skate3_native_render_scene_ssao) &&
       ApplySsaoPass(context, cmd, scene, viewport, scissor)) {
+    post_ran = true;
+    ssao_ran = true;
+  }
+
+  // ---- Screen-space reflections (ssr.hlsl) ----
+  // March + composite onto the pre-tonemap HDR plane, between the AO pass
+  // and the HDR post, so reflections tonemap and bloom exactly like
+  // directly-visible scenery. The reflection G-buffer was drawn inside the
+  // scene pass (ssr_gbuf_ready); the SSAO linear-depth plane is reused when
+  // AO ran this frame.
+  if (g_r.ssr_gbuf_ready &&
+      ApplySsrPass(context, cmd, scene, viewport, scissor, ssao_ran)) {
     post_ran = true;
   }
 

@@ -1102,6 +1102,97 @@ float4 ps_main(VSOut i) : SV_Target {
   }
   return float4(PassGamma(lit), 1.0);
 }
+// ---- SSR reflection G-buffer (consumed by ssr.hlsl ps_march) --------------
+// Rendered after the main pass from the frame's reflective items only (env
+// families 5/6/13 + water), half res, single sample, NO depth buffer:
+// RG = octahedral WORLD-space normal, B = linear view depth (the clip w),
+// A = reflectivity weight, negated for surfaces that never write scene
+// depth (water / blended fam-13 glass), which selects the march's in-front
+// visibility rule instead of the exact depth match. The caller re-stages
+// each item's main-pass root constants and t3/t4/t5 textures, so the normal
+// composition below is the material branch's own math.
+float2 OctEncode(float3 n) {
+  n /= abs(n.x) + abs(n.y) + abs(n.z);
+  if (n.z < 0.0) {
+    n.xy = float2((1.0 - abs(n.y)) * (n.x >= 0.0 ? 1.0 : -1.0),
+                  (1.0 - abs(n.x)) * (n.y >= 0.0 ? 1.0 : -1.0));
+  }
+  return n.xy;
+}
+float4 ps_refl_gbuf(VSOut i) : SV_Target {
+  float3 wn;
+  float w;
+  float trans;
+  // Env families carry cam_pos.w = -fam; water rides the legacy branch with
+  // cam_pos.w = 0 (misc.x is the packed normal-trim on fams 5/6 here, so it
+  // cannot discriminate).
+  if (cam_pos.w < -0.5) {
+    // Fams 5/6/13: the reflective branch's own normal + reflection mask.
+    // No alpha test; masked reflective draws skip the clip in ps_main too
+    // (overlay.w >= 3).
+    float fam = -cam_pos.w;
+    float4 masks = decal_art.Sample(smp, i.uv);
+    // Blend weight, not the material's energy term: the raw refmask
+    // (~0.2-0.5 on glass) is authored to scale the cube ADDEND; using it
+    // directly as the SSR lerp weight leaves the cube fallback dominating
+    // and the reflections imperceptible. Boost so real glass approaches
+    // full replacement while zero-mask texels stay out.
+    w = saturate(masks.z * 2.5);
+    trans = fam > 12.5 ? 1.0 : 0.0;
+    wn = dot(i.nrm, i.nrm) > 0.01
+             ? normalize(i.nrm)
+             : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+    if (overlay.w > 3.5) {
+      // Normal-mapped per-panel tilts (fams 5/6): the same composition as
+      // the material branch (t5 map + the constant detail-fold trim packed
+      // in misc.x; analytic world-up axes carrying the screen-frame signs).
+      float3 tt, bb;
+      ScreenTangentFrame(wn, i.rpos, i.uv, tt, bb);
+      float3 bb2 = float3(0.0, 1.0, 0.0) - wn * wn.y;
+      float lb2 = length(bb2);
+      if (lb2 > 0.05) {
+        bb2 /= lb2;
+        float3 tt2 = cross(bb2, wn);
+        tt = tt2 * (dot(tt2, tt) >= 0.0 ? 1.0 : -1.0);
+        bb = bb2 * (dot(bb2, bb) >= 0.0 ? 1.0 : -1.0);
+      }
+      float trim_yi = floor(misc.x / 1000.0);
+      float2 trim = float2(misc.x - trim_yi * 1000.0 - 500.0,
+                           trim_yi - 500.0) * 0.001;
+      float3 nmv = normal_map.Sample(smp, i.uv).rgb;
+      float3 nt = float3(nmv.xy * 2.0 - 1.0 + trim, nmv.z * 2.0 - 1.0);
+      wn = normalize(nt.x * tt + nt.y * bb + wn * max(nt.z, 0.05));
+    }
+  } else {
+    // Water: the water branch's ripple-perturbed up normal; reflectivity =
+    // the branch's own fresnel-scaled reflection weight (0.55 + 0.45*fres).
+    float t = overlay.x;
+    float2 rip;
+    if (overlay.z > 0.0) {
+      float2 wuv = i.uv * 6.0;
+      float3 n1 = macro.Sample(smp, wuv + t * float2(0.11, 0.06)).rgb;
+      float3 n2 = macro.Sample(smp, wuv * 1.71 - t * float2(0.07, 0.13)).rgb;
+      rip = (n1.xy + n2.xy) - 1.0;
+    } else {
+      float3 wp = i.rpos + cam_pos.xyz;
+      rip = 0.35 * float2(sin(wp.x * 9.7 + wp.z * 6.1 + t * 2.3) +
+                              0.6 * sin(wp.x * 17.3 - wp.z * 11.9 + t * 3.4),
+                          cos(wp.x * 7.1 - wp.z * 13.7 + t * 2.7) +
+                              0.6 * cos(wp.x * 12.9 + wp.z * 18.3 + t * 3.1));
+    }
+    wn = normalize(float3(rip.x * 0.4, 2.0, rip.y * 0.4));
+    float3 vd = -normalize(i.rpos);
+    float fres = pow(1.0 - saturate(dot(vd, wn)), 3.0);
+    w = 0.55 + 0.45 * fres;
+    trans = 1.0;
+  }
+  // B = the view depth in meters. SV_Position.w here delivers clip-space w
+  // directly, which equals view Z under the row-vector projection (m23 = 1)
+  // - verified empirically: marches from ViewPos(uv, pos.w) produce
+  // geometrically coherent reflections, and inverting this value collapses
+  // every downstream depth test (all rays die at the visibility gate).
+  return float4(OctEncode(wn), i.pos.w, w * (trans > 0.5 ? -1.0 : 1.0));
+}
 // Shadow caster pass: vs_main runs with mvp = (world *) lightVP built from
 // the captured receiver rows, so SV_Position.z IS the light-space depth
 // (the height-ramp row; viewport z range 0..1, DepthClip off so casters
