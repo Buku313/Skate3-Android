@@ -7,10 +7,8 @@ cbuffer C : register(b0) {
   float4 m[10];  // m[0..3] proj rows, m[4..7] world rows, m[8] color,
                  // m[9].x = apply D3D9 half-pixel (2D ortho draws only),
                  // m[9].y = sharp-magnification amount (0 = plain bilinear),
-                 // m[9].zw = the D3D9 half-pixel shift in NDC (7/16 of an
-                 // OUTPUT pixel; exactly 1/2 puts edge-to-edge quads'
-                 // last row/col centers ON the bottom/right edge and the
-                 // top-left rule drops them: the 1px sliver)
+                 // m[9].zw = unused (the D3D9 half-pixel shift is derived
+                 // in the VS from the draw's own ortho scale)
 };
 Texture2D<float4> tex : register(t0);
 SamplerState smp : register(s1);
@@ -23,18 +21,45 @@ VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float4 color : COLOR0)
   float4 wp = float4(dot(p, m[4]), dot(p, m[5]), dot(p, m[6]), dot(p, m[7]));
   VSOut o;
   o.pos = float4(dot(wp, m[0]), dot(wp, m[1]), dot(wp, m[2]), dot(wp, m[3]));
-  // D3D9 half-pixel convention: the art bakes half-texel UVs expecting
-  // pixel centers at integer coordinates; without this the clock-face
-  // quadrant tiles show their wrapped border rows as dark seam lines.
-  // The rasterization-convention delta is half a pixel OF THE RENDER
-  // TARGET: half a NATIVE pixel, not half a 720p pixel (0.5 * m[0].x =
-  // half a 720p pixel shifted fullscreen art 1-2 native px up-left at 2x+
-  // output scales: the see-through sliver along the bottom/right of
-  // loading screens). Must not apply to 3D (world-space SimpleDraw
-  // markers), where the projection is perspective.
+  // D3D9 half-pixel convention: the game targets integer pixel centers
+  // and bakes a -0.5px shift into its 2D geometry; host APIs put pixel
+  // centers at +0.5. The emulated path reverses this by adding +0.5 GUEST
+  // pixel down-right at the viewport transform (rexglue util/draw.cpp,
+  // half_pixel_offset cvar); replicate that exactly, deriving the guest
+  // pixel size from the draw's own ortho scale (|m[0].x| = 2/W, |m[1].y|
+  // = 2/H of the guest target; abs() pins the shift down-right on the
+  // render target like the emulated viewport offset). This both aligns
+  // pixel centers with texel centers for 1:1 art (without it the
+  // clock-face quadrant tiles show their wrapped border rows as dark seam
+  // lines) and restores full edge coverage (the previous up-left
+  // output-pixel nudge left a see-through sliver along the bottom/right
+  // of edge-to-edge loading-screen quads at 2x+ output scales). Must not
+  // apply to 3D (world-space SimpleDraw markers), where the projection is
+  // perspective.
   if (m[9].x > 0.0) {
-    o.pos.x -= m[9].z * o.pos.w;
-    o.pos.y += m[9].w * o.pos.w;
+    o.pos.x += 0.5 * abs(m[0].x) * o.pos.w;
+    o.pos.y -= 0.5 * abs(m[1].y) * o.pos.w;
+    // Edge snap: edge-to-edge art routinely lands a hair short of the
+    // target boundary (sub-pixel authoring slop; the loading screen's
+    // background reaches ~1279.5 of 1280 after the shift above, and the
+    // shift itself moves the top/left edges half a pixel inward). At 1x
+    // that is an invisible dark fringe; at 2x+ native scale it is a crisp
+    // see-through sliver. Pull vertices within 3/4 of a guest pixel of a
+    // boundary outward to exactly the boundary; the emulated path ships
+    // the same remedy for its scaled resolves
+    // (resolve_resolution_scale_fill_half_pixel_offset stretches the
+    // first covered pixel over the gap). Distortion is sub-guest-pixel
+    // and only for geometry already touching the edge; shared strip
+    // vertices snap identically (pure function of position), so no
+    // cracks are introduced between adjacent tiles.
+    float2 gpx = float2(abs(m[0].x), abs(m[1].y));  // one guest px in NDC
+    float2 ndc = o.pos.xy / o.pos.w;
+    float2 eps = 0.75 * gpx;
+    if (ndc.x <= 1.0 && ndc.x > 1.0 - eps.x) ndc.x = 1.0;
+    if (ndc.x >= -1.0 && ndc.x < -1.0 + eps.x) ndc.x = -1.0;
+    if (ndc.y <= 1.0 && ndc.y > 1.0 - eps.y) ndc.y = 1.0;
+    if (ndc.y >= -1.0 && ndc.y < -1.0 + eps.y) ndc.y = -1.0;
+    o.pos.xy = ndc * o.pos.w;
   }
   o.uv = uv;
   o.color = color;

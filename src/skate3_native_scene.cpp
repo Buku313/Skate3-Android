@@ -18791,16 +18791,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // (see the cvar; the shader gates on actual fetch magnification).
         constants[37] = float(std::clamp(
             REXCVAR_GET(skate3_native_render_scene_2d_sharp), 0.0, 2.0));
-        // m[9].zw: the D3D9 half-pixel shift in NDC, in OUTPUT-pixel units
-        // (half a 720p pixel shifted fullscreen art 1-2 native px up-left
-        // at 2x+ scales), and deliberately 7/16 px instead of exactly
-        // 1/2: an exact half puts the bottom/right edge of an
-        // edge-to-edge quad precisely THROUGH the last row/column's pixel
-        // centers, and the top-left fill rule then drops that row/column
-        // - the residual 1px see-through sliver on loading screens. The
-        // 1/16 px underhang is far below visible sampling misalignment.
-        constants[38] = viewport.width > 0.0f ? 0.875f / viewport.width : 0.0f;
-        constants[39] = viewport.height > 0.0f ? 0.875f / viewport.height : 0.0f;
+        // m[9].zw: unused. The D3D9 half-pixel shift is derived in the VS
+        // from the draw's own ortho scale (+0.5 GUEST pixel down-right,
+        // matching the emulated path's half_pixel_offset reversal); the
+        // old up-left OUTPUT-pixel nudge staged here left a see-through
+        // sliver along the bottom/right of edge-to-edge loading quads.
+        constants[38] = 0.0f;
+        constants[39] = 0.0f;
         cmd->SetRootConstants(0, 40, constants, 0);
         cmd->SetTexture(1, srv_view);
         if (yuv != nullptr) {
