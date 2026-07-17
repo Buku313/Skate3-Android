@@ -359,6 +359,12 @@ struct SubmitRecord {
 
 bool Enabled();
 
+// Host settings-overlay backdrop: while the SDK settings menu is open, run
+// the game's own popup blur chain (FrameScene::ui_blur) over every finished
+// frame; the game issues no popup blur of its own then. The overlay draws
+// its dark tint on top of the blurred scene.
+void SetSettingsMenuBlur(bool enabled);
+
 // The game's per-entity spawn/streaming fade as carried by the item's
 // validated character-lighting capture (peds c21.x, defaultcharacter c13.x,
 // cacstamp c22.x, vehicle body c20.x, hair strand scale). 1.0 for items

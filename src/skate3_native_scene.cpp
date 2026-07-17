@@ -63,6 +63,12 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmaps, true, "Skate 3",
                     "sun/shadow/AO structure), and the texture payload revalidation "
                     "re-decodes pages that were captured before composition.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_menu_blur_sigma, 9.0, "Skate 3",
+                      "Settings-menu backdrop gaussian sigma, in 1080p pixels (matches "
+                      "the menu design's blur radius; scales with output "
+                      "resolution). Only used while the host settings overlay is open.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_debug, 0, "Skate 3",
                      "Native scene debug: 0=normal, 1=clear only, 2=solid color per item, "
                      "3=limit to 20 items, 4=depth test disabled")
@@ -111,6 +117,16 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_warmup_budget_ms, 8, "Skate 3",
                      "freezing. 0 disables the takeover gates + settle pass entirely "
                      "(legacy immediate behavior, stale-scene flash and all).")
     .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_settle_max_frames, 900, "Skate 3",
+                     "Hard cap on how far past takeover the settle pass may keep "
+                     "extending itself (frames). Content that keeps failing "
+                     "revalidation (streamed payloads, old-map items over reused "
+                     "arenas after a map change) otherwise re-defers work every frame "
+                     "and holds the settle pass - and its full per-frame budget - open "
+                     "for the rest of the session (the sticky ~80fps state). Past the "
+                     "cap the draw path's own miss budgets take over. 0 = uncapped")
+    .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_warmup_min_items, 32, "Skate 3",
                      "Scene item count below which warmup keeps yielding to the "
@@ -963,6 +979,13 @@ float g_ui_blur_color[3] = {1.0f, 1.0f, 1.0f};
 // shimmer. Two publishes of hysteresis bridges the gaps; on popup close the
 // blur lingers ~2 guest frames, imperceptible.
 int g_ui_blur_hold = 0;
+// Host settings-overlay backdrop: forces the same blur chain while the SDK
+// settings menu is open (the game issues no popup blur then). Set from the
+// app UI thread, read at scene publish.
+std::atomic<bool> g_settings_menu_blur{false};
+// Emulated-post blur diagnostics: reset on each menu open so every open
+// logs a fresh burst.
+std::atomic<uint32_t> g_post_blur_log_count{0};
 // Selected-object outline capture (see DrawItem::selected): in the park
 // editor / object mover the game EXCLUDES the selected object from the main
 // color pass and re-draws it right after the sky, twice, back to back, the
@@ -1594,6 +1617,35 @@ PerfWindow g_pw_commit;       // PrewarmCommit batches (count = non-empty runs)
 PerfWindow g_pw_pre;
 PerfWindow g_pw_2d;
 PerfWindow g_pw_tail;
+// Settle-pass attribution (the sticky ~80fps post-map-change state:
+// pre=8.4ms == the whole warmup budget, GPU idle at
+// P0): the takeover settle pass extends itself +8 frames whenever a frame's
+// warm walk leaves work deferred, so content that keeps failing revalidation
+// (old-map items over reused arenas, streamed payloads) can hold it open for
+// the rest of the session, burning the full budget every frame. settle= times
+// the block; wdec/wdef count warm-path decodes/deferrals; the offender logs
+// name what churns.
+PerfWindow g_pw_settle;
+// Guest-thread build-phase attribution (the standing-still 320->250 fps
+// oscillation): build= runs on the guest render thread and its
+// variance IS guest frame-time variance. b2d/bspl/bpal split the phases;
+// the item walk is the remainder. dt histogram + slow-frame log quantify
+// and attribute the dips.
+PerfWindow g_pw_b2d;   // Publish2dDraws
+PerfWindow g_pw_bspl;  // PublishSplineDraws
+PerfWindow g_pw_bpal;  // ServeAuthoritativePalettes
+// This frame's phase costs (guest render thread only - no atomics needed).
+uint64_t g_frame_b2d_ns = 0;
+uint64_t g_frame_bspl_ns = 0;
+uint64_t g_frame_bpal_ns = 0;
+uint64_t g_frame_v3_ns = 0;
+std::atomic<uint32_t> g_dt_hist[5] = {};  // <3.6 / <4.5 / <6 / <10 / >=10 ms
+std::atomic<uint32_t> g_slow_frame_log_budget{0};
+std::atomic<uint64_t> g_warm_decodes{0};
+std::atomic<uint64_t> g_warm_deferred{0};
+std::atomic<uint32_t> g_warm_mesh_log_budget{0};
+std::atomic<uint32_t> g_warm_tex_log_budget{0};
+uint64_t g_takeover_frame = 0;
 // Camera-update cadence (the "world judders while panning at 320 fps"
 // question): if the guest updates its camera on a fixed sim tick while the
 // render loop free-runs, view_proj repeats for several rendered frames and
@@ -2891,6 +2943,18 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
 
 bool Enabled() { return SceneEnabled(); }
 
+void SetSettingsMenuBlur(bool enabled) {
+  g_settings_menu_blur.store(enabled, std::memory_order_relaxed);
+  REXLOG_INFO("native-scene: settings-menu blur {} (post-processor {})", enabled ? "ON" : "off",
+              enabled ? "armed" : "disarms after ease-out");
+  if (enabled) {
+    g_post_blur_log_count.store(0, std::memory_order_relaxed);
+    // Arms the emulated-output post-processor (boot frames / manual emulated
+    // mode). It disarms itself once the blur has fully eased out.
+    rex::graphics::RequestNativeGuestOutputPostProcess(true);
+  }
+}
+
 void FlushTextureCache() { g_flush_textures.store(true, std::memory_order_relaxed); }
 
 void RequestSceneRingDump() {
@@ -3309,6 +3373,13 @@ static std::atomic<int64_t> g_movie_decode_last_ns{-1};
 // is STALE under draw suppression, and presenting it flashed the previous
 // video's last frame at every video boundary.
 static std::atomic<int64_t> g_movie_native_last_ns{-1};
+// Last frame the 2D replay CONTAINED a video quad at all (substituted or
+// not; detection runs regardless of movie_sub). Consulted by YieldForMovie:
+// with no quad on screen there is nothing a yield could display - a
+// skipped/force-completed video (intro skip) leaves the decoder heartbeat
+// alive ~0.5 s with no quad anywhere, and yielding then just flashed the
+// stale emulated buffer (the "momentary emulated switch" at intro skip).
+static std::atomic<int64_t> g_movie_quad_last_ns{-1};
 
 void OnMovieDecode() {
   g_movie_decode_last_ns.store(
@@ -7592,23 +7663,68 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   ++g_guest_frame;  // paces the world-item cache revalidation
   // Perf telemetry: guest frame interval + this frame's capture-hook cost.
   static PerfClock::time_point s_last_frame_tp{};
+  // Previous frame's phase costs, for the slow-frame attribution below (a
+  // frame's dt is only known at the NEXT frame's entry).
+  static uint64_t s_prev_build_ns = 0, s_prev_b2d_ns = 0, s_prev_bspl_ns = 0,
+                  s_prev_bpal_ns = 0, s_prev_v3_ns = 0, s_prev_cap_ns = 0;
   const auto build_t0 = PerfClock::now();
   if (s_last_frame_tp.time_since_epoch().count() != 0) {
-    g_pw_guest_dt.Add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   build_t0 - s_last_frame_tp)
-                                   .count()));
+    const uint64_t dt_ns = uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(build_t0 - s_last_frame_tp)
+            .count());
+    g_pw_guest_dt.Add(dt_ns);
+    const double dt_ms = double(dt_ns) * 1e-6;
+    g_dt_hist[dt_ms < 3.6 ? 0 : dt_ms < 4.5 ? 1 : dt_ms < 6.0 ? 2 : dt_ms < 10.0 ? 3 : 4]
+        .fetch_add(1, std::memory_order_relaxed);
+    // Attribute dips: the previous frame stretched the interval - log its
+    // phase breakdown. "rest" = the game's own frame work + hook overhead
+    // outside the build (dt minus our measured blocks).
+    if (dt_ms >= 4.5 && dt_ms < 100.0 &&
+        g_slow_frame_log_budget.load(std::memory_order_relaxed) > 0 &&
+        g_slow_frame_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+      const double ours_ms =
+          double(s_prev_build_ns + s_prev_cap_ns) * 1e-6;
+      REXLOG_INFO(
+          "native-scene: slow guest frame dt={:.2f}ms prev[cap={:.2f} build={:.2f} "
+          "(2d={:.2f} spl={:.2f} pal={:.2f} ptail={:.2f} walk={:.2f}) rest={:.2f}]ms",
+          dt_ms, double(s_prev_cap_ns) * 1e-6, double(s_prev_build_ns) * 1e-6,
+          double(s_prev_b2d_ns) * 1e-6, double(s_prev_bspl_ns) * 1e-6,
+          double(s_prev_bpal_ns) * 1e-6, double(s_prev_v3_ns) * 1e-6,
+          double(s_prev_build_ns - std::min(s_prev_build_ns,
+                                            s_prev_b2d_ns + s_prev_bspl_ns +
+                                                s_prev_bpal_ns + s_prev_v3_ns)) *
+              1e-6,
+          dt_ms - ours_ms);
+    }
   }
   s_last_frame_tp = build_t0;
   g_pw_capture.Add(g_capture_frame_ns);
+  s_prev_cap_ns = g_capture_frame_ns;
   g_capture_frame_ns = 0;
+  g_frame_b2d_ns = 0;
+  g_frame_bspl_ns = 0;
+  g_frame_bpal_ns = 0;
+  g_frame_v3_ns = 0;
   struct BuildPerf {
     PerfClock::time_point t0;
+    uint64_t* prev_build_ns;
+    uint64_t* prev_b2d_ns;
+    uint64_t* prev_bspl_ns;
+    uint64_t* prev_bpal_ns;
+    uint64_t* prev_v3_ns;
     ~BuildPerf() {
-      g_pw_build.Add(uint64_t(
+      const uint64_t build_ns = uint64_t(
           std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - t0)
-              .count()));
+              .count());
+      g_pw_build.Add(build_ns);
+      *prev_build_ns = build_ns;
+      *prev_b2d_ns = g_frame_b2d_ns;
+      *prev_bspl_ns = g_frame_bspl_ns;
+      *prev_bpal_ns = g_frame_bpal_ns;
+      *prev_pal_tail_ns = g_frame_pal_tail_ns;
     }
-  } build_perf{build_t0};
+  } build_perf{build_t0, &s_prev_build_ns, &s_prev_b2d_ns, &s_prev_bspl_ns,
+               &s_prev_bpal_ns, &s_prev_v3_ns};
   if (g_recording.load(std::memory_order_relaxed)) {
     // Flush this frame's deferred inline-ring payloads (2D BeginVertices
     // draws): the CPU has finished writing them by frame end, and the ring
@@ -7632,8 +7748,19 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
     g_pending_inline_dumps.clear();
   }
-  Publish2dDraws(base);
-  PublishSplineDraws(base);
+  {
+    const auto t0 = PerfClock::now();
+    Publish2dDraws(base);
+    const auto t1 = PerfClock::now();
+    PublishSplineDraws(base);
+    const auto t2 = PerfClock::now();
+    g_frame_b2d_ns = uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    g_frame_bspl_ns = uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+    g_pw_b2d.Add(g_frame_b2d_ns);
+    g_pw_bspl.Add(g_frame_bspl_ns);
+  }
   // Take this frame's hook-time dynamic items regardless of how we exit,
   // leaving them in place across an early return (no perspective view, empty
   // frame) would desynchronize the indices stored in the records.
@@ -7894,7 +8021,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // consumes; per piece, one sim tick, coherent by construction). Runs
     // FIRST so the sanity gate below validates the authoritative rows and
     // the rescue caches learn them; unmapped items keep the bank pipeline.
+    const auto pal_t0 = PerfClock::now();
     g_pal_served_frame = skate3::native_v3::ServeAuthoritativePalettes(base, scene);
+    g_frame_bpal_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   PerfClock::now() - pal_t0)
+                                   .count());
+    g_pw_bpal.Add(g_frame_bpal_ns);
     g_pal_served_total.fetch_add(g_pal_served_frame, std::memory_order_relaxed);
     // Dense publish-time coherence gate (see PublishedPaletteSane): a
     // 1-frame junk palette that passed the 6-sample capture gates would
@@ -9116,6 +9248,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.sky_sun, g_sky_sun, sizeof(g_sky_sun));
     scene.sky_sun_valid = true;
   }
+  // The game's own popup blur chain (pause menu etc.), untouched by the
+  // host settings menu, whose gaussian reads host state directly at render
+  // time (see ApplyMenuBlurPass call sites).
   const bool blur_active = g_ui_blur_seen || g_ui_blur_hold > 0;
   scene.ui_blur = blur_active ? g_ui_blur : 0.0f;
   std::memcpy(scene.ui_blur_color, g_ui_blur_color, sizeof(scene.ui_blur_color));
@@ -9130,8 +9265,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       REXLOG_INFO(
           "native-scene: popup background blur {} (kernel scale {:.1f}, fade "
           "{:.2f}/{:.2f}/{:.2f})",
-          blur_active ? "ON" : "off", g_ui_blur, g_ui_blur_color[0],
-          g_ui_blur_color[1], g_ui_blur_color[2]);
+          blur_active ? "ON" : "off", scene.ui_blur, scene.ui_blur_color[0],
+          scene.ui_blur_color[1], scene.ui_blur_color[2]);
       s_blur_was_active = blur_active;
       if (!blur_active) {
         // Don't carry one popup's fade into the next popup's first frame
@@ -9396,9 +9531,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     const auto v3_t0 = PerfClock::now();
     skate3::native_v3::OnFrameBuilt(base, records, count, scene);
     skate3::native_v3_mat::OnFrameBuilt(base, records, count, scene);
-    g_pw_v3.Add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             PerfClock::now() - v3_t0)
-                             .count()));
+    g_frame_v3_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 PerfClock::now() - v3_t0)
+                                 .count());
+    g_pw_v3.Add(g_frame_v3_ns);
   }
 
   // AUX-publish gate: the skater-portrait render-to-texture passes submit a
@@ -9944,6 +10080,17 @@ struct RendererState {
   nrhi::Pipeline* pso_blur = nullptr;
   nrhi::Pipeline* pso_blur_blit = nullptr;
   nrhi::Pipeline* pso_blur_down = nullptr;
+  // Settings-menu gaussian backdrop (ps_menu_gauss): clean separable
+  // gaussian on half-output-res ping-pong intermediates, applied at the END
+  // of the compose so it frosts everything drawn (3D + HUD/2D + FMV).
+  // Deliberately independent of the popup-blur port above (that chain
+  // reproduces the console's 1152x640 lattice on purpose). Steady state
+  // RENDER_TARGET; recreated on output size change.
+  nrhi::Pipeline* pso_menu_gauss = nullptr;
+  nrhi::Texture* menu_blur_tex[2] = {nullptr, nullptr};
+  nrhi::TextureView* menu_blur_srv[2] = {nullptr, nullptr};
+  uint32_t menu_blur_w = 0;
+  uint32_t menu_blur_h = 0;
   // Native photo grab (photo_grab_native): the blur downsample pass (whose
   // 1152x640 blur space happens to BE the game's screenshot-target raster)
   // renders the finished frame into blur_tex[0], which is then copied into
@@ -12449,8 +12596,11 @@ bool EnsureBlurPsos(const NativeGuestOutputRenderContext& context) {
     nrhi::Shader* bdown = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kPixel, "blur.hlsl",
                        kBlurShaderSource, "ps_down", nullptr, ""));
+    nrhi::Shader* bgauss = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "blur.hlsl",
+                       kBlurShaderSource, "ps_menu_gauss", nullptr, ""));
     if (bvs == nullptr || bps == nullptr || bblit == nullptr ||
-        bdown == nullptr) {
+        bdown == nullptr || bgauss == nullptr) {
       REXLOG_ERROR("native-scene: blur shader compile failed");
       g_r.failed = true;
       return false;
@@ -12465,21 +12615,26 @@ bool EnsureBlurPsos(const NativeGuestOutputRenderContext& context) {
     if (g_r.pso_blur) device->DestroyDeferred(g_r.pso_blur);
     if (g_r.pso_blur_blit) device->DestroyDeferred(g_r.pso_blur_blit);
     if (g_r.pso_blur_down) device->DestroyDeferred(g_r.pso_blur_down);
+    if (g_r.pso_menu_gauss) device->DestroyDeferred(g_r.pso_menu_gauss);
     g_r.pso_blur = device->CreateGraphicsPipeline(bp);
     bp.ps = bblit;
     g_r.pso_blur_blit = device->CreateGraphicsPipeline(bp);
     bp.ps = bdown;
     g_r.pso_blur_down = device->CreateGraphicsPipeline(bp);
+    bp.ps = bgauss;
+    g_r.pso_menu_gauss = device->CreateGraphicsPipeline(bp);
     device->DestroyDeferred(bvs);
     device->DestroyDeferred(bps);
     device->DestroyDeferred(bblit);
     device->DestroyDeferred(bdown);
+    device->DestroyDeferred(bgauss);
     if (g_r.pso_blur == nullptr || g_r.pso_blur_blit == nullptr ||
-        g_r.pso_blur_down == nullptr) {
+        g_r.pso_blur_down == nullptr || g_r.pso_menu_gauss == nullptr) {
       REXLOG_ERROR("native-scene: blur PSO creation failed");
       g_r.pso_blur = nullptr;
       g_r.pso_blur_blit = nullptr;  // blur unavailable; everything else runs
       g_r.pso_blur_down = nullptr;
+      g_r.pso_menu_gauss = nullptr;
     }
   }
   return true;
@@ -13088,6 +13243,58 @@ bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context) {
     }
   }
 
+  // Settings-menu gaussian intermediates: half the output resolution
+  // (sigma halves with it; the final bilinear stretch back is invisible
+  // under a real blur), recreated whenever the output size changes.
+  const uint32_t menu_w = std::max(1u, context.guest_output_width / 2);
+  const uint32_t menu_h = std::max(1u, context.guest_output_height / 2);
+  if ((g_r.menu_blur_tex[0] == nullptr || g_r.menu_blur_w != menu_w ||
+       g_r.menu_blur_h != menu_h) &&
+      g_r.pso_menu_gauss != nullptr) {
+    for (int t = 0; t < 2; ++t) {
+      if (g_r.menu_blur_srv[t]) device->DestroyDeferred(g_r.menu_blur_srv[t]);
+      g_r.menu_blur_srv[t] = nullptr;
+      if (g_r.menu_blur_tex[t]) device->DestroyDeferred(g_r.menu_blur_tex[t]);
+      g_r.menu_blur_tex[t] = nullptr;
+    }
+    nrhi::TextureDesc desc;
+    desc.width = menu_w;
+    desc.height = menu_h;
+    desc.format = context.guest_output->format();
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
+    desc.usage = nrhi::kTextureUsageRenderTarget;
+    bool ok = true;
+    for (int t = 0; t < 2 && ok; ++t) {
+      g_r.menu_blur_tex[t] = device->CreateTexture(desc);
+      if (g_r.menu_blur_tex[t] == nullptr) {
+        ok = false;
+        break;
+      }
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.menu_blur_srv[t] = device->CreateTextureView(g_r.menu_blur_tex[t], vd);
+      if (g_r.menu_blur_srv[t] == nullptr) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      g_r.menu_blur_w = menu_w;
+      g_r.menu_blur_h = menu_h;
+    } else {
+      REXLOG_ERROR(
+          "native-scene: menu blur intermediate creation failed; menu blur "
+          "disabled");
+      for (int t = 0; t < 2; ++t) {
+        if (g_r.menu_blur_srv[t]) device->DestroyDeferred(g_r.menu_blur_srv[t]);
+        g_r.menu_blur_srv[t] = nullptr;
+        if (g_r.menu_blur_tex[t]) device->DestroyDeferred(g_r.menu_blur_tex[t]);
+        g_r.menu_blur_tex[t] = nullptr;
+      }
+      g_r.pso_menu_gauss = nullptr;  // leaked PSO acceptable on this cold path
+    }
+  }
+
   if ((g_r.outline_mask == nullptr ||
        g_r.outline_mask_width != context.guest_output_width ||
        g_r.outline_mask_height != context.guest_output_height) &&
@@ -13321,6 +13528,192 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
+// ---- Settings-menu backdrop blur (shared native + emulated-post paths) ----
+// Clean separable gaussian over the finished guest output; deliberately
+// shares nothing with the game's
+// popup chain (that one reproduces the console's 1152x640 lattice on
+// purpose). Downsample to half res (plain bilinear = 2x2 box), gaussian H,
+// gaussian V, bilinear stretch back. Eased in/out (~60 ms) so open/close
+// doesn't pop; the smoothing state is shared across the native and
+// emulated-post paths (only one runs per frame). Returns true while the
+// effect is active (target > 0 or still easing out).
+bool ApplyMenuBlurPass(const NativeGuestOutputRenderContext& context, nrhi::Cmd* cmd,
+                       float target_sigma, bool output_in_guest_output_state) {
+  static float s_menu_sigma = 0.0f;
+  static int64_t s_menu_ns = 0;
+  const int64_t menu_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  PerfClock::now().time_since_epoch())
+                                  .count();
+  float menu_dt = s_menu_ns != 0 ? float(menu_now_ns - s_menu_ns) * 1e-9f : 1.0f;
+  if (menu_dt > 0.25f) {
+    s_menu_sigma = 0.0f;
+    menu_dt = 0.0f;
+  }
+  s_menu_ns = menu_now_ns;
+  const float menu_a = 1.0f - std::exp(-menu_dt / 0.06f);
+  s_menu_sigma += (target_sigma - s_menu_sigma) * menu_a;
+  const bool active = target_sigma > 0.0f || s_menu_sigma > 0.05f;
+  if (s_menu_sigma <= 0.05f || g_r.pso_menu_gauss == nullptr ||
+      g_r.pso_blur_blit == nullptr || g_r.menu_blur_tex[0] == nullptr ||
+      g_r.output_srv_slot == nullptr) {
+    return active;
+  }
+  const float w = float(g_r.menu_blur_w);
+  const float h = float(g_r.menu_blur_h);
+  // Sigma is authored in 1080p pixels; halve again for the half-res space.
+  const float sigma_half = std::max(
+      0.3f, s_menu_sigma * (float(context.guest_output_height) / 1080.0f) * 0.5f);
+  const float radius = std::min(48.0f, std::ceil(sigma_half * 3.0f));
+  const nrhi::Viewport half_vp{0.0f, 0.0f, w, h, 0.0f, 1.0f};
+  const nrhi::Rect half_sc{0, 0, int32_t(g_r.menu_blur_w), int32_t(g_r.menu_blur_h)};
+  const nrhi::Viewport full_vp{0.0f,
+                               0.0f,
+                               float(context.guest_output_width),
+                               float(context.guest_output_height),
+                               0.0f,
+                               1.0f};
+  const nrhi::Rect full_sc{0, 0, int32_t(context.guest_output_width),
+                           int32_t(context.guest_output_height)};
+  const nrhi::ResourceState output_entry_state = output_in_guest_output_state
+                                                     ? nrhi::ResourceState::kGuestOutput
+                                                     : nrhi::ResourceState::kRenderTarget;
+  // The binding layout must be latched on this cmd before any draw; on the
+  // emulated-post path this is a FRESH frame state where no layout has been
+  // set, and nrhi draws silently no-op without one (EnsureDrawState).
+  // Harmless on the native path (same layout, re-latch).
+  cmd->SetBindingLayout(g_r.layout);
+  cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+  // Downsample: guest output -> menu[0].
+  cmd->Barrier(context.guest_output, output_entry_state,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  cmd->SetRenderTargets(g_r.menu_blur_tex[0], nullptr);
+  cmd->SetViewport(half_vp);
+  cmd->SetScissor(half_sc);
+  cmd->SetPipeline(g_r.pso_blur_blit);
+  cmd->SetTexture(1, g_r.output_srv_slot);
+  cmd->Draw(3, 0);
+  // H: menu[0] -> menu[1].
+  cmd->Barrier(g_r.menu_blur_tex[0], nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  cmd->SetRenderTargets(g_r.menu_blur_tex[1], nullptr);
+  cmd->SetPipeline(g_r.pso_menu_gauss);
+  const float h_consts[8] = {1.0f / w, 0.0f, sigma_half, radius, 1.0f, 1.0f, 1.0f, 1.0f};
+  cmd->SetRootConstants(0, 8, h_consts, 0);
+  cmd->SetTexture(1, g_r.menu_blur_srv[0]);
+  cmd->Draw(3, 0);
+  // V: menu[1] -> menu[0].
+  cmd->Barrier(g_r.menu_blur_tex[1], nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->Barrier(g_r.menu_blur_tex[0], nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
+  cmd->SetRenderTargets(g_r.menu_blur_tex[0], nullptr);
+  const float v_consts[8] = {0.0f, 1.0f / h, sigma_half, radius, 1.0f, 1.0f, 1.0f, 1.0f};
+  cmd->SetRootConstants(0, 8, v_consts, 0);
+  cmd->SetTexture(1, g_r.menu_blur_srv[1]);
+  cmd->Draw(3, 0);
+  // Stretch back over the full output.
+  cmd->Barrier(g_r.menu_blur_tex[0], nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->Barrier(context.guest_output, nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->FlushBarriers();
+  cmd->SetRenderTargets(context.guest_output, nullptr);
+  cmd->SetViewport(full_vp);
+  cmd->SetScissor(full_sc);
+  cmd->SetPipeline(g_r.pso_blur_blit);
+  cmd->SetTexture(1, g_r.menu_blur_srv[0]);
+  cmd->Draw(3, 0);
+  // Restore steady states (the intermediates stay in RENDER_TARGET; the
+  // output goes back to the state the caller's path expects).
+  cmd->Barrier(g_r.menu_blur_tex[0], nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  cmd->Barrier(g_r.menu_blur_tex[1], nrhi::ResourceState::kPixelShaderResource,
+               nrhi::ResourceState::kRenderTarget);
+  if (output_in_guest_output_state) {
+    cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
+                 nrhi::ResourceState::kGuestOutput);
+    cmd->FlushBarriers();
+  }
+  return active;
+}
+
+// Minimal resource bring-up for the emulated-output post-processor path: the
+// full EnsurePipeline never runs while the native renderer is disabled or
+// yielding, so the blur ensures just what it needs (binding layout, the blur
+// PSOs, the half-res intermediates, and a sampled view of the output).
+bool EnsureMenuBlurStandalone(const NativeGuestOutputRenderContext& context) {
+  if (g_r.failed) {
+    return false;
+  }
+  if (!EnsureRootSignature(context)) {
+    return false;
+  }
+  if (g_r.pso_menu_gauss == nullptr) {
+    static bool s_attempted = false;
+    if (s_attempted) {
+      return false;  // creation failed once; don't hammer every frame
+    }
+    s_attempted = true;
+    EnsureBlurPsos(context);
+    if (g_r.pso_menu_gauss == nullptr) {
+      return false;
+    }
+  }
+  EnsureBlurOutlineTargets(context);
+  if (g_r.menu_blur_tex[0] == nullptr) {
+    return false;
+  }
+  if (g_r.rtv_resource != context.guest_output) {
+    if (g_r.output_srv_slot) {
+      context.device->DestroyDeferred(g_r.output_srv_slot);
+      g_r.output_srv_slot = nullptr;
+    }
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.output_srv_slot = context.device->CreateTextureView(context.guest_output, vd);
+    g_r.output_srv_allocated = g_r.output_srv_slot != nullptr;
+    g_r.rtv_resource = context.guest_output;
+  }
+  return g_r.output_srv_slot != nullptr;
+}
+
+// Registered with the command processors: invoked at the end of the EMULATED
+// guest-output refresh (native-rendered frames apply the blur inline in
+// RenderScene). Covers boot/startup frames before the native scene takes
+// over and manual emulated mode.
+void PostProcessGuestOutput(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
+  const float target = g_settings_menu_blur.load(std::memory_order_relaxed)
+                           ? float(REXCVAR_GET(skate3_menu_blur_sigma))
+                           : 0.0f;
+  // Diagnostics (throttled): the emulated-path blur has several silent
+  // early-outs; log which leg each invocation takes.
+  const bool log_this = g_post_blur_log_count.load(std::memory_order_relaxed) < 8;
+  const bool ensured = EnsureMenuBlurStandalone(context);
+  if (log_this) {
+    g_post_blur_log_count.fetch_add(1, std::memory_order_relaxed);
+    REXLOG_INFO(
+        "native-scene: emulated-post blur invoked (target={:.1f} ensured={} pso={} tex={} "
+        "srv={} failed={})",
+        target, ensured, (void*)g_r.pso_menu_gauss, (void*)g_r.menu_blur_tex[0],
+        (void*)g_r.output_srv_slot, g_r.failed);
+  }
+  if (!ensured) {
+    if (target <= 0.0f) {
+      rex::graphics::RequestNativeGuestOutputPostProcess(false);
+    }
+    return;
+  }
+  if (!ApplyMenuBlurPass(context, context.cmd, target,
+                         /*output_in_guest_output_state=*/true)) {
+    // Fully eased out: stop the per-frame post-process invocations until the
+    // menu opens again.
+    rex::graphics::RequestNativeGuestOutputPostProcess(false);
+  }
+}
+
 // ---- Warm decode (loading-screen prewarm + gameplay warmup) --------------
 // Decodes, within `deadline`, every GPU resource `item`'s draw would
 // resolve: the mesh VB/IB (with fingerprint revalidation) and each texture
@@ -13348,10 +13741,21 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   auto mit = g_r.meshes.find(item.mesh);
   if (mit == g_r.meshes.end()) {
     need_mesh = true;
-  } else if (mit->second.fingerprint != item.fingerprint &&
+  } else if (mit->second.fingerprint != item.fingerprint && !item.ropa &&
              REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
     // Streaming filled/replaced the payload after an earlier (pre)decode.
+    // Ropa meshes are excluded: the cloth sim rewrites their payload every
+    // frame BY DESIGN (fingerprint never converges), so revalidating them
+    // here just destroys+redecodes the base mesh once per settle frame -
+    // the churn that kept the settle pass extending itself (log 1624:
+    // mesh 40D30140 re-fingerprinting 4x in 50ms). The draw path serves
+    // ropa content from the ropa ring / shape generations regardless.
     if (within()) {
+      if (g_warm_mesh_log_budget.load(std::memory_order_relaxed) > 0 &&
+          g_warm_mesh_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+        REXLOG_INFO("native-scene: settle mesh REVALIDATE mesh={:08X} fp {:016X}->{:016X}",
+                    item.mesh, mit->second.fingerprint, item.fingerprint);
+      }
       g_r.device->DestroyDeferred(mit->second.vb);
       g_r.device->DestroyDeferred(mit->second.ib);
       g_r.meshes.erase(mit);
@@ -13397,6 +13801,12 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
       if (!it->second.incomplete && (fp == 0 || fp == it->second.payload_fp)) {
         return;
+      }
+      if (g_warm_tex_log_budget.load(std::memory_order_relaxed) > 0 &&
+          g_warm_tex_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+        REXLOG_INFO("native-scene: settle tex RETIRE ptr={:08X} key={:016X} incomplete={} "
+                    "fp {:016X}->{:016X}",
+                    tex_ptr, key, it->second.incomplete, it->second.payload_fp, fp);
       }
       RetireGuestTexture(it->second, context.device->CurrentSubmission());
       g_r.tex_store.erase(it);
@@ -14404,8 +14814,20 @@ bool YieldForMovie() {
     s_fresh_since = now_ns;
   }
   const int64_t native_ns = g_movie_native_last_ns.load(std::memory_order_relaxed);
-  const bool yield = active && now_ns - s_fresh_since >= 400'000'000 &&
-                     (native_ns < 0 || now_ns - native_ns > 1'000'000'000);
+  // Yield only for a video that is ON SCREEN and NOT being served:
+  // (a) quad_recent - the 2D replay recently carried a video quad (detection
+  //     runs regardless of movie_sub). A skipped/force-completed video
+  //     (intro skip) leaves the decoder heartbeat alive ~0.5 s with no quad
+  //     anywhere; yielding then flashed the stale emulated buffer.
+  // (b) staleness measured decoder-vs-native, not wall-clock: at a manual
+  //     skip the quad vanishes instantly but the decoder tail keeps beating
+  //     up to ~500 ms - a genuinely unsubstituted video keeps decoding long
+  //     past the last native draw and crosses the 1 s bar within ~1.4 s of
+  //     starting; a skip tail (<= ~600 ms) never can.
+  const int64_t quad_ns = g_movie_quad_last_ns.load(std::memory_order_relaxed);
+  const bool quad_recent = quad_ns >= 0 && now_ns - quad_ns < 500'000'000;
+  const bool yield = active && now_ns - s_fresh_since >= 400'000'000 && quad_recent &&
+                     (native_ns < 0 || last_ns - native_ns > 1'000'000'000);
   static bool s_active = false;
   if (yield != s_active) {
     s_active = yield;
@@ -15385,17 +15807,31 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     const double guest_dt_ms = g_pw_guest_dt.AvgMs();
     REXLOG_INFO(
         "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
-        "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms v3={:.2f}/{:.2f}ms | render={:.2f}/{:.2f}ms "
+        "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms "
+        "bld[2d={:.2f}/{:.2f} spl={:.2f}/{:.2f} pal={:.2f}/{:.2f}]ms "
+        "dt[{}|{}|{}|{}|{}] ptail={:.2f}/{:.2f}ms | render={:.2f}/{:.2f}ms "
         "items={:.2f}/{:.2f}ms shadow={:.2f}/{:.2f}ms "
-        "pre={:.2f}/{:.2f}ms tail={:.2f}/{:.2f}ms twod={:.2f}/{:.2f}ms "
+        "pre={:.2f}/{:.2f}ms settle[{:.2f}/{:.2f}ms n={} dec={} def={}] "
+        "tail={:.2f}/{:.2f}ms twod={:.2f}/{:.2f}ms "
         "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
         "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}]",
         guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
         g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
-        g_pw_build.MaxMs(), g_pw_v3.AvgMs(), g_pw_v3.MaxMs(),
+        g_pw_build.MaxMs(), g_pw_b2d.AvgMs(), g_pw_b2d.MaxMs(), g_pw_bspl.AvgMs(),
+        g_pw_bspl.MaxMs(), g_pw_bpal.AvgMs(), g_pw_bpal.MaxMs(),
+        g_dt_hist[0].exchange(0, std::memory_order_relaxed),
+        g_dt_hist[1].exchange(0, std::memory_order_relaxed),
+        g_dt_hist[2].exchange(0, std::memory_order_relaxed),
+        g_dt_hist[3].exchange(0, std::memory_order_relaxed),
+        g_dt_hist[4].exchange(0, std::memory_order_relaxed),
+        g_pw_v3.AvgMs(), g_pw_v3.MaxMs(),
         g_pw_render.AvgMs(), g_pw_render.MaxMs(),
         g_pw_items.AvgMs(), g_pw_items.MaxMs(), g_pw_shadow.AvgMs(),
         g_pw_shadow.MaxMs(), g_pw_pre.AvgMs(), g_pw_pre.MaxMs(),
+        g_pw_settle.AvgMs(), g_pw_settle.MaxMs(),
+        g_pw_settle.count.load(std::memory_order_relaxed),
+        g_warm_decodes.exchange(0, std::memory_order_relaxed),
+        g_warm_deferred.exchange(0, std::memory_order_relaxed),
         g_pw_tail.AvgMs(), g_pw_tail.MaxMs(), g_pw_2d.AvgMs(), g_pw_2d.MaxMs(),
         g_pw_mesh_decode.count.load(std::memory_order_relaxed),
         g_pw_mesh_decode.AvgMs(), g_pw_mesh_decode.MaxMs(),
@@ -15407,11 +15843,16 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
         g_cam_max_streak.exchange(0, std::memory_order_relaxed));
     for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_v3,
+                          &g_pw_b2d, &g_pw_bspl, &g_pw_bpal,
                           &g_pw_render, &g_pw_items, &g_pw_shadow, &g_pw_pre,
-                          &g_pw_tail, &g_pw_2d, &g_pw_mesh_decode,
+                          &g_pw_settle, &g_pw_tail, &g_pw_2d, &g_pw_mesh_decode,
                           &g_pw_tex_decode, &g_pw_commit}) {
       w->Reset();
     }
+    // Refill the settle offender-log + slow-frame budgets for the next window.
+    g_warm_mesh_log_budget.store(4, std::memory_order_relaxed);
+    g_warm_tex_log_budget.store(4, std::memory_order_relaxed);
+    g_slow_frame_log_budget.store(3, std::memory_order_relaxed);
   }
   if (frames % 600 == 0) {
     uint32_t lw_ctxs = 0, lw_ents = 0;
@@ -15677,6 +16118,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (!small_or_stale) {
         g_warmup_armed.store(false, std::memory_order_relaxed);
         g_settle_until_frame = frame_number + 120;
+        g_takeover_frame = frame_number;
         size_t queued = 0;
         {
           std::lock_guard<std::mutex> lock(g_prewarm_mutex);
@@ -15691,6 +16133,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     settling = frame_number < g_settle_until_frame;
     if (settling) {
+      const auto settle_t0 = PerfClock::now();
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::milliseconds(warmup_ms);
       WarmCounters wc;
@@ -15699,13 +16142,28 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       if (wc.deferred != 0) {
         // Still behind: keep the settle pass (and the draw-path budget
-        // clamp) alive until a frame clears with budget to spare.
-        g_settle_until_frame =
-            std::max<uint64_t>(g_settle_until_frame, frame_number + 8);
+        // clamp) alive until a frame clears with budget to spare - but never
+        // past the hard cap: revalidation-churning content (streamed
+        // payloads, post-map-change stale items) re-defers every frame and
+        // would otherwise hold the full budget open for the whole session.
+        const int32_t max_frames =
+            REXCVAR_GET(skate3_native_render_scene_settle_max_frames);
+        const uint64_t extended = frame_number + 8;
+        if (max_frames <= 0 || extended <= g_takeover_frame + uint64_t(max_frames)) {
+          g_settle_until_frame = std::max<uint64_t>(g_settle_until_frame, extended);
+        } else if (g_settle_until_frame <= frame_number + 1) {
+          REXLOG_INFO(
+              "native-scene: settle pass CAPPED {} frames after takeover with {} "
+              "deferred (revalidation churn?) - draw-path budgets resume",
+              frame_number - g_takeover_frame, wc.deferred);
+        }
       }
       if (wc.decodes > 0) {
         cmd->FlushBarriers();
       }
+      g_warm_decodes.fetch_add(wc.decodes, std::memory_order_relaxed);
+      g_warm_deferred.fetch_add(wc.deferred, std::memory_order_relaxed);
+      g_pw_settle.Add(perf_ns_since(settle_t0));
     }
   }
 
@@ -18516,6 +18974,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             }
           }
         }
+        if (video_quad) {
+          // Consulted by YieldForMovie: a video is only "on screen" while
+          // the 2D replay actually carries a video quad. A skipped/dismissed
+          // video leaves the decoder tail beating with no quad anywhere -
+          // yielding then flashes the (suppressed, stale) emulated buffer
+          // for nothing.
+          g_movie_quad_last_ns.store(movie_now_ns, std::memory_order_relaxed);
+        }
         if (video_quad && yuv == nullptr) {
           static std::atomic<uint32_t> s_vskip{0};
           const uint32_t n = s_vskip.fetch_add(1, std::memory_order_relaxed);
@@ -18544,6 +19010,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
+  // Settings-menu backdrop blur over everything drawn this frame (scene +
+  // HUD/2D + FMV). Shared with the emulated-output post-processor path.
+  // Host state read directly at RENDER time - routing it through the
+  // published FrameScene made the blur depend on fresh guest publishes,
+  // which the startup flow doesn't reliably produce (stale scenes rendered
+  // with a frozen sigma of 0).
+  const float menu_blur_target = g_settings_menu_blur.load(std::memory_order_relaxed)
+                                     ? float(REXCVAR_GET(skate3_menu_blur_sigma))
+                                     : 0.0f;
+  ApplyMenuBlurPass(context, cmd, menu_blur_target,
+                    /*output_in_guest_output_state=*/false);
+
   cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
                nrhi::ResourceState::kGuestOutput);
   cmd->FlushBarriers();
@@ -18567,6 +19045,10 @@ void Install() {
   // emulated output while disabled, and the runtime toggle (F5) can flip the
   // cvar live at any point after boot.
   rex::graphics::SetNativeGuestOutputRenderer(&RenderScene, nullptr);
+  // Settings-menu backdrop blur over frames the EMULATED path produced
+  // (boot/startup before the native scene takes over, manual emulated
+  // mode); native-rendered frames blur inline in RenderScene.
+  rex::graphics::SetNativeGuestOutputPostProcessor(&PostProcessGuestOutput, nullptr);
   REXLOG_INFO("native-scene: guest output renderer registered (scene {})",
               SceneEnabled() ? "on" : "off");
 }

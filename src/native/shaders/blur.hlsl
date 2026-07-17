@@ -63,3 +63,24 @@ float4 ps_down(VSOut i) : SV_Target {
 float4 ps_blit(VSOut i) : SV_Target {
   return float4(src.SampleLevel(smp_clamp, i.uv, 0).rgb, 1.0);
 }
+// Host settings-menu backdrop: clean separable GAUSSIAN, deliberately NOT the
+// game's popup chain above (that one reproduces the console's 1152x640
+// lattice on purpose). Runs on a
+// half-res intermediate; weights are computed and normalised in-shader so the
+// sigma is a free runtime constant.
+//   dir.xy = blur axis in UV units (one texel along the axis)
+//   dir.z  = sigma in (half-res) pixels
+//   dir.w  = tap radius, ceil(3*sigma), capped by the caller
+float4 ps_menu_gauss(VSOut i) : SV_Target {
+  const float sigma = max(dir.z, 0.001);
+  const int radius = int(dir.w);
+  float3 acc = src.SampleLevel(smp_clamp, i.uv, 0).rgb;
+  float wsum = 1.0;
+  for (int k = 1; k <= radius; ++k) {
+    float w = exp(-0.5 * float(k) * float(k) / (sigma * sigma));
+    acc += src.SampleLevel(smp_clamp, i.uv + dir.xy * k, 0).rgb * w;
+    acc += src.SampleLevel(smp_clamp, i.uv - dir.xy * k, 0).rgb * w;
+    wsum += 2.0 * w;
+  }
+  return float4(acc / wsum, 1.0);
+}

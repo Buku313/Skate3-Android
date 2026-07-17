@@ -808,6 +808,7 @@ void Skate3BaseApp::OnShutdown() {
   rex::ui::UnregisterBind("bind_skate3_log_user_marker");
   rex::ui::UnregisterBind("bind_skate3_native_debug");
   ApplyGameplayCursorMode();
+  skate3::native_scene::SetSettingsMenuBlur(false);
   simple_settings_dialog_.reset();
   ultrawide_targets_dialog_.reset();
   native_debug_dialog_.reset();
@@ -820,6 +821,7 @@ void Skate3BaseApp::ToggleSimpleSettings() {
       simple_settings_dialog_->Hide();
     } else {
       ApplySettingsCursorMode();
+      skate3::native_scene::SetSettingsMenuBlur(true);
       simple_settings_dialog_->Show();
     }
     return;
@@ -860,7 +862,12 @@ void Skate3BaseApp::ToggleSimpleSettings() {
     ApplyDemoPathProfileOverride();
     ApplySelectedProfileToRuntime();
   };
-  auto close_settings = [this]() { ApplyGameplayCursorMode(); };
+  // Fires on every Hide (B/Esc, Close Settings, Close Game), the one spot
+  // that reliably sees the menu close regardless of who initiated it.
+  auto close_settings = [this]() {
+    skate3::native_scene::SetSettingsMenuBlur(false);
+    ApplyGameplayCursorMode();
+  };
   auto close_game = [this]() {
 #if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
     std::thread([]() {
@@ -904,6 +911,7 @@ void Skate3BaseApp::ToggleSimpleSettings() {
           std::move(close_settings), std::move(close_game), std::move(restart_game),
           std::move(poll_gamepad));
   ApplySettingsCursorMode();
+  skate3::native_scene::SetSettingsMenuBlur(true);
   simple_settings_dialog_->Show();
 }
 
