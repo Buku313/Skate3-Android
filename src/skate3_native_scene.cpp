@@ -95,6 +95,13 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_v2, true, "Skate 3",
                     "terms; v1 folded them to the flat-map constants). Off = the v1 "
                     "flat response, for A/B comparison.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynobj_v2, true, "Skate 3",
+                    "Dynamicobject shading v2: per-pixel normal/detail/spec maps on the "
+                    "exact dynamicobject families (mapped world normal, the game's "
+                    "GetTangentLight kd and both phong spec variants; v1 folded them "
+                    "to the flat-map constants). Off = the v1 flat response, for A/B "
+                    "comparison.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao, true, "Skate 3",
                     "Screen-space ambient occlusion (GTAO) in the native renderer: soft "
                     "contact shading where surfaces meet (under ledges, rails, vehicles, "
@@ -1083,6 +1090,10 @@ bool g_proxy_frame_done = false;
 float g_dynobj_rows[10] = {};
 bool g_dynobj_have = false;
 bool g_dynobj_frame_done = false;
+// dynamicobject static world-shadow transform rows (PS c5/c6/c7), captured
+// alongside g_dynobj_rows, see FrameScene::dynobj_ws.
+float g_dynobj_ws[12] = {};
+bool g_dynobj_ws_have = false;
 // Dynamic entities (characters, movable props) live entirely in transient
 // per-frame arenas: the context, its record, mesh pointers, transforms and
 // bone palettes are all recycled before frame end. The complete DrawItem is
@@ -4378,28 +4389,66 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
         return false;
       }
     } else {
+      // Dropped-garment gate: a garment the game removed (numCloth back to
+      // 0, VB objects freed) must never publish rigid; whatever this bank
+      // holds is foreign (the game draws the ctx skinned now), and a rigid
+      // publish would pair a live world with our retained stale drape.
+      if (skate3::native_entity::RopaGarmentDropped(base, item.ctx,
+                                                    item.vb_obj)) {
+        g_ropa_stale.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
       // The garment's rigid world is the accepted draw-time bank matrix
       // (c188/c191): the game stages it tick-exact with the deformed VB
       // content and with the body palettes packed at EndJobs. (A guest-side
       // entity L2W read at StartJobs predates the tick's locomotion update;
       // serving that as the draw world rendered the whole shirt one guest
       // tick behind the body, a constant velocity-proportional drape lag.)
-      const uint32_t m = main_pass ? 191u : 188u;
+      uint32_t m = main_pass ? 191u : 188u;
       float rows[12];
-      bool plausible = true;
-      for (int r = 0; r < 3 && plausible; ++r) {
-        float n = 0.0f;
-        for (int i = 0; i < 4; ++i) {
-          const float f = LoadGuestF32(base, bank + ((m + r) * 4 + i) * 4);
-          if (!(f > -1e7f && f < 1e7f)) {
-            plausible = false;
-            break;
+      const auto read_rows = [&](uint32_t reg) -> bool {
+        bool ok = true;
+        for (int r = 0; r < 3 && ok; ++r) {
+          float n = 0.0f;
+          for (int i = 0; i < 4; ++i) {
+            const float f = LoadGuestF32(base, bank + ((reg + r) * 4 + i) * 4);
+            if (!(f > -1e7f && f < 1e7f)) {
+              ok = false;
+              break;
+            }
+            rows[r * 4 + i] = f;
+            if (i < 3) n += f * f;
           }
-          rows[r * 4 + i] = f;
-          if (i < 3) n += f * f;
+          ok = ok && n > 0.0025f && n < 400.0f && rows[r * 4 + 3] > -20000.f &&
+               rows[r * 4 + 3] < 20000.f;
         }
-        plausible = plausible && n > 0.0025f && n < 400.0f &&
-                    rows[r * 4 + 3] > -20000.f && rows[r * 4 + 3] < 20000.f;
+        return ok;
+      };
+      const auto tail_row_at = [&](uint32_t reg) -> bool {
+        const float x = LoadGuestF32(base, bank + (reg * 4 + 0) * 4);
+        const float y = LoadGuestF32(base, bank + (reg * 4 + 1) * 4);
+        const float z = LoadGuestF32(base, bank + (reg * 4 + 2) * 4);
+        const float w = LoadGuestF32(base, bank + (reg * 4 + 3) * 4);
+        return std::fabs(x) <= 1e-4f && std::fabs(y) <= 1e-4f &&
+               std::fabs(z) <= 1e-4f && std::fabs(w - 1.0f) <= 1e-4f;
+      };
+      // The passes stage the matrix as a 4-row block each: main at
+      // c191..c194, shadow at c188..c191 (3 affine rows + a (0,0,0,1)
+      // homogeneous tail). The tail at m+3 is REQUIRED: it is the
+      // structural proof a matrix block lives at m. Without it the read is
+      // mid-palette; an 84-bone body bank's palette (c5/c8 onward) covers
+      // c188..c194 with bone matrices, and a bone matrix (world *
+      // inverse-bind) is a plausible, high-scoring affine that renders the
+      // garment rotated by the bind rotation and offset meters from the
+      // body while tracking the skater.
+      bool plausible = read_rows(m) && tail_row_at(m + 3);
+      // The shadow block's tail lands exactly on c191 = the main block's
+      // first row. A main-pass read that finds that tail at c191 is seeing
+      // the post-shadow bank state, where c188..c190 still hold the same
+      // tick's matrix: consume that copy instead of refusing the capture.
+      if (!plausible && main_pass && tail_row_at(191u) && read_rows(188u)) {
+        m = 188u;
+        plausible = true;
       }
       bool front_all = false;
       const int rigid_score =
@@ -5097,6 +5146,26 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
             g_dynobj_rows[7] = LoadGuestF32(base, ps_bank + (15 * 4 + 3) * 4);
             g_dynobj_rows[8] = mult;
             g_dynobj_rows[9] = LoadGuestF32(base, ps_bank + (8 * 4 + 3) * 4);
+            // Static world-shadow transform (c5 = u row, c6 = v row,
+            // c7 = ray depth row): consumed by the native world-shadow
+            // re-render + the PS world term. Region-stable rows; a change
+            // re-primes the native map (see RenderShadowAtlas).
+            float ws[12];
+            bool ws_ok = true;
+            float uvmag = 0.0f;
+            for (int k = 0; k < 12; ++k) {
+              ws[k] = LoadGuestF32(base, ps_bank + ((5 + k / 4) * 4 + k % 4) * 4);
+              if (!(ws[k] == ws[k]) || std::fabs(ws[k]) > 1e6f) {
+                ws_ok = false;
+              }
+              if (k < 8 && (k % 4) < 3) {
+                uvmag += std::fabs(ws[k]);
+              }
+            }
+            if (ws_ok && uvmag > 1e-6f) {
+              std::memcpy(g_dynobj_ws, ws, sizeof(ws));
+              g_dynobj_ws_have = true;
+            }
             if (!g_dynobj_have) {
               REXLOG_INFO(
                   "native-scene: dynamicobject rows captured sun=({:.3f},{:.3f},"
@@ -9304,6 +9373,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (g_dynobj_have) {
     std::memcpy(scene.dynobj_rows, g_dynobj_rows, sizeof(g_dynobj_rows));
     scene.dynobj_valid = true;
+    if (g_dynobj_ws_have) {
+      std::memcpy(scene.dynobj_ws, g_dynobj_ws, sizeof(g_dynobj_ws));
+      scene.dynobj_ws_valid = true;
+    }
   }
   if (g_sky_have) {
     scene.sky_height = g_sky_height;
@@ -10324,10 +10397,26 @@ struct RendererState {
   uint32_t shadow_dump_enqueued = 0;
   uint32_t shadow_dump_written = 0;
   bool shadow_dump_done = false;
-  // Per-frame shadow constant buffer ring (CBV b1).
+  // Per-frame shadow constant buffer ring (CBV b1). 512-byte slices: the
+  // first 256 bytes are the original 16-row block, rows 16-18 carry the
+  // dynamicobject world-shadow transform (dyn_ws* in the scene shader).
   static constexpr uint32_t kShadowCbRegions = 8;
+  static constexpr uint32_t kShadowCbSlice = 512;
   nrhi::Buffer* shadow_cb = nullptr;
   uint8_t* shadow_cb_cpu = nullptr;
+  // dynamicobject static world-shadow map (512x512, same convention as the
+  // game's own: x = light-space depth, sge(x >= ray) = lit): re-rendered
+  // natively from the frame's STATIC world items with the captured c5/c6/c7
+  // transform. MIN blend accumulates across frames WITHOUT clearing; the
+  // per-frame item list is view-culled, and dropping off-screen casters
+  // would flicker props' shade with the camera. Cleared (re-primed) only
+  // when the captured transform changes (streaming region switch).
+  nrhi::Texture* world_shadow = nullptr;
+  nrhi::TextureView* world_shadow_srv = nullptr;
+  bool world_shadow_in_srv = false;
+  bool world_shadow_primed = false;
+  float world_shadow_rows[12] = {};
+  static constexpr uint32_t kWorldShadowSize = 512;
   static constexpr uint32_t kUiRegionSize = 1u << 20;
   static constexpr uint32_t kUiRegions = 8;
   nrhi::Buffer* ui_ring = nullptr;
@@ -10818,6 +10907,11 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
       out[1] = float(iy) / 1023.0f;
       out[2] = float(iz) / 511.0f;
     };
+    // Stored-tangent-frame pack (world-shading / dynobj v2): snorm
+    // component to the unorm byte of the blend-weight word.
+    const auto pk = [](float f) {
+      return uint32_t(std::lround((f * 0.5f + 0.5f) * 255.0f)) & 0xFFu;
+    };
     float n3[3] = {0.0f, 0.0f, 0.0f};
     if (item.env_family != 0 &&
         (item.env_family <= 6 || item.env_family == 13) &&
@@ -10848,9 +10942,6 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
       if (!item.skinned && item.normal_fmt == 16) {
         float b3[3];
         unpack_10_11_11(item.normal_offset, b3);
-        const auto pk = [](float f) {
-          return uint32_t(std::lround((f * 0.5f + 0.5f) * 255.0f)) & 0xFFu;
-        };
         // w byte is a three-state presence sentinel: 0 = no stored frame
         // (meshes that skip this pack leave the word zero), 100 = negative
         // handedness, 200 = positive.
@@ -10866,6 +10957,24 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
       // interior verts where t is parallel to b and the cross vanishes,
       // measured in capture, so the stored normal is used.)
       unpack_10_11_11(item.normal_offset, n3);
+      // Dynamicobject v2: rigid props store a full usage-6/7 tangent +
+      // binormal pair alongside the usage-3 normal. Pack the binormal plus
+      // the handedness relating cross(B, N) to the stored tangent into the
+      // unused blend-weight bytes (same sentinel encoding as the env
+      // families above); the authored frame carries the per-UV-island
+      // mirror decisions the screen-space fallback cannot know.
+      if (!item.skinned && item.dynobj != 0 && item.tb_fmt == 16) {
+        float t3[3], b3[3];
+        unpack_10_11_11(item.tangent_offset, t3);
+        unpack_10_11_11(item.binormal_offset, b3);
+        const float h = (b3[1] * n3[2] - b3[2] * n3[1]) * t3[0] +
+                        (b3[2] * n3[0] - b3[0] * n3[2]) * t3[1] +
+                        (b3[0] * n3[1] - b3[1] * n3[0]) * t3[2];
+        const uint32_t packed = pk(b3[0]) | (pk(b3[1]) << 8) |
+                                (pk(b3[2]) << 16) |
+                                ((h >= 0.0f ? 200u : 100u) << 24);
+        std::memcpy(&dst[v * 14 + 7], &packed, 4);
+      }
     } else if (item.tb_fmt == 16) {
       // NPC character meshes carry no normal element; the game's VS
       // derives it as cross(tangent, binormal) (usage 6 x usage 7; verified
@@ -10878,10 +10987,30 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
       n3[0] = t3[1] * b3[2] - t3[2] * b3[1];
       n3[1] = t3[2] * b3[0] - t3[0] * b3[2];
       n3[2] = t3[0] * b3[1] - t3[1] * b3[0];
+      // Dynamicobject v2, tangent+binormal-only layout variant: the derived
+      // normal makes cross(B, N) == T x |B|^2 up to orthogonality error, so
+      // the handedness is positive by construction.
+      if (!item.skinned && item.dynobj != 0) {
+        const uint32_t packed = pk(b3[0]) | (pk(b3[1]) << 8) |
+                                (pk(b3[2]) << 16) | (200u << 24);
+        std::memcpy(&dst[v * 14 + 7], &packed, 4);
+      }
     }
     dst[v * 14 + 9] = n3[0];
     dst[v * 14 + 10] = n3[1];
     dst[v * 14 + 11] = n3[2];
+  }
+  // Dynobj v2 layout telemetry (first few meshes): which tangent-frame
+  // source the props carry decides between the packed authored frame and
+  // the shader's screen-space fallback.
+  if (item.dynobj != 0) {
+    static std::atomic<int> dynobj_layout_logged{0};
+    if (dynobj_layout_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+      REXLOG_INFO(
+          "native-scene: dynobj mesh {:08X} layout normal_fmt={} tb_fmt={} "
+          "skinned={}",
+          item.mesh, item.normal_fmt, item.tb_fmt, item.skinned);
+    }
   }
   // Stretch-veto probe (see g_skin_probe): cache ~32 decoded sample verts
   // so the guest thread can cheaply skin what the GPU will actually draw.
@@ -13330,10 +13459,37 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
                 g_r.shadow_tile, g_r.shadow_tile,
                 tile_cfg > 0 ? "" : ", auto");
   }
+  if (!g_r.world_shadow && g_r.shadow_raw != nullptr) {
+    // dynamicobject static world-shadow map (see RendererState). Fixed at
+    // the game's own 512x512: a coarse region-scale baked-shade map whose
+    // PCF footprint the props' shading was tuned against.
+    nrhi::TextureDesc desc;
+    desc.width = RendererState::kWorldShadowSize;
+    desc.height = RendererState::kWorldShadowSize;
+    desc.format = nrhi::Format::kR16G16_UNORM;
+    desc.usage = nrhi::kTextureUsageRenderTarget;
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
+    desc.clear_color[0] = 1.0f;  // depth: far = lit
+    desc.clear_color[1] = 1.0f;
+    g_r.world_shadow = device->CreateTexture(desc);
+    if (g_r.world_shadow != nullptr) {
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.world_shadow_srv = device->CreateTextureView(g_r.world_shadow, vd);
+    }
+    if (g_r.world_shadow_srv == nullptr) {
+      REXLOG_ERROR("native-scene: world-shadow map creation failed");
+      g_r.failed = true;
+      return false;
+    }
+    g_r.world_shadow_in_srv = false;
+    g_r.world_shadow_primed = false;
+  }
   if (!g_r.shadow_cb) {
     // Always created (even with shadows off): the scene PS declares b1 and
     // a root CBV must be bound; a zeroed block disables the shadow branch.
-    g_r.shadow_cb = CreateUploadBuffer(device, 256u * RendererState::kShadowCbRegions);
+    g_r.shadow_cb = CreateUploadBuffer(
+        device, size_t(RendererState::kShadowCbSlice) * RendererState::kShadowCbRegions);
     g_r.shadow_cb_cpu =
         g_r.shadow_cb ? static_cast<uint8_t*>(device->Map(g_r.shadow_cb))
                       : nullptr;
@@ -14339,12 +14495,14 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   if (REXCVAR_GET(skate3_native_render_scene_macro)) {
     warm_texture(item.macro_tex);
   }
-  if (item.water || item.char_family >= 6 ||
+  if (item.water || item.char_family >= 6 || item.dynobj != 0 ||
       (item.env_family >= 1 && item.env_family <= 6)) {
-    // v2: fams 1-4 sample their base normal map per-pixel too.
+    // v2: fams 1-4 and the dynobj families sample their base normal map
+    // per-pixel too.
     warm_texture(item.water_normal);
   }
-  if (item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) {
+  if ((item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) ||
+      item.dynobj != 0) {
     // v2 detail normal map (t8; fam 2 carries no base+detail pair).
     warm_texture(item.detail_tex);
   }
@@ -14355,9 +14513,10 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   if (item.char_family >= 4 && item.char_family <= 5) {
     warm_texture(item.hair_alpha_tex);
   }
-  if ((item.env_family != 0 && item.env_family != 10) || item.unlit) {
-    // unlit = sky: spec_tex is the 1D sun gradient. Decal fams (3/4) now
-    // consume their spec masks too (v2, t9).
+  if ((item.env_family != 0 && item.env_family != 10) || item.unlit ||
+      item.dynobj != 0) {
+    // unlit = sky: spec_tex is the 1D sun gradient. Decal fams (3/4) and
+    // the dynobj families consume their spec masks too (v2, t9).
     warm_texture(item.spec_tex);
   }
   // Environment cube (negative-cached like the draw path).
@@ -14570,12 +14729,14 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   if (REXCVAR_GET(skate3_native_render_scene_macro)) {
     stage_texture(item.macro_tex);
   }
-  if (item.water || item.char_family >= 6 ||
+  if (item.water || item.char_family >= 6 || item.dynobj != 0 ||
       (item.env_family >= 1 && item.env_family <= 6)) {
-    // v2: fams 1-4 sample their base normal map per-pixel too.
+    // v2: fams 1-4 and the dynobj families sample their base normal map
+    // per-pixel too.
     stage_texture(item.water_normal);
   }
-  if (item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) {
+  if ((item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) ||
+      item.dynobj != 0) {
     // v2 detail normal map (t8; fam 2 carries no base+detail pair).
     stage_texture(item.detail_tex);
   }
@@ -14585,9 +14746,10 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   if (item.char_family >= 4 && item.char_family <= 5) {
     stage_texture(item.hair_alpha_tex);
   }
-  if ((item.env_family != 0 && item.env_family != 10) || item.unlit) {
-    // unlit = sky: spec_tex is the 1D sun gradient. Decal fams (3/4) now
-    // consume their spec masks too (v2, t9).
+  if ((item.env_family != 0 && item.env_family != 10) || item.unlit ||
+      item.dynobj != 0) {
+    // unlit = sky: spec_tex is the 1D sun gradient. Decal fams (3/4) and
+    // the dynobj families consume their spec masks too (v2, t9).
     stage_texture(item.spec_tex);
   }
 
@@ -16253,6 +16415,122 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       }
     }
   }
+  // ---- dynamicobject static world-shadow map ----
+  // The game's props sample a 512x512 baked-shade depth map (tf1) the guest
+  // never renders in native mode (its memory stays zeroed). Re-render it
+  // natively from the frame's STATIC world items with the captured c5/c6/c7
+  // projection, ps_shadow_caster convention (x = light-space depth, MIN
+  // blend). The map ACCUMULATES across frames without clearing: the item
+  // list is view-culled, and dropping off-screen casters would flicker
+  // props' shade with the camera; static geometry seen once stays in the
+  // map until the transform changes (streaming region switch), which
+  // re-primes it.
+  if (g_r.world_shadow != nullptr && g_r.pso_shadow_caster != nullptr &&
+      debug_mode == 0 && scene.dynobj_ws_valid &&
+      REXCVAR_GET(skate3_native_render_scene_shadows) &&
+      REXCVAR_GET(skate3_native_render_scene_dynobj_v2)) {
+    bool changed = !g_r.world_shadow_primed;
+    for (int k = 0; k < 12 && !changed; ++k) {
+      changed = std::fabs(scene.dynobj_ws[k] - g_r.world_shadow_rows[k]) >
+                1e-4f * std::max(1.0f, std::fabs(g_r.world_shadow_rows[k]));
+    }
+    static uint64_t ws_pass_counter = 0;
+    ++ws_pass_counter;
+    // Accumulation cadence: a full static-item pass every 4th frame keeps
+    // newly streamed / newly visible geometry flowing into the map at
+    // negligible steady-state cost; a transform change renders immediately.
+    if (changed || (ws_pass_counter & 3u) == 0) {
+      if (g_r.world_shadow_in_srv) {
+        cmd->Barrier(g_r.world_shadow, nrhi::ResourceState::kPixelShaderResource,
+                     nrhi::ResourceState::kRenderTarget);
+        cmd->FlushBarriers();
+        g_r.world_shadow_in_srv = false;
+      }
+      if (changed) {
+        const float ws_clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+        cmd->ClearRenderTarget(g_r.world_shadow, ws_clear);
+        std::memcpy(g_r.world_shadow_rows, scene.dynobj_ws,
+                    sizeof(g_r.world_shadow_rows));
+        if (!g_r.world_shadow_primed) {
+          REXLOG_INFO(
+              "native-scene: world-shadow map primed (dynobj c5/c6/c7 rows)");
+        }
+        g_r.world_shadow_primed = true;
+      }
+      // View-proj columns = the game's own projection rows: clip.x/y/z =
+      // dot(wp4, c5/c6/c7), clip.w = 1 (same construction as the CSM
+      // lightvp above).
+      float wsvp[16];
+      for (int r = 0; r < 3; ++r) {
+        wsvp[r * 4 + 0] = scene.dynobj_ws[r];
+        wsvp[r * 4 + 1] = scene.dynobj_ws[4 + r];
+        wsvp[r * 4 + 2] = scene.dynobj_ws[8 + r];
+        wsvp[r * 4 + 3] = 0.0f;
+      }
+      wsvp[12] = scene.dynobj_ws[3];
+      wsvp[13] = scene.dynobj_ws[7];
+      wsvp[14] = scene.dynobj_ws[11];
+      wsvp[15] = 1.0f;
+      cmd->SetRenderTargets(g_r.world_shadow, nullptr);
+      cmd->SetBindingLayout(g_r.layout);
+      cmd->SetPipeline(g_r.pso_shadow_caster);
+      cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+      const float ws_size = float(RendererState::kWorldShadowSize);
+      cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f, ws_size, ws_size, 0.0f, 1.0f});
+      cmd->SetScissor(nrhi::Rect{0, 0, int32_t(RendererState::kWorldShadowSize),
+                                 int32_t(RendererState::kWorldShadowSize)});
+      for (const DrawItem& item : scene.items) {
+        // STATIC world geometry only: the game's map bakes buildings/trees/
+        // ground. Dynamic content (characters, vehicles, cloth, movable
+        // props) casts through the CSM instead, accumulating a movable
+        // prop here would freeze its shade at a stale position.
+        if (item.transparent || item.unlit || item.cloth_quads || item.water ||
+            item.skinned || item.ropa || item.char_family != 0 ||
+            item.dynobj != 0) {
+          continue;
+        }
+        auto mit = g_r.meshes.find(item.mesh);
+        if (mit == g_r.meshes.end()) {
+          continue;
+        }
+        float constants[52] = {};
+        std::memcpy(constants, item.world, sizeof(item.world));
+        float* mvp = constants + 16;
+        for (int r = 0; r < 4; ++r) {
+          for (int col = 0; col < 4; ++col) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+              sum += item.world[r * 4 + k] * wsvp[k * 4 + col];
+            }
+            mvp[r * 4 + col] = sum;
+          }
+        }
+        cmd->SetRootConstants(0, 52, constants, 0);
+        cmd->SetBufferSrv(3, g_r.bone_ring, bone_region);
+        cmd->SetVertexBuffer(mit->second.vb_view.buffer,
+                             mit->second.vb_view.offset,
+                             mit->second.vb_view.size_bytes,
+                             mit->second.vb_view.stride);
+        cmd->SetIndexBuffer(mit->second.ib_view.buffer,
+                            mit->second.ib_view.offset,
+                            mit->second.ib_view.size_bytes);
+        for (const DrawEntry& draw : item.draws) {
+          if (draw.prim == 4) {
+            cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+          } else if (draw.prim == 6) {
+            cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
+          } else {
+            continue;
+          }
+          cmd->DrawIndexed(draw.index_count, draw.start_index, draw.base_vertex);
+        }
+      }
+      cmd->Barrier(g_r.world_shadow, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kPixelShaderResource);
+      cmd->FlushBarriers();
+      g_r.world_shadow_in_srv = true;
+    }
+  }
   *out_draws = shadow_draws;
   return shadow_ready;
 }
@@ -16848,9 +17126,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // shader is also gated by sh_misc.y).
   if (g_r.shadow_cb != nullptr) {
     const uint32_t cb_offset =
-        uint32_t(frame_number % RendererState::kShadowCbRegions) * 256u;
+        uint32_t(frame_number % RendererState::kShadowCbRegions) *
+        RendererState::kShadowCbSlice;
     float* cb = reinterpret_cast<float*>(g_r.shadow_cb_cpu + cb_offset);
-    std::memset(cb, 0, 256);
+    std::memset(cb, 0, RendererState::kShadowCbSlice);
     if (shadow_ready) {
       std::memcpy(cb + 0, sh + 0, 4 * sizeof(float));    // sh_x   = PS c0
       std::memcpy(cb + 4, sh + 12, 4 * sizeof(float));   // sh_y   = PS c3
@@ -16912,6 +17191,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[51] = scene.dynobj_rows[7];  // bounce scale (c15.w)
       cb[52] = scene.dynobj_rows[8];  // material multiplier (c14.y)
       cb[53] = scene.dynobj_rows[9];  // static world-shadow floor (c8.w)
+      // Static world-shadow transform rows (dyn_wsx/dyn_wsy/dyn_wsz,
+      // cb[64..75]): consumed only when a draw carries the misc.z world-
+      // shadow bind flag (the map primed and bound at t4).
+      if (scene.dynobj_ws_valid) {
+        std::memcpy(cb + 64, scene.dynobj_ws, sizeof(scene.dynobj_ws));
+      }
     }
     cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
     // b2 (character lighting) default: point at the ring base so the root
@@ -17899,6 +18184,49 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
     }
+    // Dynamicobject v2: the same misc.z/w convention and t5/t8/t9 slots as
+    // fams 1-4; dynobj draws are never transparent/water and carry
+    // env_family 0, so both misc slots are free, and t4 stays on its white
+    // fallback (the spec-mask t4 bind is env-family-only), so the t5 pair
+    // costs nothing. The spec/ecc masks go to t9 rather than t4: it keeps
+    // t4's semantics untouched and matches the decal families' 2-channel
+    // mask convention. Gated exactly like the PS branch selection (dynobj
+    // frame rows captured) plus the dynobj_v2 cvar for A/B against the v1
+    // flat response.
+    if (item.dynobj != 0 && debug_mode == 0 && scene.dynobj_valid &&
+        REXCVAR_GET(skate3_native_render_scene_dynobj_v2)) {
+      if (item.water_normal != 0) {
+        const GuestTexture* nrm = resolve_texture(item.water_normal, 3);
+        if (nrm != &g_r.white && nrm->valid && nrm->srv_mips != 0) {
+          pair_normal = nrm;
+          normal_paired = true;
+          v2_flags |= 1;
+        }
+      }
+      if ((v2_flags & 1u) != 0 && item.detail_tex != 0 &&
+          item.detail_scale > 0.0f) {
+        const GuestTexture* det = resolve_texture(item.detail_tex, 7);
+        if (det != &g_r.white && det->valid && det->srv_mips != 0) {
+          v2_detail = det;
+          v2_flags |= 2;
+        }
+      }
+      if (item.spec_tex != 0) {
+        const GuestTexture* sp = resolve_texture(item.spec_tex, 6);
+        if (sp != &g_r.white && sp->valid && sp->srv_mips != 0) {
+          v2_spec2 = sp;
+          v2_flags |= 4;
+        }
+      }
+      // Static world-shadow map at t4 (flag 8): the native re-render of the
+      // game's baked-shade map (see RenderShadowAtlas). t4 is otherwise the
+      // white fallback on dynobj draws. Without it the PS world term is 1
+      // and props inside baked building shade light at full key.
+      if (g_r.world_shadow_srv != nullptr && g_r.world_shadow_in_srv &&
+          scene.dynobj_ws_valid) {
+        v2_flags |= 8;
+      }
+    }
     constants[44] = item.macro_scale;
     constants[45] = item.macro_opacity;
     constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
@@ -17945,7 +18273,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       std::memcpy(constants + 40, scene.fog_color, 4 * sizeof(float));
     } else if (v2_flags != 0) {
       // misc.z = the v2 material bind flags, misc.w = detailNormalUVScale
-      // (fams 1-4 opaque; see the v2 block above).
+      // (opaque fams 1-4 and the dynobj families; see the v2 blocks above).
       constants[50] = float(v2_flags);
       constants[51] = item.detail_scale;
     } else if ((item.env_family >= 5 && item.env_family <= 6) ||
@@ -18048,8 +18376,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cmd->SetTexture(1, diffuse->srv);
     cmd->SetTexture(2, (lightmap != nullptr ? lightmap : &g_r.white)->srv);
     cmd->SetTexture(4, macro_tex->srv);
-    if (normal_paired) {
-      cmd->SetTexturePair(5, decal_tex->srv, pair_normal->srv);
+    // t4 override: the dynobj world-shadow map rides the free first entry
+    // of the t4/t5 pair table (flag 8: dynobj draws never bind decal art
+    // or spec masks there).
+    nrhi::TextureView* t4_view =
+        (v2_flags & 8u) != 0 ? g_r.world_shadow_srv : decal_tex->srv;
+    if (normal_paired || t4_view != decal_tex->srv) {
+      cmd->SetTexturePair(5, t4_view,
+                          normal_paired ? pair_normal->srv : g_r.white.srv);
     } else {
       cmd->SetTexture(5, decal_tex->srv);
     }
@@ -18736,7 +19070,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cmd->SetBindingLayout(g_r.layout);
     if (g_r.shadow_cb != nullptr) {
       const uint32_t cb_offset =
-          uint32_t(frame_number % RendererState::kShadowCbRegions) * 256u;
+          uint32_t(frame_number % RendererState::kShadowCbRegions) *
+        RendererState::kShadowCbSlice;
       cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
       cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
     }
@@ -19129,7 +19464,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cmd->SetBindingLayout(g_r.layout);
       if (g_r.shadow_cb != nullptr) {
         const uint32_t cb_offset =
-            uint32_t(frame_number % RendererState::kShadowCbRegions) * 256u;
+            uint32_t(frame_number % RendererState::kShadowCbRegions) *
+        RendererState::kShadowCbSlice;
         cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
         cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
       }

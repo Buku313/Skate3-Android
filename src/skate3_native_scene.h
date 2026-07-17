@@ -303,6 +303,17 @@ struct FrameScene {
   // Consumed by the exact dynamicobject scene PS branch.
   bool dynobj_valid = false;
   float dynobj_rows[10] = {};
+  // dynamicobject.fx static world-shadow transform (PS c5/c6/c7, captured
+  // with the rows above): world-space projection rows into the game's
+  // 512x512 baked-shade map (uv = dot(wp4, c5/c6) * (+-0.5) + 0.5, ray
+  // depth = dot(wp4, c7)). The guest never renders that map in native mode
+  // (its memory stays zeroed), so the native path re-renders it from the
+  // frame's STATIC world items with these rows (see RenderShadowAtlas) and
+  // props sample it exactly like the game's PS: shadow = min(csm * gate,
+  // max(world, c8.w)); without it props inside baked building shade lit
+  // at full key (the newspaper-machine mint brightening).
+  bool dynobj_ws_valid = false;
+  float dynobj_ws[12] = {};
   // Character-receiver per-cascade CSM receive biases, captured from a
   // validated fam-2 character PIXEL bank (gameplay c8 / editor c9: one row
   // below the light row; frame-global, e.g. (0.005, 0.014, 0.020)). The

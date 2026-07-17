@@ -62,6 +62,14 @@ cbuffer S : register(b1) {
   // cross(binormal, normal) x handedness to the game's tangent; +-1,
   // cvar-tunable against the emulated reference), yzw spare.
   float4 sh_v2;
+  // dynamicobject static world-shadow transform (the game's PS c5/c6/c7):
+  // u = dot(wp4, dyn_wsx) * 0.5 + 0.5, v = dot(wp4, dyn_wsy) * -0.5 + 0.5,
+  // ray depth = dot(wp4, dyn_wsz). Compared against the natively
+  // re-rendered 512x512 baked-shade map at t4 (misc.z flag 8; see the
+  // dynobj branch).
+  float4 dyn_wsx;
+  float4 dyn_wsy;
+  float4 dyn_wsz;
 };
 // Character-family lighting (defaultcharacter.fx and friends): canonical
 // per-draw rows captured from the guest PIXEL constant bank at palette
@@ -88,10 +96,10 @@ Texture2D<float4> decal_art : register(t4);
 Texture2D<float4> normal_map : register(t5);
 Texture2D<float2> shadow_atlas : register(t7);
 TextureCube<float4> env_cube : register(t6);
-// World-shading v2 material maps (the t8/t9 pair table): the environment
-// families' detail normal map (t8, sampled at uv * misc.w) and the decal
-// families' spec/ecc masks (t9). Sampled only when the misc.z bind flags
-// say so (fams 1-4; see the env branch).
+// World-shading v2 material maps (the t8/t9 pair table): the detail normal
+// map (t8, sampled at uv * misc.w) and the spec/ecc masks (t9). Sampled
+// only when the misc.z bind flags say so (env fams 1-4 and the
+// dynamicobject families; see those branches).
 Texture2D<float4> detail_map : register(t8);
 Texture2D<float4> spec2_map : register(t9);
 // Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
@@ -231,6 +239,37 @@ float SampleCsmShadow(float3 wp, float extra_bias) {
   float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
   return saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
 }
+// Screen-space UV-gradient tangent frame (cotangent reconstruction from the
+// position/uv derivatives; signs/lengths calibrated against the meshes' REAL
+// stored TBN; see the env-family branch notes). The RAW screen frame is
+// exact for the GetTangentLight kd SIGN terms under ANY UV orientation:
+// bowl/ramp walls map their texture rotated relative to world-up, and
+// mirrored islands flip dP/dU exactly like the stored tangent does.
+void ScreenTangentFrame(float3 wn, float3 rpos, float2 uv,
+                        out float3 tt, out float3 bb) {
+  float3 dp1 = ddx(rpos), dp2 = ddy(rpos);
+  float2 du1 = ddx(uv), du2 = ddy(uv);
+  float3 dp2p = cross(dp2, wn), dp1p = cross(wn, dp1);
+  tt = dp2p * du1.x + dp1p * du2.x;
+  bb = dp2p * du1.y + dp1p * du2.y;
+  tt *= -rsqrt(max(dot(tt, tt), 1e-12));
+  bb *= rsqrt(max(dot(bb, bb), 1e-12));
+}
+// kd/normal-mapping axes: prefer the mesh's STORED frame (binormal +
+// handedness in tanb, T = cross(B, N) x handedness x calibration polarity)
+// - authoring decides per UV island whether the frame follows a mirror,
+// which no derivative frame can know (per-island brightness steps on the
+// wooden ramp panels / faint bowl striping). The screen frame is the
+// fallback for meshes without one.
+void KdAxes(float4 tanb, float3 wn, float3 tt_s, float3 bb_s,
+            out float3 kt, out float3 kb) {
+  kt = tt_s;
+  kb = bb_s;
+  if (tanb.w > 0.1) {
+    kb = normalize(tanb.xyz);
+    kt = cross(kb, wn) * ((tanb.w > 0.6 ? 1.0 : -1.0) * sh_v2.x);
+  }
+}
 float4 ps_main(VSOut i) : SV_Target {
   if (tint.a > 0.0) {
     return tint;
@@ -284,13 +323,17 @@ float4 ps_main(VSOut i) : SV_Target {
   }
   // dynamicobject.fx props (cam_pos.w = -(20 + variant): -21 default,
   // -22 alphatest). Rigid movable objects (dispensers, dumpsters, benches,
-  // cans). Lit with the game's own dynamicobject model (verified exact):
-  // key sun light + bounce + flat ambient, gated by
-  // the CSM shadow (the static world-shadow map is approximated as fully lit
-  // - its floor c8.w bounds it), then fog -> exposure -> tonemap -> sqrt and
-  // the postfx uber 1.41. v1 uses the geometric normal (cross of the mesh
-  // tangent/binormal) with the flat normal-map kd 0.93429; the base/detail/
-  // spec normal maps are v2.
+  // cans). Lit with the game's own dynamicobject model (verified exact
+  // against an offline ucode evaluation): key sun light + bounce +
+  // flat ambient, gated by min(CSM, max(static world shade, c8.w floor)),
+  // then fog -> exposure -> tonemap -> sqrt and the postfx uber 1.41.
+  // v2: misc.z
+  // carries the material bind flags (1 = base normal at t5, 2 = detail at
+  // t8 sampled at uv * misc.w, 4 = spec/ecc masks at t9: the env fams 1-4
+  // encoding); the mapped world normal drives key/bounce, the real
+  // GetTangentLight kd replaces the flat fold, and the phong spec returns.
+  // With no maps bound the flat-map fold 0.39 * 2.39562 = 0.93429 and the
+  // vertex normal apply (the v1 look).
   if (cam_pos.w < -20.5) {
     if (cam_pos.w < -21.5) {
       clip(albedo.a - 0.1176);  // dynamicobject.alphatest: ALPHAREF 30
@@ -299,19 +342,107 @@ float4 ps_main(VSOut i) : SV_Target {
     float3 n = dot(i.nrm, i.nrm) > 0.01
                    ? normalize(i.nrm)
                    : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
-    float ndl = dot(n, dyn_sun.xyz);
+    uint v2f = (uint)(misc.z + 0.5);
+    // Tangent axes for the kd sign dots / normal mapping / tangent-space
+    // spec mirror: the stored per-vertex frame when the mesh carries one
+    // (packed by DecodeMesh from the usage-6/7 tangent+binormal pair),
+    // screen-space UV-gradient frame otherwise.
+    float3 kt = float3(1.0, 0.0, 0.0), kb = float3(0.0, 1.0, 0.0);
+    if (v2f != 0u) {
+      float3 tt_s, bb_s;
+      ScreenTangentFrame(n, i.rpos, i.uv, tt_s, bb_s);
+      KdAxes(i.tanb, n, tt_s, bb_s, kt, kb);
+    }
+    // GetTangentLight's fixed SIGNED tangent-space light: the signs come
+    // from the frame axes dotted with the dynobj bank's own sun (c9:
+    // dyn_sun, not the world families' sh_sun).
+    float3 Lt = float3(0.58 * sign(dot(kt, dyn_sun.xyz)),
+                       0.62 * sign(dot(kb, dyn_sun.xyz)), 0.39);
+    // vnd = (2*base.xy + 2*detail.xy - 2, 2*base.z - 1), NORMALIZED for
+    // both the kd dot and the TBN mapping (both dynobj variants).
+    float3 vndn = float3(0.0, 0.0, 1.0);
+    float3 wn = n;
+    float kd = 0.93429;
+    if ((v2f & 1u) != 0u) {
+      float3 nmv = normal_map.Sample(smp, i.uv).rgb;
+      float2 dxy = (v2f & 2u) != 0u
+                       ? detail_map.Sample(smp, i.uv * misc.w).rg
+                       : float2(0.5, 0.5);
+      vndn = normalize(
+          float3(nmv.xy * 2.0 + dxy * 2.0 - 2.0, nmv.z * 2.0 - 1.0));
+      wn = normalize(vndn.x * kt + vndn.y * kb + vndn.z * n);
+      kd = dot(vndn, Lt) * 2.39562;
+    }
+    float ndl = dot(wn, dyn_sun.xyz);
     float key = saturate(ndl);  // key light gated on N.L >= 0
-    float bounce = saturate(dot(n, float3(-dyn_sun.x, dyn_sun.y, -dyn_sun.z)));
-    // CSM shadow (shared receiver rows at t5); the static world-shadow map is
-    // not rendered natively, so its term is 1 and the min collapses to the
-    // CSM (bounded below by the c8.w floor, dyn_misc.y). extra_bias -1 =
-    // the game's own per-cascade dynamicobject receive bias (props are
-    // casters; without it their flat tops self-shadow and flicker).
+    float bounce = saturate(dot(wn, float3(-dyn_sun.x, dyn_sun.y, -dyn_sun.z)));
+    // CSM shadow (shared receiver rows at t7). extra_bias -1 = the game's
+    // own per-cascade dynamicobject receive bias (props are casters;
+    // without it their flat tops self-shadow and flicker).
     float s = SampleCsmShadow(i.rpos + cam_pos.xyz, -1.0);
-    float shadow = min(s * (ndl >= 0.0 ? 1.0 : 0.0), max(1.0, dyn_misc.y));
+    // Static world-shadow term: the game's baked building/tree shade,
+    // sampled from the natively re-rendered map at t4 (flag 8) with the
+    // PS's own 4-tap PCF (point taps at +-0.5 texels, manual bilinear:
+    // tap.x >= ray depth reads lit; uncovered texels hold the far clear).
+    // Without the map the term is 1 and the min collapses to the CSM:
+    // props standing in baked shade lit at full key (the newspaper-machine
+    // mint brightening).
+    float world = 1.0;
+    if ((v2f & 8u) != 0u) {
+      float4 wp4 = float4(i.rpos + cam_pos.xyz, 1.0);
+      float2 wuv = float2(dot(wp4, dyn_wsx) * 0.5 + 0.5,
+                          dot(wp4, dyn_wsy) * -0.5 + 0.5);
+      float rdw = dot(wp4, dyn_wsz);
+      float2 st = wuv * 512.0 - 0.5;
+      float2 fw = frac(st);
+      int2 b0 = int2(floor(st));
+      float4 t;
+      t.x = decal_art.Load(int3(clamp(b0, int2(0, 0), int2(511, 511)), 0)).x >=
+                    rdw
+                ? 1.0
+                : 0.0;
+      t.y = decal_art.Load(int3(clamp(b0 + int2(1, 0), int2(0, 0),
+                                      int2(511, 511)),
+                                0)).x >= rdw
+                ? 1.0
+                : 0.0;
+      t.z = decal_art.Load(int3(clamp(b0 + int2(0, 1), int2(0, 0),
+                                      int2(511, 511)),
+                                0)).x >= rdw
+                ? 1.0
+                : 0.0;
+      t.w = decal_art.Load(int3(clamp(b0 + int2(1, 1), int2(0, 0),
+                                      int2(511, 511)),
+                                0)).x >= rdw
+                ? 1.0
+                : 0.0;
+      world = lerp(lerp(t.x, t.y, fw.x), lerp(t.z, t.w, fw.x), fw.y);
+    }
+    float shadow = min(s * (ndl >= 0.0 ? 1.0 : 0.0), max(world, dyn_misc.y));
     float3 lighting = key * shadow + bounce * dyn_amb.w + dyn_amb.rgb;
-    // GetTangentLight with the neutral (flat) normal map: 0.39 * 2.39562.
-    float3 lin = lighting * 0.93429 * dlin;
+    float3 lin = lighting * kd * dlin;
+    // Phong spec vs the material's spec mask (t9.x) / eccentricity (t9.y),
+    // x shadow, tint (2.1, 1.8, 1.5). Two variants: the default PS
+    // reflects the fixed SIGNED tangent-space light about vnd with the eye
+    // transformed into tangent space (it shares the kd sign dots); the
+    // alphatest PS reflects the fixed WORLD light (-0.14, 0.5, 0.9) about
+    // wN exactly like baseenvironment.
+    if ((v2f & 4u) != 0u) {
+      float2 m2 = spec2_map.Sample(smp, i.uv).rg;
+      float3 E = -normalize(i.rpos);
+      float bp;
+      if (cam_pos.w < -21.5) {
+        float3 Ls = float3(-0.14, 0.5, 0.9);
+        float3 refl = Ls - 2.0 * wn * dot(wn, Ls);
+        bp = saturate(dot(E, -refl));
+      } else {
+        float3 Et = normalize(float3(dot(E, kt), dot(E, kb), dot(E, n)));
+        float3 refl = Lt - 2.0 * dot(vndn, Lt) * vndn;
+        bp = saturate(dot(Et, -refl));
+      }
+      float ks = bp > 0.0 ? pow(max(bp, 1e-6), 10.0 + 290.0 * m2.y) : 0.0;
+      lin += ks * float3(2.1, 1.8, 1.5) * (shadow * m2.x);
+    }
     // Fog -> exposure -> tonemap -> sqrt, then the 1.41 uber scene multiplier.
     float fdist = length(i.rpos);
     float f1 = saturate(fdist * sh_fogp.x + sh_fogp.y);
@@ -611,10 +742,9 @@ float4 ps_main(VSOut i) : SV_Target {
       }
       // Tangent frames shared by kd and the reflective normal mapping.
       // Two variants of the same construction:
-      //  - tt_s/bb_s = the RAW screen-space UV-gradient frame. Exact for
-      //    the kd SIGN terms under ANY UV orientation; bowl/ramp walls
-      //    map their texture rotated relative to world-up, and mirrored
-      //    islands flip dP/dU exactly like the stored tangent does.
+      //  - tt_s/bb_s = the RAW screen-space UV-gradient frame
+      //    (ScreenTangentFrame: exact for the kd sign terms under any UV
+      //    orientation).
       //  - tt/bb = analytic world-up axes carrying the screen frame's
       //    signs; degree-accurate where the mapping IS world-up aligned
       //    (building facades, calibrated for the glass reflections).
@@ -626,13 +756,7 @@ float4 ps_main(VSOut i) : SV_Target {
       float3 tt = float3(1.0, 0.0, 0.0), bb = float3(0.0, 1.0, 0.0);
       float3 tt_s = tt, bb_s = bb;
       if (have_vnd || (overlay.w > 3.5 && abs(misc.z - 3.0) > 0.5)) {
-        float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
-        float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
-        float3 dp2p = cross(dp2, wn), dp1p = cross(wn, dp1);
-        tt = dp2p * du1.x + dp1p * du2.x;
-        bb = dp2p * du1.y + dp1p * du2.y;
-        tt *= -rsqrt(max(dot(tt, tt), 1e-12));
-        bb *= rsqrt(max(dot(bb, bb), 1e-12));
+        ScreenTangentFrame(wn, i.rpos, i.uv, tt, bb);
         tt_s = tt;
         bb_s = bb;
         float3 bb2 = float3(0.0, 1.0, 0.0) - wn * wn.y;
@@ -644,18 +768,9 @@ float4 ps_main(VSOut i) : SV_Target {
           bb = bb2 * (dot(bb2, bb) >= 0.0 ? 1.0 : -1.0);
         }
       }
-      // kd axes: prefer the mesh's STORED frame (binormal + handedness in
-      // i.tanb, T = cross(B, N) x handedness x calibration polarity);
-      // authoring decides per UV island whether the frame follows a
-      // mirror, which no derivative frame can know (per-island brightness
-      // steps on the wooden ramp panels / faint bowl striping). Screen
-      // frame is the fallback for meshes without one.
-      float3 kt = tt_s, kb = bb_s;
-      if (i.tanb.w > 0.1) {
-        kb = normalize(i.tanb.xyz);
-        kt = cross(kb, wn) *
-             ((i.tanb.w > 0.6 ? 1.0 : -1.0) * sh_v2.x);
-      }
+      // kd axes: stored per-vertex frame with the screen fallback (KdAxes).
+      float3 kt, kb;
+      KdAxes(i.tanb, wn, tt_s, bb_s, kt, kb);
       if (have_vnd) {
         // The mapped world normal feeds the spec mirror below; matte spec
         // is broad-lobed, so exact axis precision matters less than the
