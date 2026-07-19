@@ -7359,14 +7359,14 @@ static void RebasisLightRow(float* row, const float axis[3],
 
 // Rebuild the frame's captured shadow transforms around the given unit
 // direction TOWARD the sun: the light basis rows via RebasisLightRow
-// (preserving each row's scale and its value at the camera, so cascade
-// centering and bias conventions carry over) plus a camera re-center of
-// the cascade sub-boxes (c1/c2 scale.xy + offset.zw); the game fits their
-// offsets for ITS axis each frame, and under a rotated basis the finest
-// cascade can drift off the player (the shadow then falls back to the
-// coarser tiles, visibly blocky). Caster pass and receivers share these
-// rows, so the re-fit stays self-consistent. Shared by the lighting-lab
-// sun override and the static-caster basis alignment below.
+// (preserving each row's scale, so cascade sizes and bias conventions
+// carry over) plus a re-center of the base cascade and the sub-boxes
+// (c1/c2 scale.xy + offset.zw) around the camera, biased along the shadow
+// direction; the game fits its offsets for ITS axis each frame, and
+// under a rotated basis the finest cascade drifts off the player and
+// their shadow (fallback to the coarser tiles reads visibly blocky).
+// Caster pass and receivers share these rows, so the re-fit stays
+// self-consistent. Sole caller: the lighting-lab sun override.
 static void RebasisShadowRows(FrameScene& scene, const float sun[3],
                               bool include_ws) {
   // Light basis: depth axis points away from the sun; X/Y span the shadow
@@ -7385,19 +7385,54 @@ static void RebasisShadowRows(FrameScene& scene, const float sun[3],
                        zl[2] * xl[0] - zl[0] * xl[2],
                        zl[0] * xl[1] - zl[1] * xl[0]};
   const float* cam = scene.cam_pos;
+  // Shadows extend along the sun's ground projection, so each cascade
+  // centers ~35% of its radius in that direction instead of symmetrically
+  // on the camera; a rotated low sun otherwise stretches character
+  // shadows out of the fine cascade into the 4x/16x coarser tiles within
+  // a few meters (the moved-sun blocky shadow). Near-vertical suns get no
+  // bias (shadows stay under their casters).
+  float sd[3] = {-sun[0], 0.0f, -sun[2]};
+  const float sdl = std::sqrt(sd[0] * sd[0] + sd[2] * sd[2]);
+  if (sdl > 0.1f) {
+    sd[0] /= sdl;
+    sd[2] /= sdl;
+  } else {
+    sd[0] = 0.0f;
+    sd[2] = 0.0f;
+  }
   if (scene.shadow_valid) {
     RebasisLightRow(scene.shadow_rows + 0, xl, cam);    // c0 light-space X
     RebasisLightRow(scene.shadow_rows + 12, yl, cam);   // c3 light-space Y
     RebasisLightRow(scene.shadow_rows + 16, zl, cam);   // c4 depth ramp
-    const float* rows = scene.shadow_rows;
-    const float lsx =
-        rows[0] * cam[0] + rows[1] * cam[1] + rows[2] * cam[2] + rows[3];
-    const float lsy =
-        rows[12] * cam[0] + rows[13] * cam[1] + rows[14] * cam[2] + rows[15];
-    scene.shadow_rows[6] = -lsx * scene.shadow_rows[4];   // c1 offset
-    scene.shadow_rows[7] = -lsy * scene.shadow_rows[5];
-    scene.shadow_rows[10] = -lsx * scene.shadow_rows[8];  // c2 offset
-    scene.shadow_rows[11] = -lsy * scene.shadow_rows[9];
+    float* rows = scene.shadow_rows;
+    const float xlen =
+        std::sqrt(rows[0] * rows[0] + rows[1] * rows[1] + rows[2] * rows[2]);
+    const float ylen = std::sqrt(rows[12] * rows[12] + rows[13] * rows[13] +
+                                 rows[14] * rows[14]);
+    // Base cascade: center on the camera pushed along the shadow
+    // direction by 35% of its own radius (the base tile's world radius is
+    // 1 / row scale).
+    const float rbase = 1.0f / std::max(std::max(xlen, ylen), 1e-8f);
+    const float pb[3] = {cam[0] + sd[0] * 0.35f * rbase, cam[1],
+                         cam[2] + sd[2] * 0.35f * rbase};
+    rows[3] = -(rows[0] * pb[0] + rows[1] * pb[1] + rows[2] * pb[2]);
+    rows[15] = -(rows[12] * pb[0] + rows[13] * pb[1] + rows[14] * pb[2]);
+    // Sub-boxes: same construction at their own (wider) radii.
+    for (int c = 0; c < 2; ++c) {
+      const float sx = rows[4 + c * 4];
+      const float sy = rows[5 + c * 4];
+      const float rc =
+          1.0f / std::max(std::max(xlen * std::fabs(sx), ylen * std::fabs(sy)),
+                          1e-8f);
+      const float pc[3] = {cam[0] + sd[0] * 0.35f * rc, cam[1],
+                           cam[2] + sd[2] * 0.35f * rc};
+      const float lsx =
+          rows[0] * pc[0] + rows[1] * pc[1] + rows[2] * pc[2] + rows[3];
+      const float lsy =
+          rows[12] * pc[0] + rows[13] * pc[1] + rows[14] * pc[2] + rows[15];
+      rows[6 + c * 4] = -lsx * sx;   // offset.x
+      rows[7 + c * 4] = -lsy * sy;   // offset.y
+    }
   }
   if (include_ws && scene.dynobj_ws_valid) {
     RebasisLightRow(scene.dynobj_ws + 0, xl, cam);
