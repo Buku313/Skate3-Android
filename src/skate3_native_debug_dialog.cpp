@@ -4,6 +4,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
+#include <rex/ui/presenter.h>
 
 #include "skate3_native_scene.h"
 
@@ -410,6 +411,15 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
 void RenderModeIndicator::OnDraw(ImGuiIO& io) {
   if (!REXCVAR_GET(skate3_native_render_mode_indicator)) {
     return;
+  }
+  // Pre-runtime (installer wizards) no guest frame exists yet - there is no
+  // renderer to indicate.
+  if (rex::ui::Presenter* presenter = imgui_drawer()->presenter()) {
+    const rex::ui::Presenter::GuestOutputPaintRect rect =
+        presenter->GetLastGuestOutputPaintRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
   }
   const bool native = rex::graphics::IsNativeGuestOutputActive();
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 10.0f, 10.0f), ImGuiCond_Always,

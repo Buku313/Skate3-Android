@@ -385,7 +385,7 @@ void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig r
   };
 
   new rex::ui::InstallWizardDialog(
-      drawer, "Skate 3 Setup",
+      drawer, "Setup", "Game Files",
       "Skate 3 game files were not found. Select your Xbox 360 ISO to install them.",
       runtime_paths.game_data_root.string(), std::move(pick_source), std::move(install),
       [runtime_paths = std::move(runtime_paths), complete = std::move(complete)]() mutable {

@@ -770,7 +770,8 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
   const auto game_root = runtime_paths.game_data_root;
 
   rex::ui::AcquireWizardDialog::Options options;
-  options.title = "Skate 3 Title Update";
+  options.title = "Setup";
+  options.section_label = "Title Update 3";
   options.intro =
       "This build of Skate 3 requires Title Update 3, a free update originally published on "
       "Xbox Live. It is not part of the game disc.";
@@ -785,6 +786,7 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
   options.install_working_status = "Installing the title update...";
   options.done_status = "Title Update 3 installed.";
   options.done_button_label = "Start Game";
+  options.launching_status = "Starting the game...";
 
   auto fetch = [game_root](std::atomic<uint64_t>& copied_bytes, std::atomic<uint64_t>& total_bytes,
                            std::string& error) {
