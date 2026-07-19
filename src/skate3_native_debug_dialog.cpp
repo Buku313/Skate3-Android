@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
+#include <vector>
 
 #include <imgui.h>
 
@@ -84,10 +86,15 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_synthetic_pan_rate);
 REXCVAR_DECLARE(double, skate3_native_render_scene_synthetic_pan_amp);
 // SDK: emulated-draw suppression while the native output is active.
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_showcase);
+REXCVAR_DECLARE(double, skate3_native_render_scene_showcase_hold);
+REXCVAR_DECLARE(double, skate3_native_render_scene_showcase_wipe);
+REXCVAR_DECLARE(std::string, skate3_native_render_scene_showcase_order);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam);
 REXCVAR_DECLARE(double, skate3_native_render_scene_freecam_speed);
 REXCVAR_DECLARE(double, skate3_native_render_scene_freecam_look_speed);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam_capture_input);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_ssr);
 
 namespace skate3 {
 namespace {
@@ -113,6 +120,118 @@ double CvarSlider(const char* label, double value, float lo, float hi,
     ImGui::SetTooltip("%s", help);
   }
   return value;
+}
+
+// ---- Showcase setup window ------------------------------------------------
+// Editor for skate3_native_render_scene_showcase_order: one row per build-up
+// layer, reorderable, each optionally joined to the previous row's wipe. The
+// cvar string is the single source of truth ("tok,tok+tok,-tok": ',' starts
+// a new wipe, '+' joins, '-' disables in place); the rows parse from it
+// every frame and any edit writes it straight back, so the sequencer, this
+// window and hand edits in config all stay consistent.
+
+bool s_showcase_setup_open = false;
+
+struct ShowcaseRow {
+  const skate3::native_scene::ShowcaseLayer* layer;
+  bool enabled;
+  bool joined;
+};
+
+std::vector<ShowcaseRow> ParseShowcaseRows(const std::string& order) {
+  using skate3::native_scene::kShowcaseLayers;
+  std::vector<ShowcaseRow> rows;
+  std::string tok;
+  bool cur_joined = false;  // the separator before the accumulating token
+  const auto flush = [&]() {
+    while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) {
+      tok.erase(tok.begin());
+    }
+    while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) {
+      tok.pop_back();
+    }
+    bool enabled = true;
+    if (!tok.empty() && tok[0] == '-') {
+      enabled = false;
+      tok.erase(tok.begin());
+    }
+    for (char& ch : tok) {
+      if (ch >= 'A' && ch <= 'Z') {
+        ch = char(ch + 32);
+      }
+    }
+    for (const auto& layer : kShowcaseLayers) {
+      if (tok != layer.token) {
+        continue;
+      }
+      bool present = false;
+      for (const auto& row : rows) {
+        present = present || row.layer == &layer;
+      }
+      if (!present) {
+        rows.push_back({&layer, enabled, !rows.empty() && cur_joined});
+      }
+      break;
+    }
+    tok.clear();
+  };
+  for (char ch : order) {
+    if (ch == ',' || ch == '+') {
+      flush();
+      cur_joined = ch == '+';
+    } else {
+      tok += ch;
+    }
+  }
+  flush();
+  // Layers missing from the string append disabled, so they can always be
+  // re-enabled from the window.
+  for (const auto& layer : kShowcaseLayers) {
+    bool present = false;
+    for (const auto& row : rows) {
+      present = present || row.layer == &layer;
+    }
+    if (!present) {
+      rows.push_back({&layer, false, false});
+    }
+  }
+  return rows;
+}
+
+std::string BuildShowcaseOrder(const std::vector<ShowcaseRow>& rows) {
+  std::string out;
+  for (size_t k = 0; k < rows.size(); ++k) {
+    if (k > 0) {
+      out += rows[k].joined ? '+' : ',';
+    }
+    if (!rows[k].enabled) {
+      out += '-';
+    }
+    out += rows[k].layer->token;
+  }
+  return out;
+}
+
+// Mirrors the sequencer's availability rules (TickShowcase): the material
+// looks need nothing; shadow/post layers need their feature (post gates
+// live in the HDR tonemap).
+bool ShowcaseLayerAvailable(uint32_t bit) {
+  const bool hdr_on = REXCVAR_GET(skate3_native_render_scene_hdr);
+  switch (bit) {
+    case 8u:
+      return REXCVAR_GET(skate3_native_render_scene_shadows);
+    case 16u:
+      return hdr_on && REXCVAR_GET(skate3_native_render_scene_ssao);
+    case 32u:
+      return hdr_on && REXCVAR_GET(skate3_native_render_scene_ssr);
+    case 64u:
+      return hdr_on && (REXCVAR_GET(skate3_native_render_scene_shafts) ||
+                        REXCVAR_GET(skate3_native_render_scene_haze));
+    case 128u:
+      return hdr_on && REXCVAR_GET(skate3_native_render_scene_bloom);
+    default:
+      return true;
+  }
 }
 
 // Drone-camera controls (same cvars everywhere the section is embedded;
@@ -146,6 +265,130 @@ void DrawFreecamControls() {
   ImGui::TextDisabled(
       "WASD fly, E/Space up, Q/C down, arrows or right-mouse drag look,\n"
       "Z/X zoom, Shift fast, Ctrl slow.");
+}
+
+void DrawShowcaseSetupWindow(bool* p_open) {
+  using skate3::native_scene::kShowcaseLayers;
+  ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("Showcase Setup", p_open, ImGuiWindowFlags_NoCollapse)) {
+    ImGui::End();
+    return;
+  }
+  const bool running = REXCVAR_GET(skate3_native_render_scene_showcase);
+  if (ImGui::Button(running ? "Cancel showcase" : "Start showcase (Home)",
+                    ImVec2(-1.0f, 0.0f))) {
+    REXCVAR_SET(skate3_native_render_scene_showcase, !running);
+  }
+  REXCVAR_SET(skate3_native_render_scene_showcase_hold,
+              CvarSlider("stage hold (s)",
+                         REXCVAR_GET(skate3_native_render_scene_showcase_hold),
+                         0.0f, 10.0f, "%.1f",
+                         "Seconds each layer holds fullscreen between wipes"));
+  REXCVAR_SET(skate3_native_render_scene_showcase_wipe,
+              CvarSlider("wipe duration (s)",
+                         REXCVAR_GET(skate3_native_render_scene_showcase_wipe),
+                         0.5f, 10.0f, "%.1f",
+                         "Seconds each split wipe takes to cross the screen"));
+
+  ImGui::SeparatorText("Layer order");
+  ImGui::TextDisabled(
+      "Every run starts from clay geometry. \"join\" reveals a layer\n"
+      "inside the previous layer's wipe instead of its own.");
+  std::vector<ShowcaseRow> rows =
+      ParseShowcaseRows(REXCVAR_GET(skate3_native_render_scene_showcase_order));
+  bool changed = false;
+  for (int k = 0; k < int(rows.size()); ++k) {
+    ImGui::PushID(k);
+    bool en = rows[k].enabled;
+    if (ImGui::Checkbox("##on", &en)) {
+      rows[k].enabled = en;
+      changed = true;
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(k == 0);
+    if (ImGui::ArrowButton("up", ImGuiDir_Up) && k > 0) {
+      std::swap(rows[k - 1], rows[k]);
+      changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(k + 1 == int(rows.size()));
+    if (ImGui::ArrowButton("down", ImGuiDir_Down) && k + 1 < int(rows.size())) {
+      std::swap(rows[k], rows[k + 1]);
+      changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(k == 0);
+    bool joined = k > 0 && rows[k].joined;
+    if (ImGui::Checkbox("join", &joined)) {
+      rows[k].joined = joined;
+      changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ShowcaseLayerAvailable(rows[k].layer->bit)) {
+      ImGui::TextUnformatted(rows[k].layer->label);
+    } else {
+      ImGui::TextDisabled("%s (feature off)", rows[k].layer->label);
+    }
+    ImGui::PopID();
+  }
+  if (changed) {
+    if (!rows.empty()) {
+      rows[0].joined = false;
+    }
+    REXCVAR_SET(skate3_native_render_scene_showcase_order,
+                BuildShowcaseOrder(rows));
+  }
+  if (ImGui::Button("Reset to default order")) {
+    REXCVAR_SET(skate3_native_render_scene_showcase_order,
+                std::string(skate3::native_scene::kShowcaseOrderDefault));
+  }
+
+  // Live preview of the resulting run, mirrors the sequencer's step
+  // builder (cumulative layer masks; materials subsumes albedo/lighting;
+  // a final full-render step covers whatever the list leaves out).
+  ImGui::SeparatorText("Run preview");
+  uint32_t avail_mask = 0;
+  for (const auto& layer : kShowcaseLayers) {
+    if (ShowcaseLayerAvailable(layer.bit)) {
+      avail_mask |= layer.bit;
+    }
+  }
+  int step_no = 1;
+  ImGui::Text("%d. clay geometry", step_no++);
+  uint32_t cum = 0;
+  size_t k = 0;
+  while (k < rows.size()) {
+    uint32_t add = 0;
+    std::string label;
+    size_t j = k;
+    do {
+      const ShowcaseRow& row = rows[j];
+      if (row.enabled && (avail_mask & row.layer->bit) != 0 &&
+          (cum & row.layer->bit) == 0 && (add & row.layer->bit) == 0) {
+        add |= row.layer->bit;
+        if (!label.empty()) {
+          label += " & ";
+        }
+        label += row.layer->label;
+      }
+      ++j;
+    } while (j < rows.size() && rows[j].joined);
+    if (add != 0) {
+      cum |= add;
+      ImGui::Text("%d. + %s", step_no++, label.c_str());
+    }
+    k = j;
+  }
+  const bool covered = (cum & 4u) != 0 && ((avail_mask & ~cum) & 0xF8u) == 0u;
+  if (!covered) {
+    ImGui::Text("%d. full render", step_no++);
+  }
+
+  DrawFreecamControls();
+  ImGui::End();
 }
 
 }  // namespace
@@ -239,6 +482,25 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                            REXCVAR_GET(skate3_native_render_scene_backface_cull),
                            "World env materials cull FRONT like the game's material "
                            "XMLs; off = legacy cull-none (shows interior faces)"));
+
+  ImGui::SeparatorText("Graphics showcase");
+  {
+    const bool running = REXCVAR_GET(skate3_native_render_scene_showcase);
+    if (ImGui::Button(running ? "Cancel showcase" : "Start showcase (Home)")) {
+      REXCVAR_SET(skate3_native_render_scene_showcase, !running);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Strip the frame to clay geometry, then rebuild it layer by\n"
+          "layer, each layer revealed by a live vertical split wiping\n"
+          "across the screen. Layer order, grouping and pacing are edited\n"
+          "in the setup window.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Setup...")) {
+      s_showcase_setup_open = true;
+    }
+  }
 
   DrawFreecamControls();
 
@@ -674,6 +936,9 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
   ImGui::TextDisabled("MSAA + shadow tile size are restart-only (skate3.toml).");
 
   ImGui::End();
+  if (s_showcase_setup_open) {
+    DrawShowcaseSetupWindow(&s_showcase_setup_open);
+  }
   if (!open) {
     Hide();
   }

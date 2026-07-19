@@ -81,6 +81,8 @@ extern const rex::PPCImageInfo eawebkit_PPCImageConfig;
 // lift via config because they overlap with auto-discovered parent functions.
 extern "C" REX_FUNC(__restgprlr_19);
 
+// Defined in skate3_native_scene.cpp; toggled by the showcase hotkey below.
+REXCVAR_DECLARE(bool, skate3_native_render_scene_showcase);
 // Defined in skate3_native_scene.cpp; the freecam hotkey below toggles it,
 // and while it captures input the guest input system is gated off.
 REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam);
@@ -761,6 +763,12 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   rex::ui::RegisterBind("bind_skate3_native_debug", "F12",
                         "Native render debug menu", [this] {
                           ToggleNativeDebug();
+                        });
+  rex::ui::RegisterBind("bind_skate3_showcase", "Home",
+                        "Graphics build-up showcase", [] {
+                          REXCVAR_SET(
+                              skate3_native_render_scene_showcase,
+                              !REXCVAR_GET(skate3_native_render_scene_showcase));
                         });
   rex::ui::RegisterBind("bind_skate3_freecam", "End",
                         "Drone camera (free fly)", [] {

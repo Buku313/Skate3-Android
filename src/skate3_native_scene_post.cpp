@@ -781,6 +781,17 @@ bool ApplySsrPass(const NativeGuestOutputRenderContext& context,
   c[22] = float(REXCVAR_GET(skate3_native_render_scene_ssr_intensity));
   c[23] = float(REXCVAR_GET(skate3_native_render_scene_ssr_debug));
   c[24] = 250.0f;  // max ray distance (view units; the screen clip governs)
+  // Build-up showcase gate (p2, see ssr.hlsl ps_composite): the composite
+  // side whose layer mask has not revealed reflections outputs alpha 0.
+  // Rows carry 256 + mask (0 = showcase off); SSR is mask bit 32.
+  const auto ssr_visible = [](float row) {
+    return (row < 255.5f || ((uint32_t(row + 0.5f) - 256u) & 32u) != 0u)
+               ? 1.0f
+               : 0.0f;
+  };
+  c[28] = g_r.showcase_rows[2];
+  c[29] = ssr_visible(g_r.showcase_rows[0]);
+  c[30] = ssr_visible(g_r.showcase_rows[1]);
 
   cmd->SetBindingLayout(g_r.ssr_layout);
   cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);

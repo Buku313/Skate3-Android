@@ -360,9 +360,21 @@ float4 ps_bloom_up(VSOut i) : SV_Target {
 // upsample; the white fallback rides here with intensity 0 when bloom is
 // off).
 float4 ps_tonemap(VSOut i) : SV_Target {
+  // Graphics build-up showcase (see scene.hlsl ShowcaseMask): sh_v2.y/z =
+  // 256 + the layer mask left/right of the split at sh_v2.w (output
+  // pixels), 0 = off. Post layers reveal per pixel by their mask bits:
+  // AO 16, volumetrics 64, bloom 128 (SSR gates in its own composite).
+  float scv = i.pos.x < sh_v2.w ? sh_v2.y : sh_v2.z;
+  int sc_mask = scv < 255.5 ? -1 : (int)(scv + 0.5) - 256;
   float ao = ao_plane.SampleLevel(smp_linear, i.uv, 0);
+  if (sc_mask >= 0 && (sc_mask & 16) == 0) {
+    ao = 1.0;
+  }
   float3 x = max(tex0.SampleLevel(smp_point, i.uv, 0).rgb, 0.0) * ao;
   float3 bloom = tex1.SampleLevel(smp_linear, i.uv, 0).rgb * p0.z;
+  if (sc_mask >= 0 && (sc_mask & 128) == 0) {
+    bloom = 0.0;
+  }
   // Volumetric terms, applied AFTER the AO multiply (in-air light is not
   // subject to surface occlusion). The shaft plane carries the marched
   // SHADOWED-air term (see ps_vol_shafts) and dims MULTIPLICATIVELY;
@@ -376,7 +388,8 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   // across depth discontinuities) so shaft edges never bleed onto near
   // silhouettes.
   float shaft = 0.0;
-  if (vs0.w > 0.0) {
+  bool sc_vol = sc_mask < 0 || (sc_mask & 64) != 0;
+  if (vs0.w > 0.0 && sc_vol) {
     float dpix = lin_depth.SampleLevel(smp_point, i.uv, 0);
     float2 vt = size.zw * 2.0;  // one shaft-plane texel in uv
     float2 base = (floor(i.uv / vt - 0.5) + 0.5) * vt;
@@ -400,7 +413,7 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   // value only; the game's own fog already renders the isotropic part,
   // so adding a floor here just veils the whole frame.
   float3 haze = float3(0.0, 0.0, 0.0);
-  if (vs1.w > 0.0) {
+  if (vs1.w > 0.0 && sc_vol) {
     float d = lin_depth.SampleLevel(smp_point, i.uv, 0);
     float path = 1.0 - exp(-max(vs2.w, 0.0005) * d);
     float3 ray = normalize(ViewPos(i.uv, 1.0));
@@ -431,6 +444,15 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   // Dimming ceiling: shadowed air thins the light, it does not extinguish
   // it; without the ceiling a fully shaded sun-facing view (under an
   // overpass) saturated to a solid black void.
-  return float4(
-      ToneMapScene((x + haze) * (1.0 - 0.55 * saturate(shaft)) + bloom), 1.0);
+  float3 outc =
+      ToneMapScene((x + haze) * (1.0 - 0.55 * saturate(shaft)) + bloom);
+  // Showcase divider: a soft white line at the split while a wipe is in
+  // flight (the two sides show different stages).
+  if (sh_v2.w > 0.5 && abs(sh_v2.y - sh_v2.z) > 0.5) {
+    float half_w = max(size.x * 0.0012, 1.5);
+    float d = abs(i.pos.x - sh_v2.w);
+    outc = lerp(outc, float3(1.0, 1.0, 1.0),
+                saturate(1.0 - d / half_w) * 0.85);
+  }
+  return float4(outc, 1.0);
 }

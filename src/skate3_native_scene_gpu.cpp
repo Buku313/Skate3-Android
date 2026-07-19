@@ -106,6 +106,9 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_haze);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_showcase);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_sort_opaque);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_splines);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao);
@@ -127,6 +130,9 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_refl_lod);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_luma_protect);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_radius);
+REXCVAR_DECLARE(double, skate3_native_render_scene_showcase_hold);
+REXCVAR_DECLARE(double, skate3_native_render_scene_showcase_wipe);
+REXCVAR_DECLARE(std::string, skate3_native_render_scene_showcase_order);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssr_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssr_thickness);
 REXCVAR_DECLARE(double, skate3_native_render_scene_world_v2_tan_sign);
@@ -6523,6 +6529,185 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
   }
 }
 
+// ---- Graphics build-up showcase -------------------------------------------
+// Sequencer for the layer-by-layer showcase (cvar
+// skate3_native_render_scene_showcase / the bind_skate3_showcase hotkey):
+// one wipe strips the frame to clay geometry, then each following wipe
+// reveals the next visual layer, a vertical split sweeping left-to-right
+// with BOTH sides rendered live (per-pixel stage selection in the shaders,
+// no frozen frames). The split state rides the per-frame b1 rows
+// (scene.hlsl sh_v2.yzw) and g_r.showcase_rows (the SSR composite reads it
+// from root constants); every consumer treats an all-zero row as "showcase
+// off". Runs on the render thread once per frame at b1 staging. The layer
+// mask encoding matches the shader contract in scene.hlsl ShowcaseMask;
+// the reveal order and grouping come from the user-editable
+// skate3_native_render_scene_showcase_order cvar (kShowcaseLayers tokens).
+static void TickShowcase(uint32_t output_width, bool hdr_on) {
+  // One reveal step: the b1 row encoding (256 + the cumulative layer mask;
+  // 0 = the full render) and its log label.
+  struct Step {
+    float value;
+    std::string label;
+  };
+  struct State {
+    bool active = false;
+    std::vector<Step> steps;
+    int logged = -1;
+    double wipe_s = 3.0;
+    double hold_s = 2.5;
+    PerfClock::time_point t0;
+  };
+  static State s;
+  float* rows = g_r.showcase_rows;
+  rows[0] = rows[1] = rows[2] = 0.0f;
+  const bool want = REXCVAR_GET(skate3_native_render_scene_showcase);
+  if (!s.active) {
+    if (!want) {
+      return;
+    }
+    // Layer availability: the material looks need nothing; the shadow and
+    // post layers join only when their feature is enabled (the post gates
+    // live in the HDR tonemap, so they need the HDR chain).
+    const auto layer_available = [&](uint32_t bit) -> bool {
+      switch (bit) {
+        case 8u:
+          return REXCVAR_GET(skate3_native_render_scene_shadows);
+        case 16u:
+          return hdr_on && REXCVAR_GET(skate3_native_render_scene_ssao);
+        case 32u:
+          return hdr_on && REXCVAR_GET(skate3_native_render_scene_ssr);
+        case 64u:
+          return hdr_on && (REXCVAR_GET(skate3_native_render_scene_shafts) ||
+                            REXCVAR_GET(skate3_native_render_scene_haze));
+        case 128u:
+          return hdr_on && REXCVAR_GET(skate3_native_render_scene_bloom);
+        default:
+          return true;
+      }
+    };
+    uint32_t avail_mask = 0;
+    for (const auto& layer : kShowcaseLayers) {
+      if (layer_available(layer.bit)) {
+        avail_mask |= layer.bit;
+      }
+    }
+    // Build the reveal steps from the user-ordered layer list (syntax in
+    // the skate3_native_render_scene_showcase_order cvar description):
+    // comma-separated steps, '+' joins layers into one wipe, '-' prefix =
+    // disabled. Unknown, unavailable and duplicate tokens drop out; steps
+    // left empty are skipped. The run always starts from clay.
+    s.steps.clear();
+    s.steps.push_back({256.0f, "clay geometry"});
+    uint32_t cum = 0;
+    const std::string order =
+        REXCVAR_GET(skate3_native_render_scene_showcase_order);
+    size_t pos = 0;
+    while (pos <= order.size()) {
+      size_t end = order.find(',', pos);
+      if (end == std::string::npos) {
+        end = order.size();
+      }
+      const std::string group = order.substr(pos, end - pos);
+      pos = end + 1;
+      uint32_t add = 0;
+      std::string label;
+      size_t g = 0;
+      while (g <= group.size()) {
+        size_t ge = group.find('+', g);
+        if (ge == std::string::npos) {
+          ge = group.size();
+        }
+        std::string tok = group.substr(g, ge - g);
+        g = ge + 1;
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) {
+          tok.erase(tok.begin());
+        }
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) {
+          tok.pop_back();
+        }
+        for (char& ch : tok) {
+          if (ch >= 'A' && ch <= 'Z') {
+            ch = char(ch + 32);
+          }
+        }
+        if (tok.empty() || tok[0] == '-') {
+          continue;  // disabled layer (kept in the string for its position)
+        }
+        for (const auto& layer : kShowcaseLayers) {
+          if (tok == layer.token) {
+            if ((avail_mask & layer.bit) != 0 && (cum & layer.bit) == 0 &&
+                (add & layer.bit) == 0) {
+              add |= layer.bit;
+              if (!label.empty()) {
+                label += " & ";
+              }
+              label += layer.label;
+            }
+            break;
+          }
+        }
+      }
+      if (add != 0) {
+        cum |= add;
+        s.steps.push_back({float(256u + cum), std::move(label)});
+      }
+    }
+    // A final full-render reveal when the list leaves layers unrevealed
+    // (the materials look subsumes the albedo/lighting bits, so those two
+    // stop counting once materials is in).
+    const bool covered =
+        (cum & 4u) != 0 && ((avail_mask & ~cum) & 0xF8u) == 0u;
+    if (!covered) {
+      s.steps.push_back({0.0f, "full render"});
+    }
+    // Durations snapshot at start so a live cvar edit cannot jump the
+    // elapsed-time -> step mapping mid-run.
+    s.wipe_s = std::max(0.2, REXCVAR_GET(skate3_native_render_scene_showcase_wipe));
+    s.hold_s = std::max(0.0, REXCVAR_GET(skate3_native_render_scene_showcase_hold));
+    s.t0 = PerfClock::now();
+    s.logged = -1;
+    s.active = true;
+    REXLOG_INFO(
+        "native-scene: showcase started ({} steps, wipe {:.1f}s, hold "
+        "{:.1f}s, hdr={}, order=\"{}\")",
+        s.steps.size(), s.wipe_s, s.hold_s, hdr_on ? 1 : 0, order);
+  }
+  if (!want) {
+    s.active = false;
+    REXLOG_INFO("native-scene: showcase cancelled");
+    return;
+  }
+  const double elapsed =
+      std::chrono::duration<double>(PerfClock::now() - s.t0).count();
+  const double per_step = s.wipe_s + s.hold_s;
+  const int idx = int(elapsed / per_step);
+  if (idx >= int(s.steps.size())) {
+    s.active = false;
+    REXCVAR_SET(skate3_native_render_scene_showcase, false);
+    REXLOG_INFO("native-scene: showcase finished");
+    return;
+  }
+  const float cur = s.steps[idx].value;
+  if (idx != s.logged) {
+    REXLOG_INFO("native-scene: showcase step {}/{} - {}", idx + 1,
+                s.steps.size(), s.steps[idx].label);
+    s.logged = idx;
+  }
+  const float prev = idx == 0 ? 0.0f : s.steps[idx - 1].value;
+  const double phase = elapsed - double(idx) * per_step;
+  if (phase < s.wipe_s) {
+    float f = float(phase / s.wipe_s);
+    f = f * f * (3.0f - 2.0f * f);  // ease the sweep in and out
+    rows[0] = cur;
+    rows[1] = prev;
+    // Overshoot slightly so the divider line exits the screen edge cleanly.
+    rows[2] = f * float(output_width) * 1.02f;
+  } else {
+    rows[0] = rows[1] = cur;
+    rows[2] = 0.0f;
+  }
+}
+
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
   if (!SceneEnabled() ||
       (context.backend != NativeGuestOutputBackend::kD3D12 &&
@@ -7009,9 +7194,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       std::memcpy(cb + 40, scene.fog_color, 4 * sizeof(float));
     }
     // World-shading v2 row (sh_v2, cb[60..63]): x = stored-tangent
-    // polarity.
+    // polarity, yzw = the build-up showcase split state (stage left/right
+    // of the split + its position in output pixels; zeros = showcase off).
     cb[60] =
         float(REXCVAR_GET(skate3_native_render_scene_world_v2_tan_sign));
+    TickShowcase(context.guest_output_width, hdr_on);
+    cb[61] = g_r.showcase_rows[0];
+    cb[62] = g_r.showcase_rows[1];
+    cb[63] = g_r.showcase_rows[2];
     // dynamicobject.fx frame rows (dyn_sun/dyn_amb/dyn_misc at cb[44..55]).
     if (scene.dynobj_valid) {
       cb[44] = scene.dynobj_rows[0];  // sun dir (PS c9)

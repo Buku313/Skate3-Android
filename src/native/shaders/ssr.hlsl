@@ -38,7 +38,9 @@ cbuffer C : register(b0) {
   float4 p0;     // x = march steps, y = thickness (view units),
                  // z = composite intensity, w = debug mode
   float4 p1;     // x = max ray distance (view units)
-  float4 p2;     // spare
+  float4 p2;     // graphics build-up showcase: x = split position in output
+                 // pixels, y/z = SSR visibility (0/1) left/right of the
+                 // split (both 1 when the showcase is off)
 };
 // Per-pass t0/t1/t2 roles (each entry uses one of the overlapping
 // declarations; the rest drop out at compile):
@@ -283,6 +285,11 @@ float4 ps_march(VSOut i) : SV_Target {
 }
 
 float4 ps_composite(VSOut i) : SV_Target {
+  // Showcase gate: alpha 0 leaves the scene plane untouched on a side
+  // whose build-up stage has not revealed reflections yet.
+  if ((i.pos.x < p2.x ? p2.y : p2.z) < 0.5f) {
+    return float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
   float4 g = tex1c.SampleLevel(smp_point, i.uv, 0);
   float wrefl = abs(g.a);
   float dbg = p0.w;

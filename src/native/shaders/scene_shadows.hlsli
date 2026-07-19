@@ -1,8 +1,8 @@
 // Shadow receivers: the game-exact CSM atlas sampler, its
 // contact-hardening PCSS variant, and the native static sun-shadow map
 // sampler. Expects the including file to declare the b1 rows
-// (scene_frame_cb.hlsli) and the shadow_atlas / static_sun textures
-// before this include.
+// (scene_frame_cb.hlsli), the shadow_atlas / static_sun textures and
+// ShowcaseMask before this include.
 // Native CSM atlas sample at a world position: finest covering cascade,
 // s = saturate(infront + 1 - coverage). Returns 1 (lit) when uncovered or
 // shadows are off. extra_bias suppresses receiver self-shadow acne on
@@ -120,6 +120,11 @@ float PcssRotation(float2 px) {
 }
 float SampleCsmShadowSoft(float3 wp, float extra_bias, float3 nrm,
                           float2 px) {
+  // Showcase: until the shadow layer is revealed, render fully lit.
+  int sc_mask = ShowcaseMask(px.x);
+  if (sc_mask >= 0 && (sc_mask & 8) == 0) {
+    return 1.0;
+  }
   if (sh_pcss.x <= 0.5) {
     return SampleCsmShadow(wp, extra_bias);
   }
@@ -233,6 +238,11 @@ float NsmTap(float2 suv, float refd, float tile_u0) {
 }
 float SampleStaticSun(float3 wp, float3 nrm, float2 px) {
   if (nsm_p.x <= 0.0) {
+    return 1.0;
+  }
+  // Showcase: until the shadow layer is revealed, render fully lit.
+  int sc_mask = ShowcaseMask(px.x);
+  if (sc_mask >= 0 && (sc_mask & 8) == 0) {
     return 1.0;
   }
   float2 uc_far = float2(dot(nsm_x.xyz, wp) + nsm_x.w,

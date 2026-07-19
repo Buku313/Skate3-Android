@@ -292,6 +292,38 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_haze_density, 0.005,
                       "200 units).")
     .range(0.0, 0.05)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_showcase, false, "Skate 3",
+                    "Run the graphics build-up showcase: the scene is stripped to "
+                    "flat clay geometry, then rebuilt layer by layer, each layer "
+                    "revealed by a vertical split wiping across the screen with "
+                    "both sides rendered live. Layer order and grouping come from "
+                    "skate3_native_render_scene_showcase_order (edited in the F12 "
+                    "showcase setup window). Clears itself when the sequence "
+                    "finishes; set to false mid-run to cancel. Also on the Home "
+                    "key by default (bind_skate3_showcase). Layers whose feature "
+                    "is disabled (or unavailable without the HDR intermediate) "
+                    "are skipped.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(
+    skate3_native_render_scene_showcase_order,
+    skate3::native_scene::kShowcaseOrderDefault, "Skate 3",
+    "Showcase layer order: comma-separated reveal steps, '+' joins layers "
+    "into one wipe, a '-' prefix disables a layer while keeping its "
+    "position. Tokens: albedo, lighting, materials, shadows, ao, ssr, vol, "
+    "bloom (the run always starts from clay geometry, and a final "
+    "full-render step is appended when the list leaves layers unrevealed). "
+    "Example: \"albedo,lighting,materials,shadows+ao,-ssr,vol+bloom\".")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_showcase_hold, 2.5, "Skate 3",
+                      "Showcase: seconds each build-up stage holds fullscreen "
+                      "between wipes.")
+    .range(0.0, 30.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_showcase_wipe, 3.0, "Skate 3",
+                      "Showcase: seconds each split wipe takes to cross the "
+                      "screen.")
+    .range(0.2, 30.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_freecam, false, "Skate 3",
                     "Detach the render camera from the game (drone / free-fly "
                     "cam): WASD fly, E/Space up, Q/C down, arrow keys or "

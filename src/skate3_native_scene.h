@@ -435,6 +435,34 @@ struct SubmitRecord {
   uint32_t c;
 };
 
+// Graphics build-up showcase layer registry: the order-string tokens
+// (cvar skate3_native_render_scene_showcase_order), the per-layer shader
+// mask bits (contract in scene.hlsl ShowcaseMask: the split rows carry
+// 256 + the cumulative mask, 0 = showcase off) and the display labels.
+// Shared by the sequencer (skate3_native_scene_gpu.cpp) and the F12 setup
+// window (skate3_native_debug_dialog.cpp). The material bits are
+// progressive looks (materials subsumes lighting subsumes albedo); the
+// rest are independent and can reveal in any order or grouping.
+struct ShowcaseLayer {
+  const char* token;
+  uint32_t bit;
+  const char* label;
+};
+inline constexpr ShowcaseLayer kShowcaseLayers[] = {
+    {"albedo", 1u, "albedo textures"},
+    {"lighting", 2u, "baked lighting"},
+    {"materials", 4u, "materials & surface detail"},
+    {"shadows", 8u, "dynamic shadows"},
+    {"ao", 16u, "ambient occlusion"},
+    {"ssr", 32u, "reflections"},
+    {"vol", 64u, "volumetrics"},
+    {"bloom", 128u, "bloom"},
+};
+inline constexpr size_t kShowcaseLayerCount =
+    sizeof(kShowcaseLayers) / sizeof(kShowcaseLayers[0]);
+inline constexpr const char* kShowcaseOrderDefault =
+    "albedo,lighting,materials,shadows+ao,ssr,vol+bloom";
+
 bool Enabled();
 
 // Host settings-overlay backdrop: while the SDK settings menu is open, run

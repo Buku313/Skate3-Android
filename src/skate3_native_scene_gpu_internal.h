@@ -726,6 +726,11 @@ struct RendererState {
   // staged by ApplyVolumetricPass; zeros disable every term.
   bool vol_tonemap_valid = false;
   float vol_rows[16] = {};
+  // Graphics build-up showcase split state for this frame, computed by the
+  // sequencer at b1 staging and mirrored here for the SSR composite:
+  // {stage left of the split, stage right, split position in output px}.
+  // All zeros = showcase off (stage 0 = the full render in every consumer).
+  float showcase_rows[3] = {};
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // (The old D3D12 bookkeeping, the retired-resource vector, the CPU SRV
   // staging heap and its slot allocator/recycling lists, is gone: resource

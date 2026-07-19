@@ -135,12 +135,30 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
                         : float4(mul(sb, (float3x3)world), bw.w);
   return o;
 }
+// ---- Graphics build-up showcase -------------------------------------------
+// sh_v2.yzw carry the showcase split state: y/z = the LAYER MASK shown
+// left/right of the vertical split at w (in output pixels), encoded as
+// 256 + mask so an all-zero row (showcase off) is unambiguous. Mask bits
+// (the contract shared with hdr.hlsl, ssr.hlsl and the CPU sequencer,
+// see kShowcaseLayers in skate3_native_scene.h):
+//    1 albedo textures    2 baked lighting     4 materials & surface detail
+//    8 dynamic shadows   16 ambient occlusion 32 reflections (SSR)
+//   64 volumetrics      128 bloom
+// The material bits are progressive looks (materials subsumes lighting
+// subsumes albedo); the rest are independent, so the sequencer can reveal
+// them in any order or grouping. Returns -1 when the showcase is off.
+int ShowcaseMask(float px_x) {
+  float v = px_x < sh_v2.w ? sh_v2.y : sh_v2.z;
+  return v < 255.5 ? -1 : (int)(v + 0.5) - 256;
+}
 #include "scene_shadows.hlsli"
 #include "scene_common.hlsli"
 #include "scene_char.hlsli"
 #include "scene_dynobj.hlsli"
 #include "scene_water.hlsli"
-// The full material shading for every family (ps_main forwards here).
+// The full material shading for every family (see ps_main below; the
+// showcase wrapper substitutes the early build-up stages' looks over this
+// result's rgb while keeping its alpha).
 float4 ShadePixel(VSOut i) {
   if (tint.a > 0.0) {
     return float4(PassGamma(tint.rgb), tint.a);
@@ -679,7 +697,88 @@ float4 ShadePixel(VSOut i) {
   return float4(PassGamma(lit), 1.0);
 }
 float4 ps_main(VSOut i) : SV_Target {
-  return ShadePixel(i);
+  float4 c = ShadePixel(i);
+  int mask = ShowcaseMask(i.pos.x);
+  if (mask < 0 || (mask & 4) != 0) {
+    return c;  // showcase off, or the full material layer is revealed
+  }
+  // Pre-material build-up looks replace the shaded rgb but keep the
+  // branch's own alpha, so alpha tests, coverage channels, fades and blend
+  // routing all behave exactly as in the full render. The gamma-space
+  // looks encode through PassGamma like the legacy branches; the exact-
+  // chain lighting look goes through ToneOut. The sky dome (exact family
+  // -40 / the legacy unlit marker) is authored content; it arrives
+  // complete with the lighting layer and never receives cast shadows.
+  bool sky = (cam_pos.w < -39.5 && cam_pos.w > -40.5) || tint.b > 0.0;
+  if (sky && (mask & 2) != 0) {
+    return c;
+  }
+  float3 n = dot(i.nrm, i.nrm) > 0.01
+                 ? normalize(i.nrm)
+                 : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+  float3 ldir = dot(sh_sun.xyz, sh_sun.xyz) > 0.1
+                    ? sh_sun.xyz
+                    : normalize(float3(0.4, 0.8, 0.3));
+  // The dynamic-shadow layer applies to every pre-material look (the
+  // helpers self-gate on the mask, so uncovered frames sample lit).
+  float s = 1.0;
+  if (!sky && (mask & 8) != 0) {
+    s = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz,
+                                tint.g > 0.0 ? 0.012 : 0.0, i.nrm, i.pos.xy),
+            SampleStaticSun(i.rpos + cam_pos.xyz, i.nrm, i.pos.xy));
+  }
+  // Base color: the diffuse texture once the albedo layer is revealed,
+  // clay grey before it.
+  float3 base = (mask & 1) != 0 ? diffuse.Sample(smp, i.uv).rgb
+                                : float3(0.62, 0.62, 0.62);
+  if ((mask & 2) != 0 && tint.r > 0.0 && sh_sun.w > 0.01) {
+    // Baked lighting on a lightmapped surface: the REAL diffuse chain,
+    // lightmap^2 x the flat-map kd x fog/exposure/material multiplier,
+    // the exact-family formula minus surface detail, so the later step
+    // to full materials only adds normal/detail maps, specular,
+    // reflections and weathering instead of also re-grading the frame's
+    // tone. The shadow layer joins with the game's own lightmap min-clamp.
+    float3 lm = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
+    float3 lml = lm * lm;
+    if ((mask & 8) != 0) {
+      lml = min(lml, s + sh_color.rgb);
+    }
+    float3 lin = lml * 0.93429 * base * base;
+    float fdist = length(i.rpos);
+    float f1 = saturate(fdist * sh_fogp.x + sh_fogp.y);
+    if (sh_fogp.z != 1.0) {
+      f1 = pow(max(f1, 1e-6), sh_fogp.z);
+    }
+    float3 xe = (lin * ((1.0 + sh_fogc.a * f1) * sh_env.x) +
+                 sh_fogc.rgb * f1) * sh_sun.w;
+    return ToneOut(xe, c.a, false);
+  }
+  float3 col;
+  if ((mask & 2) != 0) {
+    // Lighting without exact frame rows: the legacy-branch convention
+    // (lightmap x2 in gamma space), or a neutral wrapped lambert for
+    // surfaces without a lightmap (characters, props).
+    float3 lite;
+    if (tint.r > 0.0) {
+      lite = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb * 2.0;
+    } else {
+      float wrap = 0.35 + 0.65 * saturate(dot(n, ldir));
+      lite = float3(wrap, wrap, wrap);
+    }
+    col = base * lite;
+  } else if ((mask & 1) != 0) {
+    col = base;  // raw diffuse, unlit
+  } else {
+    // Clay: grey with a simple sun-lambert so the geometry reads (a fully
+    // flat grey collapses everything into silhouettes).
+    col = base * (0.61 + 0.68 * saturate(dot(n, ldir)));
+  }
+  // Shadow layer on the gamma-space looks: a soft darkening multiply (the
+  // exact-chain look above uses the game's own clamp instead).
+  if (!sky && (mask & 8) != 0) {
+    col *= s * 0.65 + 0.35;
+  }
+  return float4(PassGamma(saturate(col)), c.a);
 }
 // ---- SSR reflection G-buffer (consumed by ssr.hlsl ps_march) --------------
 // Rendered after the main pass from the frame's reflective items only (env
