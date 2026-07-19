@@ -109,11 +109,11 @@ struct DrawItem {
   // windows). 0 = not a character.
   // char_rows = the canonical per-draw lighting block captured from the
   // PIXEL constant bank at palette-capture time (CaptureCharLighting):
-  // 15 float4 rows consumed by the scene PS character branch (cbuffer CH,
+  // 18 float4 rows consumed by the scene PS character branch (cbuffer CH,
   // b2). rows[14].y = family, > 0 only when the capture validated; items
   // without it fall back to the legacy empirical character shading.
   uint8_t char_family = 0;
-  float char_rows[60] = {};
+  float char_rows[72] = {};
   // Hair strand coverage: the hair mesh's "alpha" channel texture, sampled
   // at the SECOND texcoord (raw float2); hair renders alpha-blended in the
   // sorted sub-pass (the opaque path is the blocky-helmet look).

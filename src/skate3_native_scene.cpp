@@ -3242,11 +3242,18 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
 // Ny^2)*r8); the scale and the -1 are folded into the stored rows so the
 // shader evaluates a plain 9-row basis.
 //
-// Canonical block (15 float4 rows): [0] = light dir + hair fresnel power,
+// Canonical block (18 float4 rows): [0] = light dir + hair fresnel power,
 // [1] = key color + exposure, [2] = flat ambient rgb + SH-ambient
 // multiplier (hair ambient scalar in w), [3..11] = SH rows, [12] = tintA
-// (w = apply), [13] = tintB + strand-alpha scale, [14].x = alpha out,
-// [14].y = family (0 = capture failed validation -> legacy shading).
+// (w = apply), [13] = tintB + strand-alpha scale (fams 1/2: w = the
+// material multiplier m_params[0].y instead), [14].x = alpha out,
+// [14].y = family (0 = capture failed validation -> legacy shading),
+// [14].z = lens-alpha flag, [14].w = rim fresnel power, [15] = key spec
+// color + power, [16] = rim spec color + power, [17] = rim light color +
+// key-spec fresnel power. The spec/rim rows (defaultcharacter: spec c7,
+// rim spec c8, rim c11, fresnel powers c6.w/c5.z; cacstamp: c16/c17/c20,
+// c15.w/c14.z [+ the editor row shift]) exist on fams 1/2 only; [15].w
+// stays 0 when they fail their range gates and the PS terms vanish.
 void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   if (item.char_family == 0) {
     return;
@@ -3263,7 +3270,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   // later draw with the same buffers (the caster-pass bank is stale; its
   // shadowPS touches no PS constants), and a failed refresh must not wipe
   // rows a previous successful capture staged.
-  float local[60];
+  float local[72];
   float* d = local;
   std::memset(local, 0, sizeof(local));
   uint8_t fam = item.char_family;
@@ -3377,6 +3384,51 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
         d[12 * 4 + 1] = tint[1];
         d[12 * 4 + 2] = tint[2];
         d[12 * 4 + 3] = 1.0f;
+      }
+    }
+    // Material multiplier m_params[0].y (defaultcharacter c5.y / cacstamp
+    // c14.y): the PS multiplies the lit color by it before the tone chain
+    // (1.2 on the gameplay banks). Rides the fam-1/2-unused tintB.w row;
+    // out-of-range keeps 0 and the PS applies 1.
+    {
+      const float m0y = row((fam == 1 ? 5u : 14u) + plus, 1);
+      if (m0y > 0.25f && m0y < 4.0f) {
+        d[13 * 4 + 3] = m0y;
+      }
+    }
+    // Rim light + key/rim phong spec rows (see the header comment; observed
+    // gameplay banks: key spec white pow 5, rim spec gray pow 67/255, rim
+    // 0.2, fresnel powers 0.2-2.0). All-or-nothing behind range gates;
+    // a bank that fails them keeps [15].w at 0 and the PS skips the terms.
+    {
+      const uint32_t ks_r = (fam == 1 ? 7u : 16u) + plus;
+      const uint32_t rs_r = (fam == 1 ? 8u : 17u) + plus;
+      const uint32_t rim_r = (fam == 1 ? 11u : 20u) + plus;
+      const float kfres = row((fam == 1 ? 6u : 15u) + plus, 3);
+      const float rfres = row((fam == 1 ? 5u : 14u) + plus, 2);
+      float sr[12];
+      bool spec_ok = kfres >= 0.0f && kfres < 512.0f &&
+                     rfres >= 0.0f && rfres < 512.0f;
+      for (int r = 0; r < 3 && spec_ok; ++r) {
+        const uint32_t src = r == 0 ? ks_r : (r == 1 ? rs_r : rim_r);
+        for (int c = 0; c < 3; ++c) {
+          sr[r * 4 + c] = row(src, uint32_t(c));
+          spec_ok = spec_ok && sr[r * 4 + c] >= 0.0f && sr[r * 4 + c] < 64.0f;
+        }
+        sr[r * 4 + 3] = row(src, 3);
+      }
+      spec_ok = spec_ok && sr[3] >= 0.5f && sr[3] < 512.0f &&
+                sr[7] >= 0.5f && sr[7] < 512.0f;
+      if (spec_ok) {
+        for (int c = 0; c < 4; ++c) {
+          d[15 * 4 + c] = sr[c];
+          d[16 * 4 + c] = sr[4 + c];
+        }
+        d[17 * 4 + 0] = sr[8];
+        d[17 * 4 + 1] = sr[9];
+        d[17 * 4 + 2] = sr[10];
+        d[17 * 4 + 3] = kfres;
+        d[14 * 4 + 3] = rfres;
       }
     }
     d[14 * 4 + 0] = std::clamp(row((fam == 1 ? 13u : 22u) + plus, 0), 0.0f, 1.0f);

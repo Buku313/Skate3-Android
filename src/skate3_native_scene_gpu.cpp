@@ -7986,10 +7986,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (debug_mode == 0 && item.char_family != 0 &&
         item.char_rows[14 * 4 + 1] > 0.0f) {
       const uint32_t offset = (g_r.bone_ring_offset + 255u) & ~255u;
-      if (offset + 256u <= RendererState::kBoneRegionSize) {
+      // 18 float4 rows = 288 bytes -> a 512-byte slot keeps the next
+      // allocation 256-aligned (CBV offset requirement).
+      if (offset + 512u <= RendererState::kBoneRegionSize) {
         std::memcpy(g_r.bone_ring_cpu + bone_region + offset, item.char_rows,
                     sizeof(item.char_rows));
-        g_r.bone_ring_offset = offset + 256u;
+        g_r.bone_ring_offset = offset + 512u;
         cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region + offset);
         constants[39] = item.char_rows[14 * 4 + 1];
         g_char_drawn.fetch_add(1, std::memory_order_relaxed);
@@ -8025,7 +8027,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         item.macro_tex != 0 && REXCVAR_GET(skate3_native_render_scene_macro)
             ? resolve_texture(item.macro_tex, 2)
             : &g_r.white;
-    if ((item.water || item.char_family >= 6) && item.water_normal != 0) {
+    if ((item.water || item.char_family >= 6 ||
+         (item.char_family >= 1 && item.char_family <= 2)) &&
+        item.water_normal != 0) {
       // Water rides its ripple normal map in the macro slot (water never
       // carries a macro overlay; overlay.z stays 0 below so the macro
       // composite path never runs). Vehicles do the same with their DXN
@@ -8033,6 +8037,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // face away from the sun and shade as a dark ambient-blue patch that
       // stops at the door seams (the exact PS with a FLAT map reproduces
       // that artifact; with the real map it matches the emulated car).
+      // Character fams 1/2 (defaultcharacter / CAC skin, face, cloth,
+      // lenses) do the same with their DXT5nm `normal` channel, the
+      // garment crease / skin pore detail the emulated render shows;
+      // overlay.z > 0 tells the char branch the map resolved.
       macro_tex = resolve_texture(item.water_normal, 3);
     }
     // Water / vehicle environment cube (t6, root param 8): decoded once per
@@ -8152,6 +8160,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (sun != &g_r.white) {
         decal_tex = sun;
         sky_sun_bound = true;
+      }
+    }
+    // Character skin/face spec-mask map (the cacstamp `specular` channel):
+    // rides the free decal slot like the env families. Written to
+    // overlay.w below: 3 = mask bound, 2 = channel present but not yet
+    // decoded (the PS masks the spec OFF; the DXT1 skin diffuse's opaque
+    // alpha would read as a full-white mask), 0 = no channel (the PS masks
+    // by diffuse alpha^2, cloth/jeans). char_alpha lenses keep the decal
+    // slot for their coverage texture.
+    float char_spec = 0.0f;
+    if ((item.char_family == 1 || item.char_family == 2) && !item.char_alpha &&
+        item.spec_tex != 0) {
+      const GuestTexture* spec = resolve_texture(item.spec_tex, 6);
+      if (spec != &g_r.white && spec->valid && spec->srv_mips != 0) {
+        decal_tex = spec;
+        char_spec = 3.0f;
+      } else {
+        char_spec = 2.0f;
       }
     }
     const bool is_decal =
@@ -8310,6 +8336,21 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                       ? 4.0f
                                       : 3.0f)
                                : 0.0f);
+    if (char_spec != 0.0f) {
+      // Character fam 1/2 spec-mask state (see the bind above); chars
+      // never take the is_decal/spec_bound paths, so the slot is theirs.
+      constants[47] = char_spec;
+    }
+    if (item.char_family == 1 || item.char_family == 2) {
+      // misc.y = normal/spec-map LOD bias to the console's 640p-gradient
+      // mip (the fam 5/6 cube-bias rationale): at 4K the shader's UV
+      // gradients pick ~1.75 mips finer than the game's own render, and
+      // mip-0 sampling keeps fine wrinkle noise the console filters away
+      // - the authored garment folds read weaker than the emulated
+      // reference without this.
+      constants[49] =
+          log2f(std::max(1.0f, float(context.guest_output_height) / 640.0f));
+    }
     // Exact flowingwateralpha branch (cam_pos.w = -30): the canal/waterfall
     // shader hand-ported from the game's own PS and verified per-pixel
     // against the ucode. Requires the frame m_params rows (b1), the shared

@@ -374,7 +374,7 @@ inline std::unordered_map<uint64_t, std::array<uint32_t, 12>> g_frame_draw_fetch
 // teal-vest twins), so the fallback applies only to meshes with a single
 // instance in the frame. Guest-render-thread only (capture hooks +
 // BuildFrameScene), no lock needed.
-inline std::unordered_map<uint32_t, std::array<float, 60>> g_char_rows_cache;
+inline std::unordered_map<uint32_t, std::array<float, 72>> g_char_rows_cache;
 // Frame-global character CSM receive biases (see FrameScene::char_shadow_bias)
 // + the guest frame they were captured on (served while <120 frames stale;
 // they only change with the scene lighting setup). Guest render thread only.
@@ -413,7 +413,7 @@ inline std::atomic<uint64_t> g_lw_rows_served{0};
 // legacy flat shading: the "vehicle loses its texture/color at the edge"
 // sighting.
 struct CharRowsCtx {
-  std::array<float, 60> rows;
+  std::array<float, 72> rows;
   uint32_t entity = 0;
 };
 inline std::unordered_map<uint32_t, CharRowsCtx> g_char_rows_cache_ctx;
@@ -429,7 +429,7 @@ inline std::unordered_map<uint32_t, CharRowsCtx> g_char_rows_cache_ctx;
 // flicker). Entity-stamped like CharRowsCtx (0 for non-LW instances) so a
 // recycled ctx never inherits the previous occupant's rows.
 struct CharRowsInst {
-  std::array<float, 60> rows;
+  std::array<float, 72> rows;
   uint32_t entity = 0;
 };
 inline std::unordered_map<uint64_t, CharRowsInst> g_char_rows_cache_inst;
@@ -442,7 +442,7 @@ inline std::unordered_map<uint64_t, CharRowsInst> g_char_rows_cache_inst;
 // rows across the pair is exact. Garment-to-garment only; body pieces keep
 // their per-piece caches.
 struct CharRowsEnt {
-  std::array<float, 60> rows;
+  std::array<float, 72> rows;
   uint8_t fam = 0;  // donor family: the row layout is family-specific
 };
 inline std::unordered_map<uint32_t, CharRowsEnt> g_char_rows_cache_ent;

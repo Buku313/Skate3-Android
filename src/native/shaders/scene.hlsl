@@ -49,7 +49,11 @@ cbuffer CH : register(b2) {
                     // vehicles keep spec color + power in row 0 instead
   float4 ch_tintA;  // CAC diffuse tint / livingworld red-mask tint (w = apply)
   float4 ch_tintB;  // livingworld blue-mask tint / hair fresnel tint (w = strand-alpha scale)
-  float4 ch_misc;   // x = alpha out, y = family
+  float4 ch_misc;   // x = alpha out, y = family, z = lens-alpha flag,
+                    // w = rim fresnel power
+  float4 ch_ks;     // rgb = key spec color, w = power (0 = spec rows absent)
+  float4 ch_rs;     // rgb = rim spec color, w = power
+  float4 ch_rim;    // rgb = rim light color, w = key-spec fresnel power
 };
 Texture2D<float4> diffuse : register(t0);
 Texture2D<float4> lightmap : register(t1);

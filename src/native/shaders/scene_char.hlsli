@@ -107,18 +107,80 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
   } else {
     // defaultcharacter / CAC pieces: key light + SH irradiance ambient,
     // key gated by the CSM shadow (see the livingworld comment above).
-    float csm = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, cn, i.pos.xy),
-                    SampleStaticSun(i.rpos + cam_pos.xyz, cn, i.pos.xy));
+    // The material's DXT5nm normal map (x in ALPHA, y in GREEN; the PSes
+    // read tf4.wy) rides the macro slot; overlay.z > 0 = resolved. The
+    // skinned vertex layout has no free bytes for the authored tangent
+    // frame (blend weights/indices own them), so use the screen-space
+    // cotangent frame. ScreenTangentFrame's env calibration (negated U
+    // axis, raw V axis) holds for characters too: projecting the skinned
+    // meshes through the frame's real view_proj and taking the D3D y-down
+    // screen-basis derivatives on the CAMERA-FACING triangles dots the
+    // frame against the skinned usage-6/7 tangent frame at -0.95 (tt.T) /
+    // +0.95 (bb.B); an edge-basis check without the projection lands on
+    // the back-face orientation and reads inverted. Map x rides T, map y
+    // rides B (the VS skins the usage-6 tangent into the interpolator the
+    // PS pairs with tf4.w, the usage-7 binormal into the tf4.y one).
+    float3 vn = cn;
+    if (overlay.z > 0.5) {
+      // misc.y = LOD bias to the console's 640p-gradient mip (same
+      // rationale as the reflective families' cube bias): mip 0 at 4K
+      // keeps fine wrinkle noise the console filters away, which reads
+      // as weaker authored folds than the emulated reference.
+      float2 nm = macro.SampleBias(smp, i.uv, misc.y).ag * 2.0 - 1.0;
+      float3 tt, bb;
+      ScreenTangentFrame(cn, i.rpos, i.uv, tt, bb);
+      vn = normalize(nm.x * tt + nm.y * bb +
+                     cn * sqrt(saturate(1.0 - dot(nm, nm))));
+    }
+    float vndl_u = dot(vn, ch_light.xyz);
+    float vndl = saturate(vndl_u);
+    float csm = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, vn, i.pos.xy),
+                    SampleStaticSun(i.rpos + cam_pos.xyz, vn, i.pos.xy));
     if (ch_tintA.w > 0.0) {
       dlin *= ch_tintA.rgb;
     }
     float3 irr = saturate(
-        ch_sh[0].rgb + cn.x * ch_sh[1].rgb + cn.y * ch_sh[2].rgb +
-        cn.z * ch_sh[3].rgb + (cn.x * cn.z) * ch_sh[4].rgb +
-        (cn.z * cn.y) * ch_sh[5].rgb + (cn.y * cn.x) * ch_sh[6].rgb +
-        (cn.z * cn.z) * ch_sh[7].rgb +
-        (cn.x * cn.x - cn.y * cn.y) * ch_sh[8].rgb);
-    lin = dlin * (ch_key.rgb * ndl * csm + irr * ch_amb.w);
+        ch_sh[0].rgb + vn.x * ch_sh[1].rgb + vn.y * ch_sh[2].rgb +
+        vn.z * ch_sh[3].rgb + (vn.x * vn.z) * ch_sh[4].rgb +
+        (vn.z * vn.y) * ch_sh[5].rgb + (vn.y * vn.x) * ch_sh[6].rgb +
+        (vn.z * vn.z) * ch_sh[7].rgb +
+        (vn.x * vn.x - vn.y * vn.y) * ch_sh[8].rgb);
+    float3 lit = ch_key.rgb * vndl * csm + irr * ch_amb.w;
+    float3 spec = float3(0.0, 0.0, 0.0);
+    // Rim light + key/rim phong specular, exact from the character PSes
+    // (ch_ks.w == 0 = rows not captured -> the terms vanish). The key spec
+    // reflects the sun about the mapped normal, gated on N.L >= 0 and the
+    // shadow; the rim terms share the game's fixed rim direction built
+    // from the sun and view. Spec mask = the diffuse alpha SQUARED
+    // (linear-space decode, like the vehicle gloss); skin/face carry a
+    // dedicated mask map in the free decal slot instead (overlay.w = 3;
+    // 2 = map present but not yet decoded -> mask 0, because the DXT1
+    // skin diffuse's opaque alpha would read as a full-white mask).
+    if (ch_ks.w > 0.0) {
+      float fb = 1.0 - saturate(dot(vn, vd));
+      float kfres = pow(max(fb, 1e-6), ch_rim.w);
+      float rfres = pow(max(fb, 1e-6), ch_misc.w);
+      float3 rd = normalize(ch_light.xyz * float3(-1.0, 0.2, -1.0) - vd);
+      lit += saturate(rfres * saturate(dot(vn, rd))) * ch_rim.rgb;
+      float3 kr = ch_light.xyz - 2.0 * vndl_u * vn;
+      float ks = pow(saturate(dot(vd, -kr)), ch_ks.w) * csm *
+                 (vndl_u >= 0.0 ? 1.0 : 0.0);
+      float3 rr = rd - 2.0 * dot(vn, rd) * vn;
+      float rs = pow(saturate(dot(vd, -rr)), ch_rs.w) * rfres;
+      float smask = overlay.w > 2.5 ? decal_art.SampleBias(smp, i.uv, misc.y).r
+                                    : (overlay.w > 1.5 ? 0.0 : albedo.a);
+      smask *= smask;
+      spec = saturate((ks * ch_ks.rgb * kfres + rs * ch_rs.rgb) * smask);
+    }
+    lin = dlin * lit + spec;
+    // The PS multiplies the lit color by the material multiplier
+    // m_params[0].y before the tone chain (1.2 on the gameplay banks;
+    // without it the jeans sit ~14% darker than the emulated reference).
+    // Captured into the otherwise-unused tintB.w on fams 1/2; 0 = an
+    // older capture without it.
+    if (ch_tintB.w > 0.25) {
+      lin *= ch_tintB.w;
+    }
     // defaultcharacter/cacstamp PSes end `max oC0.w, c13.x / c22.x`:
     // the entity's spawn fade (see the livingworld comment above).
     out_a = ch_misc.x;
