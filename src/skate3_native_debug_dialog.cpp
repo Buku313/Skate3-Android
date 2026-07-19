@@ -16,7 +16,9 @@
 REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, false, "Skate 3",
                     "Small top-right corner readout of which renderer produced the "
                     "last presented frame: NATIVE (native scene renderer) or "
-                    "EMULATED (Xenos GPU emulation: menus/loading yields, F5 off).")
+                    "EMULATED (Xenos GPU emulation; menus/loading yields, F5 off). "
+                    "Shows automatically while the native scene renderer is "
+                    "switched off, regardless of this setting.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Hook-layer master (boot-time), shown read-only.
@@ -945,7 +947,14 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
 }
 
 void RenderModeIndicator::OnDraw(ImGuiIO& io) {
-  if (!REXCVAR_GET(skate3_native_render_mode_indicator)) {
+  // Force-show while the native scene renderer is switched off (F5, the
+  // settings Renderer row, or the boot-time hook-layer master): running
+  // emulated is a degraded state the player should be able to see even with
+  // the indicator cvar off. Natural per-frame yields while the scene
+  // renderer is enabled (menus/loading) do not trigger this.
+  const bool scene_off = !REXCVAR_GET(skate3_native_render) ||
+                         !REXCVAR_GET(skate3_native_render_scene);
+  if (!REXCVAR_GET(skate3_native_render_mode_indicator) && !scene_off) {
     return;
   }
   // Pre-runtime (installer wizards) no guest frame exists yet - there is no

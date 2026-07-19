@@ -28,7 +28,8 @@ class NativeDebugDialog final : public rex::ui::ImGuiDialog {
 // presented frame: NATIVE (native scene renderer) or EMULATED (Xenos
 // GPU emulation; menus/loading yields, F5 off). Input-transparent, no
 // continuous repaint (updates ride the guest frame paints); off by
-// default, shown via skate3_native_render_mode_indicator (hot).
+// default, shown via skate3_native_render_mode_indicator (hot), and
+// force-shown while the native scene renderer is switched off.
 class RenderModeIndicator final : public rex::ui::ImGuiDialog {
  public:
   explicit RenderModeIndicator(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
