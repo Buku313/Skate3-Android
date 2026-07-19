@@ -13,7 +13,8 @@
       "binaryDir": "${sourceDir}/out/build/${presetName}",
       "cacheVariables": {
         "REXSDK_DIR": "${sourceDir}/third_party/rexglue-sdk",
-        "SKATE3_GAME_DATA_ROOT": "${sourceDir}/game"
+        "SKATE3_GAME_DATA_ROOT": "${sourceDir}/game",
+        "REXGLUE_USE_VULKAN": "ON"
       }
     },
     {
