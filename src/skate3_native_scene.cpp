@@ -874,6 +874,13 @@ REXCVAR_DEFINE_STRING(skate3_native_render_scene_trace_mesh, "", "Skate 3",
                       "every worker commit touching the mesh's objects. "
                       "Empty = off.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(skate3_native_render_scene_trace_2d, "", "Skate 3",
+                      "Hex fetch word 1 (base|flags) of a 2D overlay texture "
+                      "to trace through the 2D resolver ('2d-trace:' log "
+                      "lines): per-resolve entry state, liveness probe "
+                      "results and the serve/heal route taken, plus the "
+                      "worker commits for its words key. Empty = off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_detail_hold, 240, "Skate 3",
                      "Frames an item slot keeps serving its previous HIGHER-"
                      "resolution texture after the game's material-detail "

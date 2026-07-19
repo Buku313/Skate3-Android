@@ -250,6 +250,9 @@ inline std::atomic<uint64_t> g_skip_new{0};
 // mesh's current store keys (so worker-commit events can be matched), and
 // the last logged per-ctx state signature (summaries log on change).
 inline uint32_t g_trace_mesh_addr = 0;
+// 2D-resolver trace: fetch word 1 (base|flags) selected by the trace_2d
+// cvar; 0 = off. Render thread only.
+inline uint32_t g_trace_2d_w1 = 0;
 inline std::unordered_set<uint64_t> g_trace_keys;
 inline std::unordered_map<uint32_t, uint64_t> g_trace_sig;
 // Words-keyed (event-ad / streamed-artwork) serving: stale = site served
@@ -258,8 +261,8 @@ inline std::unordered_map<uint32_t, uint64_t> g_trace_sig;
 inline std::atomic<uint64_t> g_ad_stale_served{0};
 inline std::atomic<uint64_t> g_ad_placeholder{0};
 
-// Fill GuestTexture::probe_addr with up to 16 of the texture's own mip-0
-// blocks: a 4x4 spread over the block grid, each resolved through the same
+// Fill GuestTexture::probe_addr with up to 64 of the texture's own mip-0
+// blocks: an 8x8 spread over the block grid, each resolved through the same
 // tiled/linear addressing the decode uses, clamped to the guarded copy's
 // readable range. Probes crossing into the padded macro-row tail are skipped
 // rather than clamped; the tail belongs to pool neighbors.
@@ -277,6 +280,20 @@ inline void BuildPayloadProbes(const rex::graphics::TextureInfo& info, uint32_t 
   const uint32_t height = info.height + 1u;
   const uint32_t cols = (width + fi->block_width - 1) / fi->block_width;
   const uint32_t rows = (height + fi->block_height - 1) / fi->block_height;
+  // DXT2/3/4/5 blocks LEAD with their 8-byte alpha half, and on fully
+  // opaque art that half is the same constant in every block; the leading
+  // qword hashed identically across entirely DIFFERENT images (every
+  // pause-menu location photo fingerprinted alike), so in-place content
+  // swaps were invisible to the liveness probes. Probe the color half of
+  // those blocks instead. (DXT1's 8-byte block IS the color half; DXN's
+  // leading half is a real content channel; both keep offset 0.)
+  using TF = rex::graphics::xenos::TextureFormat;
+  const uint32_t probe_off =
+      (info.format == TF::k_DXT2_3 || info.format == TF::k_DXT4_5 ||
+       info.format == TF::k_DXT2_3_AS_16_16_16_16 ||
+       info.format == TF::k_DXT4_5_AS_16_16_16_16)
+          ? 8u
+          : 0u;
   for (uint32_t gy = 0; gy < 8; ++gy) {
     for (uint32_t gx = 0; gx < 8; ++gx) {
       const uint32_t bx = cols > 1 ? gx * (cols - 1) / 7 : 0;
@@ -291,7 +308,8 @@ inline void BuildPayloadProbes(const rex::graphics::TextureInfo& info, uint32_t 
       if (off + bpb > copy_size) {
         continue;
       }
-      out.probe_addr[out.probe_count++] = (0xA0000000u | mip0_addr) + off;
+      out.probe_addr[out.probe_count++] =
+          (0xA0000000u | mip0_addr) + off + probe_off;
     }
   }
 }

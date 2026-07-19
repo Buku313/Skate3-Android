@@ -150,6 +150,7 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_ssr_steps);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_budget_ms);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_min_items);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_mesh);
+REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_2d);
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
 #if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
@@ -6688,6 +6689,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       REXLOG_INFO("tex-trace: mesh={:08X} {}", parsed,
                   parsed ? "TRACING" : "off");
     }
+    const std::string t2(REXCVAR_GET(skate3_native_render_scene_trace_2d));
+    const uint32_t parsed2 =
+        t2.empty() ? 0u : uint32_t(std::strtoul(t2.c_str(), nullptr, 16));
+    if (parsed2 != g_trace_2d_w1) {
+      g_trace_2d_w1 = parsed2;
+      REXLOG_INFO("2d-trace: w1={:08X} {}", parsed2,
+                  parsed2 ? "TRACING" : "off");
+    }
   }
 
   // ---- Loading -> gameplay takeover (seamless boot / map-change loads) ----
@@ -8830,6 +8839,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       return &g_r.white;
     }
     const uint64_t key = FetchWordsKey(fetch);
+    // 2D-resolver trace (trace_2d cvar, matched on fetch word 1): logs the
+    // per-resolve entry state + route below, and registers the words key so
+    // the worker-commit trace covers its heals too.
+    const bool tr2d = g_trace_2d_w1 != 0 && fetch[1] == g_trace_2d_w1;
+    if (tr2d) {
+      g_trace_keys.insert(key);
+    }
     // Routing (see the 2d_async_px cvar): INLINE-FIRST under the per-frame
     // budget; the run-copy untiler + in-place hot updates made decodes
     // cheap (1280x720 sub-ms; no CreateCommittedResource churn on content
@@ -8856,15 +8872,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (it != g_r.tex_store.end()) {
       it->second.last_used_frame = frame_number;
     }
-    if (it != g_r.tex_store.end() && it->second.valid && !it->second.incomplete &&
+    if (it != g_r.tex_store.end() && it->second.valid &&
         frame_number >= it->second.recheck_frame &&
         REXCVAR_GET(skate3_native_render_scene_tex_revalidate)) {
       // Content liveness for CPU-rewritten UI art: video frames and APT
       // re-rasterized tiles rewrite the same payload with the fetch words
       // unchanged; without the probe the words-keyed cache would freeze
-      // them on their first decoded content.
+      // them on their first decoded content. Incomplete decodes (truncated
+      // tiled-mip copy) re-decode here too, like the 3D route revalidator;
+      // the 2D-only art (menu thumbnails) has no other heal path.
       const uint64_t fp = SampleProbeFingerprint(base, it->second);
-      if (fp != 0 && fp != it->second.payload_fp) {
+      if ((fp != 0 && fp != it->second.payload_fp) || it->second.incomplete) {
+        // Rolling-capped heal telemetry for menu-class art (the map-switch
+        // thumbnail wrong-image reports): names the key, the route taken
+        // and the fingerprint transition.
+        static std::atomic<uint32_t> s_2d_heal_logs{0};
+        const bool log_heal =
+            uint64_t(px_w) * px_h >= 32768 &&
+            s_2d_heal_logs.fetch_add(1, std::memory_order_relaxed) < 64;
         // Content changes decode INLINE while the per-frame budget lasts
         // (1-frame latency for animating UI); fullscreen-class art gets an
         // extended budget; serving it stale/blank is a whole-screen
@@ -8873,6 +8898,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         inline_redecode =
             video || !async_ui || hot_inline_budget_ns > 0 ||
             (fullscreen_class && hot_inline_budget_ns > -4'000'000);
+        if (log_heal) {
+          REXLOG_INFO(
+              "native-scene: 2D content heal {}x{} key={:016X} fp {:016X}->"
+              "{:016X} inc={} route={}",
+              px_w, px_h, key, it->second.payload_fp, fp,
+              it->second.incomplete ? 1 : 0,
+              inline_redecode ? "inline" : "async");
+        }
         if (inline_redecode) {
           // Same layout = update the committed texture in place (no
           // CreateCommittedResource churn, SRV slot kept, tear-guarded).
@@ -8883,6 +8916,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             g_pw_tex_decode.Add(up_ns);
             it->second.last_change_frame = frame_number;
             return &it->second;
+          }
+          if (tr2d) {
+            REXLOG_INFO("2d-trace: f{} key={:016X} inplace update REFUSED - "
+                        "retire + fresh decode",
+                        frame_number, key);
           }
           RetireGuestTexture(it->second, context.device->CurrentSubmission());
           g_r.tex_store.erase(it);
@@ -8920,6 +8958,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (async_ui && !video && !inline_redecode && !inline_ok) {
         EnqueueWordsMiss(key, fetch, /*ui=*/true);
         g_2d_async_skip.fetch_add(1, std::memory_order_relaxed);
+        if (tr2d) {
+          REXLOG_INFO("2d-trace: f{} key={:016X} SKIP (async first sight)",
+                      frame_number, key);
+        }
         return nullptr;
       }
       // Small HUD/spline art decodes inline (sub-ms; async would pop
@@ -8958,7 +9000,39 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cmd->FlushBarriers();
       gt.last_used_frame = frame_number;
       gt.last_change_frame = frame_number;
+      if (tr2d) {
+        REXLOG_INFO("2d-trace: f{} key={:016X} INLINE decode valid={} inc={} "
+                    "fp={:016X}",
+                    frame_number, key, gt.valid ? 1 : 0, gt.incomplete ? 1 : 0,
+                    gt.payload_fp);
+      }
       it = g_r.tex_store.emplace(key, gt).first;
+    }
+    if (it != g_r.tex_store.end() &&
+        (tr2d || (g_in_menus_frame.load(std::memory_order_relaxed) &&
+                  uint64_t(px_w) * px_h >= 32768))) {
+      // Menu thumbnail-class serve log: per buffer (fetch word 1), log when
+      // EITHER the served cache content (stored fp) OR the live guest
+      // content (probe fp) changes. A served-fp that lags the live-fp is
+      // exactly the stale-thumbnail bug; the buffer holds the new area's
+      // art while we keep serving the previous decode.
+      static std::mutex s_2d_log_mutex;
+      static std::unordered_map<uint32_t, uint64_t> s_2d_seen;  // w1 -> stored^live
+      const uint64_t live_fp = SampleProbeFingerprint(base, it->second);
+      const uint64_t sig = it->second.payload_fp ^ (live_fp * 3);
+      std::lock_guard<std::mutex> lk(s_2d_log_mutex);
+      auto sit = s_2d_seen.find(fetch[1]);
+      if (sit == s_2d_seen.end() || sit->second != sig) {
+        s_2d_seen[fetch[1]] = sig;
+        REXLOG_INFO(
+            "2d-thumb: f{} w1={:08X} {}x{} key={:016X} served_fp={:016X} "
+            "live_fp={:016X}{} valid={} inc={} recheck=f{}",
+            frame_number, fetch[1], px_w, px_h, key, it->second.payload_fp,
+            live_fp,
+            (live_fp != 0 && live_fp != it->second.payload_fp) ? " STALE" : "",
+            it->second.valid ? 1 : 0, it->second.incomplete ? 1 : 0,
+            it->second.recheck_frame);
+      }
     }
     return it->second.valid ? &it->second : &g_r.white;
   };
