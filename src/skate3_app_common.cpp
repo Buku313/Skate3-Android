@@ -789,6 +789,11 @@ void Skate3BaseApp::OnPostSetup() {
   auto* dispatcher = runtime()->function_dispatcher();
   skate3::native_render::Install();
   skate3::demo_path::InstallHooks(dispatcher);
+  // User-facing intro-movie skip (independent of the demo path): the movie
+  // completion override polls the merged UI pad state through this provider.
+  skate3::demo_path::SetUiInputProvider([this]() {
+    return static_cast<rex::input::InputSystem*>(runtime()->input_system());
+  });
   if (dispatcher->InitializeFunctionTable(eawebkit_PPCImageConfig.code_base,
                                           eawebkit_PPCImageConfig.code_size,
                                           eawebkit_PPCImageConfig.image_base,

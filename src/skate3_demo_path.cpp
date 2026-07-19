@@ -15,6 +15,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/ultrawide_debug.h>
 #include <rex/input/input.h>
+#include <rex/input/input_system.h>
 #include <rex/kernel/xam/input_injection.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
@@ -44,6 +45,9 @@ REXCVAR_DEFINE_INT32(skate3_demo_path_input_settle_ms, 2500, "Skate 3",
 REXCVAR_DEFINE_INT32(skate3_demo_path_input_delay_ms, 600, "Skate 3",
                      "Demo path: delay between injected gameplay inputs")
     .range(50, 10000);
+REXCVAR_DEFINE_BOOL(skate3_intro_movie_skip, true, "Skate 3",
+                    "Skip the frontend intro movie when A or Start is pressed "
+                    "(the default keyboard bindings make that Space and Enter)");
 
 namespace skate3::demo_path {
 namespace {
@@ -244,6 +248,38 @@ const GameplayInputToken* FindGameplayInputToken(const std::string& name) {
   return nullptr;
 }
 
+// Set once during app setup (before the guest boots), read from the guest
+// thread by the movie-skip poll.
+std::function<rex::input::InputSystem*()> g_ui_input_provider;
+
+// User-facing movie skip: a fresh A / Start press while a frontend movie is
+// updating completes it (the generated FEMoviePlayer::Update patch consults
+// ShouldForceIntroMovieComplete every movie tick, demo path or not). The
+// merged raw pad state is polled so the default keyboard bindings (Space = A,
+// Enter = Start) work identically on every backend; rising-edge only, so a
+// button held since before the movie doesn't blow straight through it.
+bool UserRequestedMovieSkip() {
+  static std::atomic<bool> s_was_down{true};
+  if (!REXCVAR_GET(skate3_intro_movie_skip) || !g_ui_input_provider) {
+    return false;
+  }
+  rex::input::InputSystem* input = g_ui_input_provider();
+  if (input == nullptr) {
+    return false;
+  }
+  constexpr uint16_t kSkipButtons =
+      rex::input::X_INPUT_GAMEPAD_A | rex::input::X_INPUT_GAMEPAD_START;
+  rex::input::X_INPUT_GAMEPAD pad;
+  const bool down =
+      input->GetUiGamepadState(&pad) && (pad.buttons & kSkipButtons) != 0;
+  const bool was_down = s_was_down.exchange(down, std::memory_order_relaxed);
+  if (down && !was_down) {
+    REXLOG_INFO("Skate 3: frontend movie skipped by user input");
+    return true;
+  }
+  return false;
+}
+
 std::atomic<bool> g_input_worker_quit{false};
 std::thread g_input_worker;
 
@@ -364,17 +400,20 @@ void InstallHooks(rex::runtime::FunctionDispatcher* dispatcher) {
   StartGameplayInputWorkerIfNeeded();
 }
 
-bool ShouldForceIntroMovieComplete() {
-  if (!AutomationEnabled() || !g_skip_intro_movie.load(std::memory_order_relaxed)) {
-    return false;
-  }
+void SetUiInputProvider(std::function<rex::input::InputSystem*()> provider) {
+  g_ui_input_provider = std::move(provider);
+}
 
-  bool expected = false;
-  if (g_logged_intro_movie_skip.compare_exchange_strong(expected, true,
-                                                       std::memory_order_relaxed)) {
-    REXLOG_INFO("Skate 3 demo path: forcing frontend intro movie complete");
+bool ShouldForceIntroMovieComplete() {
+  if (AutomationEnabled() && g_skip_intro_movie.load(std::memory_order_relaxed)) {
+    bool expected = false;
+    if (g_logged_intro_movie_skip.compare_exchange_strong(expected, true,
+                                                          std::memory_order_relaxed)) {
+      REXLOG_INFO("Skate 3 demo path: forcing frontend intro movie complete");
+    }
+    return true;
   }
-  return true;
+  return UserRequestedMovieSkip();
 }
 
 }  // namespace skate3::demo_path
