@@ -426,7 +426,7 @@ void DrawShowcaseSetupWindow(bool* p_open) {
     return;
   }
   const bool running = REXCVAR_GET(skate3_native_render_scene_showcase);
-  if (ImGui::Button(running ? "Cancel showcase" : "Start showcase (Home)",
+  if (ImGui::Button(running ? "Cancel showcase" : "Start showcase (Ctrl+Shift+B)",
                     ImVec2(-1.0f, 0.0f))) {
     REXCVAR_SET(skate3_native_render_scene_showcase, !running);
   }
@@ -551,7 +551,7 @@ void DrawShowcaseCaptureSection() {
   DrawMaxQualityToggle();
   {
     const bool running = REXCVAR_GET(skate3_native_render_scene_showcase);
-    if (ImGui::Button(running ? "Cancel showcase" : "Start showcase (Home)")) {
+    if (ImGui::Button(running ? "Cancel showcase" : "Start showcase (Ctrl+Shift+B)")) {
       REXCVAR_SET(skate3_native_render_scene_showcase, !running);
     }
     if (ImGui::IsItemHovered()) {

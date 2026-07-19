@@ -770,7 +770,7 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         "Native render debug menu", [this] {
                           ToggleNativeDebug();
                         });
-  rex::ui::RegisterBind("bind_skate3_showcase", "Home",
+  rex::ui::RegisterBind("bind_skate3_showcase", "Ctrl+Shift+B",
                         "Graphics build-up showcase", [] {
                           REXCVAR_SET(
                               skate3_native_render_scene_showcase,
