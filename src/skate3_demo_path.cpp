@@ -400,6 +400,10 @@ void InstallHooks(rex::runtime::FunctionDispatcher* dispatcher) {
   StartGameplayInputWorkerIfNeeded();
 }
 
+rex::input::InputSystem* GetUiInputSystem() {
+  return g_ui_input_provider ? g_ui_input_provider() : nullptr;
+}
+
 void SetUiInputProvider(std::function<rex::input::InputSystem*()> provider) {
   g_ui_input_provider = std::move(provider);
 }
