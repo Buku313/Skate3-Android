@@ -235,6 +235,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
+    src/skate3_native_scene_gpu.cpp
     src/skate3_screenshot.cpp
     src/skate3_shader_disasm.cpp
     src/skate3_title_update_installer.cpp
