@@ -13,7 +13,13 @@
 //  2. Per-zone optimesh mesh cull: WorldPresEntityOptimesh rebuilds a
 //     {camX, drawDistance, camZ, 1} reference vector at entity+512 every
 //     frame (sub_82792900, attribute 0x2E9AAECD1C29F81F); the cull job
-//     compares world-mesh pieces against lane 1.
+//     compares world-mesh pieces against lane 1. Lane 1 is NOT scaled:
+//     the vector doubles as the entity's world anchor (the entity parks
+//     drawDistance meters above the camera so its own cull distance is a
+//     constant), and backdrop meshes anchored to the entity - the fake
+//     skyline dome - render at that height, so scaling it visibly raised
+//     the skyline off the horizon. Zone pieces still reach x k through
+//     the shared contribution-cull threshold in (1).
 //
 //  3. Character LOD bands: SceneRenderView::GetLODDistancesFromAttrib
 //     (sub_827E1AD8) rewrites six squared switch distances every frame,
@@ -295,9 +301,12 @@ extern "C" REX_FUNC(sub_8288DC58) {
 
 // WorldPresEntityOptimesh per-frame update: rebuilds the size-cull reference
 // vector at entity+512 from a global camera vector, with lane 1 replaced by
-// the zone attribute. The cull job projects this vector onto the view axis
-// as the synthetic mesh size (size * engage / dist^2 >= threshold), so only
-// the lane-1 term is per-zone; scale it in place each frame.
+// the zone attribute. Lane 1 doubles as the entity's world-space height
+// (the entity is parked that many meters above the camera so its cull
+// distance stays constant), and the fake-skyline backdrop renders anchored
+// to it - scaling lane 1 visibly raised the skyline off the horizon by
+// (k - 1) x drawDistance meters. Zone reach therefore rides the shared
+// contribution-cull threshold scaling only; lane 1 stays untouched.
 extern "C" REX_FUNC(sub_82792900) {
   const uint32_t entity = ctx.r3.u32;
   __imp__sub_82792900(ctx, base);
@@ -312,11 +321,6 @@ extern "C" REX_FUNC(sub_82792900) {
                   LoadGuestF32(base, entity + 516),
                   LoadGuestF32(base, entity + 520));
     }
-  }
-  const double scale = REXCVAR_GET(skate3_draw_distance_scale);
-  if (std::abs(scale - 1.0) > kScaleEpsilon) {
-    const uint32_t addr = entity + 516;
-    StoreGuestF32(base, addr, float(double(LoadGuestF32(base, addr)) * scale));
   }
   // Drone camera engaged: recenter the size-cull reference on the flown
   // position (lanes 0/2 are the camera X/Z the cull job measures distance
