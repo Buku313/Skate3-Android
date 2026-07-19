@@ -669,6 +669,45 @@ struct RendererState {
   // Per-frame handoff: the G-buffer pass drew and left ssr_gbuf in
   // PIXEL_SHADER_RESOURCE for ApplySsrPass (which consumes + restores it).
   bool ssr_gbuf_ready = false;
+  // Volumetric lighting (hdr.hlsl ps_vol_*): shadow-marched sun shafts,
+  // a half-res world-space march testing per-step sun visibility against
+  // the CSM atlas + the static world-shadow map (real shadowed air; no
+  // screen-space silhouette dependence), plus an analytic directional
+  // haze, both fused into ps_tonemap pre-tonemap (after the AO multiply;
+  // in-air light is not surface-occluded). HDR path only; shares the HDR
+  // binding layout (which carries the shadow constant slice at b1). The
+  // shaft plane idles in RENDER_TARGET state.
+  nrhi::Pipeline* pso_vol_linearize = nullptr;  // fallback when SSAO idle
+  nrhi::Pipeline* pso_vol_shafts = nullptr;
+  // 3x3 tent over the marched plane (the ps_bloom_up shader without the
+  // additive blend): integrates the march's per-pixel jitter dither and
+  // softens shadow-volume edges.
+  nrhi::Pipeline* pso_vol_blur = nullptr;
+  nrhi::Texture* vol_tex = nullptr;    // half res RGBA16F march output
+  nrhi::Texture* vol_tex_b = nullptr;  // blurred plane (the tonemap input)
+  nrhi::TextureView* vol_srv = nullptr;
+  nrhi::TextureView* vol_srv_b = nullptr;
+  uint32_t vol_width = 0, vol_height = 0;
+  nrhi::Texture* vol_lin_depth = nullptr;  // full res R32F (own linearize)
+  nrhi::TextureView* vol_lin_srv = nullptr;
+  uint32_t vol_lin_width = 0, vol_lin_height = 0;
+  // Scene-depth SRV for the own linearize, re-pointed on depth rebuilds.
+  nrhi::TextureView* vol_depth_srv = nullptr;
+  nrhi::Texture* vol_depth_srv_of = nullptr;
+  uint32_t vol_msaa = 0;  // linearize-variant PSO latch
+  bool vol_failed = false;
+  // Per-frame handoff to ApplyHdrPost: the finished shaft plane and the
+  // linear-depth plane used this frame (the SSAO plane or the own
+  // linearize) are left in PIXEL_SHADER_RESOURCE for ps_tonemap (t3/t4);
+  // ApplyHdrPost restores both and clears the flags.
+  bool vol_plane_in_psr = false;
+  nrhi::Texture* vol_lin_plane = nullptr;
+  nrhi::TextureView* vol_lin_plane_srv = nullptr;
+  bool vol_lin_in_psr = false;
+  // ps_tonemap's volumetric constant rows (b0 rows vp/vs0/vs1/vs2 tail),
+  // staged by ApplyVolumetricPass; zeros disable every term.
+  bool vol_tonemap_valid = false;
+  float vol_rows[16] = {};
   std::unordered_map<uint32_t, MeshBuffers> meshes;
   // (The old D3D12 bookkeeping, the retired-resource vector, the CPU SRV
   // staging heap and its slot allocator/recycling lists, is gone: resource
@@ -885,9 +924,16 @@ bool ApplySsrPass(const NativeGuestOutputRenderContext& context,
                   nrhi::Cmd* cmd, const FrameScene& scene,
                   const nrhi::Viewport& viewport, const nrhi::Rect& scissor,
                   bool ssao_ran);
+bool EnsureVolumetricPipeline(const NativeGuestOutputRenderContext& context);
+bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
+                         nrhi::Cmd* cmd, const FrameScene& scene,
+                         const nrhi::Viewport& viewport,
+                         const nrhi::Rect& scissor, bool ssao_ran,
+                         uint64_t frame_number);
 void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
                   nrhi::Cmd* cmd, const nrhi::Viewport& viewport,
-                  const nrhi::Rect& scissor, bool loading_native);
+                  const nrhi::Rect& scissor, bool loading_native,
+                  uint64_t frame_number);
 bool ApplyMenuBlurPass(const NativeGuestOutputRenderContext& context, nrhi::Cmd* cmd,
                        float target_sigma, bool output_in_guest_output_state);
 // Blur-over-emulated-frames post processor registered by Install().

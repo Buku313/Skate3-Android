@@ -428,6 +428,10 @@ bool Enabled();
 // its dark tint on top of the blurred scene.
 void SetSettingsMenuBlur(bool enabled);
 
+// The captured (un-overridden) sun direction, for the debug dialog's sun
+// override to seed its sliders from (unit vector toward the sun).
+void GetCapturedSunDir(float out[3]);
+
 // The game's per-entity spawn/streaming fade as carried by the item's
 // validated character-lighting capture (peds c21.x, defaultcharacter c13.x,
 // cacstamp c22.x, vehicle body c20.x, hair strand scale). 1.0 for items

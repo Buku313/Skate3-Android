@@ -217,8 +217,80 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr_packed, true, "Skate 3",
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_hdr_debug, 0, "Skate 3",
                      "HDR post debug: 0 = off, 1 = show the bloom term only, 2 = show "
                      "the raw pre-tonemap scene (clamped), 3 = show the fused SSAO "
-                     "multiplier plane.")
-    .range(0, 3)
+                     "multiplier plane, 4 = show the sun-shaft plane only, 5 = show "
+                     "the directional haze term only.")
+    .range(0, 5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shafts, true, "Skate 3",
+                    "Volumetric sun shafts: the air along each view ray is marched "
+                    "against the dynamic CSM atlas and the static world-shadow map, "
+                    "and the SHADOWED portion proportionally dims the light seen "
+                    "through it: dark crepuscular shafts cut by real shadow "
+                    "volumes (buildings, trees, underpasses) into the game's own "
+                    "sun glow. Fully lit air is untouched, so open scenes stay "
+                    "exactly as authored. Requires the HDR intermediate and this "
+                    "frame's shadow pass.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shafts_intensity, 0.6,
+                      "Skate 3",
+                      "Sun-shaft strength: how strongly fully shadowed air dims "
+                      "the scene behind it, scaled by the forward-scatter phase "
+                      "(at the default, fully shaded air dims ~30-50% at typical "
+                      "sun-facing angles and saturates looking straight at the "
+                      "sun; 0 = off).")
+    .range(0.0, 1.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shafts_reach, 40.0, "Skate 3",
+                      "Sun-shaft march reach (world units): how far in front of "
+                      "the camera the air is sampled for sun visibility. Longer "
+                      "reaches pick up more distant shadow volumes at coarser "
+                      "sampling for the same step count.")
+    .range(5.0, 300.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shafts_steps, 64, "Skate 3",
+                     "Sun-shaft march steps per pixel (half-res pass). More steps "
+                     "resolve thinner shadow volumes at proportional GPU cost.")
+    .range(8, 64)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_sun_override, false, "Skate 3",
+                    "Lighting lab: replace the captured sun direction with the "
+                    "azimuth/elevation cvars. Every per-frame light transform is "
+                    "rebuilt around the new direction, so the dynamic CSM shadows, "
+                    "the static world-shadow map, material shadow receivers and "
+                    "the volumetric shafts all follow the moved sun. Baked "
+                    "lightmap shade and the sky dome's painted sun cannot move "
+                    "(game content), a tuning tool, not a time-of-day system.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_sun_azimuth, 220.0, "Skate 3",
+                      "Overridden sun azimuth in degrees (compass heading the sun "
+                      "sits toward; 0 = +Z north, 90 = +X east).")
+    .range(0.0, 360.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_sun_elevation, 35.0, "Skate 3",
+                      "Overridden sun elevation in degrees above the horizon (low "
+                      "values = long shadows and the most visible shafts).")
+    .range(2.0, 88.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_haze, true, "Skate 3",
+                    "Directional atmospheric haze: sun-scattered light added with "
+                    "view distance, strongest looking toward the sun, tinted by the "
+                    "frame's own fog color (so it tracks time of day and fades at "
+                    "night). Kept subtle; the game's authored sky and fog carry "
+                    "the base atmosphere, and additive terms read as extra fog "
+                    "quickly. Requires the HDR intermediate.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_haze_intensity, 0.08,
+                      "Skate 3",
+                      "Directional haze strength (pre-tonemap scale of the "
+                      "toward-the-sun scattering excess; 0 = off).")
+    .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_haze_density, 0.005,
+                      "Skate 3",
+                      "Directional haze density per view unit: how quickly the "
+                      "scattering saturates with distance (0.005 reaches ~63% at "
+                      "200 units).")
+    .range(0.0, 0.05)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_2d, true, "Skate 3",
                     "Replay the game's 2D/APT (Flash HUD) draws as a native overlay pass "
@@ -6948,6 +7020,105 @@ void PublishSplineDraws(uint8_t* base) {
   g_scene_spline = std::move(published);
 }
 
+void GetCapturedSunDir(float out[3]) {
+  out[0] = g_sun_captured[0].load(std::memory_order_relaxed);
+  out[1] = g_sun_captured[1].load(std::memory_order_relaxed);
+  out[2] = g_sun_captured[2].load(std::memory_order_relaxed);
+}
+
+// Rebuild a world->light affine row (xyz = axis * scale, w = translation)
+// around a new axis, preserving the row's scale and its value at the camera
+// - cascade centering and bias conventions carry over unchanged.
+static void RebasisLightRow(float* row, const float axis[3],
+                            const float cam[3]) {
+  const float scale = std::sqrt(row[0] * row[0] + row[1] * row[1] +
+                                row[2] * row[2]);
+  if (scale < 1e-8f) {
+    return;
+  }
+  const float at_cam =
+      row[0] * cam[0] + row[1] * cam[1] + row[2] * cam[2] + row[3];
+  row[0] = axis[0] * scale;
+  row[1] = axis[1] * scale;
+  row[2] = axis[2] * scale;
+  row[3] = at_cam - (row[0] * cam[0] + row[1] * cam[1] + row[2] * cam[2]);
+}
+
+// Lighting-lab sun override (skate3_native_render_scene_sun_override):
+// rotates every captured per-frame light transform in the published scene
+// to the azimuth/elevation-driven direction. The native CSM caster pass,
+// the material receivers, the static world-shadow map (which re-primes
+// automatically when its rows change) and the volumetric shafts all read
+// these rows, so the whole dynamic lighting stack follows the moved sun.
+// Baked lightmap shade and the sky dome's painted sun are game content and
+// stay put.
+static void ApplySunOverride(FrameScene& scene) {
+  if (!REXCVAR_GET(skate3_native_render_scene_sun_override)) {
+    return;
+  }
+  const float kDeg = 0.01745329252f;
+  const float az = float(REXCVAR_GET(skate3_native_render_scene_sun_azimuth)) * kDeg;
+  const float el =
+      float(REXCVAR_GET(skate3_native_render_scene_sun_elevation)) * kDeg;
+  // Unit vector TOWARD the sun (y up; azimuth 0 = +Z, 90 = +X).
+  const float sun[3] = {std::cos(el) * std::sin(az), std::sin(el),
+                        std::cos(el) * std::cos(az)};
+  // Light basis: depth axis points away from the sun; X/Y span the shadow
+  // plane. Handedness is irrelevant; casters and receivers share the rows.
+  const float zl[3] = {-sun[0], -sun[1], -sun[2]};
+  float xl[3] = {zl[2], 0.0f, -zl[0]};  // cross((0,1,0), zl)
+  const float xll = std::sqrt(xl[0] * xl[0] + xl[2] * xl[2]);
+  if (xll > 1e-5f) {
+    xl[0] /= xll;
+    xl[2] /= xll;
+  } else {
+    xl[0] = 1.0f;
+    xl[2] = 0.0f;
+  }
+  const float yl[3] = {zl[1] * xl[2] - zl[2] * xl[1],
+                       zl[2] * xl[0] - zl[0] * xl[2],
+                       zl[0] * xl[1] - zl[1] * xl[0]};
+  const float* cam = scene.cam_pos;
+  if (scene.shadow_valid) {
+    RebasisLightRow(scene.shadow_rows + 0, xl, cam);    // c0 light-space X
+    RebasisLightRow(scene.shadow_rows + 12, yl, cam);   // c3 light-space Y
+    RebasisLightRow(scene.shadow_rows + 16, zl, cam);   // c4 depth ramp
+    scene.shadow_rows[24] = sun[0];                     // c6 sun direction
+    scene.shadow_rows[25] = sun[1];
+    scene.shadow_rows[26] = sun[2];
+    // Re-center the cascade sub-boxes (c1/c2 scale.xy + offset.zw) on the
+    // camera: the game fits their offsets for ITS sun each frame, and
+    // under a rotated basis the finest cascade can drift off the player;
+    // the shadow then falls back to the coarser tiles (visibly blocky).
+    // Caster pass and receivers share these rows, so the re-fit stays
+    // self-consistent.
+    const float* rows = scene.shadow_rows;
+    const float lsx =
+        rows[0] * cam[0] + rows[1] * cam[1] + rows[2] * cam[2] + rows[3];
+    const float lsy =
+        rows[12] * cam[0] + rows[13] * cam[1] + rows[14] * cam[2] + rows[15];
+    scene.shadow_rows[6] = -lsx * scene.shadow_rows[4];   // c1 offset
+    scene.shadow_rows[7] = -lsy * scene.shadow_rows[5];
+    scene.shadow_rows[10] = -lsx * scene.shadow_rows[8];  // c2 offset
+    scene.shadow_rows[11] = -lsy * scene.shadow_rows[9];
+  }
+  if (scene.dynobj_valid) {
+    scene.dynobj_rows[0] = sun[0];
+    scene.dynobj_rows[1] = sun[1];
+    scene.dynobj_rows[2] = sun[2];
+  }
+  if (scene.dynobj_ws_valid) {
+    RebasisLightRow(scene.dynobj_ws + 0, xl, cam);
+    RebasisLightRow(scene.dynobj_ws + 4, yl, cam);
+    RebasisLightRow(scene.dynobj_ws + 8, zl, cam);
+  }
+  if (scene.sky_sun_valid) {
+    scene.sky_sun[0] = sun[0];
+    scene.sky_sun[1] = sun[1];
+    scene.sky_sun[2] = sun[2];
+  }
+}
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
@@ -8570,6 +8741,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.sky_sun, g_sky_sun, sizeof(g_sky_sun));
     scene.sky_sun_valid = true;
   }
+  // Publish the captured sun direction BEFORE any override (the debug
+  // dialog seeds the override sliders from it).
+  {
+    const float* cap = scene.shadow_valid ? scene.shadow_rows + 24
+                                          : scene.sky_sun;
+    if (scene.shadow_valid || scene.sky_sun_valid) {
+      g_sun_captured[0].store(cap[0], std::memory_order_relaxed);
+      g_sun_captured[1].store(cap[1], std::memory_order_relaxed);
+      g_sun_captured[2].store(cap[2], std::memory_order_relaxed);
+    }
+  }
+  ApplySunOverride(scene);
   // The game's own popup blur chain (pause menu etc.), untouched by the
   // host settings menu, whose gaussian reads host state directly at render
   // time (see ApplyMenuBlurPass call sites).

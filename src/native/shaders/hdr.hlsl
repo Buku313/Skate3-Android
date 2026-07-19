@@ -15,23 +15,92 @@
 //                  (anti-firefly) on the mip-0 extraction
 //   ps_bloom_up    3x3 tent upsample, additive-blended onto the next-larger
 //                  level (ONE/ONE at the PSO)
-//   ps_tonemap     scene xe + bloom -> the exact classic tone chain -> the
-//                  gamma guest output
+//   ps_tonemap     scene xe + bloom + volumetric terms -> the exact classic
+//                  tone chain -> the gamma guest output
+//
+// Volumetric lighting (shadow-marched sun shafts + directional haze) rides
+// the same layout plus the frame's shadow constant slice at b1:
+//   ps_vol_linearize  scene depth -> linear view Z, full res (only when the
+//                     SSAO pass did not already produce the plane this frame;
+//                     VOL_MSAA=1 variant for the MSAA depth buffer)
+//   ps_vol_shafts     half res: reconstruct the world position from depth,
+//                     march the camera->pixel ray with per-pixel jitter and
+//                     test each step's sun visibility against the CSM atlas
+//                     and the static world-shadow map, real shadowed air,
+//                     so occlusion never depends on on-screen silhouettes
+//                     (no ghosting around near characters) and beams appear
+//                     wherever shadow volumes cross the view ray.
+// The shaft plane and a full-res analytic haze term (Schlick phase on the
+// view/sun angle x depth scattering, tinted by the frame's captured fog
+// color) both join in ps_tonemap AFTER the AO multiply; in-air light is
+// not subject to surface occlusion, and before the tone chain, so they
+// bloom and tonemap like scene light.
 cbuffer C : register(b0) {
   float4 size;  // xy = destination size in px, zw = 1 / destination size
   float4 src;   // xy = source size in px, zw = 1 / source size
   float4 p0;    // x = bloom threshold (xe space), y = soft knee,
-                // z = bloom intensity, w = debug (1 = bloom term, 2 = raw xe)
+                // z = bloom intensity, w = debug (1 = bloom term, 2 = raw xe,
+                // 3 = AO plane, 4 = shaft plane, 5 = haze term)
   float4 p1;    // x = downsample tap spread in source texels (2 on the 4x
                 // extraction so the 13-tap footprint covers the whole
                 // source block, 1 on the 2x chain), yzw spare
+  // Volumetric rows (zero when the effect is off; every term drops out).
+  // ps_vol_shafts overloads the tail with the world unprojection instead:
+  // src = camera world position (xyz) + march reach, p0 = march steps /
+  // strength / phase g, p1.xy = proj m22 / m32, vp/vs0/vs1/vs2 = the
+  // row-vector inverse view-projection (world = clip * M).
+  float4 vp;    // tonemap/linearize: x = |m00|, y = |m11|, z = m22, w = m32
+  float4 vs0;   // tonemap: w = shaft intensity (xyz unused)
+  float4 vs1;   // tonemap: xyz = haze tint (xe space), w = haze intensity
+  float4 vs2;   // tonemap: xyz = sun direction in AO view space (toward the
+                // sun), w = haze density (1 / view unit)
+};
+// Per-frame shadow constant slice (the scene pass's b1; see scene.hlsl for
+// the authoritative layout); ps_vol_shafts samples sun visibility with the
+// exact receiver math the materials use. Only the rows up to the static
+// world-shadow transform are declared (the tail is water state).
+cbuffer S : register(b1) {
+  float4 sh_x;      // light-space X row (xyz) + translation (w)
+  float4 sh_y;      // light-space Y row
+  float4 sh_z;      // depth row (height ramp)
+  float4 sh_c1;     // cascade 1 scale.xy + offset.zw
+  float4 sh_c2;     // cascade 2 scale.xy + offset.zw
+  float4 sh_color;  // shadow color rgb + luma
+  float4 sh_misc;   // x = depth bias, y = enable, zw = atlas dimensions
+  float4 sh_sun;    // xyz = sun direction (toward the sun), w = exposure
+  float4 sh_env;
+  float4 sh_fogp;
+  float4 sh_fogc;
+  float4 dyn_sun;
+  float4 dyn_amb;
+  float4 dyn_misc;  // y = static world-shadow floor
+  float4 sh_char;
+  float4 sh_v2;
+  float4 dyn_wsx;   // static world-shadow rows: u = dot(wp4, wsx)*0.5+0.5,
+  float4 dyn_wsy;   // v = dot(wp4, wsy)*-0.5+0.5,
+  float4 dyn_wsz;   // ray depth = dot(wp4, wsz)
 };
 Texture2D<float4> tex0 : register(t0);  // per-pass primary input
+#ifdef VOL_MSAA
+Texture2DMS<float> depth_ms : register(t0);  // ps_vol_linearize MSAA depth
+#endif
+Texture2D<float> tex0d : register(t0);  // ps_vol_linearize 1x depth
 Texture2D<float4> tex1 : register(t1);  // ps_tonemap: the bloom plane
+Texture2D<float> tex1d : register(t1);  // ps_vol_shafts: linear depth
 // ps_tonemap: the SSAO multiplier plane (fused pre-tonemap apply, replaces
 // the classic path's separate full-res composite draw; white when AO is
 // off). Bilinear upsample from the AO raster, like the classic composite.
 Texture2D<float> ao_plane : register(t2);
+// ps_vol_shafts: the CSM atlas (x = light-space depth, y = coverage).
+Texture2D<float2> shadow_tex : register(t2);
+// ps_tonemap: the half-res shaft plane (white with vs0.w = 0 when shafts
+// did not run) and the full-res linear view-Z plane (white with vs1.w = 0
+// when no depth was produced this frame).
+Texture2D<float4> vol_plane : register(t3);
+// ps_vol_shafts: the 512x512 static world-shadow map (x = light-space
+// depth; sge(stored >= ray) = lit, uncovered texels hold the far clear).
+Texture2D<float4> ws_tex : register(t3);
+Texture2D<float> lin_depth : register(t4);
 SamplerState smp_point : register(s0);
 SamplerState smp_linear : register(s1);
 
@@ -53,6 +122,134 @@ float3 ToneMapScene(float3 x) {
   float3 t1 = saturate(1.0 - x);
   float3 tm = max(x * 0.25 + 0.75, 1.0) - t1 * t1;
   return saturate(sqrt(max(tm * 0.5, 0.0)) * 1.41);
+}
+
+// Device depth -> view-space Z. Row-vector projection with m23 = 1:
+// ndc_z = m22 + m32 / z_view.
+float LinearZ(float d) {
+  return clamp(vp.w / min(d - vp.z, -1e-6), 0.05f, 4e5f);
+}
+
+// View-space position from UV + linear Z (|m00|/|m11| make this the SSAO
+// passes' possibly-mirrored view space; the sun direction row is folded
+// into the same space CPU-side, so angles stay consistent).
+float3 ViewPos(float2 uv, float z) {
+  float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+  return float3(ndc.x * z / vp.x, ndc.y * z / vp.y, z);
+}
+
+// Interleaved gradient noise: per-pixel march phase jitter (the bilinear
+// half-res upsample integrates the dither).
+float Ign(float2 p) {
+  return frac(52.9829189f * frac(dot(p, float2(0.06711056f, 0.00583715f))));
+}
+
+float ps_vol_linearize(VSOut i) : SV_Target {
+#ifdef VOL_MSAA
+  float d = depth_ms.Load(int2(i.pos.xy), 0);
+#else
+  float d = tex0d.Load(int3(int2(i.pos.xy), 0));
+#endif
+  return LinearZ(d);
+}
+
+// CSM atlas sun visibility at a world position: the material receiver
+// math (see scene.hlsl SampleCsmShadow) with the dynamicobject per-cascade
+// biases (air samples are not casters; the world bias is 0 in captures).
+// Returns -1 outside every cascade: uncovered air is EXCLUDED from the
+// march average rather than assumed lit, so out-of-range distance cannot
+// wash the beams out.
+float CsmVis(float3 wp) {
+  float2 lsv = float2(dot(sh_x.xyz, wp) + sh_x.w, dot(sh_y.xyz, wp) + sh_y.w);
+  float2 luv = 0.0;
+  float casc = 0.0;
+  float2 l2 = lsv * sh_c2.xy + sh_c2.zw;
+  if (max(abs(l2.x), abs(l2.y)) < 0.99) { luv = l2; casc = 3.0; }
+  float2 l1 = lsv * sh_c1.xy + sh_c1.zw;
+  if (max(abs(l1.x), abs(l1.y)) < 0.99) { luv = l1; casc = 2.0; }
+  if (max(abs(lsv.x), abs(lsv.y)) < 0.99) { luv = lsv; casc = 1.0; }
+  if (casc <= 0.0) {
+    return -1.0;
+  }
+  float2 suv = float2(luv.x / 6.0 + (casc * 2.0 - 1.0) / 6.0,
+                      luv.y * -0.5 + 0.5);
+  float rd = dot(sh_z.xyz, wp) + sh_z.w - (casc > 1.5 ? 0.015 : 0.007);
+  float2 sm2 = shadow_tex.SampleLevel(smp_linear, suv, 0);
+  return saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
+}
+
+// Static world-shadow (region-wide baked building/tree shade) visibility;
+// -1 outside the map's projection.
+float WorldVis(float3 wp) {
+  float4 wp4 = float4(wp, 1.0);
+  float2 wuv = float2(dot(wp4, dyn_wsx) * 0.5 + 0.5,
+                      dot(wp4, dyn_wsy) * -0.5 + 0.5);
+  if (any(saturate(wuv) != wuv)) {
+    return -1.0;
+  }
+  return ws_tex.SampleLevel(smp_point, wuv, 0).x >= dot(wp4, dyn_wsz)
+             ? 1.0
+             : 0.0;
+}
+
+// Shadow-marched volumetric sun shafts (half res). The camera->pixel ray
+// is marched with per-pixel jitter; each step's sun visibility comes from
+// the CSM atlas and the static world-shadow map, so the beams are cast by
+// real shadow volumes, never by on-screen silhouettes. Output = the
+// SHADOWED fraction x Henyey-Greenstein forward-scatter phase x marched
+// path fraction: the game's sky and fog already carry the authored
+// scattering of fully-lit air, so adding lit-air glow double-counts it
+// into a structureless veil; only the shadow volumes' CUTS into that
+// glow are new information, and ps_tonemap SUBTRACTS them (crepuscular
+// shafts by contrast). Fully lit air contributes exactly zero.
+float4 ps_vol_shafts(VSOut i) : SV_Target {
+  float d = tex1d.SampleLevel(smp_point, i.uv, 0);
+  // World position via the inverse view-projection (row-vector): the clip
+  // vector is (ndc * w, ndc_z * w, w) with w = view Z and ndc_z = m22 +
+  // m32 / z.
+  float2 ndc = float2(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0);
+  float zn = p1.x + p1.y / max(d, 1e-4);
+  float4 clip = float4(ndc.x * d, ndc.y * d, zn * d, d);
+  float4 wp4 = clip.x * vp + clip.y * vs0 + clip.z * vs1 + clip.w * vs2;
+  float3 wp = wp4.xyz / max(wp4.w, 1e-6);
+  float3 cam = src.xyz;
+  float3 ray = wp - cam;
+  float dist = length(ray);
+  float3 rdir = ray / max(dist, 1e-4);
+  float reach = min(dist, src.w);
+  float steps = clamp(p0.x, 8.0, 64.0);
+  float jitter = Ign(i.pos.xy);
+  float lit = 0.0;
+  float tot = 0.0;
+  [loop] for (int k = 0; k < 64; ++k) {
+    if (k >= (int)steps) {
+      break;
+    }
+    float3 sp = cam + rdir * ((float(k) + jitter) / steps * reach);
+    float cv = CsmVis(sp);
+    float wv = WorldVis(sp);
+    if (cv >= 0.0 || wv >= 0.0) {
+      lit += min(cv < 0.0 ? 1.0 : cv, wv < 0.0 ? 1.0 : wv);
+      tot += 1.0;
+    }
+  }
+  if (tot < 2.5) {
+    return float4(0.0, 0.0, 0.0, 1.0);
+  }
+  float ct = dot(rdir, sh_sun.xyz);
+  float g = p0.z;
+  // Henyey-Greenstein SHAPE without the 4-pi radiance normalization; the
+  // output is a dimming factor, not integrated radiance, so the phase only
+  // steers directionality: ~1.25 at 50 degrees off the sun, capped toward
+  // the sun axis (the 4-pi-normalized form peaked at 0.03-0.1 at typical
+  // viewing angles and made the effect invisible at any intensity).
+  float hg = min((1.0 - g * g) /
+                     pow(max(1.0 + g * g - 2.0 * g * ct, 1e-3), 1.5),
+                 2.0);
+  // Path fraction: a near surface has little air in front of it; the term
+  // that keeps the shafts off close characters.
+  float e = (1.0 - lit / tot) * hg * saturate(reach / max(src.w, 1.0));
+  return float4(e, e, e, 1.0);
 }
 
 // Soft-knee brightpass (kept in xe space, where 1.0 is the tonemapper's
@@ -130,6 +327,62 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   float ao = ao_plane.SampleLevel(smp_linear, i.uv, 0);
   float3 x = max(tex0.SampleLevel(smp_point, i.uv, 0).rgb, 0.0) * ao;
   float3 bloom = tex1.SampleLevel(smp_linear, i.uv, 0).rgb * p0.z;
+  // Volumetric terms, applied AFTER the AO multiply (in-air light is not
+  // subject to surface occlusion). The shaft plane carries the marched
+  // SHADOWED-air term (see ps_vol_shafts) and dims MULTIPLICATIVELY;
+  // shadowed air removes a proportional share of the light seen through
+  // it. Against the bright sky that reads as dark crepuscular shafts;
+  // against a dim facade it is a slight deepening; fully lit air changes
+  // nothing. An ABSOLUTE subtraction was tried and rejected: the game
+  // bakes its scatter glow into bright sky pixels only, so subtracting a
+  // phase-weighted constant clamped whole shaded street canyons toward
+  // black. The half-res plane upsamples depth-aware (weights collapse
+  // across depth discontinuities) so shaft edges never bleed onto near
+  // silhouettes.
+  float shaft = 0.0;
+  if (vs0.w > 0.0) {
+    float dpix = lin_depth.SampleLevel(smp_point, i.uv, 0);
+    float2 vt = size.zw * 2.0;  // one shaft-plane texel in uv
+    float2 base = (floor(i.uv / vt - 0.5) + 0.5) * vt;
+    float2 f = saturate((i.uv - base) / vt);
+    float acc = 0.0;
+    float wsum = 0.0;
+    [unroll] for (int k = 0; k < 4; ++k) {
+      const float2 kC[4] = {float2(0.0, 0.0), float2(1.0, 0.0),
+                            float2(0.0, 1.0), float2(1.0, 1.0)};
+      float2 su = base + kC[k] * vt;
+      float w = (kC[k].x > 0.5 ? f.x : 1.0 - f.x) *
+                (kC[k].y > 0.5 ? f.y : 1.0 - f.y);
+      float ds = lin_depth.SampleLevel(smp_point, su, 0);
+      w *= 1.0 / (1.0 + 8.0 * abs(ds - dpix) / max(dpix, 1.0));
+      acc += vol_plane.SampleLevel(smp_point, su, 0).r * w;
+      wsum += w;
+    }
+    shaft = acc / max(wsum, 1e-4) * vs0.w;
+  }
+  // Directional haze: the phase function's excess over its perpendicular
+  // value only; the game's own fog already renders the isotropic part,
+  // so adding a floor here just veils the whole frame.
+  float3 haze = float3(0.0, 0.0, 0.0);
+  if (vs1.w > 0.0) {
+    float d = lin_depth.SampleLevel(smp_point, i.uv, 0);
+    float path = 1.0 - exp(-max(vs2.w, 0.0005) * d);
+    float3 ray = normalize(ViewPos(i.uv, 1.0));
+    float cosv = dot(ray, vs2.xyz);
+    const float g = 0.75;
+    float denom = max(1.0 - g * cosv, 1e-3);
+    float phase = (1.0 - g * g) / (denom * denom);
+    phase = min(max(phase - (1.0 - g * g), 0.0), 3.0);
+    haze = vs1.xyz * (phase * path * vs1.w);
+  }
+  if (p0.w > 4.5) {
+    return float4(ToneMapScene(haze), 1.0);  // debug: haze term only
+  }
+  if (p0.w > 3.5) {
+    // Debug: the shaft shadowing term only (inverted feel: bright = air
+    // that will darken in the composite).
+    return float4(ToneMapScene(shaft.xxx), 1.0);
+  }
   if (p0.w > 2.5) {
     return float4(ao, ao, ao, 1.0);  // debug: AO multiplier plane
   }
@@ -139,5 +392,9 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   if (p0.w > 0.5) {
     return float4(ToneMapScene(bloom), 1.0);  // debug: bloom term only
   }
-  return float4(ToneMapScene(x + bloom), 1.0);
+  // Dimming ceiling: shadowed air thins the light, it does not extinguish
+  // it; without the ceiling a fully shaded sun-facing view (under an
+  // overpass) saturated to a solid black void.
+  return float4(
+      ToneMapScene((x + haze) * (1.0 - 0.55 * saturate(shaft)) + bloom), 1.0);
 }

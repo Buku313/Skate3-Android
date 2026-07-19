@@ -8586,13 +8586,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     post_ran = true;
   }
 
+  // ---- Volumetric lighting (hdr.hlsl ps_vol_*) ----
+  // Shadow-marched sun shafts (per-step visibility against the CSM atlas +
+  // the static world-shadow map), plus the constant staging for the
+  // directional haze; both terms join in ps_tonemap after the AO multiply,
+  // so they bloom and tonemap like scene light.
+  if (hdr_on && use_depth && !loading_native &&
+      ApplyVolumetricPass(context, cmd, scene, viewport, scissor, ssao_ran,
+                          frame_number)) {
+    post_ran = true;
+  }
+
   // ---- HDR post (hdr.hlsl: bloom pyramid + the extracted tonemap) ----
   // Bloom reads the AO-composited float scene; ps_tonemap applies the
   // game's shared tone chain once into the guest output, which every later
   // consumer (photo chain, 2D overlay, blur, grab) reads exactly as on the
   // classic path.
   if (hdr_on) {
-    ApplyHdrPost(context, cmd, viewport, scissor, loading_native);
+    ApplyHdrPost(context, cmd, viewport, scissor, loading_native,
+                 frame_number);
     post_ran = true;
   }
 

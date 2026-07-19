@@ -62,9 +62,16 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_knee);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_threshold);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_haze);
+REXCVAR_DECLARE(double, skate3_native_render_scene_haze_density);
+REXCVAR_DECLARE(double, skate3_native_render_scene_haze_intensity);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_hdr);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_hdr_debug);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_hdr_packed);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shafts_intensity);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shafts_reach);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shafts_steps);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao_debug);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao_full_res);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_intensity);
@@ -845,6 +852,438 @@ bool ApplySsrPass(const NativeGuestOutputRenderContext& context,
   return true;
 }
 
+// ---- Volumetric lighting (hdr.hlsl ps_vol_*: sun shafts + haze) ---------
+// PSOs under the HDR binding layout, built lazily on the first enabled frame
+// and rebuilt when the MSAA level (linearize variant) changes. Failure
+// disables the effect only.
+bool EnsureVolumetricPipeline(const NativeGuestOutputRenderContext& context) {
+  if (g_r.vol_failed || !g_r.hdr_active || g_r.hdr_layout == nullptr) {
+    return false;
+  }
+  if (g_r.pso_vol_shafts != nullptr && g_r.vol_msaa == g_r.msaa) {
+    return true;
+  }
+  nrhi::Device* device = context.device;
+  const auto fail = [&](const char* what) {
+    REXLOG_ERROR("native-scene: volumetric pipeline setup failed ({})", what);
+    g_r.vol_failed = true;
+    return false;
+  };
+  for (nrhi::Pipeline** p : {&g_r.pso_vol_linearize, &g_r.pso_vol_shafts,
+                             &g_r.pso_vol_blur}) {
+    if (*p != nullptr) {
+      device->DestroyDeferred(*p);
+      *p = nullptr;
+    }
+  }
+  const bool msaa = g_r.msaa > 1;
+  const nrhi::ShaderMacro msaa_defs[] = {{"VOL_MSAA", "1"},
+                                         {nullptr, nullptr}};
+  nrhi::Shader* vs = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kVertex, "hdr.hlsl", kHdrShaderSource,
+                     "vs_main", nullptr, ""));
+  nrhi::Shader* ps_lin = device->CreateShader(MakeShaderDesc(
+      nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
+      "ps_vol_linearize", msaa ? msaa_defs : nullptr,
+      msaa ? "VOL_MSAA=1" : ""));
+  nrhi::Shader* ps_shafts = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
+                     "ps_vol_shafts", nullptr, ""));
+  // The 3x3 tent blur reuses ps_bloom_up (in a non-blended PSO): it
+  // integrates the march jitter and softens shadow-volume edges.
+  nrhi::Shader* ps_blur = device->CreateShader(
+      MakeShaderDesc(nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
+                     "ps_bloom_up", nullptr, ""));
+  const bool shaders_ok = vs != nullptr && ps_lin != nullptr &&
+                          ps_shafts != nullptr && ps_blur != nullptr;
+  if (!shaders_ok) {
+    for (nrhi::Shader* s : {vs, ps_lin, ps_shafts, ps_blur}) {
+      device->DestroyDeferred(s);
+    }
+    return fail("shader compile");
+  }
+  nrhi::GraphicsPipelineDesc pso;
+  pso.layout = g_r.hdr_layout;
+  pso.vs = vs;
+  pso.cull = nrhi::CullMode::kNone;
+  pso.sample_count = 1;
+  pso.ps = ps_lin;
+  pso.rtv_format = nrhi::Format::kR32_FLOAT;
+  g_r.pso_vol_linearize = device->CreateGraphicsPipeline(pso);
+  pso.rtv_format = nrhi::Format::kR16G16B16A16_FLOAT;
+  pso.ps = ps_shafts;
+  g_r.pso_vol_shafts = device->CreateGraphicsPipeline(pso);
+  pso.ps = ps_blur;
+  g_r.pso_vol_blur = device->CreateGraphicsPipeline(pso);
+  for (nrhi::Shader* s : {vs, ps_lin, ps_shafts, ps_blur}) {
+    device->DestroyDeferred(s);
+  }
+  if (g_r.pso_vol_linearize == nullptr || g_r.pso_vol_shafts == nullptr ||
+      g_r.pso_vol_blur == nullptr) {
+    return fail("pso");
+  }
+  g_r.vol_msaa = g_r.msaa;
+  REXLOG_INFO("native-scene: volumetric pipeline created (MSAA x{})",
+              g_r.msaa);
+  return true;
+}
+
+// General 4x4 inverse (Gauss-Jordan). Returns false on a singular matrix.
+static bool Invert4x4(const float m[16], float out[16]) {
+  float a[4][8];
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      a[r][c] = m[r * 4 + c];
+      a[r][c + 4] = r == c ? 1.0f : 0.0f;
+    }
+  }
+  for (int col = 0; col < 4; ++col) {
+    int pivot = col;
+    for (int r = col + 1; r < 4; ++r) {
+      if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) {
+        pivot = r;
+      }
+    }
+    if (std::fabs(a[pivot][col]) < 1e-12f) {
+      return false;
+    }
+    if (pivot != col) {
+      for (int c = 0; c < 8; ++c) {
+        std::swap(a[col][c], a[pivot][c]);
+      }
+    }
+    const float inv = 1.0f / a[col][col];
+    for (int c = 0; c < 8; ++c) {
+      a[col][c] *= inv;
+    }
+    for (int r = 0; r < 4; ++r) {
+      if (r == col) {
+        continue;
+      }
+      const float f = a[r][col];
+      for (int c = 0; c < 8; ++c) {
+        a[r][c] -= f * a[col][c];
+      }
+    }
+  }
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      out[r * 4 + c] = a[r][c + 4];
+    }
+  }
+  return true;
+}
+
+// Shadow-marched sun shafts + the constant staging for the haze term
+// ps_tonemap evaluates. Runs between the SSR composite and the HDR post.
+// Leaves the shaft plane and the linear-depth plane in
+// PIXEL_SHADER_RESOURCE for ps_tonemap (ApplyHdrPost restores both).
+// Returns true when it staged anything; the binding layout changed and
+// the caller's post_ran block restores the main-pass bindings.
+bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
+                         nrhi::Cmd* cmd, const FrameScene& scene,
+                         const nrhi::Viewport& viewport,
+                         const nrhi::Rect& scissor, bool ssao_ran,
+                         uint64_t frame_number) {
+  // Shafts need this frame's shadow state: the receiver constants (b1
+  // slice), the blurred CSM atlas left in PIXEL_SHADER_RESOURCE by the
+  // shadow pass, and a valid capture. The haze needs only the sun capture.
+  const bool shafts = REXCVAR_GET(skate3_native_render_scene_shafts) &&
+                      scene.shadow_valid && g_r.shadow_cb != nullptr &&
+                      g_r.shadow_srv_final != nullptr &&
+                      g_r.shadow_in_srv_state;
+  const bool haze_want =
+      REXCVAR_GET(skate3_native_render_scene_haze) && scene.sky_sun_valid;
+  if ((!shafts && !haze_want) || g_r.hdr_resolved == nullptr ||
+      g_r.hdr_srv == nullptr) {
+    return false;
+  }
+  // The published projection must be the live perspective matrix.
+  const float* pr = scene.proj;
+  if (pr[11] != 1.0f || pr[0] == 0.0f || pr[5] == 0.0f || pr[14] == 0.0f) {
+    return false;
+  }
+  if (!EnsureVolumetricPipeline(context)) {
+    return false;
+  }
+  nrhi::Device* device = context.device;
+  const uint32_t width = context.guest_output_width;
+  const uint32_t height = context.guest_output_height;
+
+  // ---- Full-res linear view-Z: the SSAO plane when AO linearized this
+  // frame (it idles back in RENDER_TARGET after the AO pass), else the own
+  // linearize below.
+  bool lin_ready = ssao_ran && g_r.ao_lin_depth != nullptr &&
+                   g_r.ao_lin_srv != nullptr && g_r.ao_lin_width == width &&
+                   g_r.ao_lin_height == height;
+  if (!lin_ready) {
+    if (g_r.vol_lin_depth == nullptr || g_r.vol_lin_width != width ||
+        g_r.vol_lin_height != height) {
+      if (g_r.vol_lin_srv != nullptr) {
+        device->DestroyDeferred(g_r.vol_lin_srv);
+        g_r.vol_lin_srv = nullptr;
+      }
+      if (g_r.vol_lin_depth != nullptr) {
+        device->DestroyDeferred(g_r.vol_lin_depth);
+        g_r.vol_lin_depth = nullptr;
+      }
+      nrhi::TextureDesc desc;
+      desc.width = width;
+      desc.height = height;
+      desc.mip_levels = 1;
+      desc.format = nrhi::Format::kR32_FLOAT;
+      desc.usage = nrhi::kTextureUsageRenderTarget;
+      desc.initial_state = nrhi::ResourceState::kRenderTarget;
+      g_r.vol_lin_depth = device->CreateTexture(desc);
+      if (g_r.vol_lin_depth == nullptr) {
+        g_r.vol_failed = true;
+        return false;
+      }
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.vol_lin_srv = device->CreateTextureView(g_r.vol_lin_depth, vd);
+      if (g_r.vol_lin_srv == nullptr) {
+        g_r.vol_failed = true;
+        return false;
+      }
+      g_r.vol_lin_width = width;
+      g_r.vol_lin_height = height;
+    }
+    // Scene-depth SRV, re-pointed when the depth buffer is rebuilt.
+    if (g_r.vol_depth_srv == nullptr || g_r.vol_depth_srv_of != g_r.depth) {
+      if (g_r.vol_depth_srv != nullptr) {
+        device->DestroyDeferred(g_r.vol_depth_srv);
+        g_r.vol_depth_srv = nullptr;
+      }
+      nrhi::TextureViewDesc sd_desc;
+      if (g_r.msaa > 1) {
+        sd_desc.dimension = nrhi::ViewDimension::k2DMS;
+      } else {
+        sd_desc.dimension = nrhi::ViewDimension::k2D;
+        sd_desc.mip_levels = 1;
+      }
+      g_r.vol_depth_srv = device->CreateTextureView(g_r.depth, sd_desc);
+      if (g_r.vol_depth_srv == nullptr) {
+        g_r.vol_failed = true;
+        return false;
+      }
+      g_r.vol_depth_srv_of = g_r.depth;
+    }
+  }
+
+  // ---- Shaft planes (half res, march + blurred), rebuilt on resize.
+  const uint32_t vw = std::max(1u, (width + 1) / 2);
+  const uint32_t vh = std::max(1u, (height + 1) / 2);
+  if (shafts &&
+      (g_r.vol_width != vw || g_r.vol_height != vh || g_r.vol_tex == nullptr ||
+       g_r.vol_tex_b == nullptr)) {
+    nrhi::Texture** texs[2] = {&g_r.vol_tex, &g_r.vol_tex_b};
+    nrhi::TextureView** views[2] = {&g_r.vol_srv, &g_r.vol_srv_b};
+    for (int i = 0; i < 2; ++i) {
+      if (*views[i] != nullptr) {
+        device->DestroyDeferred(*views[i]);
+        *views[i] = nullptr;
+      }
+      if (*texs[i] != nullptr) {
+        device->DestroyDeferred(*texs[i]);
+        *texs[i] = nullptr;
+      }
+      nrhi::TextureDesc desc;
+      desc.width = vw;
+      desc.height = vh;
+      desc.mip_levels = 1;
+      desc.format = nrhi::Format::kR16G16B16A16_FLOAT;
+      desc.usage = nrhi::kTextureUsageRenderTarget;
+      desc.initial_state = nrhi::ResourceState::kRenderTarget;
+      *texs[i] = device->CreateTexture(desc);
+      if (*texs[i] == nullptr) {
+        g_r.vol_failed = true;
+        return false;
+      }
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      *views[i] = device->CreateTextureView(*texs[i], vd);
+      if (*views[i] == nullptr) {
+        g_r.vol_failed = true;
+        return false;
+      }
+    }
+    g_r.vol_width = vw;
+    g_r.vol_height = vh;
+  }
+
+  // Sun direction in the AO view space (the projection's per-axis signs
+  // folded into the world->view rotation, exactly as the SSR pass builds
+  // it): the space ps_tonemap reconstructs view rays in for the haze.
+  const float* sd = scene.sky_sun;  // [0..2] = unit vector toward the sun
+  const float* vpm = scene.view_proj;
+  const float sxs = pr[0] < 0.0f ? -1.0f : 1.0f;
+  const float sys = pr[5] < 0.0f ? -1.0f : 1.0f;
+  const float inv00 = 1.0f / pr[0];
+  const float inv11 = 1.0f / pr[5];
+  float sun_view[3] = {
+      sd[0] * vpm[0] * inv00 * sxs + sd[1] * vpm[4] * inv00 * sxs +
+          sd[2] * vpm[8] * inv00 * sxs,
+      sd[0] * vpm[1] * inv11 * sys + sd[1] * vpm[5] * inv11 * sys +
+          sd[2] * vpm[9] * inv11 * sys,
+      sd[0] * vpm[3] + sd[1] * vpm[7] + sd[2] * vpm[11]};
+  const float svl = std::sqrt(sun_view[0] * sun_view[0] +
+                              sun_view[1] * sun_view[1] +
+                              sun_view[2] * sun_view[2]);
+  if (svl > 1e-6f) {
+    sun_view[0] /= svl;
+    sun_view[1] /= svl;
+    sun_view[2] /= svl;
+  }
+  // Haze tint: the frame's captured linear fog color folded through the
+  // scene exposure: the fully-fogged xe value, so the haze always matches
+  // the game's own atmosphere (and fades out at night with it).
+  const float expo = scene.sky_sun[5] > 0.0f ? scene.sky_sun[5] : 2.5f;
+  const float haze_int =
+      haze_want ? float(REXCVAR_GET(skate3_native_render_scene_haze_intensity))
+                : 0.0f;
+  const float shaft_int =
+      shafts ? float(REXCVAR_GET(skate3_native_render_scene_shafts_intensity))
+             : 0.0f;
+
+  // The march reconstructs world positions through the inverse
+  // view-projection.
+  float inv_vp[16];
+  const bool inv_ok = Invert4x4(scene.view_proj, inv_vp);
+
+  const uint32_t cb_offset =
+      uint32_t(frame_number % RendererState::kShadowCbRegions) *
+      RendererState::kShadowCbSlice;
+  cmd->SetBindingLayout(g_r.hdr_layout);
+  cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+  cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
+
+  float c[32] = {};
+  // 1) Own linearize when AO did not produce the plane this frame (needs
+  // the m22/m32 rows in the vp slot).
+  nrhi::Texture* lin_tex = lin_ready ? g_r.ao_lin_depth : g_r.vol_lin_depth;
+  nrhi::TextureView* lin_srv = lin_ready ? g_r.ao_lin_srv : g_r.vol_lin_srv;
+  if (!lin_ready) {
+    c[16] = std::fabs(pr[0]);
+    c[17] = std::fabs(pr[5]);
+    c[18] = pr[10];
+    c[19] = pr[14];
+    cmd->SetRootConstants(0, 32, c, 0);
+    cmd->Barrier(g_r.depth, nrhi::ResourceState::kDepthWrite,
+                 nrhi::ResourceState::kPixelShaderResource);
+    cmd->FlushBarriers();
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    cmd->SetRenderTargets(g_r.vol_lin_depth, nullptr);
+    cmd->SetPipeline(g_r.pso_vol_linearize);
+    cmd->SetTexture(1, g_r.vol_depth_srv);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.depth, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kDepthWrite);
+  }
+  cmd->Barrier(lin_tex, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+
+  // 2) Shadow-marched shafts (half res): world-space camera->pixel march
+  // testing per-step sun visibility against the CSM atlas + the static
+  // world-shadow map (see ps_vol_shafts).
+  bool shaft_plane = false;
+  if (shafts && inv_ok && g_r.vol_tex != nullptr && g_r.vol_tex_b != nullptr) {
+    const nrhi::Viewport vol_vp{0.0f, 0.0f, float(vw), float(vh), 0.0f, 1.0f};
+    const nrhi::Rect vol_sc{0, 0, int32_t(vw), int32_t(vh)};
+    c[0] = float(vw);
+    c[1] = float(vh);
+    c[2] = 1.0f / float(vw);
+    c[3] = 1.0f / float(vh);
+    c[4] = scene.cam_pos[0];
+    c[5] = scene.cam_pos[1];
+    c[6] = scene.cam_pos[2];
+    c[7] = float(REXCVAR_GET(skate3_native_render_scene_shafts_reach));
+    c[8] = float(REXCVAR_GET(skate3_native_render_scene_shafts_steps));
+    c[10] = 0.6f;  // Henyey-Greenstein forward-scatter anisotropy
+    c[12] = pr[10];
+    c[13] = pr[14];
+    std::memcpy(c + 16, inv_vp, sizeof(inv_vp));
+    cmd->SetRootConstants(0, 32, c, 0);
+    cmd->SetViewport(vol_vp);
+    cmd->SetScissor(vol_sc);
+    cmd->SetRenderTargets(g_r.vol_tex, nullptr);
+    cmd->SetPipeline(g_r.pso_vol_shafts);
+    cmd->SetTexture(2, lin_srv);                 // t1 = linear depth
+    cmd->SetTexture(3, g_r.shadow_srv_final);    // t2 = CSM atlas
+    // t3 = the static world-shadow map when primed (white is neutral: the
+    // stored depth 1 compares lit everywhere).
+    cmd->SetTexture(4, (g_r.world_shadow_srv != nullptr &&
+                        g_r.world_shadow_in_srv)
+                           ? g_r.world_shadow_srv
+                           : g_r.white.srv);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.vol_tex, nrhi::ResourceState::kRenderTarget,
+                 nrhi::ResourceState::kPixelShaderResource);
+    cmd->FlushBarriers();
+    // 3x3 tent blur (integrates the march jitter, softens shadow-volume
+    // edges); the blurred plane is what ps_tonemap samples.
+    c[4] = float(vw);
+    c[5] = float(vh);
+    c[6] = 1.0f / float(vw);
+    c[7] = 1.0f / float(vh);
+    cmd->SetRootConstants(0, 8, c, 0);
+    cmd->SetRenderTargets(g_r.vol_tex_b, nullptr);
+    cmd->SetPipeline(g_r.pso_vol_blur);
+    cmd->SetTexture(1, g_r.vol_srv);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.vol_tex, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->Barrier(g_r.vol_tex_b, nrhi::ResourceState::kRenderTarget,
+                 nrhi::ResourceState::kPixelShaderResource);
+    cmd->FlushBarriers();
+    shaft_plane = true;
+  }
+
+  // 3) Stage ps_tonemap's volumetric rows + the plane handoffs.
+  g_r.vol_rows[0] = std::fabs(pr[0]);
+  g_r.vol_rows[1] = std::fabs(pr[5]);
+  g_r.vol_rows[2] = pr[10];
+  g_r.vol_rows[3] = pr[14];
+  g_r.vol_rows[4] = 0.0f;
+  g_r.vol_rows[5] = 0.0f;
+  g_r.vol_rows[6] = 0.0f;
+  g_r.vol_rows[7] = shaft_plane ? shaft_int : 0.0f;
+  g_r.vol_rows[8] = scene.fog_color[0] * expo;
+  g_r.vol_rows[9] = scene.fog_color[1] * expo;
+  g_r.vol_rows[10] = scene.fog_color[2] * expo;
+  g_r.vol_rows[11] = haze_int;
+  g_r.vol_rows[12] = sun_view[0];
+  g_r.vol_rows[13] = sun_view[1];
+  g_r.vol_rows[14] = sun_view[2];
+  g_r.vol_rows[15] =
+      float(REXCVAR_GET(skate3_native_render_scene_haze_density));
+  g_r.vol_tonemap_valid = true;
+  g_r.vol_plane_in_psr = shaft_plane;
+  g_r.vol_lin_plane = lin_tex;
+  g_r.vol_lin_plane_srv = lin_srv;
+  g_r.vol_lin_in_psr = true;
+  // Throttled diagnostics: the terms degrade to zero silently when the
+  // shadow state or the fog capture is missing; log what decides them.
+  static uint32_t s_vol_log = 0;
+  if (s_vol_log < 4 || (s_vol_log % 36000) == 0) {
+    REXLOG_INFO(
+        "native-scene: vol2 shafts={} gates[cvar={} shvalid={} atlas={} "
+        "insrv={}] inv={} ws={} tex={} tint=({:.3f},{:.3f},{:.3f}) "
+        "expo={:.2f} sunv=({:.2f},{:.2f},{:.2f}) lin={}",
+        shaft_plane ? 1 : 0,
+        REXCVAR_GET(skate3_native_render_scene_shafts) ? 1 : 0,
+        scene.shadow_valid ? 1 : 0, g_r.shadow_srv_final != nullptr ? 1 : 0,
+        g_r.shadow_in_srv_state ? 1 : 0, inv_ok ? 1 : 0,
+        g_r.world_shadow_in_srv ? 1 : 0, g_r.vol_tex != nullptr ? 1 : 0,
+        g_r.vol_rows[8], g_r.vol_rows[9], g_r.vol_rows[10], expo, sun_view[0],
+        sun_view[1], sun_view[2], lin_ready ? "ao" : "own");
+  }
+  ++s_vol_log;
+  return true;
+}
+
 // ---- HDR post chain (hdr.hlsl: bloom pyramid + the extracted tonemap) ----
 // Layout + PSOs, built when the HDR path activates and rebuilt when the
 // guest output format (the tonemap target) changes. Failure falls back to
@@ -867,18 +1306,29 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
     return false;
   };
   if (g_r.hdr_layout == nullptr) {
-    // The SSAO layout shape plus a third single-texture table (t2 = the
-    // fused AO multiplier plane): root constants b0 + three single-texture
-    // tables + point/linear clamp samplers (hdr.hlsl's frozen Vulkan plan).
+    // The SSAO layout shape widened for the fused tonemap consumers: root
+    // constants b0 (32 floats: the tail rows carry the volumetric params)
+    // + five single-texture tables (t2 = the fused AO multiplier plane,
+    // t3 = the shaft plane, t4 = linear depth) + point/linear clamp
+    // samplers + the per-frame shadow constant slice at b1 (the volumetric
+    // march samples sun visibility with the material receiver math). The
+    // CBV is APPENDED so the table param indices stay 1..5 (Vulkan's set-0
+    // derivation orders buffer params by declaration order regardless).
     nrhi::BindingLayoutDesc ld;
-    ld.param_count = 4;
-    ld.params[0] = {nrhi::BindingParamKind::kConstants, /*b*/ 0, 16,
+    ld.param_count = 7;
+    ld.params[0] = {nrhi::BindingParamKind::kConstants, /*b*/ 0, 32,
                     nrhi::Visibility::kAll};
     ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 1,
                     nrhi::Visibility::kPixel};
     ld.params[2] = {nrhi::BindingParamKind::kTextureTable, 1, 1,
                     nrhi::Visibility::kPixel};
     ld.params[3] = {nrhi::BindingParamKind::kTextureTable, 2, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[4] = {nrhi::BindingParamKind::kTextureTable, 3, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[5] = {nrhi::BindingParamKind::kTextureTable, 4, 1,
+                    nrhi::Visibility::kPixel};
+    ld.params[6] = {nrhi::BindingParamKind::kConstantBuffer, /*b*/ 1, 1,
                     nrhi::Visibility::kPixel};
     ld.static_sampler_count = 2;
     ld.static_samplers[0] = {/*s*/ 0, nrhi::Filter::kPoint,
@@ -966,7 +1416,8 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
 // consumer expects); the caller restores the main binding layout after.
 void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
                   nrhi::Cmd* cmd, const nrhi::Viewport& viewport,
-                  const nrhi::Rect& scissor, bool loading_native) {
+                  const nrhi::Rect& scissor, bool loading_native,
+                  uint64_t frame_number) {
   nrhi::Device* device = context.device;
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
@@ -1034,12 +1485,26 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
 
   cmd->SetBindingLayout(g_r.hdr_layout);
   cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+  // The layout carries the shadow constant slice at b1 (the volumetric
+  // march); bind it for every draw on this layout; the bloom/tonemap
+  // shaders never read it, but the descriptor must hold a valid buffer.
+  if (g_r.shadow_cb != nullptr) {
+    const uint32_t cb_offset =
+        uint32_t(frame_number % RendererState::kShadowCbRegions) *
+        RendererState::kShadowCbSlice;
+    cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
+  }
   // The scene plane is the sampled source for the whole chain.
   cmd->Barrier(g_r.hdr_resolved, nrhi::ResourceState::kRenderTarget,
                nrhi::ResourceState::kPixelShaderResource);
   cmd->FlushBarriers();
 
-  float c[16];
+  float c[32] = {};
+  // Rows 16-31 = the volumetric params ApplyVolumetricPass staged this
+  // frame (zeros otherwise; every volumetric term drops out).
+  if (g_r.vol_tonemap_valid) {
+    std::memcpy(c + 16, g_r.vol_rows, sizeof(g_r.vol_rows));
+  }
   const auto set_consts = [&](uint32_t dw, uint32_t dh, uint32_t sw,
                               uint32_t sh, float intensity, float tap_scale) {
     c[0] = float(dw);
@@ -1062,7 +1527,7 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
     }
     c[12] = tap_scale;
     c[13] = c[14] = c[15] = 0.0f;
-    cmd->SetRootConstants(0, 16, c, 0);
+    cmd->SetRootConstants(0, 32, c, 0);
   };
 
   if (bloom) {
@@ -1128,6 +1593,11 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
   cmd->SetTexture(2, bloom ? g_r.bloom_srv[0] : g_r.white.srv);
   // t2 = the fused AO multiplier plane (white = no AO this frame).
   cmd->SetTexture(3, g_r.ao_plane_in_psr ? g_r.ao_srv[0] : g_r.white.srv);
+  // t3/t4 = the volumetric shaft plane + linear depth (white with
+  // zero-weight constant rows when the pass did not run).
+  cmd->SetTexture(4, g_r.vol_plane_in_psr ? g_r.vol_srv_b : g_r.white.srv);
+  cmd->SetTexture(5, g_r.vol_lin_in_psr ? g_r.vol_lin_plane_srv
+                                        : g_r.white.srv);
   cmd->Draw(3, 0);
 
   // Restore steady states.
@@ -1138,6 +1608,19 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
                  nrhi::ResourceState::kRenderTarget);
     g_r.ao_plane_in_psr = false;
   }
+  if (g_r.vol_plane_in_psr) {
+    cmd->Barrier(g_r.vol_tex_b, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+    g_r.vol_plane_in_psr = false;
+  }
+  if (g_r.vol_lin_in_psr) {
+    cmd->Barrier(g_r.vol_lin_plane, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+    g_r.vol_lin_in_psr = false;
+    g_r.vol_lin_plane = nullptr;
+    g_r.vol_lin_plane_srv = nullptr;
+  }
+  g_r.vol_tonemap_valid = false;
   if (bloom) {
     for (uint32_t i = 0; i < g_r.bloom_levels; ++i) {
       cmd->Barrier(g_r.bloom_tex[i],

@@ -221,6 +221,10 @@ inline bool g_sky_frame_done = false;
 // exposure (c3.x). Persist like g_sky_height once captured.
 inline float g_sky_sun[6] = {};
 inline bool g_sky_sun_have = false;
+// The CAPTURED (un-overridden) sun direction, published each frame for the
+// debug dialog: enabling the sun override seeds its azimuth/elevation from
+// this so the sun starts at its true position instead of jumping.
+inline std::atomic<float> g_sun_captured[3] = {0.0f, 1.0f, 0.0f};
 // UI background blur (see FrameScene::ui_blur and kBlurShaderSource): while
 // a frontend popup is up the game appends blur_hBlur/vBlur + basictex passes
 // after the postfx uber. g_ui_blur holds the captured kernel scale (PS c0.x,
