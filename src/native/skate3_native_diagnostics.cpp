@@ -22,6 +22,10 @@
 
 #include <rex/cvar.h>
 
+// Guest-thread shared scene state (the post-sweep's shadow-readiness gate
+// reads g_shadow_have; OnCaptureFrameEnd runs on the same thread).
+#include "skate3_native_scene_state.h"
+
 #include "generated/skate3_init.h"
 #include "skate3_screenshot.h"
 
@@ -58,6 +62,22 @@ REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_stride, 1, "Skate 3",
                      "Record every Nth frame while collecting (long viewer recordings: "
                      "e.g. 12 = ~12 recorded frames/sec at 144fps)")
     .range(1, 32)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Defined in skate3_native_scene.cpp (the HDR post-effect cvars the sweep
+// below drives).
+REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_haze);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_hdr_debug);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_post_sweep, false, "Skate 3",
+    "One-shot HDR post-effect comparison sweep: once gameplay is on screen, "
+    "steps through baseline (bloom/shafts/haze off), each effect alone, "
+    "everything on, and the hdr_debug views (shaft plane / haze term / sky "
+    "gate), settling between steps and writing one tagged screenshot per "
+    "step (shot_<ts>_sweep_<step>.png), then restores the previous cvar "
+    "values and turns itself off. Arm via config for a hands-off capture "
+    "run, or from the debug dialog mid-session.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(skate3_native_render_snapshot_dir, "native_render_snapshots", "Skate 3",
                       "Directory for native-render guest memory snapshots and metadata")
@@ -768,6 +788,135 @@ void OnCaptureFrameEnd(uint8_t* base, uint64_t frame_index,
         break;
     }
     f11_was_down = f11_down;
+  }
+  // Post-effect comparison sweep (skate3_native_render_post_sweep): one
+  // session, one screenshot per render state: baseline, each HDR post
+  // effect alone, everything on, then the hdr_debug diagnostic views.
+  // Gameplay detection reuses the auto-snapshot heuristic (a sustained
+  // full-scene mesh count); each step settles before its capture so
+  // hot-reload toggles and exposure have taken effect.
+  {
+    struct SweepStep {
+      const char* tag;
+      bool bloom;
+      bool shafts;
+      bool haze;
+      int32_t debug;
+    };
+    static constexpr SweepStep kSweepSteps[] = {
+        {"base", false, false, false, 0},
+        {"bloom", true, false, false, 0},
+        {"shafts", false, true, false, 0},
+        {"haze", false, false, true, 0},
+        {"all", true, true, true, 0},
+        {"dbg_shaftplane", true, true, true, 4},
+        {"dbg_hazeterm", true, true, true, 5},
+    };
+    enum class SweepState { kIdle, kWaitGameplay, kStep };
+    static SweepState sweep_state = SweepState::kIdle;
+    static uint32_t sweep_gameplay_frames = 0;
+    static size_t sweep_index = 0;
+    static uint64_t sweep_capture_frame = 0;
+    static bool sweep_captured = false;
+    static bool saved_bloom = false, saved_shafts = false, saved_haze = false;
+    static int32_t saved_debug = 0;
+    static char sweep_ts[24] = {};
+    // Every swept cvar is a per-frame hot read (no pipeline rebuilds), so
+    // settling is short. Kept to a fraction of a second per step: quick
+    // enough that the captures stay frame-comparable for offline A/B
+    // diffing, slow enough to follow by eye.
+    constexpr uint64_t kSweepSettleFrames = 48;
+    const bool sweep_armed = REXCVAR_GET(skate3_native_render_post_sweep);
+    const auto sweep_restore = [&] {
+      REXCVAR_SET(skate3_native_render_scene_bloom, saved_bloom);
+      REXCVAR_SET(skate3_native_render_scene_shafts, saved_shafts);
+      REXCVAR_SET(skate3_native_render_scene_haze, saved_haze);
+      REXCVAR_SET(skate3_native_render_scene_hdr_debug, saved_debug);
+      REXCVAR_SET(skate3_native_render_post_sweep, false);
+      sweep_state = SweepState::kIdle;
+    };
+    switch (sweep_state) {
+      case SweepState::kIdle:
+        if (sweep_armed) {
+          sweep_state = SweepState::kWaitGameplay;
+          sweep_gameplay_frames = 0;
+          REXLOG_INFO("native-render post sweep: armed, waiting for gameplay");
+        }
+        break;
+      case SweepState::kWaitGameplay:
+        if (!sweep_armed) {
+          sweep_state = SweepState::kIdle;
+          break;
+        }
+        // Gameplay AND the frame-global shadow rows captured: the sweep's
+        // shaft states are meaningless before the shadow pass is live, and
+        // right after takeover the sweep otherwise outruns its bring-up.
+        sweep_gameplay_frames =
+            (mesh_count >= 300 && g_shadow_have) ? sweep_gameplay_frames + 1
+                                                 : 0;
+        if (sweep_gameplay_frames >= 240) {
+          saved_bloom = REXCVAR_GET(skate3_native_render_scene_bloom);
+          saved_shafts = REXCVAR_GET(skate3_native_render_scene_shafts);
+          saved_haze = REXCVAR_GET(skate3_native_render_scene_haze);
+          saved_debug = REXCVAR_GET(skate3_native_render_scene_hdr_debug);
+          const std::time_t t = std::time(nullptr);
+          std::tm tm{};
+          localtime_s(&tm, &t);
+          std::snprintf(sweep_ts, sizeof(sweep_ts), "%02d%02d%02d", tm.tm_hour,
+                        tm.tm_min, tm.tm_sec);
+          sweep_index = 0;
+          sweep_captured = false;
+          sweep_capture_frame = frame_index + kSweepSettleFrames;
+          REXCVAR_SET(skate3_native_render_scene_bloom, kSweepSteps[0].bloom);
+          REXCVAR_SET(skate3_native_render_scene_shafts, kSweepSteps[0].shafts);
+          REXCVAR_SET(skate3_native_render_scene_haze, kSweepSteps[0].haze);
+          REXCVAR_SET(skate3_native_render_scene_hdr_debug, kSweepSteps[0].debug);
+          sweep_state = SweepState::kStep;
+          REXLOG_INFO("native-render post sweep: started, tag {} ({} steps)",
+                      sweep_ts, std::size(kSweepSteps));
+        }
+        break;
+      case SweepState::kStep:
+        if (!sweep_armed) {
+          sweep_restore();
+          REXLOG_INFO("native-render post sweep: cancelled, cvars restored");
+          break;
+        }
+        if (!sweep_captured && frame_index >= sweep_capture_frame) {
+          char tag[48];
+          std::snprintf(tag, sizeof(tag), "%s_sweep_%s", sweep_ts,
+                        kSweepSteps[sweep_index].tag);
+          skate3::screenshot::CaptureWindow(
+              skate3::screenshot::RememberedWindow(), tag);
+          REXLOG_INFO("native-render post sweep: captured {} ({}/{})", tag,
+                      sweep_index + 1, std::size(kSweepSteps));
+          sweep_captured = true;
+          // A short hold so the (asynchronous) window grab reads this
+          // state's frame before the next step's cvars apply.
+          sweep_capture_frame = frame_index + 12;
+          break;
+        }
+        if (sweep_captured && frame_index >= sweep_capture_frame) {
+          if (++sweep_index >= std::size(kSweepSteps)) {
+            sweep_restore();
+            REXLOG_INFO(
+                "native-render post sweep: done, cvars restored (tag {})",
+                sweep_ts);
+            break;
+          }
+          REXCVAR_SET(skate3_native_render_scene_bloom,
+                      kSweepSteps[sweep_index].bloom);
+          REXCVAR_SET(skate3_native_render_scene_shafts,
+                      kSweepSteps[sweep_index].shafts);
+          REXCVAR_SET(skate3_native_render_scene_haze,
+                      kSweepSteps[sweep_index].haze);
+          REXCVAR_SET(skate3_native_render_scene_hdr_debug,
+                      kSweepSteps[sweep_index].debug);
+          sweep_captured = false;
+          sweep_capture_frame = frame_index + kSweepSettleFrames;
+        }
+        break;
+    }
   }
 #endif
   if (!g_collecting && frame_index % 32 == 0) {

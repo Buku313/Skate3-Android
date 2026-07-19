@@ -1,5 +1,8 @@
 #include "skate3_native_debug_dialog.h"
 
+#include <algorithm>
+#include <cmath>
+
 #include <imgui.h>
 
 #include <rex/cvar.h>
@@ -38,6 +41,27 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
+// HDR post-effect stack (hot; skate3_native_scene.cpp).
+REXCVAR_DECLARE(bool, skate3_native_render_scene_hdr);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_hdr_debug);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
+REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_threshold);
+REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_knee);
+REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_intensity);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shafts_intensity);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shafts_reach);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shafts_steps);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_haze);
+REXCVAR_DECLARE(double, skate3_native_render_scene_haze_intensity);
+REXCVAR_DECLARE(double, skate3_native_render_scene_haze_density);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao);
+REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_radius);
+REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_intensity);
+REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_luma_protect);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_sun_override);
+REXCVAR_DECLARE(double, skate3_native_render_scene_sun_azimuth);
+REXCVAR_DECLARE(double, skate3_native_render_scene_sun_elevation);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_refl_mode);
 REXCVAR_DECLARE(double, skate3_native_render_scene_refl_lod);
 REXCVAR_DECLARE(double, skate3_native_render_scene_refl_bias_x);
@@ -64,6 +88,20 @@ bool CvarCheckbox(const char* label, bool value, const char* help = nullptr) {
     ImGui::SetTooltip("%s", help);
   }
   return v;
+}
+
+// Float-cvar slider (the cvars are hot-reload doubles; edits apply next
+// frame). Returns the possibly-changed value for REXCVAR_SET.
+double CvarSlider(const char* label, double value, float lo, float hi,
+                  const char* fmt, const char* help = nullptr) {
+  float v = float(value);
+  if (ImGui::SliderFloat(label, &v, lo, hi, fmt)) {
+    value = double(v);
+  }
+  if (help != nullptr && (ImGui::IsItemHovered() || ImGui::IsItemActive())) {
+    ImGui::SetTooltip("%s", help);
+  }
+  return value;
 }
 
 }  // namespace
@@ -157,6 +195,140 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                            REXCVAR_GET(skate3_native_render_scene_backface_cull),
                            "World env materials cull FRONT like the game's material "
                            "XMLs; off = legacy cull-none (shows interior faces)"));
+
+  ImGui::SeparatorText("HDR post effects (live)");
+  REXCVAR_SET(skate3_native_render_scene_hdr,
+              CvarCheckbox("HDR intermediate",
+                           REXCVAR_GET(skate3_native_render_scene_hdr),
+                           "Float scene target + single host tonemap, the basis for "
+                           "bloom, shafts and haze. Off = the classic in-material "
+                           "tonemap (parity A/B)."));
+  {
+    int dbg = REXCVAR_GET(skate3_native_render_scene_hdr_debug);
+    const char* kHdrDbg[] = {"0: off",           "1: bloom term",
+                             "2: raw pre-tonemap", "3: AO plane",
+                             "4: shaft plane",   "5: haze term"};
+    if (ImGui::Combo("HDR debug view", &dbg, kHdrDbg, 6)) {
+      REXCVAR_SET(skate3_native_render_scene_hdr_debug, dbg);
+    }
+  }
+  REXCVAR_SET(skate3_native_render_scene_shafts,
+              CvarCheckbox("Volumetric sun shafts",
+                           REXCVAR_GET(skate3_native_render_scene_shafts),
+                           "Shadow-marched air: shadowed portions of each view ray "
+                           "proportionally dim the light seen through them (dark "
+                           "crepuscular shafts from buildings/trees/underpasses). "
+                           "Fully lit air is untouched."));
+  REXCVAR_SET(skate3_native_render_scene_shafts_intensity,
+              CvarSlider("shaft intensity",
+                         REXCVAR_GET(skate3_native_render_scene_shafts_intensity),
+                         0.0f, 1.5f, "%.2f",
+                         "How strongly fully shadowed air dims the scene behind it "
+                         "(scaled by the forward-scatter phase toward the sun)."));
+  REXCVAR_SET(skate3_native_render_scene_shafts_reach,
+              CvarSlider("shaft reach (world units)",
+                         REXCVAR_GET(skate3_native_render_scene_shafts_reach),
+                         5.0f, 300.0f, "%.0f",
+                         "How far in front of the camera the air is sampled. Longer "
+                         "= more distant shadow volumes, coarser sampling."));
+  {
+    int steps = REXCVAR_GET(skate3_native_render_scene_shafts_steps);
+    if (ImGui::SliderInt("shaft steps", &steps, 8, 64)) {
+      REXCVAR_SET(skate3_native_render_scene_shafts_steps, steps);
+    }
+  }
+  REXCVAR_SET(skate3_native_render_scene_haze,
+              CvarCheckbox("Directional haze",
+                           REXCVAR_GET(skate3_native_render_scene_haze),
+                           "Fog-tinted sun scattering added with view distance, "
+                           "strongest toward the sun. Off by default: the game's "
+                           "authored sky/fog already carry the base atmosphere."));
+  REXCVAR_SET(skate3_native_render_scene_haze_intensity,
+              CvarSlider("haze intensity",
+                         REXCVAR_GET(skate3_native_render_scene_haze_intensity),
+                         0.0f, 0.5f, "%.3f"));
+  REXCVAR_SET(skate3_native_render_scene_haze_density,
+              CvarSlider("haze density (1/unit)",
+                         REXCVAR_GET(skate3_native_render_scene_haze_density),
+                         0.0f, 0.02f, "%.4f",
+                         "How quickly the scattering saturates with distance "
+                         "(0.005 reaches ~63% at 200 units)."));
+  REXCVAR_SET(skate3_native_render_scene_bloom,
+              CvarCheckbox("Bloom",
+                           REXCVAR_GET(skate3_native_render_scene_bloom),
+                           "Downsample/upsample pyramid driven by pre-tonemap "
+                           "brightness (night lamps, neon, sun glare)."));
+  REXCVAR_SET(skate3_native_render_scene_bloom_threshold,
+              CvarSlider("bloom threshold",
+                         REXCVAR_GET(skate3_native_render_scene_bloom_threshold),
+                         0.0f, 1.5f, "%.2f",
+                         "Pre-tonemap onset (1.0 = the tone curve's saturation "
+                         "point). Below ~0.7 the sunlit day frame starts feeding "
+                         "the pyramid and veils in glow."));
+  REXCVAR_SET(skate3_native_render_scene_bloom_knee,
+              CvarSlider("bloom knee",
+                         REXCVAR_GET(skate3_native_render_scene_bloom_knee),
+                         0.0f, 0.5f, "%.2f"));
+  REXCVAR_SET(skate3_native_render_scene_bloom_intensity,
+              CvarSlider("bloom intensity",
+                         REXCVAR_GET(skate3_native_render_scene_bloom_intensity),
+                         0.0f, 0.3f, "%.3f"));
+  REXCVAR_SET(skate3_native_render_scene_ssao,
+              CvarCheckbox("SSAO (GTAO)",
+                           REXCVAR_GET(skate3_native_render_scene_ssao),
+                           "Screen-space ambient occlusion: contact shading under "
+                           "ledges, rails, vehicles, feet."));
+  REXCVAR_SET(skate3_native_render_scene_ssao_radius,
+              CvarSlider("SSAO radius (world units)",
+                         REXCVAR_GET(skate3_native_render_scene_ssao_radius),
+                         0.1f, 4.0f, "%.2f"));
+  REXCVAR_SET(skate3_native_render_scene_ssao_intensity,
+              CvarSlider("SSAO intensity",
+                         REXCVAR_GET(skate3_native_render_scene_ssao_intensity),
+                         0.0f, 3.0f, "%.2f",
+                         "Exponent on the visibility term (1 = physical, >1 = "
+                         "accentuated)."));
+  REXCVAR_SET(skate3_native_render_scene_ssao_luma_protect,
+              CvarSlider("SSAO sunlit protection",
+                         REXCVAR_GET(skate3_native_render_scene_ssao_luma_protect),
+                         0.0f, 3.0f, "%.2f",
+                         "How strongly bright (sun-lit) surfaces resist SSAO "
+                         "darkening (ambient-only approximation)."));
+  {
+    const bool was_on = REXCVAR_GET(skate3_native_render_scene_sun_override);
+    const bool now_on =
+        CvarCheckbox("Sun override (lighting lab)", was_on,
+                     "Move the sun with the sliders below: dynamic CSM "
+                     "shadows, the static world-shadow map, shadow receivers "
+                     "and the volumetric shafts all follow. Baked lightmap "
+                     "shade and the sky dome's painted sun stay put (game "
+                     "content).");
+    if (now_on && !was_on) {
+      // Seed the sliders from the captured sun so enabling the override
+      // starts at the true position instead of jumping.
+      float sun[3];
+      skate3::native_scene::GetCapturedSunDir(sun);
+      const float kRad = 57.29577951f;
+      REXCVAR_SET(skate3_native_render_scene_sun_azimuth,
+                  double(std::fmod(std::atan2(sun[0], sun[2]) * kRad + 360.0f,
+                                   360.0f)));
+      REXCVAR_SET(
+          skate3_native_render_scene_sun_elevation,
+          double(std::clamp(std::asin(std::clamp(sun[1], -1.0f, 1.0f)) * kRad,
+                            2.0f, 88.0f)));
+    }
+    REXCVAR_SET(skate3_native_render_scene_sun_override, now_on);
+  }
+  REXCVAR_SET(skate3_native_render_scene_sun_azimuth,
+              CvarSlider("sun azimuth (deg)",
+                         REXCVAR_GET(skate3_native_render_scene_sun_azimuth),
+                         0.0f, 360.0f, "%.0f"));
+  REXCVAR_SET(skate3_native_render_scene_sun_elevation,
+              CvarSlider("sun elevation (deg)",
+                         REXCVAR_GET(skate3_native_render_scene_sun_elevation),
+                         2.0f, 88.0f, "%.0f",
+                         "Low elevations give long shadows and the most visible "
+                         "volumetric shafts."));
 
   ImGui::SeparatorText("Reflective glass isolation (env fam 5/6/13)");
   {
