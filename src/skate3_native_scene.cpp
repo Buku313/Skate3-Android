@@ -1910,6 +1910,8 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.macro_tex = 0;
   item.macro_scale = 1.0f;
   item.macro_opacity = 1.0f;
+  item.scroll_u = 0.0f;
+  item.scroll_v = 0.0f;
   item.decal_art = 0;
   item.hair = false;
   item.char_family = 0;
@@ -1995,6 +1997,16 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
           const float f = std::bit_cast<float>(chan_u32(i, 0x10));
           if (f > 0.0f && f < 1e6f) {
             item.detail_scale = f;
+          }
+          continue;
+        } else if (std::memcmp(text, "uAnimationSpeed", 16) == 0 ||
+                   std::memcmp(text, "vAnimationSpeed", 16) == 0) {
+          // Shader-constant channels (the game's VS c7.x / c8.x): UV scroll
+          // speed in texcoords per second, consumed by the fam-14
+          // scrollincandescent branch. Signed; the direction is authored.
+          const float f = std::bit_cast<float>(chan_u32(i, 0x10));
+          if (std::fabs(f) < 1e6f) {  // false for NaN too
+            (text[0] == 'u' ? item.scroll_u : item.scroll_v) = f;
           }
           continue;
         } else if (std::memcmp(text, "macroOverlayUVScale", 20) == 0 ||
@@ -2142,6 +2154,11 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
               item.env_family = 11;
             } else if (is("incandescent.default", 21)) {
               item.env_family = 12;
+            } else if (is("incandescent.backlituvscroll", 29)) {
+              // scrollincandescent.fx: emissive diffuse scrolled by
+              // g_fAnimationTime x the u/vAnimationSpeed channels (the
+              // stadium LED chyron band).
+              item.env_family = 14;
             }
             // dynamicobject.fx props (dispensers, dumpsters, benches, cans):
             // rigid movable objects with their own dual-shadow lit PS
@@ -4161,7 +4178,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   if ((!g_fog_frame_done || !g_shadow_frame_done || !g_sky_frame_done ||
        !g_tree_frame_done || !g_proxy_frame_done || !g_dynobj_frame_done ||
        !g_water_frame_done || !g_ocean_frame_done ||
-       !g_oceanrefl_frame_done) &&
+       !g_oceanrefl_frame_done || !g_scroll_frame_done) &&
       func == 0 && flags2d == 0 && SceneEnabled() &&
       (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
     const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
@@ -4378,6 +4395,46 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
                   "native-scene: water m_params REJECTED by range gate: "
                   "mult={:.3g} thr={:.3g} pow={:.3g} floor={:.3g} t={:.3g}",
                   rows[1], rows[13], rows[14], rows[15], rows[16]);
+            }
+          }
+        }
+      }
+      // scrollincandescent.fx (the emissive time-scrolled LED chyron):
+      // g_fAnimationTime from the VERTEX bank (c9.x) and the material
+      // multiplier m_params[0].y from the PIXEL bank (c3.y). Same POSITIVE
+      // debug-path gate as the water rows; the bank values alone cannot
+      // discriminate this family.
+      if (!g_scroll_frame_done && ps_bank != 0) {
+        const auto scroll_ps = [&]() -> bool {
+          const auto check = [&](uint32_t obj) -> bool {
+            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
+              return false;
+            }
+            char text[120] = {};
+            for (int k = 0; k < 119; ++k) {
+              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+              if (text[k] == '\0') break;
+            }
+            return std::strstr(text, "\\scrollincandescent") != nullptr;
+          };
+          return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
+                 check(g_cur_vs_obj.load(std::memory_order_relaxed));
+        };
+        if (scroll_ps()) {
+          const float t = LoadGuestF32(base, bank + 36 * 4);        // VS c9.x
+          const float mult = LoadGuestF32(base, ps_bank + 13 * 4);  // PS c3.y
+          // Range gate: the animation clock is a non-negative seconds
+          // counter, the multiplier a small positive scale.
+          if (t >= 0.0f && t < 1e7f && mult > 0.0f && mult <= 8.0f) {
+            const bool first = !g_scroll_have;
+            g_scroll_rows[0] = t;
+            g_scroll_rows[1] = mult;
+            g_scroll_have = true;
+            g_scroll_frame_done = true;
+            if (first) {
+              REXLOG_INFO(
+                  "native-scene: scroll rows captured: t={:.2f} mult={:.3g}",
+                  t, mult);
             }
           }
         }
@@ -9080,6 +9137,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                 sizeof(scene.oceanrefl_rows));
     scene.oceanrefl_valid = true;
   }
+  if (g_scroll_have) {
+    std::memcpy(scene.scroll_rows, g_scroll_rows, sizeof(scene.scroll_rows));
+    scene.scroll_valid = true;
+  }
   if (g_shadow_have) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
@@ -9226,6 +9287,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_water_frame_done = false;
   g_ocean_frame_done = false;
   g_oceanrefl_frame_done = false;
+  g_scroll_frame_done = false;
 
 
   // Draw-time STRETCH VETO: the last line of defense, judging what the GPU

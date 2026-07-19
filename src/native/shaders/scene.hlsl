@@ -28,6 +28,8 @@ cbuffer C : register(b0) {
   // items never use otherwise. Fog is currently applied to transparent
   // items only (the km-distant mist sheets; everything else we render is
   // near enough for fog to be negligible).
+  // Fam 14 (scrollincandescent, opaque, so every fog slot is free):
+  // xy = the period-wrapped UV scroll offset, z = the material multiplier.
   float4 misc;
 };
 // Per-frame dynamic-shadow (CSM) receiver constants, captured from the
@@ -648,8 +650,10 @@ float4 ps_main(VSOut i) : SV_Target {
     // dynamicobject items (cam_pos.w <= -21) are excluded here and clip in
     // their own branch (only the .alphatest variant tests, at ALPHAREF 30).
     // Fam 13 (reflective_trans glass, cam_pos.w = -13) never alpha-tests;
-    // it alpha-BLENDS in the sorted sub-pass.
-    if (cam_pos.w > -12.5 || cam_pos.w < -13.5) {
+    // it alpha-BLENDS in the sorted sub-pass. Fam 14 (scrollincandescent)
+    // never alpha-tests either (its technique sets no test state, and its
+    // PS ignores the diffuse alpha entirely).
+    if (cam_pos.w > -12.5 || cam_pos.w < -14.5) {
       float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
       clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
     }
@@ -1128,6 +1132,16 @@ float4 ps_main(VSOut i) : SV_Target {
       } else {
         lin = dlin * (fam < 11.5 ? sh_fogp.w : 1.0);
       }
+    } else if (fam > 13.5 && fam < 14.5) {
+      // scrollincandescent (the stadium LED chyron band): emissive scrolled
+      // diffuse. The game's VS adds g_fAnimationTime * (uSpeed, vSpeed) to
+      // the texcoord (misc.xy carries that offset, period-wrapped CPU-side);
+      // its PS is one diffuse fetch -> D^2 * m_params[0].y (misc.z) ->
+      // the shared fog/exposure/tone tail. No lightmap term, no kd, no
+      // shadow receive, no material multiplier on the fog term
+      // (ucode-exact: scrollincandescent_defaultPS).
+      float3 sd = diffuse.Sample(smp, i.uv + misc.xy).rgb;
+      lin = sd * sd * misc.z;
     } else {
       // Environment families: macro overlay (0.5-neutral, fades under decal
       // art), linear decal composite, lightmap squared and min-clamped

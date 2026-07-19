@@ -7801,7 +7801,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // exposure / material multiplier at b1); without them the tone chain
     // would multiply by zero and render black.
     if (debug_mode == 0 && item.env_family != 0 && scene.shadow_valid &&
-        !item.water && !item.transparent) {
+        !item.water && !item.transparent &&
+        // Fam 14 needs the frame's scroll rows (time + multiplier); the
+        // tone chain would multiply by zero without them; the legacy
+        // shading covers the capture-less frames.
+        (item.env_family != 14 || scene.scroll_valid)) {
       constants[39] = -float(item.env_family);
     }
     // cam_pos.w = -(20 + variant) selects the exact dynamicobject branch
@@ -8190,6 +8194,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[50] = scene.fog_ramp[1];
       constants[51] = scene.fog_ramp[2];
       std::memcpy(constants + 40, scene.fog_color, 4 * sizeof(float));
+    } else if (item.env_family == 14 && constants[39] < -13.5f) {
+      // Fam 14 (scrollincandescent, the LED chyron): misc.xy = the frame's
+      // UV scroll offset (g_fAnimationTime x the material's channel speeds,
+      // wrapped to one texture period here; the shader adds a small
+      // bounded offset instead of losing uv precision to a large raw
+      // time x speed product), misc.z = the material multiplier
+      // m_params[0].y.
+      const float ou = scene.scroll_rows[0] * item.scroll_u;
+      const float ov = scene.scroll_rows[0] * item.scroll_v;
+      constants[48] = ou - std::floor(ou);
+      constants[49] = ov - std::floor(ov);
+      constants[50] = scene.scroll_rows[1];
     } else if (v2_flags != 0) {
       // misc.z = the v2 material bind flags, misc.w = detailNormalUVScale
       // (opaque fams 1-4 and the dynobj families; see the v2 blocks above).

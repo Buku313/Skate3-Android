@@ -64,6 +64,11 @@ struct DrawItem {
   uint32_t macro_tex;     // guest renderengine::Texture address (0 = none)
   float macro_scale;      // macroOverlayUVScale channel constant
   float macro_opacity;    // macroOverlayOpacity channel constant
+  // uAnimationSpeed / vAnimationSpeed channel constants (texcoords per
+  // second of the frame's animation time): the scrollincandescent UV
+  // scroll (fam 14: the stadium LED chyron band). 0 = no scroll.
+  float scroll_u;
+  float scroll_v;
   uint16_t pos_offset;
   uint16_t uv_offset;
   uint16_t uv2_offset;
@@ -210,7 +215,9 @@ struct DrawItem {
   // 7 = environmentsimple.alphatest, 8 = environmentsimple.diffuse,
   // 9 = tree.default, 10 = animated.tree, 11 = proxyworld.default,
   // 12 = incandescent.default, 13 = environment.reflective_trans
-  // (transparentenvironmentreflective: blended glass, alpha sub-pass).
+  // (transparentenvironmentreflective: blended glass, alpha sub-pass),
+  // 14 = incandescent.backlituvscroll (scrollincandescent: the emissive
+  // time-scrolled LED chyron band).
   uint8_t env_family = 0;
   // dynamicobject.fx family (movable props: dispensers, dumpsters, benches,
   // cans, ...). 0 = not a dynamic object, 1 = dynamicobject.default,
@@ -340,6 +347,12 @@ struct FrameScene {
   // height-ramp alpha fade bounds.
   bool oceanrefl_valid = false;
   float oceanrefl_rows[4] = {};
+  // scrollincandescent.fx rows, captured once per frame from a
+  // scrollincandescent draw (debug-path classified): [0] = g_fAnimationTime
+  // (VS c9.x), [1] = the material multiplier m_params[0].y (PS c3.y).
+  // Consumed by the fam-14 branch (the scrolling LED chyron).
+  bool scroll_valid = false;
+  float scroll_rows[2] = {};
   // dynamicobject.fx frame-global lighting rows, captured from a
   // dynamicobject/alphatestdynamicobject PS bank (debug-path classified):
   // [0..2] sun direction (PS c9), [3] scene exposure (c13.x),

@@ -310,6 +310,13 @@ inline bool g_ocean_frame_done = false;
 inline float g_oceanrefl_rows[4] = {};
 inline bool g_oceanrefl_have = false;
 inline bool g_oceanrefl_frame_done = false;
+// scrollincandescent.fx rows (see FrameScene::scroll_rows): [0] =
+// g_fAnimationTime (VS c9.x), [1] = the material multiplier m_params[0].y
+// (PS c3.y). Captured from a scrollincandescent draw (debug-path
+// classified). Guest render thread only.
+inline float g_scroll_rows[2] = {};
+inline bool g_scroll_have = false;
+inline bool g_scroll_frame_done = false;
 // dynamicobject.fx frame-global lighting rows (see FrameScene::dynobj_rows),
 // captured from a dynamicobject/alphatestdynamicobject PS bank (debug-path
 // classified). Guest render thread only.
