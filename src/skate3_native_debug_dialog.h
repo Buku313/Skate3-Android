@@ -1,8 +1,10 @@
 #pragma once
 
-// F12 native-render debug menu: live checkboxes for every native renderer
-// subsystem (all hot-reload cvars), used to bisect visual regressions
-// (flicker, wrong shading) in-game without rebuilds.
+// F12 native-render debug menu: live controls for every native renderer
+// subsystem (all hot-reload cvars), grouped by intent (capture tools,
+// image quality, lighting, shadows, content, diagnostics), used to bisect
+// visual regressions in-game without rebuilds. Includes the max-quality
+// photo-mode toggle for showcase/promo recording.
 
 #include <rex/ui/imgui_dialog.h>
 
