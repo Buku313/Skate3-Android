@@ -21,6 +21,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/window.h>
 
 REXCVAR_DEFINE_BOOL(skate3_native_render, false, "Skate 3",
                     "Enable the Skate 3 data-driven native renderer hook layer")
@@ -40,6 +41,16 @@ REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
                       "frame arrives on a steady beat. Precise pacing: coarse sleep to "
                       "~1.5 ms before the target, then spin.")
     .range(0.0, 1000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, false, "Skate 3",
+                    "Derive the guest frame cap from the display the window is on: "
+                    "cap at (refresh rate - 4) fps, the VRR recipe above, without "
+                    "hand-tuning per monitor. Above the display refresh the extra "
+                    "frames cannot be shown anyway; refreshes beat-sample the "
+                    "frame stream and steady motion judders (measured: a "
+                    "mathematically perfect synthetic pan judders at 330 fps on a "
+                    "144 Hz panel and is smooth capped below it). Overrides "
+                    "skate3_guest_fps_cap while the display refresh is known.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_render {
@@ -128,7 +139,15 @@ void OnClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t 
 // interval) so sleep jitter never accumulates; resyncs when the guest falls
 // more than one interval behind (loads, hitches).
 void PaceGuestFrame() {
-  const double cap = REXCVAR_GET(skate3_guest_fps_cap);
+  double cap = REXCVAR_GET(skate3_guest_fps_cap);
+  if (REXCVAR_GET(skate3_guest_fps_cap_auto)) {
+    // Refresh-derived cap (see the cvar). Falls through to the explicit cap
+    // while the platform hasn't reported a refresh rate.
+    const double hz = double(rex::ui::Window::CachedDisplayRefreshHz());
+    if (hz >= 30.0) {
+      cap = hz - 4.0;
+    }
+  }
   static std::chrono::steady_clock::time_point s_next{};
   if (cap < 1.0) {
     s_next = {};
