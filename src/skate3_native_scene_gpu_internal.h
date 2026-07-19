@@ -648,6 +648,9 @@ struct RendererState {
   // Scene float format the output-sized targets were built with (kUnknown
   // when classic); packed-format toggles rebuild them.
   nrhi::Format targets_scene_fmt = nrhi::Format::kUnknown;
+  // MSAA level the output-sized targets were built with; hot MSAA changes
+  // rebuild the depth buffer and the multisample color target.
+  uint32_t targets_msaa = 0;
   // Screen-space reflections (ssr.hlsl + scene.hlsl ps_refl_gbuf): a
   // half-res reflection G-buffer re-rendered from the frame's reflective
   // items (env fams 5/6/13 + water), a half-res screen-space march over the

@@ -2420,9 +2420,9 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
-// MSAA level selection + the main scene PSO and its culling/blend/depth
-// variants (cull-back sheets, transparent, entity fade, hair 2-pass,
-// no-depth, outline mask).
+// The main scene PSO and its culling/blend/depth variants (cull-back
+// sheets, transparent, entity fade, hair 2-pass, no-depth, outline mask),
+// built at the g_r.msaa sample count EnsurePipeline selected.
 bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
   // Scene color format: the float HDR intermediate when the HDR post chain
@@ -2431,16 +2431,10 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   const nrhi::Format scene_fmt = g_r.hdr_active
                                      ? g_r.hdr_scene_format
                                      : context.guest_output->format();
-  // MSAA level: the requested count, reduced to what the scene color format
-  // supports (1 disables and renders directly into the 1x target). The
-  // RHI walks the requested count down in powers of two, exactly like the
-  // old CheckFeatureSupport loop.
-  const int32_t req = REXCVAR_GET(skate3_native_render_scene_msaa);
-  uint32_t msaa = req >= 8 ? 8u : req >= 4 ? 4u : req >= 2 ? 2u : 1u;
-  msaa = device->GetSupportedSampleCount(scene_fmt, msaa);
-  g_r.msaa = msaa;
+  // g_r.msaa is selected by EnsurePipeline (which triggers this rebuild on
+  // change).
 
-  // The family rebuilds on HDR toggles / output-format changes: retire the
+  // The family rebuilds on HDR/MSAA toggles / output-format changes: retire the
   // previous pipelines (in-flight frames keep them alive via the deferred
   // destruction queue).
   for (nrhi::Pipeline** p :
@@ -3189,6 +3183,38 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
 // Shadow atlas targets + the always-bound b1 receiver constant buffer.
 bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
+  // Cascade tile size: explicit, or auto = the game's 512 tiles at the
+  // RENDER resolution scale. guest_output is the scaled frontbuffer (720p x
+  // the draw resolution scale, independent of window/monitor size), so
+  // deriving from its height follows the Resolution Scale setting, including
+  // any device-limit clamping the texture cache applied, and gives the same
+  // effective shadow raster the emulated GPU renders at that scale.
+  const int32_t tile_cfg = REXCVAR_GET(skate3_native_render_scene_shadow_tile);
+  const uint32_t want_tile =
+      tile_cfg > 0
+          ? uint32_t(tile_cfg)
+          : std::min(512u * std::max(1u, (context.guest_output_height + 719u) /
+                                             720u),
+                     4096u);
+  if (g_r.shadow_raw != nullptr && g_r.shadow_tile != want_tile) {
+    // Hot tile-size change: retire the atlas chain; recreated below. The
+    // new atlas starts in RENDER_TARGET state and is re-rendered by this
+    // frame's shadow pass.
+    nrhi::Texture** targets[3] = {&g_r.shadow_raw, &g_r.shadow_mid,
+                                  &g_r.shadow_final};
+    nrhi::TextureView** views[3] = {&g_r.shadow_srv_raw, &g_r.shadow_srv_mid,
+                                    &g_r.shadow_srv_final};
+    for (int t = 0; t < 3; ++t) {
+      if (*views[t] != nullptr) {
+        device->DestroyDeferred(*views[t]);
+        *views[t] = nullptr;
+      }
+      if (*targets[t] != nullptr) {
+        device->DestroyDeferred(*targets[t]);
+        *targets[t] = nullptr;
+      }
+    }
+  }
   if (!g_r.shadow_raw && REXCVAR_GET(skate3_native_render_scene_shadows)) {
     // Dynamic-shadow atlas chain: raw casters -> hblur intermediate ->
     // blurred final (the texture the scene pass samples). Three fixed-size
@@ -3196,22 +3222,7 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     // half-float ulp at the typical ~0.85 depth is ~6 mm of world height,
     // too coarse for board/feet-height casters 1-2 cm off the ground),
     // 3 tiles of tile x tile each.
-    const int32_t tile_cfg = REXCVAR_GET(skate3_native_render_scene_shadow_tile);
-    if (tile_cfg > 0) {
-      g_r.shadow_tile = uint32_t(tile_cfg);
-    } else {
-      // Auto: the game's 512 tiles at the RENDER resolution scale.
-      // guest_output is the scaled frontbuffer (720p x the draw resolution
-      // scale, independent of window/monitor size), so deriving from its
-      // height follows the Resolution Scale setting, including any
-      // device-limit clamping the texture cache applied, and gives the
-      // same effective shadow raster the emulated GPU renders at that
-      // scale. Resolved once at atlas creation (the cvar is
-      // restart-scoped).
-      const uint32_t scale =
-          std::max(1u, (context.guest_output_height + 719u) / 720u);
-      g_r.shadow_tile = std::min(512u * scale, 4096u);
-    }
+    g_r.shadow_tile = want_tile;
     nrhi::TextureDesc desc;
     desc.width = g_r.shadow_tile * 3;
     desc.height = g_r.shadow_tile;
@@ -3271,15 +3282,27 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     g_r.world_shadow_in_srv = false;
     g_r.world_shadow_primed = false;
   }
+  const uint32_t want_static_size = uint32_t(std::clamp(
+      REXCVAR_GET(skate3_native_render_scene_shadow_static_size), 1024, 8192));
+  if (g_r.static_sun != nullptr && g_r.static_sun_size != want_static_size) {
+    // Hot size change: retire the map; recreated below. The recreated map
+    // is uninitialized, so force the cross-frame cache to re-render it
+    // (RenderStaticSunMap rebuilds whenever nsm_built_radius <= 0).
+    if (g_r.static_sun_srv != nullptr) {
+      device->DestroyDeferred(g_r.static_sun_srv);
+      g_r.static_sun_srv = nullptr;
+    }
+    device->DestroyDeferred(g_r.static_sun);
+    g_r.static_sun = nullptr;
+    g_r.nsm_built_radius = 0.0f;
+  }
   if (!g_r.static_sun && g_r.shadow_raw != nullptr &&
       REXCVAR_GET(skate3_native_render_scene_shadow_static_casters)) {
     // Native static sun-shadow map (see RendererState). THREE cascade
     // tiles side by side: inner (r/6, centimeter contact detail with
     // useful reach), mid (r/2) and far (full radius, large-caster
-    // coverage); size is per tile, restart-scoped.
-    const int32_t size_cfg =
-        REXCVAR_GET(skate3_native_render_scene_shadow_static_size);
-    g_r.static_sun_size = uint32_t(std::clamp(size_cfg, 1024, 8192));
+    // coverage); size is per tile.
+    g_r.static_sun_size = want_static_size;
     nrhi::TextureDesc desc;
     desc.width = g_r.static_sun_size * 3;
     desc.height = g_r.static_sun_size;
@@ -3545,7 +3568,8 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
       g_r.hdr_active ? g_r.hdr_scene_format : nrhi::Format::kUnknown;
   if (!g_r.depth || g_r.depth_width != width || g_r.depth_height != height ||
       g_r.targets_hdr != g_r.hdr_active ||
-      g_r.targets_scene_fmt != want_scene_fmt) {
+      g_r.targets_scene_fmt != want_scene_fmt ||
+      g_r.targets_msaa != g_r.msaa) {
     if (g_r.depth) {
       g_r.device->DestroyDeferred(g_r.depth);
       g_r.depth = nullptr;
@@ -3615,6 +3639,18 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
       vd.dimension = nrhi::ViewDimension::k2DMS;
       g_r.msaa_srv_slot = device->CreateTextureView(g_r.msaa_color, vd);
       g_r.msaa_srv_allocated = g_r.msaa_srv_slot != nullptr;
+    } else {
+      // MSAA switched off: retire the multisample color target and its
+      // resolve view (the scene renders directly into the 1x target).
+      if (g_r.msaa_srv_slot) {
+        g_r.device->DestroyDeferred(g_r.msaa_srv_slot);
+        g_r.msaa_srv_slot = nullptr;
+        g_r.msaa_srv_allocated = false;
+      }
+      if (g_r.msaa_color) {
+        g_r.device->DestroyDeferred(g_r.msaa_color);
+        g_r.msaa_color = nullptr;
+      }
     }
 
     // 1x float scene plane for the HDR post chain: the MSAA resolve
@@ -3654,6 +3690,7 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
     }
     g_r.targets_hdr = g_r.hdr_active;
     g_r.targets_scene_fmt = want_scene_fmt;
+    g_r.targets_msaa = g_r.msaa;
   }
   return true;
 }
@@ -3677,11 +3714,37 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       REXCVAR_GET(skate3_native_render_scene_hdr_packed)
           ? nrhi::Format::kR11G11B10_FLOAT
           : nrhi::Format::kR16G16B16A16_FLOAT;
+  // MSAA level: the requested count, reduced to what the scene color format
+  // supports (1 disables and renders directly into the 1x target). The RHI
+  // walks the requested count down in powers of two, exactly like the old
+  // CheckFeatureSupport loop. Hot: a change rebuilds the pipeline family
+  // (the AO/SSR/volumetric passes and the MSAA targets latch on g_r.msaa
+  // and follow).
+  const nrhi::Format scene_fmt_want =
+      hdr_want ? hdr_fmt_want : context.guest_output->format();
+  const int32_t msaa_req = REXCVAR_GET(skate3_native_render_scene_msaa);
+  uint32_t msaa_want =
+      msaa_req >= 8 ? 8u : msaa_req >= 4 ? 4u : msaa_req >= 2 ? 2u : 1u;
+  msaa_want = device->GetSupportedSampleCount(scene_fmt_want, msaa_want);
   if (!g_r.pso || g_r.rtv_format != context.guest_output->format() ||
       g_r.hdr_active != hdr_want ||
-      (hdr_want && g_r.hdr_scene_format != hdr_fmt_want)) {
+      (hdr_want && g_r.hdr_scene_format != hdr_fmt_want) ||
+      g_r.msaa != msaa_want) {
+    if (g_r.msaa != msaa_want && g_r.pfx_ready) {
+      // The photo-postfx depth-pack pass is compiled against the depth
+      // buffer's sample count (PFX_MSAA variant); retire the chain's PSOs
+      // so the next photo-editor frame rebuilds them.
+      for (nrhi::Pipeline*& p : g_r.pfx_pso) {
+        if (p != nullptr) {
+          device->DestroyDeferred(p);
+          p = nullptr;
+        }
+      }
+      g_r.pfx_ready = false;
+    }
     g_r.hdr_active = hdr_want;
     g_r.hdr_scene_format = hdr_fmt_want;
+    g_r.msaa = msaa_want;
     if (!EnsureScenePsoFamily(context) || !EnsureResolvePso(context) ||
         !EnsureBlurPsos(context) || !EnsureOutlineEdgePso(context) ||
         !Ensure2dPso(context) || !EnsureSplinePsos(context) ||

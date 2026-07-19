@@ -86,9 +86,10 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_debug, 0, "Skate 3",
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 4, "Skate 3",
                      "MSAA sample count for the native scene (1 = off, 2/4/8). Distant "
                      "thin geometry (railings, wires) shimmers without it; mipmaps only "
-                     "fix texture aliasing.")
+                     "fix texture aliasing. Applies live: the scene pipeline family and "
+                     "MSAA targets rebuild on change.")
     .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_world_v2_tan_sign, 1.0, "Skate 3",
                       "World-shading v2: polarity relating the stored frame's "
                       "cross(binormal, normal) x handedness to the game's tangent "
@@ -650,9 +651,10 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_tile, 0, "Skate 3",
                      "original-console look, blocky up close. 0 = auto: 512 x "
                      "the render resolution scale (the Resolution Scale "
                      "setting), matching the emulated renderer's shadow "
-                     "crispness at any render resolution.")
+                     "crispness at any render resolution. Applies live: the "
+                     "atlas chain recreates on change.")
     .range(0, 4096)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_caster_parity, true,
                     "Skate 3",
                     "Character pieces cast dynamic shadows only when the game "
@@ -696,9 +698,9 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
                      "Static sun-shadow map resolution per cascade tile "
                      "(the map is three tiles). At the default radius the "
                      "inner cascade gets ~1.5 cm texels, mid ~4 cm, far "
-                     "~9 cm.")
+                     "~9 cm. Applies live: the map recreates on change.")
     .range(1024, 8192)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_pcss, true, "Skate 3",
                     "Contact-hardening soft shadows (PCSS): a blocker search "
                     "estimates the caster distance per pixel and the filter "
