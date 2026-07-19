@@ -202,7 +202,7 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_knee, 0.08, "Skate 3",
                       "Bloom soft-knee width around the threshold (0 = hard cutoff).")
     .range(0.0, 2.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_intensity, 0.06, "Skate 3",
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_intensity, 0.025, "Skate 3",
                       "Bloom strength: the pyramid's contribution added to the "
                       "pre-tonemap scene (0 = off; the pyramid accumulates ~5 levels, "
                       "so small values are already visible around bright lights).")
