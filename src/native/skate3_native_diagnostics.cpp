@@ -82,6 +82,13 @@ REXCVAR_DEFINE_BOOL(
 REXCVAR_DEFINE_STRING(skate3_native_render_snapshot_dir, "native_render_snapshots", "Skate 3",
                       "Directory for native-render guest memory snapshots and metadata")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_capture_hotkeys, false, "Skate 3",
+                    "Enable the diagnostic capture triggers: F7 scene-ring dump, F8 "
+                    "cache flush, F9/F10 snapshot recording, F11 A/B parity capture, "
+                    "controller RB+X / RB+A combos, and the snapshot-dir trigger "
+                    "file. Off = no key/pad polling and no capture output.")
+    .debug_only()
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_scene {
 
@@ -624,9 +631,11 @@ void OnCaptureFrameEnd(uint8_t* base, uint64_t frame_index,
   // Manual triggers (work repeatedly): press F9 (window recording per the
   // snapshot cvars), F10 (IMMEDIATE single-frame capture: full memory
   // snapshot + this frame's records/draws, for catching a broken object the
-  // moment it is on screen), or create <snapshot_dir>\trigger.
+  // moment it is on screen), or create <snapshot_dir>\trigger. All of them
+  // (and their key/pad polling) sit behind skate3_native_render_capture_hotkeys.
+  const bool capture_hotkeys = REXCVAR_GET(skate3_native_render_capture_hotkeys);
 #if defined(_WIN32)
-  if (!g_collecting) {
+  if (capture_hotkeys && !g_collecting) {
     static bool f9_was_down = false;
     const bool f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     if (f9_down && !f9_was_down) {
@@ -733,7 +742,10 @@ void OnCaptureFrameEnd(uint8_t* base, uint64_t frame_index,
     static uint64_t ab_resume_frame = 0;
     static char ab_tag[24] = {};
     static bool f11_was_down = false;
-    const bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    // Gate the poll itself; a sequence already in flight still runs to
+    // completion so the renderer is never left toggled to emulated.
+    const bool f11_down =
+        capture_hotkeys && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     constexpr uint64_t kSettleFrames = 60;
     switch (ab_state) {
       case AbState::kIdle:
@@ -919,7 +931,7 @@ void OnCaptureFrameEnd(uint8_t* base, uint64_t frame_index,
     }
   }
 #endif
-  if (!g_collecting && frame_index % 32 == 0) {
+  if (capture_hotkeys && !g_collecting && frame_index % 32 == 0) {
     const std::filesystem::path trigger = SnapshotDir() / "trigger";
     std::error_code ec;
     if (std::filesystem::exists(trigger, ec)) {

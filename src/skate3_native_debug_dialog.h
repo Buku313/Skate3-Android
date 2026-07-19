@@ -24,11 +24,11 @@ class NativeDebugDialog final : public rex::ui::ImGuiDialog {
   bool visible_ = false;
 };
 
-// Tiny always-on top-right corner readout of which renderer produced the
-// last presented frame: NATIVE (native scene renderer) or EMULATED (Xenos
+// Tiny top-right corner readout of which renderer produced the last
+// presented frame: NATIVE (native scene renderer) or EMULATED (Xenos
 // GPU emulation; menus/loading yields, F5 off). Input-transparent, no
-// continuous repaint (updates ride the guest frame paints); hidden via
-// skate3_native_render_mode_indicator (hot).
+// continuous repaint (updates ride the guest frame paints); off by
+// default, shown via skate3_native_render_mode_indicator (hot).
 class RenderModeIndicator final : public rex::ui::ImGuiDialog {
  public:
   explicit RenderModeIndicator(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}

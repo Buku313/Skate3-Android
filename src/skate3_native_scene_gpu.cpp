@@ -2135,8 +2135,8 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
       }
     }
     device->Unmap(out.upload);
-    REXLOG_INFO("native-scene: cube {:08X} {}x{} fmt={} -> RGBA full chain ({} levels)",
-                tex_ptr, width, height, uint32_t(info.format), levels);
+    REXLOG_DEBUG("native-scene: cube {:08X} {}x{} fmt={} -> RGBA full chain ({} levels)",
+                 tex_ptr, width, height, uint32_t(info.format), levels);
     nrhi::Swizzle swizzle_mapping[4];
     ComposeSrvSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
                       swizzle_mapping);
@@ -2256,8 +2256,8 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   }
   device->Unmap(out.upload);
 
-  REXLOG_INFO("native-scene: cube {:08X} {}x{} fmt={} mips={} (of {} avail)", tex_ptr,
-              width, height, uint32_t(info.format), mip_levels, info.mip_levels());
+  REXLOG_DEBUG("native-scene: cube {:08X} {}x{} fmt={} mips={} (of {} avail)", tex_ptr,
+               width, height, uint32_t(info.format), mip_levels, info.mip_levels());
   if (g_tex_stage_out != nullptr) {
     // Decode worker: export the commit recipe, face-major (face * levels +
     // mip) entries matching the old D3D12 subresource numbering.
@@ -3765,8 +3765,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     if (within()) {
       if (g_warm_mesh_log_budget.load(std::memory_order_relaxed) > 0 &&
           g_warm_mesh_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
-        REXLOG_INFO("native-scene: settle mesh REVALIDATE mesh={:08X} fp {:016X}->{:016X}",
-                    item.mesh, mit->second.fingerprint, item.fingerprint);
+        REXLOG_DEBUG("native-scene: settle mesh REVALIDATE mesh={:08X} fp {:016X}->{:016X}",
+                     item.mesh, mit->second.fingerprint, item.fingerprint);
       }
       g_r.device->DestroyDeferred(mit->second.vb);
       g_r.device->DestroyDeferred(mit->second.ib);
@@ -3816,9 +3816,9 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       }
       if (g_warm_tex_log_budget.load(std::memory_order_relaxed) > 0 &&
           g_warm_tex_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
-        REXLOG_INFO("native-scene: settle tex RETIRE ptr={:08X} key={:016X} incomplete={} "
-                    "fp {:016X}->{:016X}",
-                    tex_ptr, key, it->second.incomplete, it->second.payload_fp, fp);
+        REXLOG_DEBUG("native-scene: settle tex RETIRE ptr={:08X} key={:016X} incomplete={} "
+                     "fp {:016X}->{:016X}",
+                     tex_ptr, key, it->second.incomplete, it->second.payload_fp, fp);
       }
       RetireGuestTexture(it->second, context.device->CurrentSubmission());
       g_r.tex_store.erase(it);
@@ -4450,7 +4450,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
               s_swap_logs.store(0, std::memory_order_relaxed);
             }
             if (s_swap_logs.fetch_add(1) < 8) {
-              REXLOG_INFO(
+              REXLOG_DEBUG(
                   "native-scene: texture heal commit key={:016X} fp {:016X} "
                   "-> {:016X}",
                   t.words_key, wit->second.payload_fp, t.gt.payload_fp);
@@ -6475,7 +6475,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     g_warm_tex_log_budget.store(4, std::memory_order_relaxed);
     g_slow_frame_log_budget.store(3, std::memory_order_relaxed);
   }
-  if (frames % 600 == 0) {
+  if (frames % 600 == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     uint32_t lw_ctxs = 0, lw_ents = 0;
     skate3::native_lw::QueryLwStats(&lw_ctxs, &lw_ents);
     REXLOG_INFO(
@@ -7018,7 +7018,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       static std::atomic<uint32_t> s_sh_logged{0};
       const uint32_t sl = s_sh_logged.fetch_add(1, std::memory_order_relaxed);
       if (sl < 24 || (sl & 1023u) == 0) {
-        REXLOG_INFO(
+        REXLOG_DEBUG(
             "native-scene: SHADOW ALTERNATION valid={} ready={} draws={} "
             "row0=({:.3f},{:.3f},{:.3f},{:.3f}) (n={})",
             scene.shadow_valid ? 1 : 0, shadow_ready ? 1 : 0, shadow_draws,
@@ -8645,7 +8645,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               const uint32_t ln =
                   s_stale.fetch_add(1, std::memory_order_relaxed);
               if (ln < 16 || (ln & 1023u) == 0) {
-                REXLOG_INFO(
+                REXLOG_DEBUG(
                     "native-scene: ropa shape STALE gen dropped mesh={:08X} "
                     "age={:.2f}s seq_gap={} (n={})",
                     item.mesh, ring_newest_t - g.t,
@@ -8703,7 +8703,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         const uint32_t ln =
             s_blend_miss_log.fetch_add(1, std::memory_order_relaxed);
         if (ln < 64 || (ln & 63u) == 0) {
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: ropa blend MISS mesh={:08X} sc={} ng={} "
               "total={:.2f} stride={} ring={} ring_off={} (n={})",
               item.mesh, item.shape_count, ng, total, buffers.vb_view.stride,
@@ -8855,7 +8855,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         static std::atomic<uint32_t> s_flip_logged{0};
         const uint32_t fl = s_flip_logged.fetch_add(1, std::memory_order_relaxed);
         if (fl < 24 || (fl & 511u) == 0) {
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: hair ROUTE FLIP mesh={:08X} ctx={:08X} fam={} "
               "alpha={} -> route {} rows14=({:.3f},{:.3f},{:.3f}) (n={})",
               item.mesh, item.ctx, item.char_family, item.char_alpha ? 1 : 0,
@@ -8869,7 +8869,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         static std::atomic<uint32_t> s_bone_alt_logged{0};
         const uint32_t bl = s_bone_alt_logged.fetch_add(1, std::memory_order_relaxed);
         if (bl < 24 || (bl & 1023u) == 0) {
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: hair BONES ALTERNATION mesh={:08X} ctx={:08X} "
               "fam={} bones={} src={} caster_bank={} (n={})",
               item.mesh, item.ctx, item.char_family, item.bones.size() / 12,
@@ -8918,7 +8918,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         static std::atomic<uint64_t> s_blinks{0};
         const uint64_t n = s_blinks.fetch_add(1, std::memory_order_relaxed);
         if (n < 16 || (n & 255u) == 0) {
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: fade BLINK repaired mesh={:08X} fam={} ropa={} "
               "src={} rows13=({:.3f},{:.3f},{:.3f},{:.3f}) "
               "rows14=({:.3f},{:.3f}) (n={})",
@@ -9705,7 +9705,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         if (frame_number - s_pfx_log_frame > 120) {
           s_pfx_log_frame = frame_number;
           const auto& fx = scene.photo_fx;
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: pfx live rows: visualfx c2=({:.3f},{:.3f}) "
               "c4.x={:.5f} c7=({:.4f},{:.4f},{:.4f},{:.4f}) | dofmb "
               "c2.x={:.3f} | dof c0.x={:.3f} | uber c0.x={:.3f} "

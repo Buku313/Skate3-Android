@@ -59,7 +59,7 @@
 
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene, false, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene, true, "Skate 3",
                     "Render the game scene natively from the hooked MeshContext stream, "
                     "replacing the emulated GPU output (requires skate3_native_render). "
                     "Hot-toggles live between the native and emulated renderers (F5).")
@@ -967,8 +967,13 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_stretch_guard, true, "Skate 3",
                     "Draw-time stretch veto: skin cached sample verts of each "
                     "skinned mesh's GPU-resident decode with the final palette "
                     "every frame; wider than bind size = the 1-frame mangled-"
-                    "ribbon flash: skip the item's draws (blink) and dump the "
-                    "palette to logs/stretch_*.txt for diagnosis")
+                    "ribbon flash; skip the item's draws (blink)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_stretch_guard_dump, false, "Skate 3",
+                    "On a stretch veto, dump the full bone palette and probe "
+                    "verts to logs/stretch_*.txt (first 6 trips) for offline "
+                    "diagnosis of which rows are junk")
+    .debug_only()
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lm_dump, false, "Skate 3",
                     "Diagnostic: dump the decoded mip 0 of every generated-mip "
@@ -1036,8 +1041,8 @@ REXCVAR_DEFINE_DOUBLE(
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_synthetic_pan, 0, "Skate 3",
                      "Synthetic constant-rate camera pan (judder isolation): 0 = off, "
                      "1 = time-based at scene build, 2 = fixed angle step per frame, "
-                     "3 = synthetic samples through the camera smoother. Hotkey P "
-                     "cycles the modes.")
+                     "3 = synthetic samples through the camera smoother.")
+    .debug_only()
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_synthetic_pan_rate, 90.0, "Skate 3",
                       "Synthetic pan rate in degrees/second")
@@ -2523,19 +2528,6 @@ void RequestSceneRingDump() {
   g_scene_ring_dump.store(true, std::memory_order_release);
 }
 void FlushMeshCache() { g_flush_meshes.store(true, std::memory_order_relaxed); }
-
-int CycleSyntheticPan() {
-  const int mode =
-      (std::clamp(int(REXCVAR_GET(skate3_native_render_scene_synthetic_pan)), 0, 3) + 1) %
-      4;
-  REXCVAR_SET(skate3_native_render_scene_synthetic_pan, mode);
-  static const char* kModeNames[] = {"off", "time-based (host clock at scene build)",
-                                     "fixed angle step per frame",
-                                     "synthetic samples through the smoother"};
-  REXLOG_INFO("native-scene synthetic-pan: hotkey -> mode {} ({})", mode,
-              kModeNames[mode]);
-  return mode;
-}
 
 // RecordBoneSignal / RecordCameraSignal: native/skate3_native_diagnostics.cpp.
 
@@ -7580,7 +7572,7 @@ void Publish2dDraws(uint8_t* base) {
           s_seen.clear();
         }
         if (s_seen.size() < 24 && s_seen.insert(d.fetch[1]).second) {
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: BIG 2D quad tex=({:08x},{:08x},{:08x}) flags={:02x} "
               "src_stride={} count={} bbox=({:.0f},{:.0f})-({:.0f},{:.0f}) "
               "c8=({:.2f},{:.2f},{:.2f},{:.2f}) (n={})",
@@ -7618,7 +7610,7 @@ void Publish2dDraws(uint8_t* base) {
             s_fade_logs.store(0, std::memory_order_relaxed);
           }
           if (s_fade_logs.fetch_add(1, std::memory_order_relaxed) < 6) {
-            REXLOG_INFO(
+            REXLOG_DEBUG(
                 "native-scene: transition fade fill alpha={:.2f} "
                 "rgb=({:.2f},{:.2f},{:.2f}) flags={:02x}",
                 alpha, d.consts[32], d.consts[33], d.consts[34], d.flags);
@@ -7921,7 +7913,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         g_slow_frame_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
       const double ours_ms =
           double(s_prev_build_ns + s_prev_cap_ns) * 1e-6;
-      REXLOG_INFO(
+      REXLOG_DEBUG(
           "native-scene: slow guest frame dt={:.2f}ms prev[cap={:.2f} build={:.2f} "
           "(2d={:.2f} spl={:.2f} pal={:.2f} ptail={:.2f} walk={:.2f}) rest={:.2f}]ms",
           dt_ms, double(s_prev_cap_ns) * 1e-6, double(s_prev_build_ns) * 1e-6,
@@ -8053,7 +8045,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         static std::atomic<uint64_t> s_aux_views{0};
         const uint64_t n = s_aux_views.fetch_add(1, std::memory_order_relaxed);
         if (n < 4 || (n & 255u) == 0) {
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: aux perspective view skipped (portrait RTT "
               "pass, proj aspect {:.2f}) (n={})",
               m00 > 1e-6f ? m11 / m00 : 0.0f, n);
@@ -8274,7 +8266,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       static std::atomic<uint32_t> incoh_logged{0};
       const uint32_t ln = incoh_logged.fetch_add(1, std::memory_order_relaxed);
       if (ln < 32 || (ln & 255u) == 0) {
-        REXLOG_INFO(
+        REXLOG_DEBUG(
             "native-scene: publish INCOHERENT palette mesh={:08X} fam={} "
             "ropa={} src={} spread={:.2f} bind=({:.2f},{:.2f},{:.2f}) "
             "bone0_t=({:.1f},{:.1f},{:.1f})",
@@ -8570,7 +8562,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                 const uint32_t ln =
                     s_fam_logged.fetch_add(1, std::memory_order_relaxed);
                 if (ln < 8 || (ln & 1023u) == 0) {
-                  REXLOG_INFO(
+                  REXLOG_DEBUG(
                       "native-scene: rows bridge cross-family serve "
                       "mesh={:08X} fam {}->{} (n={})",
                       item.mesh, item.char_family, eit->second.fam, ln);
@@ -9072,7 +9064,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           const uint32_t ln =
               s_sub_logged.fetch_add(1, std::memory_order_relaxed);
           if (ln < 16 || (ln & 511u) == 0) {
-            REXLOG_INFO(
+            REXLOG_DEBUG(
                 "native-scene: LW palette substituted ctx={:08X} mesh={:08X} "
                 "fam={} rows={} (n={})",
                 item.ctx, item.mesh, item.char_family, n, ln);
@@ -9723,7 +9715,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             probe.fp == item.fingerprint ? 1 : 0, item.bones[3],
             item.bones[7], item.bones[11]);
       }
-      if (ln < 6) {
+      if (ln < 6 && REXCVAR_GET(skate3_native_render_scene_stretch_guard_dump)) {
         // Full palette + probe dump for offline diagnosis (which rows are
         // junk, which bones the stretched samples weight to).
         char path[128];

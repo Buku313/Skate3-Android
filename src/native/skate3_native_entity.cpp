@@ -23,10 +23,16 @@
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_entity_ident, true, "Skate 3",
     "Build the presentation-entity identity store (MeshContext -> owning "
-    "entity, from the game's BindConstants walks) and compare the entity's "
-    "direct fields (world transform, opacity) against the renderer's "
-    "captured values. Observer only: emits the ident[] stats line, serves "
-    "nothing.")
+    "entity, from the game's BindConstants walks). The store feeds the "
+    "entity serve paths (fade serve, ROPA world serve, palette identity); "
+    "off disables those consumers as well.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_entity_ident_log, false, "Skate 3",
+    "Log identity-store diagnostics: the periodic ident[] stats line and "
+    "rate-limited serve-path lines.")
+    .debug_only()
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(
@@ -279,7 +285,8 @@ void OnBindClass(uint32_t entity, EntClass cls) {
   // table, for promoting vtable-based classification later.
   static std::unordered_map<uint64_t, bool> s_seen;
   const uint64_t key = (uint64_t(it->second.vtable) << 8) | uint8_t(cls);
-  if (s_seen.size() < 64 && s_seen.emplace(key, true).second) {
+  if (REXCVAR_GET(skate3_native_render_scene_entity_ident_log) &&
+      s_seen.size() < 64 && s_seen.emplace(key, true).second) {
     REXLOG_INFO("native-entity: class {} vtbl={:08X} entity={:08X}",
                 ClassName(cls), it->second.vtable, entity);
   }
@@ -377,7 +384,8 @@ void ObserveRopaWorld(uint8_t* base, uint32_t ctx, const float rows[12]) {
   if (c416 == 2 && c352 == 2) {
     static std::atomic<uint32_t> s_logged{0};
     const uint32_t ln = s_logged.fetch_add(1, std::memory_order_relaxed);
-    if (ln < 8 || (ln & 1023u) == 0) {
+    if (REXCVAR_GET(skate3_native_render_scene_entity_ident_log) &&
+        (ln < 8 || (ln & 1023u) == 0)) {
       REXLOG_INFO(
           "native-entity: ropa world DIVERGES both fields ctx={:08X} "
           "cls={} entity={:08X} bank=({:.3f},{:.3f},{:.3f},{:.2f}) "
@@ -424,7 +432,8 @@ void ObserveCharItem(uint8_t* base, uint32_t ctx, uint32_t family,
     g_fade_div.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<uint32_t> s_logged{0};
     const uint32_t ln = s_logged.fetch_add(1, std::memory_order_relaxed);
-    if (ln < 8 || (ln & 2047u) == 0) {
+    if (REXCVAR_GET(skate3_native_render_scene_entity_ident_log) &&
+        (ln < 8 || (ln & 2047u) == 0)) {
       REXLOG_INFO(
           "native-entity: fade divergence ctx={:08X} cls={} fam={} "
           "e496={:.3f} used={:.3f} (n={})",
@@ -441,7 +450,8 @@ void NoteAcceptedWorldCompare(const float bank_rows[12],
       g_wprim_div.fetch_add(1, std::memory_order_relaxed);
       static std::atomic<uint32_t> s_logged{0};
       const uint32_t ln = s_logged.fetch_add(1, std::memory_order_relaxed);
-      if (ln < 8 || (ln & 1023u) == 0) {
+      if (REXCVAR_GET(skate3_native_render_scene_entity_ident_log) &&
+          (ln < 8 || (ln & 1023u) == 0)) {
         REXLOG_INFO(
             "native-entity: PRIMARY world diverges from accepted bank "
             "i={} bank={:.4f} ent={:.4f} (n={})",
@@ -633,7 +643,8 @@ bool ServeRopaWorld(uint8_t* base, uint32_t ctx, uint32_t vb_obj,
   g_wserve.fetch_add(1, std::memory_order_relaxed);
   static std::atomic<uint32_t> s_logged{0};
   const uint32_t ln = s_logged.fetch_add(1, std::memory_order_relaxed);
-  if (ln < 8 || (ln & 2047u) == 0) {
+  if (REXCVAR_GET(skate3_native_render_scene_entity_ident_log) &&
+      (ln < 8 || (ln & 2047u) == 0)) {
     REXLOG_INFO(
         "native-entity: ropa world SERVED ctx={:08X} cls={} entity={:08X} "
         "t=({:.2f},{:.2f},{:.2f}) (n={})",
@@ -644,7 +655,8 @@ bool ServeRopaWorld(uint8_t* base, uint32_t ctx, uint32_t vb_obj,
 }
 
 void EmitStats() {
-  if (!REXCVAR_GET(skate3_native_render_scene_entity_ident)) {
+  if (!REXCVAR_GET(skate3_native_render_scene_entity_ident) ||
+      !REXCVAR_GET(skate3_native_render_scene_entity_ident_log)) {
     return;
   }
   const uint32_t frame =

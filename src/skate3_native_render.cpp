@@ -23,7 +23,7 @@
 #include <rex/logging.h>
 #include <rex/ui/window.h>
 
-REXCVAR_DEFINE_BOOL(skate3_native_render, false, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render, true, "Skate 3",
                     "Enable the Skate 3 data-driven native renderer hook layer")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",

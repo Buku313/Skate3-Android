@@ -714,8 +714,8 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
 }
 
 void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
-  // Always-on native/emulated corner readout (top right; cvar
-  // skate3_native_render_mode_indicator hides it live). Input-transparent,
+  // Native/emulated corner readout (top right; off by default, cvar
+  // skate3_native_render_mode_indicator shows it live). Input-transparent,
   // so it never affects cursor or focus handling.
   render_mode_indicator_ = std::make_unique<skate3::RenderModeIndicator>(drawer);
   rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings", [this] {
@@ -746,7 +746,12 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         });
   rex::ui::RegisterBind("bind_skate3_ultrawide_targets", "F7",
                         "Skate 3 ultrawide targets", [this] {
-                          ToggleUltrawideTargets();
+                          // Developer tuning dialog; rides the same opt-in as
+                          // the F4 cvar browser.
+                          if (rex::cvar::Query<bool>(
+                                  "advanced_settings_overlay_enabled")) {
+                            ToggleUltrawideTargets();
+                          }
                         });
   rex::ui::RegisterBind("bind_skate3_save_draw_fingerprints", "F8",
                         "Save draw fingerprint log", [this] {

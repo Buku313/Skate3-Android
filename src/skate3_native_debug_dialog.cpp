@@ -13,7 +13,7 @@
 
 #include "skate3_native_scene.h"
 
-REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, false, "Skate 3",
                     "Small top-right corner readout of which renderer produced the "
                     "last presented frame: NATIVE (native scene renderer) or "
                     "EMULATED (Xenos GPU emulation: menus/loading yields, F5 off).")
