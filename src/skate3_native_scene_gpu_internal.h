@@ -751,11 +751,13 @@ struct RendererState {
   uint32_t shadow_dump_enqueued = 0;
   uint32_t shadow_dump_written = 0;
   bool shadow_dump_done = false;
-  // Per-frame shadow constant buffer ring (CBV b1). 512-byte slices: the
+  // Per-frame shadow constant buffer ring (CBV b1). 768-byte slices: the
   // first 256 bytes are the original 16-row block, rows 16-18 carry the
-  // dynamicobject world-shadow transform (dyn_ws* in the scene shader).
+  // dynamicobject world-shadow transform (dyn_ws*), rows 19-22 the
+  // flowingwateralpha m_params (wat_p*), rows 23-33 the ocean PCA/material
+  // rows and the oceanreflection fade row (oc_* / orf).
   static constexpr uint32_t kShadowCbRegions = 8;
-  static constexpr uint32_t kShadowCbSlice = 512;
+  static constexpr uint32_t kShadowCbSlice = 768;
   nrhi::Buffer* shadow_cb = nullptr;
   uint8_t* shadow_cb_cpu = nullptr;
   // dynamicobject static world-shadow map (512x512, same convention as the

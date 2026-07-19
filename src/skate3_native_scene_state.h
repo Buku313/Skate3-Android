@@ -292,6 +292,20 @@ inline bool g_shadow_frame_done = false;
 inline float g_family_rows[4] = {0.3435f, 0.02f, 1.0f, 0.45f};
 inline bool g_tree_frame_done = false;
 inline bool g_proxy_frame_done = false;
+// flowingwateralpha m_params + animation-time rows (see
+// FrameScene::water_rows), captured from a flowingwateralpha PS bank
+// (debug-path classified). Guest render thread only.
+inline float g_water_rows[17] = {};
+inline bool g_water_have = false;
+inline bool g_water_frame_done = false;
+// ocean_defaultPS / oceanreflection_defaultPS rows (see
+// FrameScene::ocean_rows / oceanrefl_rows). Guest render thread only.
+inline float g_ocean_rows[40] = {};
+inline bool g_ocean_have = false;
+inline bool g_ocean_frame_done = false;
+inline float g_oceanrefl_rows[4] = {};
+inline bool g_oceanrefl_have = false;
+inline bool g_oceanrefl_frame_done = false;
 // dynamicobject.fx frame-global lighting rows (see FrameScene::dynobj_rows),
 // captured from a dynamicobject/alphatestdynamicobject PS bank (debug-path
 // classified). Guest render thread only.
@@ -719,6 +733,7 @@ inline std::atomic<uint64_t> g_char_attempts{0};
 inline std::atomic<uint64_t> g_char_valid{0};
 inline std::atomic<uint64_t> g_char_drawn{0};
 inline std::atomic<uint64_t> g_dynobj_drawn{0};
+inline std::atomic<uint64_t> g_water_drawn{0};  // exact-branch water draws
 // character.cloth_ropa items captured in the sim-active RIGID mode (world
 // from c188/c191 instead of a bone palette, see CaptureSkinnedState).
 inline std::atomic<uint64_t> g_ropa_rigid{0};

@@ -526,8 +526,9 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     // encodings (decalenvironment VS: o0.zw = |uv|; baseenvironment VS:
     // maxs r2.zw = |r4.xy|). Raw signed values sample mirrored atlas cells.
     // Exception: hair meshes, their second texcoord is the strand-alpha
-    // UV, passed RAW by the hair VS (o0.zw = uv, float2).
-    if (item.char_family < 4) {
+    // UV, passed RAW by the hair VS (o0.zw = uv, float2), and the ocean,
+    // whose VS passes the lightmap UV raw (Out.UV.zw = In.LM, no abs).
+    if (item.char_family < 4 && item.water_ocean == 0) {
       dst[v * 14 + 5] = std::fabs(dst[v * 14 + 5]);
       dst[v * 14 + 6] = std::fabs(dst[v * 14 + 6]);
     }
@@ -578,7 +579,35 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
       return uint32_t(std::lround((f * 0.5f + 0.5f) * 255.0f)) & 0xFFu;
     };
     float n3[3] = {0.0f, 0.0f, 0.0f};
-    if (item.env_family != 0 &&
+    if (item.water_flowing && !item.skinned && item.uv2_fmt == 26 &&
+        item.tan_fmt == 16) {
+      // Water meshes (flowingwater VS layout): the fmt-26 element is
+      // lm_norm: xy = |unwrap| with sign bits, zw = normal.xy (snorm),
+      // normal.z = sign.y * sqrt(1 - xy^2), and the usage-6 k_10_11_11
+      // element is the TANGENT (no usage-3 normal, no usage-7 binormal).
+      // Pack the tangent into the free blend-weight bytes with the unwrap
+      // sign.x in the sentinel byte; the shader rebuilds the frame as
+      // B = sign.x * cross(N, T), exactly the game's VS
+      // (vBinormal = signs.x * cross(vNormal, vTangent)).
+      const uint8_t* q = src_vb + size_t(v) * item.stride + item.uv2_offset;
+      const int16_t sx = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q)));
+      const int16_t sy = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q + 2)));
+      const int16_t nx = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q + 4)));
+      const int16_t ny = int16_t(SwapU16(*reinterpret_cast<const uint16_t*>(q + 6)));
+      n3[0] = nx / 32767.0f;
+      n3[1] = ny / 32767.0f;
+      // The game clamps xy_len at 0.999 (water normals ride |xy| ~ 1, so
+      // z floors at 0.0316 rather than 0, verified against the VS ucode).
+      const float xylen =
+          std::min(n3[0] * n3[0] + n3[1] * n3[1], 0.999f);
+      n3[2] = (sy > 0 ? 1.0f : -1.0f) * std::sqrt(1.0f - xylen);
+      float t3[3];
+      unpack_10_11_11(item.tangent_offset, t3);
+      const uint32_t packed = pk(t3[0]) | (pk(t3[1]) << 8) |
+                              (pk(t3[2]) << 16) |
+                              ((sx > 0 ? 200u : 100u) << 24);
+      std::memcpy(&dst[v * 14 + 7], &packed, 4);
+    } else if (item.env_family != 0 &&
         (item.env_family <= 6 || item.env_family == 13) &&
         item.uv2_fmt == 26) {
       // Exact world families: the REAL vertex normal is packed in the
@@ -1892,8 +1921,10 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   // chain down to 1x1 below; other formats fall back to copying the guest
   // chain (down to 32px: smaller levels live packed inside a shared 32x32
   // tile, see GetPackedTileOffset).
+  const xenos::TextureFormat cube_base_fmt = rex::graphics::GetBaseFormat(info.format);
   const bool rgba_chain =
-      rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_DXT1 &&
+      (cube_base_fmt == xenos::TextureFormat::k_DXT1 ||
+       cube_base_fmt == xenos::TextureFormat::k_8_8_8_8) &&
       width >= 8 && (width & (width - 1)) == 0 && width == height;
   uint32_t mip_levels = 1;
   if (!rgba_chain && info.memory.mip_address != 0 && (width & (width - 1)) == 0 &&
@@ -1954,9 +1985,13 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   }
 
   if (rgba_chain) {
-    // Decode DXT1 mip 0 -> RGBA8 per face, box-filter the full chain to
-    // 1x1, upload as an RGBA cube. CPU cost is one-time per cube (runs on
-    // the decode workers).
+    // Decode mip 0 -> RGBA8 per face (DXT1 block decode, or plain 8888
+    // texels: the water canal cubes), box-filter the full chain to 1x1,
+    // upload as an RGBA cube. The GUEST cube mip chain is never trusted:
+    // its packed sub-32px levels and per-face slice layout are exactly
+    // where garbage sneaks in, and the reflection fetch runs at a deep
+    // gradient LOD where a bad level dominates. CPU cost is one-time per
+    // cube (runs on the decode workers).
     nrhi::Device* device = context.device;
     const uint32_t levels = 1u + uint32_t(std::countr_zero(width));
     struct Level {
@@ -2022,13 +2057,33 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
                       bytes_per_block);
         }
         SwapGuestEndian(bc_row.data(), uint32_t(bc_row.size()), info.endianness);
-        for (uint32_t bx = 0; bx < L0.cols; ++bx) {
-          uint8_t px[16][4];
-          DecodeBc1Block(&bc_row[size_t(bx) * bytes_per_block], px);
-          for (uint32_t r = 0; r < 4; ++r) {
-            std::memcpy(&rgba[(size_t(by * 4 + r) * width + bx * 4) * 4], px[r * 4],
-                        16);
+        if (cube_base_fmt == xenos::TextureFormat::k_DXT1) {
+          for (uint32_t bx = 0; bx < L0.cols; ++bx) {
+            uint8_t px[16][4];
+            DecodeBc1Block(&bc_row[size_t(bx) * bytes_per_block], px);
+            for (uint32_t r = 0; r < 4; ++r) {
+              std::memcpy(&rgba[(size_t(by * 4 + r) * width + bx * 4) * 4],
+                          px[r * 4], 16);
+            }
           }
+        } else {
+          // k_8_8_8_8: post-endian-swap bytes are already component order
+          // X,Y,Z,W (the SRV swizzle applies the fetch's channel remap).
+          std::memcpy(&rgba[size_t(by) * width * 4], bc_row.data(),
+                      size_t(width) * 4);
+        }
+      }
+      // Diagnostic dump (skate3_native_render_scene_lm_dump): the decoded
+      // face exactly as uploaded, for offline byte-diff against the
+      // reference decode of the same fetch words.
+      if (REXCVAR_GET(skate3_native_render_scene_lm_dump)) {
+        char path[260];
+        std::snprintf(path, sizeof(path),
+                      "native_texture_dumps/cube_%08X_f%u_%ux%u.rgba",
+                      info.memory.base_address, face, width, height);
+        if (FILE* f = std::fopen(path, "wb")) {
+          std::fwrite(rgba.data(), 1, size_t(width) * height * 4, f);
+          std::fclose(f);
         }
       }
       // Upload level 0, then box-filter down the chain in place.
@@ -2062,8 +2117,8 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
       }
     }
     device->Unmap(out.upload);
-    REXLOG_INFO("native-scene: cube {:08X} {}x{} DXT1 -> RGBA full chain ({} levels)",
-                tex_ptr, width, height, levels);
+    REXLOG_INFO("native-scene: cube {:08X} {}x{} fmt={} -> RGBA full chain ({} levels)",
+                tex_ptr, width, height, uint32_t(info.format), levels);
     nrhi::Swizzle swizzle_mapping[4];
     ComposeSrvSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
                       swizzle_mapping);
@@ -3756,6 +3811,9 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     // per-pixel too.
     warm_texture(item.water_normal);
   }
+  if (item.water_ocean == 1) {
+    warm_texture(item.water_normal2);  // second PCA component (t8)
+  }
   if ((item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) ||
       item.dynobj != 0) {
     // v2 detail normal map (t8; fam 2 carries no base+detail pair).
@@ -3989,6 +4047,9 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     // v2: fams 1-4 and the dynobj families sample their base normal map
     // per-pixel too.
     stage_texture(item.water_normal);
+  }
+  if (item.water_ocean == 1) {
+    stage_texture(item.water_normal2);  // second PCA component (t8)
   }
   if ((item.env_family >= 1 && item.env_family <= 4 && item.env_family != 2) ||
       item.dynobj != 0) {
@@ -5968,7 +6029,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "store[n={} routes={} evict={}] "
         "heal[vfail={} demote={}] serve[sticky={} skipnew={} adstale={} adnone={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} "
-        "reused={}] dynobj[valid={} drawn={}] "
+        "reused={}] dynobj[valid={} drawn={}] water[valid={} drawn={}] "
         "lw[ctxs={} ents={} stamp={} fade0={} resc={} fill={} pal={} rows={}] "
         "refl[pair={} flat={} gate={:#x}] flips={} alt[bones={} shadow={}] "
         "rows_inst={} pal_srv={}",
@@ -5997,7 +6058,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         shadow_ready, shadow_draws,
         g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
         g_char_rows_reused.load(), scene.dynobj_valid,
-        g_dynobj_drawn.load(), lw_ctxs, lw_ents, g_lw_stamped.load(),
+        g_dynobj_drawn.load(), scene.water_valid, g_water_drawn.load(),
+        lw_ctxs, lw_ents, g_lw_stamped.load(),
         g_lw_fade0.load(), g_lw_ctx_rescued.load(), g_lw_gap_filled.load(),
         g_lw_pal_sub.load(), g_lw_rows_served.load(),
         g_refl_pair.load(), g_refl_flat.load(), g_refl_gate.load(),
@@ -6458,6 +6520,27 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (scene.dynobj_ws_valid) {
         std::memcpy(cb + 64, scene.dynobj_ws, sizeof(scene.dynobj_ws));
       }
+    }
+    // flowingwateralpha m_params rows (wat_p0..wat_p3 at cb[76..91]):
+    // m_params[0..2] verbatim, then (time, mask threshold, spec power,
+    // alpha floor). Consumed by the exact water branch (cam_pos.w = -30),
+    // which is only selected per draw when scene.water_valid.
+    if (scene.water_valid) {
+      std::memcpy(cb + 76, scene.water_rows, 12 * sizeof(float));   // c11..c13
+      cb[88] = scene.water_rows[16];  // g_fAnimationTime (c15.x)
+      cb[89] = scene.water_rows[13];  // mask threshold (c14.y)
+      cb[90] = scene.water_rows[14];  // spec power (c14.z)
+      cb[91] = scene.water_rows[15];  // alpha floor (c14.w)
+    }
+    // ocean_defaultPS rows (oc_mean/oc_w0..5/oc_p0..2 at cb[92..131]) and
+    // the oceanreflection fade row (orf at cb[132..135]); consumed by the
+    // exact ocean branches (cam_pos.w = -31 / -32).
+    if (scene.ocean_valid) {
+      std::memcpy(cb + 92, scene.ocean_rows, sizeof(scene.ocean_rows));
+    }
+    if (scene.oceanrefl_valid) {
+      std::memcpy(cb + 132, scene.oceanrefl_rows,
+                  sizeof(scene.oceanrefl_rows));
     }
     cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
     // b2 (character lighting) default: point at the ring base so the root
@@ -7337,7 +7420,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // refmask map (or the animated.tree noise tint) in the free decal slot;
     // overlay.w == 3 tells the shader the masks are live.
     bool spec_bound = false;
-    if (item.env_family != 0 && !item.decal && item.env_family != 10 &&
+    if (((item.env_family != 0 && !item.decal && item.env_family != 10) ||
+         item.water_flowing) &&
         item.spec_tex != 0) {
       const GuestTexture* spec = resolve_texture(item.spec_tex, 6);
       if (spec != &g_r.white) {
@@ -7475,6 +7559,29 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         v2_flags |= 8;
       }
     }
+    // Exact ocean (fam 31): the second PCA normal component rides the free
+    // t8 pair slot and the 16x16 macro overlay the t9 slot (water items use
+    // neither). v2_flags stays 0; the ocean branch signals its binds
+    // through the overlay row.
+    bool ocean_n2 = false;
+    bool ocean_ov = false;
+    if (item.water_ocean == 1 && debug_mode == 0 && scene.shadow_valid &&
+        scene.ocean_valid) {
+      if (item.water_normal2 != 0) {
+        const GuestTexture* n2 = resolve_texture(item.water_normal2, 7);
+        if (n2 != &g_r.white && n2->valid && n2->srv_mips != 0) {
+          v2_detail = n2;
+          ocean_n2 = true;
+        }
+      }
+      if (item.macro_tex != 0) {
+        const GuestTexture* mo = resolve_texture(item.macro_tex, 6);
+        if (mo != &g_r.white && mo->valid && mo->srv_mips != 0) {
+          v2_spec2 = mo;
+          ocean_ov = true;
+        }
+      }
+    }
     constants[44] = item.macro_scale;
     constants[45] = item.macro_opacity;
     constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
@@ -7490,7 +7597,53 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                       ? 4.0f
                                       : 3.0f)
                                : 0.0f);
-    if (item.water) {
+    // Exact flowingwateralpha branch (cam_pos.w = -30): the canal/waterfall
+    // shader hand-ported from the game's own PS and verified per-pixel
+    // against the ucode. Requires the frame m_params rows (b1), the shared
+    // world frame rows (exposure/sun/fog at b1, scene.shadow_valid) and the
+    // ripple normal map resolved in the macro slot; the legacy water
+    // shading covers every gap (and every non-flowing water material).
+    const bool water_exact = item.water && item.water_flowing &&
+                             debug_mode == 0 && scene.shadow_valid &&
+                             scene.water_valid && macro_tex != &g_r.white;
+    // Exact ocean surface (fam 31): both PCA component maps must resolve
+    // (t3 = comp 0 via the water_normal macro-slot bind, t8 = comp 1); the
+    // legacy water shading covers every gap. The horizon sheet (fam 32)
+    // needs only its baked texture (t0) and the captured fade row.
+    const bool ocean_exact = item.water && item.water_ocean == 1 &&
+                             debug_mode == 0 && scene.shadow_valid &&
+                             scene.ocean_valid && macro_tex != &g_r.white &&
+                             ocean_n2;
+    const bool oceanrefl_exact = item.water && item.water_ocean == 2 &&
+                                 debug_mode == 0 && scene.shadow_valid &&
+                                 scene.oceanrefl_valid;
+    if (water_exact) {
+      // overlay.x = spec/reflection masks bound at t4, overlay.y = real
+      // environment cube at t6, overlay.z = ripple resolved (gate above).
+      constants[39] = -30.0f;
+      constants[44] = spec_bound ? 1.0f : 0.0f;
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      constants[46] = 1.0f;
+      constants[47] = 0.0f;
+      g_water_drawn.fetch_add(1, std::memory_order_relaxed);
+    } else if (ocean_exact) {
+      // overlay.x = second PCA component at t8 (gate above guarantees it),
+      // overlay.y = real environment cube at t6, overlay.z = macro overlay
+      // at t9, overlay.w = macroOverlayUVScale.
+      constants[39] = -31.0f;
+      constants[44] = 1.0f;
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      constants[46] = ocean_ov ? 1.0f : 0.0f;
+      constants[47] = item.macro_scale;
+      g_water_drawn.fetch_add(1, std::memory_order_relaxed);
+    } else if (oceanrefl_exact) {
+      constants[39] = -32.0f;
+      constants[44] = 0.0f;
+      constants[45] = 0.0f;
+      constants[46] = 0.0f;
+      constants[47] = 0.0f;
+      g_water_drawn.fetch_add(1, std::memory_order_relaxed);
+    } else if (item.water) {
       // overlay.x = ripple scroll time, overlay.y = real environment cube
       // bound at t6, overlay.z = ripple normal map resolved (in the macro
       // slot; the shader synthesizes procedural ripples otherwise).
@@ -7514,7 +7667,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // mat_tint row (color), unused by these items otherwise
     // (root-signature DWORD budget).
     constants[48] = item.water ? 2.0f : (item.transparent ? 1.0f : 0.0f);
-    if (item.transparent || item.water) {
+    if (water_exact || ocean_exact || oceanrefl_exact) {
+      // misc.y = cube LOD bias (same 640p-gradient rationale as fams 5/6);
+      // fog comes from the shared b1 rows; misc.zw stay free. misc.x keeps
+      // the water marker for the SSR G-buffer restage.
+      constants[49] =
+          log2f(std::max(1.0f, float(context.guest_output_height) / 640.0f));
+      constants[50] = 0.0f;
+      constants[51] = 0.0f;
+    } else if (item.transparent || item.water) {
       constants[49] = scene.fog_ramp[0];
       constants[50] = scene.fog_ramp[1];
       constants[51] = scene.fog_ramp[2];
@@ -7656,8 +7817,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // t6 (cube) shares its table with t7 (shadow atlas); re-pair both.
     cmd->SetTexturePair(7, cube_tex->srv,
                         shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
-    // World-shading v2 material pair (t8 detail + t9 decal spec).
-    if (v2_flags != 0) {
+    // World-shading v2 material pair (t8 detail + t9 decal spec); the exact
+    // ocean rides the same pair (t8 = second PCA component, t9 = overlay).
+    if (v2_flags != 0 || ocean_n2 || ocean_ov) {
       cmd->SetTexturePair(8, (v2_detail != nullptr ? v2_detail : &g_r.white)->srv,
                           (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv);
     }
@@ -8008,9 +8170,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
     };
+    // The exact ocean surface (fam 31) is an OPAQUE draw in the game (its
+    // PS outputs alpha 0 and it writes z-prepass depth); routing it through
+    // the sorted alpha sub-pass would composite the blended horizon sheet
+    // (ocean.reflection) UNDER it. The legacy fallback also renders opaque,
+    // so the route holds while textures/rows are still resolving.
+    const bool ocean_opaque = item.water && item.water_ocean == 1 &&
+                              scene.shadow_valid && scene.ocean_valid;
     if ((item.transparent || item.water || hair_blend || glass_blend ||
          cac_alpha_blend || refl_trans_blend || char_fade_blend) &&
-        debug_mode == 0) {
+        !ocean_opaque && debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
         stamp_route(2);

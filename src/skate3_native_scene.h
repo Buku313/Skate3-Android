@@ -139,8 +139,28 @@ struct DrawItem {
   // `water_normal` is the material's `normal` channel texture, bound in the
   // macro slot (water never carries a macro overlay).
   bool water;
+  // AttribulatorMaterialName starts "water.flowing": the flowingwateralpha
+  // shader family (canal / waterfall surfaces). These take the exact water
+  // branch (hand-ported from flowingwateralpha_defaultPS and verified
+  // per-pixel against the ucode) when the frame's water m_params rows are
+  // captured; other water.* / ocean.* materials keep the legacy water
+  // shading until their own shader layouts are verified from a capture.
+  bool water_flowing = false;
+  // ocean materials: 1 = ocean.default (the sea surface, ocean_defaultPS:
+  // PCA dual-component normal + ward spec + cube reflection, drawn OPAQUE),
+  // 2 = ocean.reflection (the baked horizon reflection sheet, height-ramp
+  // alpha). Exact branches gated on the frame's ocean rows.
+  uint8_t water_ocean = 0;
   uint32_t water_normal;
+  // `normal2` channel: the ocean's second PCA normal component map (the
+  // flowingwater families ignore it).
+  uint32_t water_normal2 = 0;
   uint32_t water_env;  // `environment` channel cube map (reflection term)
+  // Usage-6 tangent present WITHOUT a usage-7 binormal (tan_fmt = 16, the
+  // water-mesh layout: pos + uv + lm_norm + tangent). The flowingwater VS
+  // reconstructs the frame as N from lm_norm.zw + sign bits, B =
+  // sign.x * cross(N, T); DecodeMesh mirrors that (see the water pack).
+  uint8_t tan_fmt = 0;
   // character.cloth_ropa (Ropa cloth-simulated garments, e.g. player tees):
   // the VS variant branches on a flag row kept in front of the bone palette
   // - sim active means the dynamic VB already holds deformed root-local
@@ -295,6 +315,29 @@ struct FrameScene {
   // [2] = tree PS c4.y (tint multiplier), [3] = proxyworld PS c3.y (0.45).
   // Defaults from the day capture cover frames before the first hit.
   float family_rows[4] = {0.3435f, 0.02f, 1.0f, 0.45f};
+  // flowingwateralpha.fx (the water.flowing* materials) m_params rows,
+  // captured once per frame from a flowingwateralpha PS bank (debug-path
+  // classified): [0..3] = m_params[0] (PS c11: normal scale xzw + the
+  // material multiplier in y), [4..7] = m_params[1] (c12: the two animated
+  // UV scroll speeds), [8..11] = m_params[2] (c13: the two tap UV scales),
+  // [12..15] = m_params[3] (c14: y = mask threshold, z = spec power,
+  // w = alpha floor), [16] = g_fAnimationTime (c15.x). Consumed by the
+  // exact water scene PS branch (cam_pos.w = -30).
+  bool water_valid = false;
+  float water_rows[17] = {};
+  // ocean_defaultPS material rows, captured once per frame from an ocean PS
+  // bank (debug-path classified): [0..3] = PCA mean pre-swizzled for the
+  // (R,G,B) channel order (PS c2.x, c2.z, c2.y), [4..27] = the six PCA
+  // weight rows in model order (c3, c4, c7, c8, c5, c6), [28..31] =
+  // m_params[0] (spec color, c12), [32..35] = m_params[1] (c13: y = mult,
+  // z = tonedown scale, w = uv scale), [36..39] = m_params[2] (c14: ward
+  // spread u/v + roughness).
+  bool ocean_valid = false;
+  float ocean_rows[40] = {};
+  // oceanreflection_defaultPS row (PS c3): x = multiplier, y/z = the
+  // height-ramp alpha fade bounds.
+  bool oceanrefl_valid = false;
+  float oceanrefl_rows[4] = {};
   // dynamicobject.fx frame-global lighting rows, captured from a
   // dynamicobject/alphatestdynamicobject PS bank (debug-path classified):
   // [0..2] sun direction (PS c9), [3] scene exposure (c13.x),

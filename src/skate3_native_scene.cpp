@@ -1650,6 +1650,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.tangent_offset = 0;
   item.binormal_offset = 0;
   item.tb_fmt = 0;
+  item.tan_fmt = 0;
   bool have_tan = false;
   bool have_bin = false;
   item.skinned = false;
@@ -1691,6 +1692,9 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   }
   if (have_tan && have_bin) {
     item.tb_fmt = 16;
+  }
+  if (have_tan) {
+    item.tan_fmt = 16;  // tangent-only layouts (water meshes) use this
   }
   if (!have_pos) {
     g_rej_geom.fetch_add(1, std::memory_order_relaxed);
@@ -1754,7 +1758,10 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.decal_tileable = false;
   item.transparent = false;
   item.water = false;
+  item.water_flowing = false;
+  item.water_ocean = 0;
   item.water_normal = 0;
+  item.water_normal2 = 0;
   item.water_env = 0;
   item.unlit = false;
   item.env_family = 0;
@@ -1795,9 +1802,13 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
         } else if (std::memcmp(text, "decal", 6) == 0) {
           slot = &item.decal_art;
         } else if (std::memcmp(text, "normal", 7) == 0) {
-          // Exact match only ("normal2" is the second flowing-water tap).
-          // Consumed by the water branch; other families ignore it.
+          // Exact match only. Consumed by the water branches (the flowing
+          // ripple map / the ocean's first PCA component); other families
+          // ignore it.
           slot = &item.water_normal;
+        } else if (std::memcmp(text, "normal2", 8) == 0) {
+          // The ocean's second PCA normal component map.
+          slot = &item.water_normal2;
         } else if (std::memcmp(text, "alpha", 6) == 0) {
           // Hair strand coverage (cac_hair/defaulthair tf5, sampled at the
           // second texcoord), the hair alpha-blend term.
@@ -1922,6 +1933,18 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             // fallback diffuse x near-white ocean lightmap x2).
             item.water = std::memcmp(mat_name, "water.", 6) == 0 ||
                          std::memcmp(mat_name, "ocean.", 6) == 0;
+            // water.flowing* = the flowingwateralpha shader family (canal /
+            // waterfall). Takes the exact water branch when the frame's
+            // m_params rows are captured (see FrameScene::water_rows).
+            item.water_flowing =
+                std::memcmp(mat_name, "water.flowing", 13) == 0;
+            // ocean.default / ocean.reflection: the sea surface and its
+            // baked horizon reflection sheet (see DrawItem::water_ocean).
+            if (std::memcmp(mat_name, "ocean.default", 14) == 0) {
+              item.water_ocean = 1;
+            } else if (std::memcmp(mat_name, "ocean.reflection", 17) == 0) {
+              item.water_ocean = 2;
+            }
             // Exact world-shading family (see DrawItem::env_family). The
             // attrib <-> pixel-shader-family mapping is 1:1; the shading
             // models were verified per-pixel against the game's own shaders.
@@ -3975,7 +3998,9 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // independent done-flag: the first main-pass draw can be a character/tree
   // whose PS allocates differently (rejected by the sanity gate below).
   if ((!g_fog_frame_done || !g_shadow_frame_done || !g_sky_frame_done ||
-       !g_tree_frame_done || !g_proxy_frame_done || !g_dynobj_frame_done) &&
+       !g_tree_frame_done || !g_proxy_frame_done || !g_dynobj_frame_done ||
+       !g_water_frame_done || !g_ocean_frame_done ||
+       !g_oceanrefl_frame_done) &&
       func == 0 && flags2d == 0 && SceneEnabled() &&
       (g_fog_cam[0] != 0.0f || g_fog_cam[1] != 0.0f || g_fog_cam[2] != 0.0f)) {
     const float dx = LoadGuestF32(base, bank + 16 * 4) - g_fog_cam[0];
@@ -4125,6 +4150,157 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
                   g_cur_vs_obj.load(std::memory_order_relaxed),
                   g_cur_ps_obj.load(std::memory_order_relaxed), rows[4], rows[5],
                   rows[6], g_fog_rows[4], g_fog_rows[5], g_fog_rows[6]);
+            }
+          }
+        }
+      }
+      // flowingwateralpha m_params + animation time (PS c11..c14, c15.x),
+      // POSITIVE debug-path gate like the receiver rows: the water bank
+      // keeps the whole baseenvironment receiver layout, so only the name
+      // discriminates. One material's rows serve the frame; every
+      // flowingwateralpha draw in a capture carried identical m_params, and
+      // the animation time is pass-global anyway.
+      if (!g_water_frame_done && ps_bank != 0) {
+        const auto water_ps = [&]() -> bool {
+          const auto check = [&](uint32_t obj) -> bool {
+            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
+              return false;
+            }
+            char text[120] = {};
+            for (int k = 0; k < 119; ++k) {
+              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+              if (text[k] == '\0') break;
+            }
+            return std::strstr(text, "\\flowingwateralpha") != nullptr;
+          };
+          return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
+                 check(g_cur_vs_obj.load(std::memory_order_relaxed));
+        };
+        if (water_ps()) {
+          float rows[17];
+          for (int i = 0; i < 16; ++i) {
+            rows[i] = LoadGuestF32(base, ps_bank + (44 + i) * 4);  // c11..c14
+          }
+          rows[16] = LoadGuestF32(base, ps_bank + 60 * 4);  // c15.x = time
+          // Range gate: normal scales O(1), material multiplier small
+          // positive, scroll speeds/UV scales bounded, spec power a real
+          // exponent, alpha floor a blend factor, time non-negative.
+          bool sane = rows[1] > 0.0f && rows[1] <= 8.0f &&    // c11.y mult
+                      rows[13] >= 0.0f && rows[13] <= 1.0f && // c14.y thr
+                      rows[14] >= 1.0f && rows[14] <= 1000.0f && // c14.z pow
+                      rows[15] >= 0.0f && rows[15] <= 1.0f && // c14.w floor
+                      rows[16] >= 0.0f && rows[16] < 1e7f;    // time
+          for (int i = 0; i < 4 && sane; ++i) {
+            sane = std::fabs(rows[0 + i]) <= 8.0f &&    // c11
+                   std::fabs(rows[4 + i]) <= 64.0f &&   // c12 speeds
+                   std::fabs(rows[8 + i]) <= 256.0f;    // c13 scales
+          }
+          if (sane) {
+            const bool first = !g_water_have;
+            std::memcpy(g_water_rows, rows, sizeof(rows));
+            g_water_have = true;
+            g_water_frame_done = true;
+            if (first) {
+              REXLOG_INFO(
+                  "native-scene: water m_params captured: p0=({:.3g},{:.3g},"
+                  "{:.3g},{:.3g}) speed=({:.3g},{:.3g},{:.3g},{:.3g}) "
+                  "scale=({:.3g},{:.3g},{:.3g},{:.3g}) thr={:.3g} pow={:.3g} "
+                  "floor={:.3g} t={:.2f}",
+                  rows[0], rows[1], rows[2], rows[3], rows[4], rows[5],
+                  rows[6], rows[7], rows[8], rows[9], rows[10], rows[11],
+                  rows[13], rows[14], rows[15], rows[16]);
+            }
+          } else {
+            static std::atomic<int> s_water_rejects{0};
+            if (s_water_rejects.fetch_add(1, std::memory_order_relaxed) < 4) {
+              REXLOG_INFO(
+                  "native-scene: water m_params REJECTED by range gate: "
+                  "mult={:.3g} thr={:.3g} pow={:.3g} floor={:.3g} t={:.3g}",
+                  rows[1], rows[13], rows[14], rows[15], rows[16]);
+            }
+          }
+        }
+      }
+      // ocean_defaultPS material rows (PCA mean/weights at c2..c8,
+      // m_params[0..2] at c12..c14) and the oceanreflection sheet row (c3).
+      // Same POSITIVE debug-path gating as the water rows.
+      if ((!g_ocean_frame_done || !g_oceanrefl_frame_done) && ps_bank != 0) {
+        const auto ps_name_has = [&](const char* needle) -> bool {
+          const auto check = [&](uint32_t obj) -> bool {
+            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
+              return false;
+            }
+            char text[120] = {};
+            for (int k = 0; k < 119; ++k) {
+              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+              if (text[k] == '\0') break;
+            }
+            return std::strstr(text, needle) != nullptr;
+          };
+          return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
+                 check(g_cur_vs_obj.load(std::memory_order_relaxed));
+        };
+        if (!g_ocean_frame_done && ps_name_has("\\ocean_default")) {
+          float c[64];
+          for (int i = 0; i < 64; ++i) {
+            c[i] = LoadGuestF32(base, ps_bank + (8 + i) * 4);  // c2..c17
+          }
+          const float* m0 = c + (12 - 2) * 4;  // c12
+          const float* m1 = c + (13 - 2) * 4;  // c13
+          const float* m2 = c + (14 - 2) * 4;  // c14
+          bool sane = m1[1] > 0.0f && m1[1] <= 8.0f &&   // multiplier
+                      m1[2] >= 0.0f && m1[2] <= 8.0f &&  // tonedown scale
+                      m1[3] > 0.0f && m1[3] <= 4096.0f &&  // uv scale
+                      m2[0] > 0.01f && m2[0] <= 1000.0f &&  // spread u
+                      m2[1] > 0.01f && m2[1] <= 1000.0f &&  // spread v
+                      m2[2] > 0.001f && m2[2] <= 100.0f;    // roughness
+          for (int i = 0; i < 4 && sane; ++i) {
+            sane = c[i] >= -2.0f && c[i] <= 2.0f;  // PCA mean row
+          }
+          if (sane) {
+            float* o = g_ocean_rows;
+            // mean pre-swizzled for (R,G,B): PS c2.x, c2.z, c2.y
+            o[0] = c[0];
+            o[1] = c[2];
+            o[2] = c[1];
+            o[3] = 0.0f;
+            // weight rows in model order: c3, c4, c7, c8, c5, c6
+            const int worder[6] = {3, 4, 7, 8, 5, 6};
+            for (int w = 0; w < 6; ++w) {
+              std::memcpy(o + 4 + w * 4, c + (worder[w] - 2) * 4,
+                          4 * sizeof(float));
+            }
+            std::memcpy(o + 28, m0, 4 * sizeof(float));
+            std::memcpy(o + 32, m1, 4 * sizeof(float));
+            std::memcpy(o + 36, m2, 4 * sizeof(float));
+            const bool first = !g_ocean_have;
+            g_ocean_have = true;
+            g_ocean_frame_done = true;
+            if (first) {
+              REXLOG_INFO(
+                  "native-scene: ocean rows captured: mult={:.3g} "
+                  "tonedown={:.3g} uvscale={:.3g} ward=({:.3g},{:.3g},{:.3g})",
+                  m1[1], m1[2], m1[3], m2[0], m2[1], m2[2]);
+            }
+          }
+        }
+        if (!g_oceanrefl_frame_done && ps_name_has("\\oceanreflection")) {
+          float row[4];
+          for (int i = 0; i < 4; ++i) {
+            row[i] = LoadGuestF32(base, ps_bank + (12 + i) * 4);  // c3
+          }
+          // multiplier small positive; the fade bounds must not coincide.
+          if (row[0] > 0.0f && row[0] <= 8.0f &&
+              std::fabs(row[1] - row[2]) > 1e-4f) {
+            std::memcpy(g_oceanrefl_rows, row, sizeof(row));
+            const bool first = !g_oceanrefl_have;
+            g_oceanrefl_have = true;
+            g_oceanrefl_frame_done = true;
+            if (first) {
+              REXLOG_INFO(
+                  "native-scene: oceanreflection row captured: mult={:.3g} "
+                  "fade=({:.3g},{:.3g})",
+                  row[0], row[1], row[2]);
             }
           }
         }
@@ -8353,6 +8529,19 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.fog_ramp, g_fog_rows, 4 * sizeof(float));
     std::memcpy(scene.fog_color, g_fog_rows + 4, 4 * sizeof(float));
   }
+  if (g_water_have) {
+    std::memcpy(scene.water_rows, g_water_rows, sizeof(scene.water_rows));
+    scene.water_valid = true;
+  }
+  if (g_ocean_have) {
+    std::memcpy(scene.ocean_rows, g_ocean_rows, sizeof(scene.ocean_rows));
+    scene.ocean_valid = true;
+  }
+  if (g_oceanrefl_have) {
+    std::memcpy(scene.oceanrefl_rows, g_oceanrefl_rows,
+                sizeof(scene.oceanrefl_rows));
+    scene.oceanrefl_valid = true;
+  }
   if (g_shadow_have) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
@@ -8484,6 +8673,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_tree_frame_done = false;
   g_proxy_frame_done = false;
   g_dynobj_frame_done = false;
+  g_water_frame_done = false;
+  g_ocean_frame_done = false;
+  g_oceanrefl_frame_done = false;
 
 
   // Draw-time STRETCH VETO: the last line of defense, judging what the GPU
