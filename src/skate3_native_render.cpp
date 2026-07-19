@@ -526,9 +526,6 @@ void OnFrameEnd(uint8_t* base) {
       }
     }
   }
-  // The synthetic camera pan probe (judder isolation) is cvar/debug-dialog
-  // only: skate3_native_render_scene_synthetic_pan. Its P hotkey was removed
-  // - a bare letter key fired constantly during normal play.
   // F11: paired A/B parity capture; one keypress produces
   // shot_<ts>_native.png + shot_<ts>_emulated.png (same viewpoint, ~half a
   // second apart while the renderer toggles) + an immediate F10-style
@@ -1113,22 +1110,6 @@ extern "C" REX_FUNC(sub_82B7A970) {
   }
 }
 
-// Fourth SetPending_AluConstants caller (symbol mislabeled as
-// D3DQuery_GetData: it stages draw constants, so it is a draw variant;
-// never observed firing in gameplay). Hooked so the draw-sequence counter
-// and recording stay complete if it ever does.
-extern "C" REX_FUNC(sub_82B7A458) {
-  const bool enabled = skate3::native_render::Enabled();
-  const uint32_t r4 = ctx.r4.u32;
-  const uint32_t r5 = ctx.r5.u32;
-  const uint32_t r6 = ctx.r6.u32;
-  const uint32_t r7 = ctx.r7.u32;
-  __imp__sub_82B7A458(ctx, base);
-  if (enabled) {
-    skate3::native_scene::OnDrawDone(base, 3, r4, r5, r6, r7);
-  }
-}
-
 // ---- 2D / APT (Flash-converted HUD) reconnaissance hooks -----------------
 // Every HUD/menu 2D element is a Flash SWF converted to EA APT, rendered by
 // Sk8::FE::AptRenderingIntegration through the same guest D3D draw functions
@@ -1251,31 +1232,6 @@ extern "C" REX_FUNC(sub_82B79FC0) {
   __imp__sub_82B79FC0(ctx, base);
   if (enabled) {
     skate3::native_scene::OnDrawDone(base, 2, r4, r5, r6, ctx.r3.u32 != 0 ? ctx.r3.u32 : r7);
-  }
-}
-
-// ---- v3 shadow-mat reader hooks (observers only; see
-// native/skate3_native_v3_shadow_mat.h). Declared here instead of including
-// the header so this section is a pure append.
-
-namespace skate3::native_v3_mat {
-void OnConstantTable(uint8_t* base, uint32_t table, uint32_t count);
-}  // namespace skate3::native_v3_mat
-
-// renderengine::ProgramBuffer::Xbox2CreateConstantTable: builds a shader's
-// 8-byte {name, register, dataType, numConstants} record array. Register
-// conventions VERIFIED in generated/skate3_recomp.60.cpp:37720: ENTRY r3 =
-// shader-blob holder (+16 = CTAB rel offset), r4 = destination record array
-// (NULL on the sizing pass: the Initialize caller at .60.cpp:38221 passes
-// ProgramBuffer + *(u32*)(PB+8) + 20 on the fill pass and stores the return
-// count at PB+4), r5 = out name-bytes; EXIT r3 = record count. Firing once
-// per shader table as it is built gives the reflect reader every table with
-// no ProgramBuffer back-pointer needed.
-extern "C" REX_FUNC(sub_82A77EA0) {
-  const uint32_t table = ctx.r4.u32;
-  __imp__sub_82A77EA0(ctx, base);
-  if (skate3::native_render::Enabled()) {
-    skate3::native_v3_mat::OnConstantTable(base, table, ctx.r3.u32);
   }
 }
 

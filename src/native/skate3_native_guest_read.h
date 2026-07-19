@@ -1,16 +1,15 @@
 #pragma once
 
 // Shared sample-vertex decode + skin + spread helpers for the native scene
-// renderer: the ONE copy of the decode+skin loop that was open-coded five
-// times (RefinePaletteBase, ScoreRigidAffine, RopaPayloadCoherent,
+// renderer: the one copy of the decode+skin loop shared by the palette and
+// coherence gates (RefinePaletteBase, ScoreRigidAffine, RopaPayloadCoherent,
 // PublishedPaletteSane, the InterpolateDynamicItems centroid pass).
 //
-// Decode conventions unified here (verified against the original sites):
+// Decode conventions unified here:
 //  - guest u8x4 blend attribs are big-endian per 32-bit word: influence k is
 //    guest byte k, i.e. byte (24 - 8k) of the host-order load;
 //  - position fmt 57 = float3, 32 = half4 (xyz), 26 = s16x4 with scale
-//    2/32767 and the +0.8 Y bias;
-//  - a raw copied payload holds the same guest bytes (big-endian).
+//    2/32767 and the +0.8 Y bias.
 
 #include <bit>
 #include <cstddef>
@@ -53,14 +52,6 @@ bool ReadSkinVertGuest(uint8_t* base, const DrawItem& item, uint32_t vtx,
 // unsupported or the VB holds fewer than 2 vertices.
 bool ReadSkinSamplesGuest(uint8_t* base, const DrawItem& item, uint32_t n,
                           SkinSampleVert* out);
-
-// Same sampling from a COPIED raw payload (big-endian guest bytes). Sample
-// addressing uses the item's stride/count (item.vb_bytes), bounds-checked
-// against the copy: returns the number of samples decoded before the first
-// out-of-bounds sample (callers treat a short read as "nothing to judge"),
-// or -1 when the position format is unsupported / count < 2.
-int ReadSkinSamplesRaw(const uint8_t* vb, size_t vb_size, const DrawItem& item,
-                       uint32_t n, SkinSampleVert* out);
 
 // Weighted [R | t] skin with HOST palette rows (DrawItem::bones layout:
 // 3 float4 rows per bone, column-vector affine). Influences whose rows fall

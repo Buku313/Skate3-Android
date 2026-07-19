@@ -1,6 +1,4 @@
 // Shared sample-vertex decode + skin + spread helpers (see the header).
-// Extracted verbatim from the five open-coded copies in
-// skate3_native_scene.cpp, behavior-preserving.
 
 #include "native/skate3_native_guest_read.h"
 
@@ -24,9 +22,9 @@
 
 namespace skate3::native_scene {
 
-// Lock-free guarded bulk copy for reads of guest payloads (moved verbatim
-// from skate3_native_scene.cpp so every TU shares the one
-// correctly-built guard). GuestRangeReadable's VirtualQuery loop takes the
+// Lock-free guarded bulk copy for reads of guest payloads (shared here so
+// every TU uses the one correctly-built guard). GuestRangeReadable's
+// VirtualQuery loop takes the
 // process VAD lock, which the guest streaming threads hammer exactly while
 // panning streams the world in; every render-thread decode then queues
 // behind them (multi-ms stalls; same lock as the 3 fps PERF TRAP). An
@@ -202,68 +200,6 @@ bool ReadSkinSamplesGuest(uint8_t* base, const DrawItem& item, uint32_t n,
     }
   }
   return true;
-}
-
-int ReadSkinSamplesRaw(const uint8_t* vb, size_t vb_size, const DrawItem& item,
-                       uint32_t n, SkinSampleVert* out) {
-  if (item.stride == 0) {
-    return -1;
-  }
-  const uint32_t count = item.vb_bytes / item.stride;
-  if (count < 2 || n < 2) {
-    return -1;
-  }
-  for (uint32_t s = 0; s < n; ++s) {
-    const uint32_t v = (s * (count - 1) / (n - 1)) * item.stride;
-    if (uint64_t(v) + item.stride > vb_size) {
-      return int(s);  // short read: caller treats as nothing-to-judge
-    }
-    const uint8_t* vp = vb + v;
-    SkinSampleVert& sv = out[s];
-    float* p = sv.p;
-    // Guest payload copied raw = big-endian attributes.
-    switch (item.pos_fmt) {
-      case 57:
-        for (int a = 0; a < 3; ++a) {
-          const uint8_t* b = vp + item.pos_offset + a * 4;
-          const uint32_t w = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 |
-                             uint32_t(b[2]) << 8 | b[3];
-          p[a] = std::bit_cast<float>(w);
-        }
-        break;
-      case 32:
-        for (int a = 0; a < 3; ++a) {
-          const uint8_t* b = vp + item.pos_offset + a * 2;
-          p[a] = GuestHalfToFloat(uint16_t(uint16_t(b[0]) << 8 | b[1]));
-        }
-        break;
-      case 26: {
-        constexpr float kScale = 2.0f / 32767.0f;
-        for (int a = 0; a < 3; ++a) {
-          const uint8_t* b = vp + item.pos_offset + a * 2;
-          p[a] = int16_t(uint16_t(b[0]) << 8 | b[1]) * kScale + (a == 1 ? 0.8f : 0.0f);
-        }
-        break;
-      }
-      default:
-        return -1;
-    }
-    sv.pos_finite = PosFinite(p);
-    if (item.bw_offset != 0 && item.bi_offset != 0) {
-      // Component k = guest byte k (matches the live path's
-      // byte-(24-8k)-of-host-load convention).
-      const uint8_t* bw = vp + item.bw_offset;
-      const uint8_t* bi = vp + item.bi_offset;
-      for (int k = 0; k < 4; ++k) {
-        sv.w[k] = bw[k];
-        sv.bone[k] = bi[k];
-      }
-    } else {
-      std::memset(sv.w, 0, sizeof(sv.w));
-      std::memset(sv.bone, 0, sizeof(sv.bone));
-    }
-  }
-  return int(n);
 }
 
 uint32_t SkinPointHostRows(const SkinSampleVert& sv, const float* rows,
