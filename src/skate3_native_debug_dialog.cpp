@@ -59,6 +59,13 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_radius);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_luma_protect);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_static_casters);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_pcss);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_sun_deg);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_max_m);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_sun_override);
 REXCVAR_DECLARE(double, skate3_native_render_scene_sun_azimuth);
 REXCVAR_DECLARE(double, skate3_native_render_scene_sun_elevation);
@@ -294,6 +301,59 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                          0.0f, 3.0f, "%.2f",
                          "How strongly bright (sun-lit) surfaces resist SSAO "
                          "darkening (ambient-only approximation)."));
+  REXCVAR_SET(skate3_native_render_scene_shadow_static_casters,
+              CvarCheckbox(
+                  "Static sun shadows",
+                  REXCVAR_GET(skate3_native_render_scene_shadow_static_casters),
+                  "Native static sun-shadow map: buildings, trees, rails and "
+                  "placed props cast live shadows from a dedicated "
+                  "sun-aligned depth map: shade on characters and props, "
+                  "and shadows that follow a moved sun. The game's own "
+                  "dynamic shadow cascades are untouched."));
+  REXCVAR_SET(
+      skate3_native_render_scene_shadow_static_strength,
+      CvarSlider(
+          "static shadow strength",
+          REXCVAR_GET(skate3_native_render_scene_shadow_static_strength),
+          0.0f, 1.0f, "%.2f",
+          "How dark static-geometry shadows get (characters/props always "
+          "cast at full strength). Lower if live static shade fights the "
+          "baked lighting."));
+  REXCVAR_SET(
+      skate3_native_render_scene_shadow_static_radius,
+      CvarSlider(
+          "static shadow radius (m)",
+          REXCVAR_GET(skate3_native_render_scene_shadow_static_radius), 40.0f,
+          600.0f, "%.0f",
+          "Far-cascade half-extent of the static sun-shadow map (mid and "
+          "inner cascades cover 1/2 and 1/6 at 2x/6x density). Larger "
+          "reaches farther at lower far-cascade density."));
+  REXCVAR_SET(skate3_native_render_scene_shadow_pcss,
+              CvarCheckbox(
+                  "Soft shadows (PCSS)",
+                  REXCVAR_GET(skate3_native_render_scene_shadow_pcss),
+                  "Contact-hardening filter: crisp where a shadow touches "
+                  "its caster, progressively softer with caster height."));
+  REXCVAR_SET(skate3_native_render_scene_shadow_pcss_sun_deg,
+              CvarSlider(
+                  "sun angular size (deg)",
+                  REXCVAR_GET(skate3_native_render_scene_shadow_pcss_sun_deg),
+                  0.1f, 8.0f, "%.1f",
+                  "Penumbra growth per meter of caster height (the real sun "
+                  "is ~0.53 deg)."));
+  REXCVAR_SET(skate3_native_render_scene_shadow_pcss_max_m,
+              CvarSlider(
+                  "max penumbra (m)",
+                  REXCVAR_GET(skate3_native_render_scene_shadow_pcss_max_m),
+                  0.05f, 5.0f, "%.2f"));
+  REXCVAR_SET(
+      skate3_native_render_scene_shadow_static_bias,
+      CvarSlider("static receive bias (m)",
+                 REXCVAR_GET(skate3_native_render_scene_shadow_static_bias),
+                 0.0f, 0.5f, "%.3f",
+                 "Raise if static geometry shows self-shadow acne (stipple "
+                 "on sunlit ground/walls); lower if static shadows visibly "
+                 "detach from their casters."));
   {
     const bool was_on = REXCVAR_GET(skate3_native_render_scene_sun_override);
     const bool now_on =

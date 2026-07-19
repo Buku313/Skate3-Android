@@ -13,6 +13,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -94,6 +95,16 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_ropa_blend);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ropa_inline);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_selection_outline);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_caster_parity);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_pcss);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_static_casters);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_blocker_m);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_max_m);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_min_texel);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_sun_deg);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_sort_opaque);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_splines);
@@ -2369,9 +2380,12 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
     ld.params[7] = {nrhi::BindingParamKind::kTextureTable, 6, 2,
                     nrhi::Visibility::kPixel};
     // World-shading v2 material maps: the detail normal map (t8) + the
-    // decal families' spec/ecc masks (t9), bound as a pair on draws whose
-    // misc.z flags enable them.
-    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 2,
+    // decal families' spec/ecc masks (t9), plus the native static
+    // sun-shadow map (t10) as the table's third entry; extending an
+    // existing table costs no root-signature DWORDs. Bound together via
+    // SetTextures (a pair-only bind would drop t10 to the backend
+    // fallback).
+    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 3,
                     nrhi::Visibility::kPixel};
     // Character lighting block (b2): the canonical per-draw rows captured
     // from the guest PS bank (CaptureCharLighting), sliced out of the bone
@@ -2851,13 +2865,17 @@ bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
     nrhi::Shader* cps = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kPixel, "scene.hlsl", kShaderSource,
                        "ps_shadow_caster", nullptr, ""));
+    nrhi::Shader* cpc = device->CreateShader(
+        MakeShaderDesc(nrhi::ShaderStage::kPixel, "scene.hlsl", kShaderSource,
+                       "ps_shadow_caster_clip", nullptr, ""));
     nrhi::Shader* bvs = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kVertex, "shadow_blur.hlsl",
                        kShadowBlurSource, "vs_main", nullptr, ""));
     nrhi::Shader* bps = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kPixel, "shadow_blur.hlsl",
                        kShadowBlurSource, "ps_main", nullptr, ""));
-    if (cvs == nullptr || cps == nullptr || bvs == nullptr || bps == nullptr) {
+    if (cvs == nullptr || cps == nullptr || cpc == nullptr || bvs == nullptr ||
+        bps == nullptr) {
       REXLOG_ERROR("native-scene: shadow shader compile failed");
       g_r.failed = true;
       return false;
@@ -2882,6 +2900,8 @@ bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
     cp.rtv_format = nrhi::Format::kR16G16_UNORM;
     cp.sample_count = 1;
     g_r.pso_shadow_caster = device->CreateGraphicsPipeline(cp);
+    cp.ps = cpc;
+    g_r.pso_shadow_caster_clip = device->CreateGraphicsPipeline(cp);
     nrhi::GraphicsPipelineDesc bp;
     bp.layout = g_r.layout;
     bp.vs = bvs;
@@ -2893,9 +2913,12 @@ bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
     g_r.pso_shadow_blur = device->CreateGraphicsPipeline(bp);
     device->DestroyDeferred(cvs);
     device->DestroyDeferred(cps);
+    device->DestroyDeferred(cpc);
     device->DestroyDeferred(bvs);
     device->DestroyDeferred(bps);
-    if (g_r.pso_shadow_caster == nullptr || g_r.pso_shadow_blur == nullptr) {
+    if (g_r.pso_shadow_caster == nullptr ||
+        g_r.pso_shadow_caster_clip == nullptr ||
+        g_r.pso_shadow_blur == nullptr) {
       REXLOG_ERROR("native-scene: shadow PSO creation failed");
       g_r.failed = true;
       return false;
@@ -3240,6 +3263,39 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     }
     g_r.world_shadow_in_srv = false;
     g_r.world_shadow_primed = false;
+  }
+  if (!g_r.static_sun && g_r.shadow_raw != nullptr &&
+      REXCVAR_GET(skate3_native_render_scene_shadow_static_casters)) {
+    // Native static sun-shadow map (see RendererState). THREE cascade
+    // tiles side by side: inner (r/6, centimeter contact detail with
+    // useful reach), mid (r/2) and far (full radius, large-caster
+    // coverage); size is per tile, restart-scoped.
+    const int32_t size_cfg =
+        REXCVAR_GET(skate3_native_render_scene_shadow_static_size);
+    g_r.static_sun_size = uint32_t(std::clamp(size_cfg, 1024, 8192));
+    nrhi::TextureDesc desc;
+    desc.width = g_r.static_sun_size * 3;
+    desc.height = g_r.static_sun_size;
+    desc.format = nrhi::Format::kR16G16_UNORM;
+    desc.usage = nrhi::kTextureUsageRenderTarget;
+    desc.initial_state = nrhi::ResourceState::kRenderTarget;
+    desc.clear_color[0] = 1.0f;  // depth: far = lit
+    desc.clear_color[1] = 1.0f;
+    g_r.static_sun = device->CreateTexture(desc);
+    if (g_r.static_sun != nullptr) {
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      g_r.static_sun_srv = device->CreateTextureView(g_r.static_sun, vd);
+    }
+    if (g_r.static_sun_srv == nullptr) {
+      REXLOG_ERROR("native-scene: static sun-shadow map creation failed");
+      g_r.failed = true;
+      return false;
+    }
+    g_r.static_sun_in_srv = false;
+    REXLOG_INFO(
+        "native-scene: static sun-shadow map created ({}x{}, 3 cascades)",
+        g_r.static_sun_size * 3, g_r.static_sun_size);
   }
   if (!g_r.shadow_cb) {
     // Always created (even with shadows off): the scene PS declares b1 and
@@ -4663,6 +4719,15 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
       ClearItemCache();
       // Off-screen retention holds guest-address-keyed copies too.
       g_retained_clear.store(true, std::memory_order_relaxed);
+      // The static-caster cache holds world-positioned records from the
+      // OUTGOING map; different maps share coordinate ranges, so stale
+      // records whose meshes survive the transition would keep casting
+      // (an entire arriving area sat under the previous map's building
+      // shadows). Invalidate the sun map with it.
+      g_r.static_casters.clear();
+      g_r.nsm_dirty = true;
+      g_r.static_sun_valid = false;
+      g_r.nsm_built_radius = 0.0f;
       std::lock_guard<std::mutex> lock(g_prewarm_mutex);
       g_prewarm_seen.clear();
       g_prewarm_tex_seen.clear();
@@ -5428,6 +5493,361 @@ void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context)
   // three cascade tiles with the captured light rows, then applies the
   // game's coverage blur + depth dilation. Runs before the main pass so the
   // scene shader can sample the finished atlas.
+// Read-only resolved-texture lookup (route -> store entry) for the caster
+// passes' alpha-test binding: the main pass owns decode scheduling and
+// live guest reads; an unresolved diffuse just casts opaque for the frames
+// a first-sight decode takes.
+static nrhi::TextureView* LookupResolvedTexture(uint32_t tex_ptr) {
+  if (tex_ptr == 0) {
+    return nullptr;
+  }
+  auto rit = g_r.tex_routes.find(tex_ptr);
+  if (rit == g_r.tex_routes.end()) {
+    return nullptr;
+  }
+  auto sit = g_r.tex_store.find(rit->second.key);
+  if (sit == g_r.tex_store.end() || !sit->second.valid) {
+    return nullptr;
+  }
+  return sit->second.srv;
+}
+
+// Native static sun-shadow map: one camera-centered ortho depth pass over
+// the STATIC world items along the material sun (the captured c6 row:
+// the direction the world materials and their baked shadows are lit
+// from). The game's own cascade transforms are a stylized near-vertical
+// projection fit to a ~12 m height window (measured ~43 degrees off the
+// material sun): adequate for the dynamic casters they were built for,
+// but tall static geometry projected through them shadows its own
+// plan-view footprint. This map gives static shade a true sun axis, a
+// full-range depth window (no clamp blobs) and its own resolution;
+// receivers min it with the CSM term (SampleStaticSun), bottoming out at
+// the configured strength. Re-rendered every frame; the box follows the
+// camera, with the origin snapped to the texel grid so the static raster
+// never swims sub-texel (foliage shimmer).
+static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
+                               const FrameScene& scene, uint32_t bone_region,
+                               int32_t debug_mode, uint64_t frame_number) {
+  g_r.static_sun_valid = false;
+  if (g_r.static_sun == nullptr || g_r.pso_shadow_caster == nullptr ||
+      g_r.pso_shadow_caster_clip == nullptr || debug_mode != 0 ||
+      !scene.shadow_valid ||
+      !REXCVAR_GET(skate3_native_render_scene_shadows) ||
+      !REXCVAR_GET(skate3_native_render_scene_shadow_static_casters)) {
+    return;
+  }
+  // Sun axis = the material sun (c6). It is the only sun-like direction
+  // in the captured data: the game's cascade transforms AND its baked
+  // static-shade (world-shadow) projection are both the same stylized
+  // near-vertical axis, measured ~43 degrees off c6, projecting statics
+  // along either shadows their plan-view footprint. Shadows cast along c6
+  // are geometrically consistent with the materials' lighting; where the
+  // baked lightmaps were authored with yet another sun the two can
+  // disagree, which the strength floor and the receivers' min-clamp keep
+  // plausible rather than doubled.
+  float sun[3] = {scene.shadow_rows[24], scene.shadow_rows[25],
+                  scene.shadow_rows[26]};
+  const float slen =
+      std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+  if (slen < 0.5f) {
+    return;
+  }
+  for (float& v : sun) {
+    v /= slen;
+  }
+  if (sun[1] < 0.08f) {
+    return;  // sun at/below the horizon: no usable static sun term
+  }
+  const float zl[3] = {-sun[0], -sun[1], -sun[2]};
+  float xl[3] = {zl[2], 0.0f, -zl[0]};
+  const float xll = std::sqrt(xl[0] * xl[0] + xl[2] * xl[2]);
+  if (xll > 1e-5f) {
+    xl[0] /= xll;
+    xl[2] /= xll;
+  } else {
+    xl[0] = 1.0f;
+    xl[2] = 0.0f;
+  }
+  const float yl[3] = {zl[1] * xl[2] - zl[2] * xl[1],
+                       zl[2] * xl[0] - zl[0] * xl[2],
+                       zl[0] * xl[1] - zl[1] * xl[0]};
+  const float radius = std::clamp(
+      float(REXCVAR_GET(skate3_native_render_scene_shadow_static_radius)),
+      20.0f, 500.0f);
+  // Depth window +-2r along the axis: covers cliffs/towers far above the
+  // box at ~16-bit millimeter precision.
+  const float depth_half = radius * 2.0f;
+  const float texel_m = 2.0f * radius / float(g_r.static_sun_size);
+  const float* cam = scene.cam_pos;
+  // Upsert this frame's visible statics into the persistent caster cache
+  // (same static filter as the world-shadow map pass). scene.items is the
+  // game's view-culled list; drawing the map from it directly popped
+  // shadows with the camera; the cache keeps once-seen geometry casting
+  // from any direction. A new or content-changed record marks the map
+  // dirty for a rebuild.
+  for (const DrawItem& item : scene.items) {
+    if (item.transparent || item.unlit || item.cloth_quads || item.water ||
+        item.water_ocean != 0 || item.skinned || item.ropa ||
+        item.char_family != 0 || item.dynobj != 0) {
+      continue;
+    }
+    // Key: mesh + quantized world translation (placed instances of one
+    // mesh are distinct casters; a re-streamed identical placement maps
+    // back onto its record).
+    const auto q = [](float v) {
+      return uint64_t(int64_t(std::llround(double(v) * 8.0)));
+    };
+    uint64_t key = uint64_t(item.mesh) * 0x9E3779B97F4A7C15ull;
+    key ^= q(item.world[12]) * 0xC2B2AE3D27D4EB4Full;
+    key ^= (q(item.world[13]) + 0x165667B19E3779F9ull) * 0x27D4EB2F165667C5ull;
+    key ^= (q(item.world[14]) + 0x9E3779B97F4A7C15ull) * 0x85EBCA77C2B2AE63ull;
+    RendererState::StaticCaster& rec = g_r.static_casters[key];
+    if (rec.mesh == 0 || rec.fingerprint != item.fingerprint) {
+      rec.mesh = item.mesh;
+      rec.fingerprint = item.fingerprint;
+      std::memcpy(rec.world, item.world, sizeof(rec.world));
+      std::memcpy(rec.bbox_min, item.bbox_min, sizeof(rec.bbox_min));
+      std::memcpy(rec.bbox_max, item.bbox_max, sizeof(rec.bbox_max));
+      rec.diffuse_tex = item.diffuse_tex;
+      rec.clip = item.env_family == 7 || item.env_family == 9 ||
+                 item.env_family == 10;
+      rec.draws.assign(item.draws.begin(), item.draws.end());
+      g_r.nsm_dirty = true;
+    }
+    rec.last_seen_frame = frame_number;
+  }
+  // Cache maintenance: distance eviction (region streamed away) plus a
+  // long staleness timeout, which bounds ghost shadows from content the
+  // game actually removed (deleted park-editor objects) at the cost of a
+  // late pop for casters never re-viewed.
+  if (frame_number >= g_r.static_casters_sweep_frame) {
+    g_r.static_casters_sweep_frame = frame_number + 600;
+    const float evict_r = radius * 6.0f;
+    for (auto it = g_r.static_casters.begin();
+         it != g_r.static_casters.end();) {
+      const RendererState::StaticCaster& rec = it->second;
+      const float ex = rec.world[12] - cam[0];
+      const float ey = rec.world[13] - cam[1];
+      const float ez = rec.world[14] - cam[2];
+      const bool far_away = ex * ex + ey * ey + ez * ez > evict_r * evict_r;
+      const bool stale = frame_number > rec.last_seen_frame + 30000;
+      if (far_away || stale) {
+        it = g_r.static_casters.erase(it);
+        g_r.nsm_dirty = true;
+      } else {
+        ++it;
+      }
+    }
+  }
+  // Cross-frame cache: the map re-renders only when something it depends
+  // on changed. Between rebuilds the stored rows and the map contents are
+  // served as-is; statics and the sun are near-constant, so this removes
+  // almost the entire steady-state caster cost (and freezes the raster,
+  // so foliage dapple cannot shimmer frame to frame).
+  // Dirty (content changed) rebuilds are RATE-LIMITED: dense areas stream
+  // new casters near-continuously, and an unthrottled dirty flag degraded
+  // to a full map redraw every frame. A <=30-frame shadow latency for
+  // newly streamed geometry is invisible; drift/sun rebuilds stay
+  // immediate.
+  bool rebuild = g_r.nsm_built_radius <= 0.0f ||
+                 std::fabs(radius - g_r.nsm_built_radius) > 0.5f ||
+                 frame_number >= g_r.nsm_rebuild_frame ||
+                 (g_r.nsm_dirty &&
+                  frame_number >= g_r.nsm_last_build_frame + 30);
+  if (!rebuild) {
+    // Camera drift from the built center, measured in the map plane: the
+    // INNER tile (radius/6) must keep covering the player's
+    // surroundings, so the threshold rides its extent.
+    const float dcx = cam[0] - g_r.nsm_center[0];
+    const float dcy = cam[1] - g_r.nsm_center[1];
+    const float dcz = cam[2] - g_r.nsm_center[2];
+    const float du = xl[0] * dcx + xl[1] * dcy + xl[2] * dcz;
+    const float dv = yl[0] * dcx + yl[1] * dcy + yl[2] * dcz;
+    rebuild = std::max(std::fabs(du), std::fabs(dv)) > radius * 0.0667f;
+  }
+  if (!rebuild) {
+    rebuild = sun[0] * g_r.nsm_sun[0] + sun[1] * g_r.nsm_sun[1] +
+                  sun[2] * g_r.nsm_sun[2] <
+              0.999995f;
+  }
+  if (!rebuild) {
+    g_r.static_sun_valid = true;  // serve the cached map + stored rows
+    return;
+  }
+  g_r.nsm_dirty = false;
+  g_r.nsm_rebuild_frame = frame_number + 600;
+  g_r.nsm_last_build_frame = frame_number;
+  g_r.nsm_built_radius = radius;
+  std::memcpy(g_r.nsm_sun, sun, sizeof(g_r.nsm_sun));
+  float o[3] = {cam[0], cam[1], cam[2]};
+  const float cx = xl[0] * o[0] + xl[1] * o[1] + xl[2] * o[2];
+  const float cy = yl[0] * o[0] + yl[1] * o[1] + yl[2] * o[2];
+  const float dx = cx - std::round(cx / texel_m) * texel_m;
+  const float dy = cy - std::round(cy / texel_m) * texel_m;
+  for (int a = 0; a < 3; ++a) {
+    o[a] -= xl[a] * dx + yl[a] * dy;
+  }
+  std::memcpy(g_r.nsm_center, o, sizeof(g_r.nsm_center));
+  // world -> map rows, shared by this caster pass and the receivers
+  // (b1 nsm_x/y/z): uc = dot(row.xyz, wp) + row.w.
+  float rows[12];
+  for (int a = 0; a < 3; ++a) {
+    rows[0 + a] = xl[a] / radius;
+    rows[4 + a] = yl[a] / radius;
+    rows[8 + a] = zl[a] / (2.0f * depth_half);
+  }
+  rows[3] = -(rows[0] * o[0] + rows[1] * o[1] + rows[2] * o[2]);
+  rows[7] = -(rows[4] * o[0] + rows[5] * o[1] + rows[6] * o[2]);
+  rows[11] = 0.5f - (rows[8] * o[0] + rows[9] * o[1] + rows[10] * o[2]);
+  std::memcpy(g_r.nsm_rows, rows, sizeof(rows));
+  g_r.nsm_depth_range = 2.0f * depth_half;
+  g_r.nsm_radius = radius;
+  // View-proj columns from the rows (same construction as the CSM
+  // lightvp; clip.y lands in the sampler's v = -y/2 + 0.5 convention via
+  // the raster y-flip).
+  float vp[16] = {};
+  for (int r = 0; r < 3; ++r) {
+    vp[r * 4 + 0] = rows[0 + r];
+    vp[r * 4 + 1] = rows[4 + r];
+    vp[r * 4 + 2] = rows[8 + r];
+  }
+  vp[12] = rows[3];
+  vp[13] = rows[7];
+  vp[14] = rows[11];
+  vp[15] = 1.0f;
+  // Finer-tile view-projections: same origin, radius/2 and radius/6,
+  // exact rescales of the far transform's X/Y columns (the shader selects
+  // tiles by the same ratios; keep in sync with its
+  // kRatioInner/kRatioMid). Snapping used the FAR texel grid, whose
+  // multiples are also finer-texel multiples (integer 1:2:6 chain), so
+  // every tile stays swim-free.
+  constexpr float kRatioMid = 2.0f;
+  constexpr float kRatioInner = 6.0f;
+  float vp_mid[16];
+  float vp_inner[16];
+  std::memcpy(vp_mid, vp, sizeof(vp));
+  std::memcpy(vp_inner, vp, sizeof(vp));
+  for (int r = 0; r < 4; ++r) {
+    vp_mid[r * 4 + 0] *= kRatioMid;
+    vp_mid[r * 4 + 1] *= kRatioMid;
+    vp_inner[r * 4 + 0] *= kRatioInner;
+    vp_inner[r * 4 + 1] *= kRatioInner;
+  }
+  nrhi::Cmd* cmd = context.cmd;
+  if (g_r.static_sun_in_srv) {
+    cmd->Barrier(g_r.static_sun, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->FlushBarriers();
+    g_r.static_sun_in_srv = false;
+  }
+  const float clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+  cmd->ClearRenderTarget(g_r.static_sun, clear);
+  cmd->SetRenderTargets(g_r.static_sun, nullptr);
+  cmd->SetBindingLayout(g_r.layout);
+  cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+  const float size = float(g_r.static_sun_size);
+  // Per tile (0 = inner r/6, 1 = mid r/2, 2 = far), two phases each:
+  // opaque statics, then the alpha-tested families (trees, alphatest
+  // fences/grates) with the clip PSO and their diffuse.
+  for (int tile = 0; tile < 3; ++tile) {
+    const float* tvp = tile == 0 ? vp_inner : (tile == 1 ? vp_mid : vp);
+    // Cull threshold in FAR uc units (finer tiles cover 1/ratio of the
+    // far extent).
+    const float cull = tile == 0   ? 1.05f / kRatioInner
+                       : tile == 1 ? 1.05f / kRatioMid
+                                   : 1.05f;
+    cmd->SetViewport(
+        nrhi::Viewport{size * tile, 0.0f, size, size, 0.0f, 1.0f});
+    cmd->SetScissor(nrhi::Rect{int32_t(g_r.static_sun_size) * tile, 0,
+                               int32_t(g_r.static_sun_size) * (tile + 1),
+                               int32_t(g_r.static_sun_size)});
+    for (int phase = 0; phase < 2; ++phase) {
+      cmd->SetPipeline(phase == 0 ? g_r.pso_shadow_caster
+                                  : g_r.pso_shadow_caster_clip);
+      for (const auto& [key, rec] : g_r.static_casters) {
+        if (rec.clip != (phase == 1)) {
+          continue;
+        }
+        auto mit = g_r.meshes.find(rec.mesh);
+        // Fingerprint mismatch = the arena address was reused for
+        // different content; drawing it would raster a foreign mesh into
+        // the map. The record refreshes the next time the item is
+        // actually seen.
+        if (mit == g_r.meshes.end() ||
+            mit->second.fingerprint != rec.fingerprint) {
+          continue;
+        }
+        // Cull by the mesh bbox footprint in (far) map space.
+        float umin = std::numeric_limits<float>::max(), umax = -umin;
+        float vmin = umin, vmax = -umin;
+        for (int corner = 0; corner < 8; ++corner) {
+          const float px = (corner & 1) ? rec.bbox_max[0] : rec.bbox_min[0];
+          const float py = (corner & 2) ? rec.bbox_max[1] : rec.bbox_min[1];
+          const float pz = (corner & 4) ? rec.bbox_max[2] : rec.bbox_min[2];
+          float w[3];
+          for (int a = 0; a < 3; ++a) {
+            w[a] = px * rec.world[0 + a] + py * rec.world[4 + a] +
+                   pz * rec.world[8 + a] + rec.world[12 + a];
+          }
+          const float u = rows[0] * w[0] + rows[1] * w[1] + rows[2] * w[2] +
+                          rows[3];
+          const float v = rows[4] * w[0] + rows[5] * w[1] + rows[6] * w[2] +
+                          rows[7];
+          umin = std::min(umin, u);
+          umax = std::max(umax, u);
+          vmin = std::min(vmin, v);
+          vmax = std::max(vmax, v);
+        }
+        if (umax < -cull || umin > cull || vmax < -cull || vmin > cull) {
+          continue;
+        }
+        float constants[52] = {};
+        std::memcpy(constants, rec.world, sizeof(rec.world));
+        float* mvp = constants + 16;
+        for (int r = 0; r < 4; ++r) {
+          for (int col = 0; col < 4; ++col) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+              sum += rec.world[r * 4 + k] * tvp[k * 4 + col];
+            }
+            mvp[r * 4 + col] = sum;
+          }
+        }
+        cmd->SetRootConstants(0, 52, constants, 0);
+        cmd->SetBufferSrv(3, g_r.bone_ring, bone_region);
+        if (phase == 1) {
+          nrhi::TextureView* srv = LookupResolvedTexture(rec.diffuse_tex);
+          cmd->SetTexture(1, srv != nullptr ? srv : g_r.white.srv);
+        }
+        cmd->SetVertexBuffer(mit->second.vb_view.buffer,
+                             mit->second.vb_view.offset,
+                             mit->second.vb_view.size_bytes,
+                             mit->second.vb_view.stride);
+        cmd->SetIndexBuffer(mit->second.ib_view.buffer,
+                            mit->second.ib_view.offset,
+                            mit->second.ib_view.size_bytes);
+        for (const DrawEntry& draw : rec.draws) {
+          if (draw.prim == 4) {
+            cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+          } else if (draw.prim == 6) {
+            cmd->SetPrimitiveTopology(
+                nrhi::PrimitiveTopology::kTriangleStrip);
+          } else {
+            continue;
+          }
+          cmd->DrawIndexed(draw.index_count, draw.start_index,
+                           draw.base_vertex);
+        }
+      }
+    }
+  }
+  cmd->Barrier(g_r.static_sun, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  g_r.static_sun_in_srv = true;
+  g_r.static_sun_valid = true;
+}
+
 bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
                        const FrameScene& scene, uint32_t bone_region,
                        int32_t debug_mode, uint32_t* out_draws) {
@@ -5477,8 +5897,14 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       const DrawItem* item;
       uint32_t bone_offset;
       bool bones;
+      // Alpha-tested caster (dynamicobject.alphatest): draws with the clip
+      // PSO and the item's diffuse bound so the cutout silhouette casts,
+      // not the full card quad.
+      bool clip;
+      nrhi::TextureView* clip_srv;
     };
     std::vector<Caster> casters;
+    bool any_clip = false;
     for (const DrawItem& item : scene.items) {
       if (item.transparent || item.unlit || item.cloth_quads) {
         continue;
@@ -5494,7 +5920,11 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       // plaza glass towers (a "reflection-like" soft dark blob high on the
       // facade, geometrically impossible as a real shadow: sun at 47 deg,
       // lamp 8 m tall, blob at 96 m; the emulated frame has no such
-      // shadow).
+      // shadow). Moreover the cascade transforms are a stylized
+      // near-vertical projection serving a ~12 m height window; tall
+      // static geometry projected through them shadows its own plan-view
+      // footprint. Live static shade comes from the separate sun-aligned
+      // static shadow map instead (RenderStaticSunMap).
       if (!skinned && item.dynobj == 0 && !item.ropa && item.char_family == 0) {
         continue;
       }
@@ -5522,7 +5952,12 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       if (!g_r.meshes.contains(item.mesh)) {
         continue;
       }
-      Caster c{&item, 0, false};
+      Caster c{&item, 0, false, false, nullptr};
+      if (item.dynobj == 2) {
+        c.clip = true;
+        c.clip_srv = LookupResolvedTexture(item.diffuse_tex);
+        any_clip = true;
+      }
       if (skinned) {
         const uint32_t bytes = uint32_t(item.bones.size() * sizeof(float));
         const uint32_t offset = (g_r.bone_ring_offset + 255u) & ~255u;
@@ -5579,47 +6014,62 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
                                         float(tile), 0.0f, 1.0f});
         cmd->SetScissor(nrhi::Rect{int32_t(tile) * ci, 0,
                                    int32_t(tile) * (ci + 1), int32_t(tile)});
-        for (const Caster& c : casters) {
-          auto mit = g_r.meshes.find(c.item->mesh);
-          if (mit == g_r.meshes.end()) {
-            continue;  // undecodable this frame; casts once the workers land
-          }
-          // A stale fingerprint is fine here: cloth decodes ride one frame
-          // behind the sim by design (dyn decode jobs).
-          float constants[52] = {};
-          std::memcpy(constants, c.item->world, sizeof(c.item->world));
-          float* mvp = constants + 16;
-          for (int r = 0; r < 4; ++r) {
-            for (int col = 0; col < 4; ++col) {
-              float sum = 0.0f;
-              for (int k = 0; k < 4; ++k) {
-                sum += c.item->world[r * 4 + k] * lightvp[k * 4 + col];
-              }
-              mvp[r * 4 + col] = sum;
-            }
-          }
-          constants[33] = c.bones ? 1.0f : 0.0f;  // tint.g = skinned branch
-          cmd->SetRootConstants(0, 52, constants, 0);
-          cmd->SetBufferSrv(3, g_r.bone_ring,
-                            bone_region + (c.bones ? c.bone_offset : 0));
-          cmd->SetVertexBuffer(mit->second.vb_view.buffer,
-                               mit->second.vb_view.offset,
-                               mit->second.vb_view.size_bytes,
-                               mit->second.vb_view.stride);
-          cmd->SetIndexBuffer(mit->second.ib_view.buffer,
-                              mit->second.ib_view.offset,
-                              mit->second.ib_view.size_bytes);
-          for (const DrawEntry& draw : c.item->draws) {
-            if (draw.prim == 4) {
-              cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
-            } else if (draw.prim == 6) {
-              cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
-            } else {
+        // Two phases per cascade: opaque casters, then the alpha-tested
+        // set with the clip PSO and per-item diffuse.
+        for (int phase = 0; phase < (any_clip ? 2 : 1); ++phase) {
+          cmd->SetPipeline(phase == 0 ? g_r.pso_shadow_caster
+                                      : g_r.pso_shadow_caster_clip);
+          for (const Caster& c : casters) {
+            if (c.clip != (phase == 1)) {
               continue;
             }
-            cmd->DrawIndexed(draw.index_count, draw.start_index,
-                             draw.base_vertex);
-            ++shadow_draws;
+            auto mit = g_r.meshes.find(c.item->mesh);
+            if (mit == g_r.meshes.end()) {
+              continue;  // undecodable this frame; casts once the workers land
+            }
+            // A stale fingerprint is fine here: cloth decodes ride one frame
+            // behind the sim by design (dyn decode jobs).
+            float constants[52] = {};
+            std::memcpy(constants, c.item->world, sizeof(c.item->world));
+            float* mvp = constants + 16;
+            for (int r = 0; r < 4; ++r) {
+              for (int col = 0; col < 4; ++col) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                  sum += c.item->world[r * 4 + k] * lightvp[k * 4 + col];
+                }
+                mvp[r * 4 + col] = sum;
+              }
+            }
+            constants[33] = c.bones ? 1.0f : 0.0f;  // tint.g = skinned branch
+            cmd->SetRootConstants(0, 52, constants, 0);
+            cmd->SetBufferSrv(3, g_r.bone_ring,
+                              bone_region + (c.bones ? c.bone_offset : 0));
+            if (phase == 1) {
+              cmd->SetTexture(1, c.clip_srv != nullptr ? c.clip_srv
+                                                       : g_r.white.srv);
+            }
+            cmd->SetVertexBuffer(mit->second.vb_view.buffer,
+                                 mit->second.vb_view.offset,
+                                 mit->second.vb_view.size_bytes,
+                                 mit->second.vb_view.stride);
+            cmd->SetIndexBuffer(mit->second.ib_view.buffer,
+                                mit->second.ib_view.offset,
+                                mit->second.ib_view.size_bytes);
+            for (const DrawEntry& draw : c.item->draws) {
+              if (draw.prim == 4) {
+                cmd->SetPrimitiveTopology(
+                    nrhi::PrimitiveTopology::kTriangleList);
+              } else if (draw.prim == 6) {
+                cmd->SetPrimitiveTopology(
+                    nrhi::PrimitiveTopology::kTriangleStrip);
+              } else {
+                continue;
+              }
+              cmd->DrawIndexed(draw.index_count, draw.start_index,
+                               draw.base_vertex);
+              ++shadow_draws;
+            }
           }
         }
       }
@@ -6356,6 +6806,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
   shadow_ready =
       RenderShadowAtlas(context, scene, bone_region, debug_mode, &shadow_draws);
+  RenderStaticSunMap(context, scene, bone_region, debug_mode, frame_number);
   g_pw_shadow.Add(perf_ns_since(shadow_t0));
   // Scene-level flicker probe: the shadow cascade rows (or validity/readiness)
   // returning EXACTLY to the previous-but-one frame's state; hair samples the
@@ -6482,6 +6933,53 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         cb[59] = 1.0f;
       }
     }
+    // PCSS soft-shadow rows (sh_pcss / sh_pcss2, cb[136..143]). Filled
+    // whenever the light rows are valid; the static sun-shadow sampler
+    // shares the angular knobs even on frames with no dynamic casters.
+    if (scene.shadow_valid) {
+      cb[136] =
+          REXCVAR_GET(skate3_native_render_scene_shadow_pcss) ? 1.0f : 0.0f;
+      cb[137] = std::tan(
+          0.5f * 0.01745329f *
+          float(REXCVAR_GET(skate3_native_render_scene_shadow_pcss_sun_deg)));
+      cb[138] =
+          float(REXCVAR_GET(skate3_native_render_scene_shadow_pcss_max_m));
+      cb[139] = 0.0f;  // atlas slope bias unused (dynamic casters only)
+      cb[140] =
+          float(REXCVAR_GET(skate3_native_render_scene_shadow_pcss_blocker_m));
+      const float zlen =
+          std::sqrt(sh[16] * sh[16] + sh[17] * sh[17] + sh[18] * sh[18]);
+      const float xlen =
+          std::sqrt(sh[0] * sh[0] + sh[1] * sh[1] + sh[2] * sh[2]);
+      cb[141] = zlen > 1e-8f ? 1.0f / zlen : 0.0f;
+      cb[142] = xlen;
+      cb[143] = float(
+          REXCVAR_GET(skate3_native_render_scene_shadow_pcss_min_texel));
+    }
+    // Native static sun-shadow rows (nsm_x/y/z + params, cb[144..163]);
+    // nsm_p.x = 0 disables the term in every branch.
+    if (g_r.static_sun_valid) {
+      std::memcpy(cb + 144, g_r.nsm_rows, sizeof(g_r.nsm_rows));
+      cb[156] = std::clamp(
+          float(REXCVAR_GET(skate3_native_render_scene_shadow_static_strength)),
+          0.0f, 1.0f);
+      cb[157] = 1.0f / g_r.nsm_radius;  // far-tile uc units per meter
+      cb[158] = g_r.nsm_depth_range;    // meters per depth unit
+      // Filter floor: 2 physical texels (uc spans [-1,1] over one tile);
+      // the map has no dilation blur, so a sub-texel kernel exposes raw
+      // stair-step aliasing at full strength; two texels of
+      // rotated-poisson filtering dissolve the steps into a smooth edge.
+      cb[159] = 2.0f * 2.0f *
+                float(REXCVAR_GET(
+                    skate3_native_render_scene_shadow_pcss_min_texel)) /
+                float(std::max(1u, g_r.static_sun_size));
+      const float bias_m = float(
+          REXCVAR_GET(skate3_native_render_scene_shadow_static_bias));
+      cb[160] = bias_m / g_r.nsm_depth_range;  // base receiver bias
+      cb[161] = bias_m / g_r.nsm_depth_range;  // slope-scaled term
+      cb[162] = 0.0f;  // reserved (cascade ratios are shader constants)
+      cb[163] = float(std::max(1u, g_r.static_sun_size));  // tile px
+    }
     // Exact world-shading frame rows (valid whenever the env-family PS bank
     // was captured this frame, independent of the shadow ATLAS being
     // rendered; draw_item only selects the exact branch when
@@ -6553,7 +7051,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // (draw_item re-pairs with the item's real cube when one resolves).
     cmd->SetTexturePair(7, g_r.white_cube.srv,
                         shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
+    // v2 material table default (t8/t9 white) + the static sun-shadow map
+    // at its third entry (t10); every lit branch samples it, so the table
+    // must be bound for all draws, not only the v2/ocean re-binds.
+    nrhi::TextureView* t8_default[3] = {
+        g_r.white.srv, g_r.white.srv,
+        g_r.static_sun_valid ? g_r.static_sun_srv : g_r.white.srv};
+    cmd->SetTextures(8, t8_default, 3);
   }
+  nrhi::TextureView* const nsm_view =
+      g_r.static_sun_valid ? g_r.static_sun_srv : g_r.white.srv;
 
   uint32_t drawn = 0;
   uint32_t item_index = 0;
@@ -7823,8 +8330,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // World-shading v2 material pair (t8 detail + t9 decal spec); the exact
     // ocean rides the same pair (t8 = second PCA component, t9 = overlay).
     if (v2_flags != 0 || ocean_n2 || ocean_ov) {
-      cmd->SetTexturePair(8, (v2_detail != nullptr ? v2_detail : &g_r.white)->srv,
-                          (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv);
+      // Three-entry bind: re-pairing only t8/t9 would reset the t10 static
+      // sun-shadow map to the backend fallback.
+      nrhi::TextureView* t8_views[3] = {
+          (v2_detail != nullptr ? v2_detail : &g_r.white)->srv,
+          (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv, nsm_view};
+      cmd->SetTextures(8, t8_views, 3);
     }
     // ROPA shape blend (see RendererState::ropa_shapes): combine the shape
     // generations with the kernel weights InterpolateDynamicItems computed

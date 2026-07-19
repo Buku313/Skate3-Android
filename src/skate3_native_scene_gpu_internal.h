@@ -766,6 +766,10 @@ struct RendererState {
   // 3-tap cascade 1, format-convert-only cascade 2) into the atlas the
   // scene pass samples at t5.
   nrhi::Pipeline* pso_shadow_caster = nullptr;
+  // Alpha-tested caster variant (ps_shadow_caster_clip): binds the item's
+  // diffuse at t0 and clips at the world families' ALPHAREF so foliage
+  // cards and alphatest fences cast their cutout silhouette.
+  nrhi::Pipeline* pso_shadow_caster_clip = nullptr;
   nrhi::Pipeline* pso_shadow_blur = nullptr;
   nrhi::Texture* shadow_raw = nullptr;    // caster pass target
   nrhi::Texture* shadow_mid = nullptr;    // hblur output
@@ -794,11 +798,59 @@ struct RendererState {
   // first 256 bytes are the original 16-row block, rows 16-18 carry the
   // dynamicobject world-shadow transform (dyn_ws*), rows 19-22 the
   // flowingwateralpha m_params (wat_p*), rows 23-33 the ocean PCA/material
-  // rows and the oceanreflection fade row (oc_* / orf).
+  // rows and the oceanreflection fade row (oc_* / orf), rows 34-35 the
+  // PCSS soft-shadow parameters (sh_pcss / sh_pcss2).
   static constexpr uint32_t kShadowCbRegions = 8;
   static constexpr uint32_t kShadowCbSlice = 768;
   nrhi::Buffer* shadow_cb = nullptr;
   uint8_t* shadow_cb_cpu = nullptr;
+  // Native static sun-shadow map: a single camera-centered ortho depth map
+  // of the STATIC world along the material sun (RenderStaticSunMap),
+  // sampled at t10 by every lit branch (SampleStaticSun). RG16 to reuse
+  // the caster pipeline/clear conventions; G unused. nsm_rows are this
+  // frame's world->map transform rows for the b1 fill.
+  nrhi::Texture* static_sun = nullptr;
+  nrhi::TextureView* static_sun_srv = nullptr;
+  bool static_sun_in_srv = false;
+  bool static_sun_valid = false;
+  uint32_t static_sun_size = 0;
+  float nsm_rows[12] = {};
+  float nsm_depth_range = 1.0f;  // meters per depth-map unit
+  float nsm_radius = 1.0f;       // far-tile ortho half-extent in meters
+  // Cross-frame map cache: the map only re-renders when the camera drifts
+  // from the built center, the sun moves, the caster cache changed, or on
+  // a periodic safety rebuild (newly decoded meshes); statics and the sun
+  // are near-constant, so per-frame redraws of the full two-tile atlas
+  // were almost pure waste (and re-snapping the origin every frame made
+  // the foliage dapple shimmer).
+  float nsm_center[3] = {};
+  float nsm_sun[3] = {};
+  float nsm_built_radius = 0.0f;
+  bool nsm_dirty = true;
+  uint64_t nsm_rebuild_frame = 0;
+  uint64_t nsm_last_build_frame = 0;
+  // Persistent static-caster cache for the sun map. scene.items is the
+  // game's VIEW-CULLED draw list; rendering the map from it directly made
+  // shadows pop with the camera (look away and the caster leaves the list;
+  // geometry behind the camera never cast at all). Items upsert into this
+  // cache when visible and keep casting from it afterwards, validated
+  // against the mesh store's fingerprint at draw time. Eviction: distance
+  // from the camera (region streamed away) plus a long staleness timeout
+  // (bounds ghosts from content the game actually removed, e.g. deleted
+  // park-editor objects).
+  struct StaticCaster {
+    uint32_t mesh = 0;
+    uint64_t fingerprint = 0;
+    float world[16] = {};
+    float bbox_min[3] = {};
+    float bbox_max[3] = {};
+    uint32_t diffuse_tex = 0;
+    bool clip = false;
+    std::vector<DrawEntry> draws;
+    uint64_t last_seen_frame = 0;
+  };
+  std::unordered_map<uint64_t, StaticCaster> static_casters;
+  uint64_t static_casters_sweep_frame = 0;
   // dynamicobject static world-shadow map (512x512, same convention as the
   // game's own: x = light-space depth, sge(x >= ray) = lit): re-rendered
   // natively from the frame's STATIC world items with the captured c5/c6/c7

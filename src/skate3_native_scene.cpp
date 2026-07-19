@@ -604,6 +604,87 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_caster_parity, true,
                     "casting it painted a hard brim band across the editor face). "
                     "OFF = every published character piece casts (old behavior).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_static_casters, true,
+                    "Skate 3",
+                    "Native static sun-shadow map: render the STATIC world "
+                    "(buildings, trees, rails, placed props) into a separate "
+                    "camera-centered ortho depth map along the material sun, "
+                    "sampled by every lit surface in addition to the game's "
+                    "dynamic cascades. Live static shade on characters and "
+                    "props (which baked lightmaps cannot shade) and shadows "
+                    "that follow a moved sun; receivers keep the darker of "
+                    "baked and live shade rather than doubling.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_strength, 1.0,
+                      "Skate 3",
+                      "How dark static-geometry shadows get (1 = the full "
+                      "dynamic-shadow clamp, 0 = invisible). Applied at "
+                      "receive from the static sun map, so characters and "
+                      "props keep full-strength shadows. Moderate values "
+                      "keep live static shade believable where it disagrees "
+                      "with the baked lighting's own sun.")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_radius, 180.0,
+                      "Skate 3",
+                      "Half-extent in meters of the static sun-shadow map's "
+                      "far cascade (camera-centered; the mid and inner "
+                      "cascades cover 1/2 and 1/6 of this at 2x and 6x "
+                      "the texel density). Larger reaches farther at lower "
+                      "texel density; the term fades out at the outer edge.")
+    .range(40.0, 600.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
+                     "Skate 3",
+                     "Static sun-shadow map resolution per cascade tile "
+                     "(the map is three tiles). At the default radius the "
+                     "inner cascade gets ~1.5 cm texels, mid ~4 cm, far "
+                     "~9 cm.")
+    .range(1024, 8192)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_pcss, true, "Skate 3",
+                    "Contact-hardening soft shadows (PCSS): a blocker search "
+                    "estimates the caster distance per pixel and the filter "
+                    "width follows the sun's angular size: crisp at the "
+                    "contact point, progressively softer with caster height. "
+                    "OFF = the game's fixed-width blurred atlas sampling.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_pcss_sun_deg, 2.5,
+                      "Skate 3",
+                      "Sun angular diameter in degrees for the PCSS penumbra "
+                      "(the real sun is ~0.53; larger reads softer).")
+    .range(0.1, 8.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_pcss_max_m, 0.8,
+                      "Skate 3",
+                      "Maximum PCSS penumbra half-width in meters (caps how "
+                      "soft very tall casters can get).")
+    .range(0.05, 5.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_pcss_blocker_m, 2.5,
+                      "Skate 3",
+                      "PCSS blocker-search radius in meters. Must be at "
+                      "least the max penumbra for distant casters to soften "
+                      "fully; larger values let unrelated nearby casters "
+                      "soften edges they should not.")
+    .range(0.1, 8.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_pcss_min_texel, 1.0,
+                      "Skate 3",
+                      "Minimum PCSS filter radius in physical atlas texels "
+                      "(keeps fully hardened edges filtered).")
+    .range(0.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_bias, 0.08,
+                      "Skate 3",
+                      "Static sun-shadow receiver bias in METERS; static "
+                      "geometry is its own caster, so its surfaces compare "
+                      "against their own map depth. Slope-scaled: grazing "
+                      "sun angles get up to several times this. Raise on "
+                      "acne (stipple on sunlit ground/walls), lower if "
+                      "static shadows visibly detach from their casters.")
+    .range(0.0, 0.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_char_shadow_exact, true,
                     "Skate 3",
                     "Characters sample the CSM atlas with the game's own math: "
@@ -7276,25 +7357,18 @@ static void RebasisLightRow(float* row, const float axis[3],
   row[3] = at_cam - (row[0] * cam[0] + row[1] * cam[1] + row[2] * cam[2]);
 }
 
-// Lighting-lab sun override (skate3_native_render_scene_sun_override):
-// rotates every captured per-frame light transform in the published scene
-// to the azimuth/elevation-driven direction. The native CSM caster pass,
-// the material receivers, the static world-shadow map (which re-primes
-// automatically when its rows change) and the volumetric shafts all read
-// these rows, so the whole dynamic lighting stack follows the moved sun.
-// Baked lightmap shade and the sky dome's painted sun are game content and
-// stay put.
-static void ApplySunOverride(FrameScene& scene) {
-  if (!REXCVAR_GET(skate3_native_render_scene_sun_override)) {
-    return;
-  }
-  const float kDeg = 0.01745329252f;
-  const float az = float(REXCVAR_GET(skate3_native_render_scene_sun_azimuth)) * kDeg;
-  const float el =
-      float(REXCVAR_GET(skate3_native_render_scene_sun_elevation)) * kDeg;
-  // Unit vector TOWARD the sun (y up; azimuth 0 = +Z, 90 = +X).
-  const float sun[3] = {std::cos(el) * std::sin(az), std::sin(el),
-                        std::cos(el) * std::cos(az)};
+// Rebuild the frame's captured shadow transforms around the given unit
+// direction TOWARD the sun: the light basis rows via RebasisLightRow
+// (preserving each row's scale and its value at the camera, so cascade
+// centering and bias conventions carry over) plus a camera re-center of
+// the cascade sub-boxes (c1/c2 scale.xy + offset.zw); the game fits their
+// offsets for ITS axis each frame, and under a rotated basis the finest
+// cascade can drift off the player (the shadow then falls back to the
+// coarser tiles, visibly blocky). Caster pass and receivers share these
+// rows, so the re-fit stays self-consistent. Shared by the lighting-lab
+// sun override and the static-caster basis alignment below.
+static void RebasisShadowRows(FrameScene& scene, const float sun[3],
+                              bool include_ws) {
   // Light basis: depth axis points away from the sun; X/Y span the shadow
   // plane. Handedness is irrelevant; casters and receivers share the rows.
   const float zl[3] = {-sun[0], -sun[1], -sun[2]};
@@ -7315,15 +7389,6 @@ static void ApplySunOverride(FrameScene& scene) {
     RebasisLightRow(scene.shadow_rows + 0, xl, cam);    // c0 light-space X
     RebasisLightRow(scene.shadow_rows + 12, yl, cam);   // c3 light-space Y
     RebasisLightRow(scene.shadow_rows + 16, zl, cam);   // c4 depth ramp
-    scene.shadow_rows[24] = sun[0];                     // c6 sun direction
-    scene.shadow_rows[25] = sun[1];
-    scene.shadow_rows[26] = sun[2];
-    // Re-center the cascade sub-boxes (c1/c2 scale.xy + offset.zw) on the
-    // camera: the game fits their offsets for ITS sun each frame, and
-    // under a rotated basis the finest cascade can drift off the player;
-    // the shadow then falls back to the coarser tiles (visibly blocky).
-    // Caster pass and receivers share these rows, so the re-fit stays
-    // self-consistent.
     const float* rows = scene.shadow_rows;
     const float lsx =
         rows[0] * cam[0] + rows[1] * cam[1] + rows[2] * cam[2] + rows[3];
@@ -7334,15 +7399,42 @@ static void ApplySunOverride(FrameScene& scene) {
     scene.shadow_rows[10] = -lsx * scene.shadow_rows[8];  // c2 offset
     scene.shadow_rows[11] = -lsy * scene.shadow_rows[9];
   }
+  if (include_ws && scene.dynobj_ws_valid) {
+    RebasisLightRow(scene.dynobj_ws + 0, xl, cam);
+    RebasisLightRow(scene.dynobj_ws + 4, yl, cam);
+    RebasisLightRow(scene.dynobj_ws + 8, zl, cam);
+  }
+}
+
+// Lighting-lab sun override (skate3_native_render_scene_sun_override):
+// rotates every captured per-frame light transform in the published scene
+// to the azimuth/elevation-driven direction. The native CSM caster pass,
+// the material receivers, the static world-shadow map (which re-primes
+// automatically when its rows change) and the volumetric shafts all read
+// these rows, so the whole dynamic lighting stack follows the moved sun.
+// Baked lightmap shade and the sky dome's painted sun are game content and
+// stay put.
+static void ApplySunOverride(FrameScene& scene) {
+  if (!REXCVAR_GET(skate3_native_render_scene_sun_override)) {
+    return;
+  }
+  const float kDeg = 0.01745329252f;
+  const float az = float(REXCVAR_GET(skate3_native_render_scene_sun_azimuth)) * kDeg;
+  const float el =
+      float(REXCVAR_GET(skate3_native_render_scene_sun_elevation)) * kDeg;
+  // Unit vector TOWARD the sun (y up; azimuth 0 = +Z, 90 = +X).
+  const float sun[3] = {std::cos(el) * std::sin(az), std::sin(el),
+                        std::cos(el) * std::cos(az)};
+  RebasisShadowRows(scene, sun, /*include_ws=*/true);
+  if (scene.shadow_valid) {
+    scene.shadow_rows[24] = sun[0];  // c6 sun direction
+    scene.shadow_rows[25] = sun[1];
+    scene.shadow_rows[26] = sun[2];
+  }
   if (scene.dynobj_valid) {
     scene.dynobj_rows[0] = sun[0];
     scene.dynobj_rows[1] = sun[1];
     scene.dynobj_rows[2] = sun[2];
-  }
-  if (scene.dynobj_ws_valid) {
-    RebasisLightRow(scene.dynobj_ws + 0, xl, cam);
-    RebasisLightRow(scene.dynobj_ws + 4, yl, cam);
-    RebasisLightRow(scene.dynobj_ws + 8, zl, cam);
   }
   if (scene.sky_sun_valid) {
     scene.sky_sun[0] = sun[0];
