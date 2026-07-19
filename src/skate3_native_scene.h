@@ -447,6 +447,13 @@ void SetSettingsMenuBlur(bool enabled);
 // override to seed its sliders from (unit vector toward the sun).
 void GetCapturedSunDir(float out[3]);
 
+// While the drone/free-fly camera is engaged, fills out_pos with the flown
+// camera world position and returns true (false = guest camera in control).
+// Consumed by the draw-distance hooks to recenter distance culls on the
+// drone; the render camera itself is taken over via the ViewCamera::
+// SetViewMatrix override in skate3_native_scene.cpp.
+bool FreecamGuestPose(float out_pos[3]);
+
 // The game's per-entity spawn/streaming fade as carried by the item's
 // validated character-lighting capture (peds c21.x, defaultcharacter c13.x,
 // cacstamp c22.x, vehicle body c20.x, hair strand scale). 1.0 for items

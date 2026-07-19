@@ -84,6 +84,10 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_synthetic_pan_rate);
 REXCVAR_DECLARE(double, skate3_native_render_scene_synthetic_pan_amp);
 // SDK: emulated-draw suppression while the native output is active.
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam);
+REXCVAR_DECLARE(double, skate3_native_render_scene_freecam_speed);
+REXCVAR_DECLARE(double, skate3_native_render_scene_freecam_look_speed);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam_capture_input);
 
 namespace skate3 {
 namespace {
@@ -109,6 +113,39 @@ double CvarSlider(const char* label, double value, float lo, float hi,
     ImGui::SetTooltip("%s", help);
   }
   return value;
+}
+
+// Drone-camera controls (same cvars everywhere the section is embedded;
+// edits apply live).
+void DrawFreecamControls() {
+  ImGui::SeparatorText("Drone camera");
+  bool freecam = REXCVAR_GET(skate3_native_render_scene_freecam);
+  if (ImGui::Checkbox("Free-fly drone cam (End)", &freecam)) {
+    REXCVAR_SET(skate3_native_render_scene_freecam, freecam);
+  }
+  ImGui::SameLine();
+  bool capture = REXCVAR_GET(skate3_native_render_scene_freecam_capture_input);
+  if (ImGui::Checkbox("capture game input", &capture)) {
+    REXCVAR_SET(skate3_native_render_scene_freecam_capture_input, capture);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "While flying, keep keyboard/controller input away from the game so\n"
+        "the fly keys don't also steer the skater.");
+  }
+  REXCVAR_SET(skate3_native_render_scene_freecam_speed,
+              CvarSlider("fly speed (m/s)",
+                         REXCVAR_GET(skate3_native_render_scene_freecam_speed),
+                         0.5f, 60.0f, "%.1f",
+                         "Base fly speed; Shift = 4x, Ctrl = 0.2x"));
+  REXCVAR_SET(
+      skate3_native_render_scene_freecam_look_speed,
+      CvarSlider("look speed (deg/s)",
+                 REXCVAR_GET(skate3_native_render_scene_freecam_look_speed),
+                 20.0f, 240.0f, "%.0f", "Arrow-key look rate"));
+  ImGui::TextDisabled(
+      "WASD fly, E/Space up, Q/C down, arrows or right-mouse drag look,\n"
+      "Z/X zoom, Shift fast, Ctrl slow.");
 }
 
 }  // namespace
@@ -202,6 +239,8 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
                            REXCVAR_GET(skate3_native_render_scene_backface_cull),
                            "World env materials cull FRONT like the game's material "
                            "XMLs; off = legacy cull-none (shows interior faces)"));
+
+  DrawFreecamControls();
 
   ImGui::SeparatorText("HDR post effects (live)");
   REXCVAR_SET(skate3_native_render_scene_hdr,

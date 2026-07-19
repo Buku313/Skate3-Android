@@ -292,6 +292,31 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_haze_density, 0.005,
                       "200 units).")
     .range(0.0, 0.05)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_freecam, false, "Skate 3",
+                    "Detach the render camera from the game (drone / free-fly "
+                    "cam): WASD fly, E/Space up, Q/C down, arrow keys or "
+                    "right-mouse drag look, Z/X zoom, Shift fast, Ctrl slow. "
+                    "The game keeps simulating, but its main render camera is "
+                    "taken over (ViewCamera::SetViewMatrix override), so the "
+                    "game culls and submits the world around the flown pose "
+                    "itself. Also on the End key (bind_skate3_freecam).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_freecam_speed, 8.0, "Skate 3",
+                      "Freecam base fly speed in world units (meters) per "
+                      "second. Shift = 4x, Ctrl = 0.2x.")
+    .range(0.5, 100.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_freecam_look_speed, 90.0,
+                      "Skate 3",
+                      "Freecam arrow-key look rate in degrees per second.")
+    .range(10.0, 360.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_freecam_capture_input, true,
+                    "Skate 3",
+                    "While the freecam is engaged, keep keyboard/controller "
+                    "input away from the game so flying doesn't also steer "
+                    "the skater. Turn off to fly and play at the same time.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_2d, true, "Skate 3",
                     "Replay the game's 2D/APT (Flash HUD) draws as a native overlay pass "
                     "on top of the 3D scene")
@@ -5698,6 +5723,244 @@ void ComposeViewProj(const CamPose& p, const float proj[16], float vp_out[16],
   std::memcpy(cam_out, p.c, 3 * sizeof(float));
 }
 
+// Drone / free-fly camera: overrides the published pose with a user-flown
+// one while the game keeps simulating on its own camera. Engaged from the
+// current guest pose (roll is dropped; the gameplay camera never rolls),
+// the projection is frozen at engage so gameplay FOV changes don't disturb
+// the shot, and both linear and angular key input drive exponentially
+// smoothed velocities for drone-like motion.
+//
+// Guest-side culling is handled by taking over the game's own render
+// camera: the frame build publishes the flown view matrix below, and the
+// Sk8::Render::ViewCamera::SetViewMatrix override (bottom of this file)
+// rewrites the game's main-camera argument with it, so the game derives
+// its view-proj, frustum planes and cull/submit lists from the drone pose
+// itself; statics, characters and props are all submitted exactly as if
+// the game were looking there. (A draw-item union like the synthetic-pan
+// probe's cannot do this: it can only re-append items the game already
+// submitted from poses it actually rendered, and rigid props that ride
+// entity animation smear at their stale transforms.)
+std::mutex g_freecam_guest_mutex;
+float g_freecam_guest_view[16] = {};  // row-vector view, host endianness
+float g_freecam_guest_pos[3] = {};    // camera world position
+std::atomic<uint32_t> g_freecam_guest_active{0};
+std::atomic<uint64_t> g_freecam_guest_rewrites{0};
+struct FreecamState {
+  bool engaged = false;
+  double yaw = 0.0, pitch = 0.0;  // radians: yaw about world Y, then pitch
+  double pos[3] = {};
+  double vel[3] = {};                     // smoothed world-space velocity
+  double yaw_vel = 0.0, pitch_vel = 0.0;  // smoothed key-look rates (rad/s)
+  double zoom = 1.0;                      // projection scale (Z/X keys)
+  float proj0[16] = {};                   // projection frozen at engage
+  // Basis and screen-direction signs resolved numerically at engage (the
+  // view right/up column signs against cross-product candidates, and the
+  // projection's x/y scale signs), so no handedness convention is assumed;
+  // the game's projection carries a negative x scale.
+  float sign_right = 1.0f, sign_up = 1.0f;
+  double look_sign_x = 1.0, look_sign_y = 1.0;
+  double last_t = 0.0;
+#if defined(_WIN32)
+  bool mouse_anchored = false;
+  POINT mouse_last = {};
+#endif
+};
+FreecamState g_freecam;
+
+// Guest render thread only. Returns true while engaged; scene.view_proj,
+// scene.proj and scene.cam_pos then hold the flown pose.
+bool UpdateFreecam(FrameScene& scene, const float cam_view[16], double now) {
+  FreecamState& fc = g_freecam;
+  if (!REXCVAR_GET(skate3_native_render_scene_freecam)) {
+    if (fc.engaged) {
+      fc.engaged = false;
+      g_freecam_guest_active.store(0, std::memory_order_release);
+      REXLOG_INFO(
+          "native-scene freecam: off (guest camera restored; {} guest "
+          "SetViewMatrix rewrites while engaged)",
+          g_freecam_guest_rewrites.exchange(0, std::memory_order_relaxed));
+    }
+    return false;
+  }
+  if (!fc.engaged) {
+    // Engage from this frame's raw guest pose. The view's upper-3x3 columns
+    // are the camera axes in world space (row-vector convention):
+    // 0 = right, 1 = up, 2 = forward.
+    const float f0[3] = {cam_view[2], cam_view[6], cam_view[10]};
+    fc.yaw = std::atan2(double(f0[0]), double(f0[2]));
+    fc.pitch = std::asin(std::clamp(double(f0[1]), -1.0, 1.0));
+    for (int j = 0; j < 3; ++j) {
+      fc.pos[j] = -(cam_view[12] * cam_view[j * 4 + 0] +
+                    cam_view[13] * cam_view[j * 4 + 1] +
+                    cam_view[14] * cam_view[j * 4 + 2]);
+    }
+    // Right candidate cross(world_up, forward) = (f.z, 0, -f.x): its sign
+    // against the live right column fixes the basis handedness.
+    fc.sign_right = f0[2] * cam_view[0] - f0[0] * cam_view[8] >= 0.0f ? 1.0f : -1.0f;
+    const float r0[3] = {f0[2] * fc.sign_right, 0.0f, -f0[0] * fc.sign_right};
+    const float u0[3] = {f0[1] * r0[2] - f0[2] * r0[1],
+                         f0[2] * r0[0] - f0[0] * r0[2],
+                         f0[0] * r0[1] - f0[1] * r0[0]};
+    fc.sign_up = u0[0] * cam_view[1] + u0[1] * cam_view[5] + u0[2] * cam_view[9] >= 0.0f
+                     ? 1.0f
+                     : -1.0f;
+    std::memcpy(fc.proj0, scene.proj, sizeof(fc.proj0));
+    // Screen-relative look/strafe directions: view +x maps to screen right
+    // only when the projection x scale is positive (it isn't in this game),
+    // so fold the projection signs in once. +yaw rotates forward toward +x
+    // (the right column direction times sign_right), hence the product.
+    fc.look_sign_x = double(fc.sign_right) * (fc.proj0[0] >= 0.0f ? 1.0 : -1.0);
+    fc.look_sign_y = double(fc.sign_up) * (fc.proj0[5] >= 0.0f ? 1.0 : -1.0);
+    fc.vel[0] = fc.vel[1] = fc.vel[2] = 0.0;
+    fc.yaw_vel = fc.pitch_vel = 0.0;
+    fc.zoom = 1.0;
+    fc.last_t = now;
+#if defined(_WIN32)
+    fc.mouse_anchored = false;
+#endif
+    fc.engaged = true;
+    REXLOG_INFO(
+        "native-scene freecam: ENGAGED at ({:.1f}, {:.1f}, {:.1f}); WASD fly, "
+        "E/Space up, Q/C down, arrows/right-drag look, Z/X zoom, Shift fast, "
+        "Ctrl slow",
+        fc.pos[0], fc.pos[1], fc.pos[2]);
+  }
+  const double dt = std::clamp(now - fc.last_t, 0.0, 0.1);
+  fc.last_t = now;
+
+  double mv_f = 0.0, mv_r = 0.0, mv_u = 0.0;  // move intent (camera-relative)
+  double lk_yaw = 0.0, lk_pitch = 0.0;        // arrow-key look intent
+  double mouse_yaw = 0.0, mouse_pitch = 0.0;  // right-drag deltas (radians)
+  double speed_mult = 1.0, zoom_dir = 0.0;
+#if defined(_WIN32)
+  const auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+  mv_f = (down('W') ? 1.0 : 0.0) - (down('S') ? 1.0 : 0.0);
+  mv_r = (down('D') ? 1.0 : 0.0) - (down('A') ? 1.0 : 0.0);
+  mv_u = ((down('E') || down(VK_SPACE)) ? 1.0 : 0.0) -
+         ((down('Q') || down('C')) ? 1.0 : 0.0);
+  lk_yaw = (down(VK_RIGHT) ? 1.0 : 0.0) - (down(VK_LEFT) ? 1.0 : 0.0);
+  lk_pitch = (down(VK_UP) ? 1.0 : 0.0) - (down(VK_DOWN) ? 1.0 : 0.0);
+  zoom_dir = (down('Z') ? 1.0 : 0.0) - (down('X') ? 1.0 : 0.0);
+  if (down(VK_SHIFT)) {
+    speed_mult = 4.0;
+  } else if (down(VK_CONTROL)) {
+    speed_mult = 0.2;
+  }
+  if (down(VK_RBUTTON)) {
+    POINT p;
+    if (GetCursorPos(&p)) {
+      if (fc.mouse_anchored) {
+        constexpr double kRadPerPixel = 0.0022;  // ~0.13 deg per pixel
+        mouse_yaw = (p.x - fc.mouse_last.x) * kRadPerPixel;
+        mouse_pitch = -(p.y - fc.mouse_last.y) * kRadPerPixel;
+      }
+      fc.mouse_last = p;
+      fc.mouse_anchored = true;
+    }
+  } else {
+    fc.mouse_anchored = false;
+  }
+#endif
+
+  // Look: arrow keys drive a smoothed angular velocity (cinematic ease-in/
+  // out); mouse deltas apply directly. Pitch is clamped short of the poles.
+  const double look_rate =
+      REXCVAR_GET(skate3_native_render_scene_freecam_look_speed) *
+      (3.14159265358979323846 / 180.0);
+  const double ang_k = dt > 0.0 ? 1.0 - std::exp(-dt / 0.08) : 0.0;
+  fc.yaw_vel += (lk_yaw * look_rate - fc.yaw_vel) * ang_k;
+  fc.pitch_vel += (lk_pitch * look_rate - fc.pitch_vel) * ang_k;
+  fc.yaw += (fc.yaw_vel * dt + mouse_yaw) * fc.look_sign_x;
+  fc.pitch += (fc.pitch_vel * dt + mouse_pitch) * fc.look_sign_y;
+  constexpr double kPitchMax = 89.0 * 3.14159265358979323846 / 180.0;
+  fc.pitch = std::clamp(fc.pitch, -kPitchMax, kPitchMax);
+  if (zoom_dir != 0.0) {
+    // Zoom-in only: the guest camera (and therefore the game's culling)
+    // keeps the unzoomed projection, so a narrower rendered FOV is always a
+    // subset of what was culled; zooming wider would show unculled edges.
+    fc.zoom = std::clamp(fc.zoom * std::exp(zoom_dir * dt), 1.0, 4.0);
+  }
+
+  // Basis from yaw/pitch (unit length by construction, signs from engage).
+  const double cy = std::cos(fc.yaw), sy = std::sin(fc.yaw);
+  const double cp = std::cos(fc.pitch), sp = std::sin(fc.pitch);
+  const float fwd[3] = {float(sy * cp), float(sp), float(cy * cp)};
+  const float right[3] = {float(cy) * fc.sign_right, 0.0f,
+                          float(-sy) * fc.sign_right};
+  const float up[3] = {float(-sp * sy) * fc.sign_right * fc.sign_up,
+                       float(cp) * fc.sign_right * fc.sign_up,
+                       float(-sp * cy) * fc.sign_right * fc.sign_up};
+
+  // Move: forward along the view direction (true drone flight), strafe
+  // along screen right, vertical along world up; combined intent normalized
+  // so diagonals don't fly faster. Exponential ease toward the target.
+  const double ilen = std::sqrt(mv_f * mv_f + mv_r * mv_r + mv_u * mv_u);
+  const double speed = REXCVAR_GET(skate3_native_render_scene_freecam_speed) *
+                       speed_mult * (ilen > 1.0 ? 1.0 / ilen : 1.0);
+  const double strafe = mv_r * fc.look_sign_x * speed;
+  const double tvel[3] = {mv_f * speed * fwd[0] + strafe * right[0],
+                          mv_f * speed * fwd[1] + mv_u * speed,
+                          mv_f * speed * fwd[2] + strafe * right[2]};
+  const double vel_k = dt > 0.0 ? 1.0 - std::exp(-dt / 0.25) : 0.0;
+  for (int j = 0; j < 3; ++j) {
+    fc.vel[j] += (tvel[j] - fc.vel[j]) * vel_k;
+    fc.pos[j] += fc.vel[j] * dt;
+  }
+
+  // Compose and publish: view columns = right/up/forward, translation row
+  // = -pos * R; projection = the engage-frozen one with the zoom folded in
+  // (published to scene.proj too so depth-based post passes unproject with
+  // what was actually rendered).
+  float view[16] = {};
+  for (int i = 0; i < 3; ++i) {
+    view[i * 4 + 0] = right[i];
+    view[i * 4 + 1] = up[i];
+    view[i * 4 + 2] = fwd[i];
+  }
+  const float posf[3] = {float(fc.pos[0]), float(fc.pos[1]), float(fc.pos[2])};
+  for (int k = 0; k < 3; ++k) {
+    view[12 + k] = -(posf[0] * view[0 * 4 + k] + posf[1] * view[1 * 4 + k] +
+                     posf[2] * view[2 * 4 + k]);
+  }
+  view[15] = 1.0f;
+  // Hand the flown view to the guest-camera takeover (the SetViewMatrix
+  // override): the game's next camera update culls/submits with this pose.
+  {
+    std::lock_guard<std::mutex> lock(g_freecam_guest_mutex);
+    std::memcpy(g_freecam_guest_view, view, sizeof(view));
+    std::memcpy(g_freecam_guest_pos, posf, sizeof(posf));
+  }
+  g_freecam_guest_active.store(1, std::memory_order_release);
+  float pr[16];
+  std::memcpy(pr, fc.proj0, sizeof(pr));
+  pr[0] *= float(fc.zoom);
+  pr[5] *= float(fc.zoom);
+  std::memcpy(scene.proj, pr, sizeof(pr));
+  for (int r = 0; r < 4; ++r) {
+    for (int col = 0; col < 4; ++col) {
+      float sum = 0.0f;
+      for (int k = 0; k < 4; ++k) {
+        sum += view[r * 4 + k] * pr[k * 4 + col];
+      }
+      scene.view_proj[r * 4 + col] = sum;
+    }
+  }
+  std::memcpy(scene.cam_pos, posf, sizeof(posf));
+  return true;
+}
+
+// While the freecam is engaged, fills out_pos with the flown camera world
+// position and returns true. Consumed by the draw-distance hooks to
+// recenter the guest distance culls on the drone.
+bool FreecamGuestPose(float out_pos[3]) {
+  if (g_freecam_guest_active.load(std::memory_order_acquire) == 0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_freecam_guest_mutex);
+  std::memcpy(out_pos, g_freecam_guest_pos, 3 * sizeof(float));
+  return true;
+}
+
 // Guest render thread only. Returns true when vp_out/cam_out hold a
 // re-timed pose for `now`; false = keep the raw guest pose (no history yet,
 // or a cut/teleport snapped).
@@ -8385,7 +8648,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // ring's coherent history instead of a frozen step.
   if (REXCVAR_GET(skate3_native_render_scene_retain_offscreen) &&
       REXCVAR_GET(skate3_native_render_scene_dynamic_items) &&
-      g_synpan_active.load(std::memory_order_relaxed) == 0) {
+      g_synpan_active.load(std::memory_order_relaxed) == 0 &&
+      !REXCVAR_GET(skate3_native_render_scene_freecam)) {
     // Covers the camera-smoothing lag only; vehicle pose data just ages.
     constexpr uint64_t kDynRetainFrames = 10;
     const uint64_t rnow = g_guest_frame;
@@ -8879,10 +9143,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // Off-screen retention (see g_retained_items): re-append statics the game
   // view-culled this frame while the trailing rendered pose can still see
   // them. Runs AFTER the smoothing block so retained copies never enter the
-  // dynamic pose histories, and stands down while the synthetic-pan probe
-  // maintains its own full-surround union.
+  // dynamic pose histories. Stands down while the synthetic-pan probe
+  // maintains its own full-surround union, and while the freecam has taken
+  // over the guest camera (the game then culls around the rendered pose
+  // directly, so re-appends would only risk double draws).
   if (REXCVAR_GET(skate3_native_render_scene_retain_offscreen) &&
-      g_synpan_active.load(std::memory_order_relaxed) == 0) {
+      g_synpan_active.load(std::memory_order_relaxed) == 0 &&
+      !REXCVAR_GET(skate3_native_render_scene_freecam)) {
     if (g_retained_clear.exchange(false, std::memory_order_relaxed)) {
       g_retained_items.clear();
       g_dyn_retained.clear();
@@ -9124,6 +9391,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+
+  // Drone / free-fly camera (skate3_native_render_scene_freecam, End key):
+  // runs after the smoothing and synthetic-pan blocks so the flown pose
+  // wins while engaged. No draw-item union here; the SetViewMatrix
+  // override hands the flown pose to the game, whose own culling then
+  // submits exactly what the drone sees (statics AND animated entities).
+  UpdateFreecam(scene, cam_view,
+                std::chrono::duration<double>(build_t0.time_since_epoch()).count());
 
   // Publish the frame's captured fog rows and re-arm the OnDrawDone capture
   // (keyed to this frame's camera) for the next frame.
@@ -9500,4 +9775,37 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
 // StartRecording / WriteRecording: native/skate3_native_diagnostics.cpp.
 
 }  // namespace skate3::native_scene
+
+// Sk8::Render::ViewCamera::SetViewMatrix(const rw::math::Matrix44&): the
+// game passes each frame's freshly computed view matrix here and derives
+// the stored view (+0x20), its transpose (+0xE0), the view-proj (+0xA0) and
+// the frustum data used for culling from the argument. While the freecam is
+// engaged, rewrite the incoming matrix for the MAIN scene camera (the one
+// the frame build publishes as g_sampler_viewcam) with the flown view
+// before the game consumes it; culling, submission and every derived
+// consumer then operate around the drone pose natively. Other ViewCameras
+// (shadow cascades, portrait render-to-texture passes) pass through
+// untouched.
+extern "C" REX_FUNC(sub_82802A00) {
+  namespace ns = skate3::native_scene;
+  const uint32_t cam = ctx.r3.u32;
+  const uint32_t mtx = ctx.r4.u32;
+  if (ns::g_freecam_guest_active.load(std::memory_order_acquire) != 0 &&
+      mtx != 0 &&
+      cam == ns::g_sampler_viewcam.load(std::memory_order_relaxed)) {
+    float v[16];
+    {
+      std::lock_guard<std::mutex> lock(ns::g_freecam_guest_mutex);
+      std::memcpy(v, ns::g_freecam_guest_view, sizeof(v));
+    }
+    for (int i = 0; i < 16; ++i) {
+      uint32_t raw;
+      std::memcpy(&raw, &v[i], 4);
+      raw = __builtin_bswap32(raw);
+      std::memcpy(base + mtx + i * 4, &raw, 4);
+    }
+    ns::g_freecam_guest_rewrites.fetch_add(1, std::memory_order_relaxed);
+  }
+  __imp__sub_82802A00(ctx, base);
+}
 

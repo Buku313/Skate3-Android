@@ -81,6 +81,11 @@ extern const rex::PPCImageInfo eawebkit_PPCImageConfig;
 // lift via config because they overlap with auto-discovered parent functions.
 extern "C" REX_FUNC(__restgprlr_19);
 
+// Defined in skate3_native_scene.cpp; the freecam hotkey below toggles it,
+// and while it captures input the guest input system is gated off.
+REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam_capture_input);
+
 REXCVAR_DEFINE_STRING(skate3_dlc_root, "", "Skate 3",
                       "Directory containing Skate 3 DLC package files");
 REXCVAR_DEFINE_BOOL(skate3_auto_install_dlc, true, "Skate 3",
@@ -757,6 +762,12 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         "Native render debug menu", [this] {
                           ToggleNativeDebug();
                         });
+  rex::ui::RegisterBind("bind_skate3_freecam", "End",
+                        "Drone camera (free fly)", [] {
+                          REXCVAR_SET(
+                              skate3_native_render_scene_freecam,
+                              !REXCVAR_GET(skate3_native_render_scene_freecam));
+                        });
 }
 
 void Skate3BaseApp::OnPostSetup() {
@@ -768,7 +779,12 @@ void Skate3BaseApp::OnPostSetup() {
     input_system->SetActiveCallback([this]() {
       const bool settings_visible = simple_settings_dialog_ && simple_settings_dialog_->visible();
       const bool xam_ui_active = rex::kernel::xam::xeXamIsUIActive();
-      return !settings_visible && !xam_ui_active;
+      // The drone cam owns the keyboard while flying: keep guest input off
+      // so the fly keys don't also steer the skater.
+      const bool freecam_captures =
+          REXCVAR_GET(skate3_native_render_scene_freecam) &&
+          REXCVAR_GET(skate3_native_render_scene_freecam_capture_input);
+      return !settings_visible && !xam_ui_active && !freecam_captures;
     });
     input_system->SetMenuChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() { ToggleSimpleSettings(); });

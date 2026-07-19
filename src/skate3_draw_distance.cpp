@@ -31,6 +31,7 @@
 #include "generated/skate3_init.h"
 #include "native/skate3_native_guest_read.h"
 #include "skate3_demo_path.h"
+#include "skate3_native_scene.h"
 
 #include <algorithm>
 #include <atomic>
@@ -313,11 +314,19 @@ extern "C" REX_FUNC(sub_82792900) {
     }
   }
   const double scale = REXCVAR_GET(skate3_draw_distance_scale);
-  if (std::abs(scale - 1.0) <= kScaleEpsilon) {
-    return;
+  if (std::abs(scale - 1.0) > kScaleEpsilon) {
+    const uint32_t addr = entity + 516;
+    StoreGuestF32(base, addr, float(double(LoadGuestF32(base, addr)) * scale));
   }
-  const uint32_t addr = entity + 516;
-  StoreGuestF32(base, addr, float(double(LoadGuestF32(base, addr)) * scale));
+  // Drone camera engaged: recenter the size-cull reference on the flown
+  // position (lanes 0/2 are the camera X/Z the cull job measures distance
+  // from) so world pieces near the drone don't get distance-culled against
+  // the far-away gameplay camera.
+  float drone[3];
+  if (skate3::native_scene::FreecamGuestPose(drone)) {
+    StoreGuestF32(base, entity + 512, drone[0]);
+    StoreGuestF32(base, entity + 520, drone[2]);
+  }
 }
 
 // Asset-stream request logging (diagnostics only): a pop-in that coincides
