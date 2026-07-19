@@ -33,7 +33,10 @@
 
 #include <rex/ui/window_win.h>
 #elif defined(__APPLE__)
+#include <sys/wait.h>
 #else
+#include <sys/wait.h>
+
 #include <gtk/gtk.h>
 #endif
 
@@ -451,10 +454,12 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
 
     DWORD content_length = 0;
     DWORD length_size = sizeof(content_length);
-    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &content_length, &length_size,
-                            WINHTTP_NO_HEADER_INDEX) &&
-        content_length > 0) {
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &content_length, &length_size,
+                             WINHTTP_NO_HEADER_INDEX)) {
+      content_length = 0;
+    }
+    if (content_length > 0) {
       total_bytes.store(content_length, std::memory_order_relaxed);
     }
 
@@ -507,10 +512,19 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
       error = "Failed to write the downloaded file.";
       break;
     }
-    ok = received > 0;
-    if (!ok) {
+    if (received == 0) {
       error = "The download was empty.";
+      break;
     }
+    // A server that drops the connection mid-body looks like a normal end of
+    // stream to WinHTTP, so an undersized response must be caught here rather
+    // than surfacing later as a corrupt content package.
+    if (content_length > 0 && received != content_length) {
+      error = "The download was incomplete (received " + std::to_string(received) + " of " +
+              std::to_string(content_length) + " bytes).";
+      break;
+    }
+    ok = true;
   } while (false);
 
   if (request) {
@@ -537,12 +551,24 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
     error = "The temporary download path is not usable.";
     return false;
   }
-  const std::string command = "curl -fsSL --connect-timeout 30 --max-time 600 -o '" +
+  const std::string command = "curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 -o '" +
                               destination_str + "' '" + url + "'";
   REXLOG_INFO("Downloading Skate 3 title update via curl");
   const int status = std::system(command.c_str());
   if (status != 0) {
-    error = "The download failed (curl exit status " + std::to_string(status) +
+    // std::system returns the raw wait status; decode it into the actual curl
+    // exit code (e.g. 22 = HTTP error response) for a readable message.
+    std::string detail;
+    if (status == -1) {
+      detail = "curl could not be launched";
+    } else if (WIFEXITED(status)) {
+      detail = "curl exit code " + std::to_string(WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+      detail = "curl terminated by signal " + std::to_string(WTERMSIG(status));
+    } else {
+      detail = "curl status " + std::to_string(status);
+    }
+    error = "The download failed (" + detail +
             "). Check your internet connection, or select the title update file manually.";
     return false;
   }
@@ -628,14 +654,28 @@ bool DownloadAndStageTitleUpdate(const std::filesystem::path& game_root,
   const auto temp_file = temp_dir / "skate3_title_update_download.tmp";
 
   const std::string url = REXCVAR_GET(skate3_title_update_url);
-  REXLOG_INFO("Downloading Skate 3 title update from {}", url);
-  const bool downloaded = DownloadToFile(url, temp_file, copied_bytes, total_bytes, error);
-  bool staged = false;
-  if (downloaded) {
-    staged = StageTitleUpdateFromFile(temp_file, game_root, error);
+
+  // The download server is known to intermittently return errors or truncated
+  // bodies under load, so a failed attempt (either at the HTTP level or when
+  // the package fails extraction/verification) is retried from scratch before
+  // giving up. The package is small, so full re-downloads are cheap.
+  constexpr int kAttempts = 3;
+  bool ok = false;
+  for (int attempt = 1; attempt <= kAttempts && !ok; ++attempt) {
+    if (attempt > 1) {
+      REXLOG_WARN("Skate 3 title update attempt {} failed ({}), retrying", attempt - 1, error);
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      copied_bytes.store(0, std::memory_order_relaxed);
+      total_bytes.store(kContainerSize, std::memory_order_relaxed);
+    }
+    error.clear();
+    REXLOG_INFO("Downloading Skate 3 title update from {} (attempt {}/{})", url, attempt,
+                kAttempts);
+    ok = DownloadToFile(url, temp_file, copied_bytes, total_bytes, error) &&
+         StageTitleUpdateFromFile(temp_file, game_root, error);
+    std::filesystem::remove(temp_file, ec);
   }
-  std::filesystem::remove(temp_file, ec);
-  return downloaded && staged;
+  return ok;
 }
 
 }  // namespace
