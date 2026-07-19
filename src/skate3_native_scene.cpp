@@ -1518,7 +1518,6 @@ struct SceneRingItem {
 struct SceneRingFrame {
   uint64_t frame = 0;
   float cam[3] = {};
-  bool v3_walk = false;
   // Per-frame captured globals: a one-frame glitch in any of these shifts
   // shading on every consumer with the composition identical.
   float fog[6] = {};        // ramp xyz + color rgb
@@ -1556,7 +1555,7 @@ void MaybeDumpSceneRing() {
                   "%.3f,%.4f,%.4f,%.4f,fam,%.4f,%.4f,%.4f,%.4f,sky,%.1f,"
                   "shadow,%d\n",
                   static_cast<unsigned long long>(fr.frame), double(fr.cam[0]),
-                  double(fr.cam[1]), double(fr.cam[2]), fr.v3_walk ? 1 : 0,
+                  double(fr.cam[1]), double(fr.cam[2]),
                   fr.items.size(), double(fr.fog[0]), double(fr.fog[1]),
                   double(fr.fog[2]), double(fr.fog[3]), double(fr.fog[4]),
                   double(fr.fog[5]), double(fr.family_rows[0]),
@@ -1736,7 +1735,7 @@ PerfWindow g_pw_bpal;  // ServeAuthoritativePalettes
 uint64_t g_frame_b2d_ns = 0;
 uint64_t g_frame_bspl_ns = 0;
 uint64_t g_frame_bpal_ns = 0;
-uint64_t g_frame_v3_ns = 0;
+uint64_t g_frame_pal_tail_ns = 0;
 std::atomic<uint32_t> g_dt_hist[5] = {};  // <3.6 / <4.5 / <6 / <10 / >=10 ms
 std::atomic<uint32_t> g_slow_frame_log_budget{0};
 std::atomic<uint64_t> g_warm_decodes{0};
@@ -7829,7 +7828,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // Previous frame's phase costs, for the slow-frame attribution below (a
   // frame's dt is only known at the NEXT frame's entry).
   static uint64_t s_prev_build_ns = 0, s_prev_b2d_ns = 0, s_prev_bspl_ns = 0,
-                  s_prev_bpal_ns = 0, s_prev_v3_ns = 0, s_prev_cap_ns = 0;
+                  s_prev_bpal_ns = 0, s_prev_pal_tail_ns = 0, s_prev_cap_ns = 0;
   const auto build_t0 = PerfClock::now();
   if (s_last_frame_tp.time_since_epoch().count() != 0) {
     const uint64_t dt_ns = uint64_t(
@@ -7852,10 +7851,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           "(2d={:.2f} spl={:.2f} pal={:.2f} ptail={:.2f} walk={:.2f}) rest={:.2f}]ms",
           dt_ms, double(s_prev_cap_ns) * 1e-6, double(s_prev_build_ns) * 1e-6,
           double(s_prev_b2d_ns) * 1e-6, double(s_prev_bspl_ns) * 1e-6,
-          double(s_prev_bpal_ns) * 1e-6, double(s_prev_v3_ns) * 1e-6,
+          double(s_prev_bpal_ns) * 1e-6, double(s_prev_pal_tail_ns) * 1e-6,
           double(s_prev_build_ns - std::min(s_prev_build_ns,
                                             s_prev_b2d_ns + s_prev_bspl_ns +
-                                                s_prev_bpal_ns + s_prev_v3_ns)) *
+                                                s_prev_bpal_ns + s_prev_pal_tail_ns)) *
               1e-6,
           dt_ms - ours_ms);
     }
@@ -7867,14 +7866,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_frame_b2d_ns = 0;
   g_frame_bspl_ns = 0;
   g_frame_bpal_ns = 0;
-  g_frame_v3_ns = 0;
+  g_frame_pal_tail_ns = 0;
   struct BuildPerf {
     PerfClock::time_point t0;
     uint64_t* prev_build_ns;
     uint64_t* prev_b2d_ns;
     uint64_t* prev_bspl_ns;
     uint64_t* prev_bpal_ns;
-    uint64_t* prev_v3_ns;
+    uint64_t* prev_pal_tail_ns;
     ~BuildPerf() {
       const uint64_t build_ns = uint64_t(
           std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - t0)
@@ -7887,7 +7886,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       *prev_pal_tail_ns = g_frame_pal_tail_ns;
     }
   } build_perf{build_t0, &s_prev_build_ns, &s_prev_b2d_ns, &s_prev_bspl_ns,
-               &s_prev_bpal_ns, &s_prev_v3_ns};
+               &s_prev_bpal_ns, &s_prev_pal_tail_ns};
   if (g_recording.load(std::memory_order_relaxed)) {
     // Flush this frame's deferred inline-ring payloads (2D BeginVertices
     // draws): the CPU has finished writing them by frame end, and the ring
@@ -9657,12 +9656,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // block in the perf line; this tail runs on the guest render thread,
   // where spikes are visible stutter.
   {
-    const auto v3_t0 = PerfClock::now();
+    const auto pal_tail_t0 = PerfClock::now();
     skate3::native_palette::OnFrameBuilt();
-    g_frame_v3_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 PerfClock::now() - v3_t0)
+    g_frame_pal_tail_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 PerfClock::now() - pal_tail_t0)
                                  .count());
-    g_pw_v3.Add(g_frame_v3_ns);
+    g_pw_pal_tail.Add(g_frame_pal_tail_ns);
   }
 
   // AUX-publish gate: the skater-portrait render-to-texture passes submit a
@@ -17586,7 +17585,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_dt_hist[2].exchange(0, std::memory_order_relaxed),
         g_dt_hist[3].exchange(0, std::memory_order_relaxed),
         g_dt_hist[4].exchange(0, std::memory_order_relaxed),
-        g_pw_v3.AvgMs(), g_pw_v3.MaxMs(),
+        g_pw_pal_tail.AvgMs(), g_pw_pal_tail.MaxMs(),
         g_pw_render.AvgMs(), g_pw_render.MaxMs(),
         g_pw_items.AvgMs(), g_pw_items.MaxMs(), g_pw_shadow.AvgMs(),
         g_pw_shadow.MaxMs(), g_pw_pre.AvgMs(), g_pw_pre.MaxMs(),
@@ -17604,7 +17603,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_cam_changes.exchange(0, std::memory_order_relaxed),
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
         g_cam_max_streak.exchange(0, std::memory_order_relaxed));
-    for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_v3,
+    for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_pal_tail,
                           &g_pw_b2d, &g_pw_bspl, &g_pw_bpal,
                           &g_pw_render, &g_pw_items, &g_pw_shadow, &g_pw_pre,
                           &g_pw_settle, &g_pw_tail, &g_pw_2d, &g_pw_mesh_decode,
