@@ -26,7 +26,9 @@
 //   ps_vol_shafts     half res: reconstruct the world position from depth,
 //                     march the camera->pixel ray with per-pixel jitter and
 //                     test each step's sun visibility against the CSM atlas
-//                     and the static world-shadow map, real shadowed air,
+//                     and the native static sun-shadow map (falling back to
+//                     the baked world-shadow map outside its coverage),
+//                     real shadowed air,
 //                     so occlusion never depends on on-screen silhouettes
 //                     (no ghosting around near characters) and beams appear
 //                     wherever shadow volumes cross the view ray.
@@ -57,8 +59,8 @@ cbuffer C : register(b0) {
 };
 // Per-frame shadow constant slice (the scene pass's b1; see scene.hlsl for
 // the authoritative layout); ps_vol_shafts samples sun visibility with the
-// exact receiver math the materials use. Only the rows up to the static
-// world-shadow transform are declared (the tail is water state).
+// exact receiver math the materials use. Declared through the native static
+// sun-shadow rows; the water/ocean material rows in between are padding.
 cbuffer S : register(b1) {
   float4 sh_x;      // light-space X row (xyz) + translation (w)
   float4 sh_y;      // light-space Y row
@@ -79,6 +81,20 @@ cbuffer S : register(b1) {
   float4 dyn_wsx;   // static world-shadow rows: u = dot(wp4, wsx)*0.5+0.5,
   float4 dyn_wsy;   // v = dot(wp4, wsy)*-0.5+0.5,
   float4 dyn_wsz;   // ray depth = dot(wp4, wsz)
+  // Rows 19-33 carry water/ocean material state, not consumed here.
+  float4 s_water[15];
+  float4 sh_pcss;   // contact-hardening knobs (surface receivers only)
+  float4 sh_pcss2;
+  // Native static sun-shadow map transform (authoritative layout and
+  // receiver math in scene.hlsl SampleStaticSun): world -> far-tile rows
+  // uc = dot(nsm_*.xyz, wp) + nsm_*.w, depth = dot(nsm_z.xyz, wp) + nsm_z.w.
+  // nsm_p.x = strength (0 = feature off / map not rendered this frame),
+  // nsm_p2.x = base receiver bias, nsm_p2.w = tile size in pixels.
+  float4 nsm_x;
+  float4 nsm_y;
+  float4 nsm_z;
+  float4 nsm_p;
+  float4 nsm_p2;
 };
 Texture2D<float4> tex0 : register(t0);  // per-pass primary input
 #ifdef VOL_MSAA
@@ -101,6 +117,11 @@ Texture2D<float4> vol_plane : register(t3);
 // depth; sge(stored >= ray) = lit, uncovered texels hold the far clear).
 Texture2D<float4> ws_tex : register(t3);
 Texture2D<float> lin_depth : register(t4);
+// ps_vol_shafts: the native static sun-shadow atlas (the scene pass's t10,
+// three tiles inner/mid/far left to right, x = depth along the material
+// sun). White fallback = the far clear = lit everywhere when the map was
+// not rendered this frame.
+Texture2D<float2> nsm_tex : register(t4);
 SamplerState smp_point : register(s0);
 SamplerState smp_linear : register(s1);
 
@@ -192,10 +213,55 @@ float WorldVis(float3 wp) {
              : 0.0;
 }
 
+// Native static sun-shadow visibility (nsm_tex, the scene pass's t10): the
+// static world rendered along the TRUE material sun, so static-geometry
+// shafts align with the sun glow; the baked ws map above projects along
+// the game's near-vertical utility axis, ~40 degrees off the sun, which
+// skews its shadow volumes accordingly. Cascade select mirrors
+// SampleStaticSun (three tiles sharing the origin, ratios 6/2/1); a single
+// soft-free compare per step is enough for the jittered march average.
+// Returns -1 outside the map or with the feature off. Uncovered texels
+// hold the far clear = lit.
+float NsmVis(float3 wp) {
+  if (nsm_p.x <= 0.0) {
+    return -1.0;
+  }
+  float2 uc_far = float2(dot(nsm_x.xyz, wp) + nsm_x.w,
+                         dot(nsm_y.xyz, wp) + nsm_y.w);
+  if (max(abs(uc_far.x), abs(uc_far.y)) >= 0.99) {
+    return -1.0;
+  }
+  float2 uc0 = uc_far * 6.0;
+  float2 uc1 = uc_far * 2.0;
+  float tile;
+  float2 uc;
+  if (max(abs(uc0.x), abs(uc0.y)) < 0.99) {
+    tile = 0.0;
+    uc = uc0;
+  } else if (max(abs(uc1.x), abs(uc1.y)) < 0.99) {
+    tile = 1.0;
+    uc = uc1;
+  } else {
+    tile = 2.0;
+    uc = uc_far;
+  }
+  float2 suv = float2(uc.x / 6.0 + (tile * 2.0 + 1.0) / 6.0,
+                      uc.y * -0.5 + 0.5);
+  // Keep the bilinear tap off the tile seams (the atlas is 3 tiles wide).
+  float hx = 0.1666667 / nsm_p2.w;
+  suv.x = clamp(suv.x, tile / 3.0 + hx, tile / 3.0 + 0.3333333 - hx);
+  float refd = dot(nsm_z.xyz, wp) + nsm_z.w - nsm_p2.x;
+  float s = nsm_tex.SampleLevel(smp_linear, suv, 0).x >= refd ? 1.0 : 0.0;
+  // The material receive bottoms out at 1 - strength; shadowed air follows
+  // the same authored blend so the shafts fade with the surface shadows.
+  return 1.0 - nsm_p.x * (1.0 - s);
+}
+
 // Shadow-marched volumetric sun shafts (half res). The camera->pixel ray
 // is marched with per-pixel jitter; each step's sun visibility comes from
-// the CSM atlas and the static world-shadow map, so the beams are cast by
-// real shadow volumes, never by on-screen silhouettes. Output = the
+// the CSM atlas plus the native static sun map (baked ws map outside its
+// coverage), so the beams are cast by real shadow volumes, never by
+// on-screen silhouettes. Output = the
 // SHADOWED fraction x Henyey-Greenstein forward-scatter phase x marched
 // path fraction: the game's sky and fog already carry the authored
 // scattering of fully-lit air, so adding lit-air glow double-counts it
@@ -227,9 +293,14 @@ float4 ps_vol_shafts(VSOut i) : SV_Target {
     }
     float3 sp = cam + rdir * ((float(k) + jitter) / steps * reach);
     float cv = CsmVis(sp);
-    float wv = WorldVis(sp);
-    if (cv >= 0.0 || wv >= 0.0) {
-      lit += min(cv < 0.0 ? 1.0 : cv, wv < 0.0 ? 1.0 : wv);
+    // Static shade: the native sun map where it covers (true material-sun
+    // axis), else the baked ws map. Never both: inside the sun map's range
+    // the two would draw the same caster's shadow volume on two different
+    // axes and read as a doubled shaft.
+    float nv = NsmVis(sp);
+    float sv = nv >= 0.0 ? nv : WorldVis(sp);
+    if (cv >= 0.0 || sv >= 0.0) {
+      lit += min(cv < 0.0 ? 1.0 : cv, sv < 0.0 ? 1.0 : sv);
       tot += 1.0;
     }
   }

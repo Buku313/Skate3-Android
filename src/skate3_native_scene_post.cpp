@@ -1186,8 +1186,9 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
   cmd->FlushBarriers();
 
   // 2) Shadow-marched shafts (half res): world-space camera->pixel march
-  // testing per-step sun visibility against the CSM atlas + the static
-  // world-shadow map (see ps_vol_shafts).
+  // testing per-step sun visibility against the CSM atlas + the native
+  // static sun-shadow map, with the baked world-shadow map as the fallback
+  // outside its coverage (see ps_vol_shafts).
   bool shaft_plane = false;
   if (shafts && inv_ok && g_r.vol_tex != nullptr && g_r.vol_tex_b != nullptr) {
     const nrhi::Viewport vol_vp{0.0f, 0.0f, float(vw), float(vh), 0.0f, 1.0f};
@@ -1217,6 +1218,15 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
     cmd->SetTexture(4, (g_r.world_shadow_srv != nullptr &&
                         g_r.world_shadow_in_srv)
                            ? g_r.world_shadow_srv
+                           : g_r.white.srv);
+    // t4 = the native static sun-shadow atlas (the scene pass's t10) when
+    // rendered this frame; the march prefers it over the ws map inside its
+    // coverage so static shafts follow the true material-sun axis. The b1
+    // nsm rows are zeroed when the map is invalid, so the white fallback is
+    // never actually compared.
+    cmd->SetTexture(5, (g_r.static_sun_valid && g_r.static_sun_in_srv &&
+                        g_r.static_sun_srv != nullptr)
+                           ? g_r.static_sun_srv
                            : g_r.white.srv);
     cmd->Draw(3, 0);
     cmd->Barrier(g_r.vol_tex, nrhi::ResourceState::kRenderTarget,
@@ -1270,13 +1280,15 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
   if (s_vol_log < 4 || (s_vol_log % 36000) == 0) {
     REXLOG_INFO(
         "native-scene: vol2 shafts={} gates[cvar={} shvalid={} atlas={} "
-        "insrv={}] inv={} ws={} tex={} tint=({:.3f},{:.3f},{:.3f}) "
+        "insrv={}] inv={} ws={} nsm={} tex={} tint=({:.3f},{:.3f},{:.3f}) "
         "expo={:.2f} sunv=({:.2f},{:.2f},{:.2f}) lin={}",
         shaft_plane ? 1 : 0,
         REXCVAR_GET(skate3_native_render_scene_shafts) ? 1 : 0,
         scene.shadow_valid ? 1 : 0, g_r.shadow_srv_final != nullptr ? 1 : 0,
         g_r.shadow_in_srv_state ? 1 : 0, inv_ok ? 1 : 0,
-        g_r.world_shadow_in_srv ? 1 : 0, g_r.vol_tex != nullptr ? 1 : 0,
+        g_r.world_shadow_in_srv ? 1 : 0,
+        (g_r.static_sun_valid && g_r.static_sun_in_srv) ? 1 : 0,
+        g_r.vol_tex != nullptr ? 1 : 0,
         g_r.vol_rows[8], g_r.vol_rows[9], g_r.vol_rows[10], expo, sun_view[0],
         sun_view[1], sun_view[2], lin_ready ? "ao" : "own");
   }
