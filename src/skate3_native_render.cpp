@@ -35,7 +35,7 @@
 REXCVAR_DEFINE_BOOL(skate3_native_render, false, "Skate 3",
                     "Enable the Skate 3 data-driven native renderer hook layer")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 600, "Skate 3",
+REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",
                      "Frames between native-render hook liveness log lines (0 = off)")
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -51,6 +51,7 @@ REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_frames, 4, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // Defined in skate3_native_scene.cpp (the recording filter lives there).
 REXCVAR_DECLARE(bool, skate3_native_render_snapshot_all_draws);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_photo_compose_trace, false, "Skate 3",
     "Auto-capture an F10-style diagnostic recording (all draws, ~360 "
@@ -343,7 +344,8 @@ void OnFrameEnd(uint8_t* base) {
   static double s_bd_frame_ns = 0, s_bd_frame_max = 0;
   static double s_bd_build_ns = 0, s_bd_build_max = 0;
   static uint64_t s_bd_draws0 = 0;
-  const bool emu_profile = !skate3::native_scene::Enabled();
+  const bool emu_profile = !skate3::native_scene::Enabled() &&
+                           REXCVAR_GET(skate3_native_render_scene_perf_log);
   const auto bd_now = Clock::now();
   if (emu_profile && s_bd_prev.time_since_epoch().count() != 0) {
     const double dt =

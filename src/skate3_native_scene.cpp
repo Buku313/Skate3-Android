@@ -874,6 +874,10 @@ REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 // synchronous during menu contexts by YieldForMenus so one-shot portrait
 // renders can't lose still-compiling pieces (first-run armless skaters).
 REXCVAR_DECLARE(bool, async_shader_compilation);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_log, false, "Skate 3",
+                    "Log periodic native-renderer performance breakdown lines "
+                    "(600-frame windows)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_scene {
 namespace {
@@ -1479,7 +1483,7 @@ std::atomic<uint64_t> g_refl_flat{0};
 std::atomic<uint32_t> g_refl_gate{0};
 
 // ---- F7 scene-composition ring (see RequestSceneRingDump in the header) ----
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ring, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ring, false, "Skate 3",
                     "Record a rolling per-frame scene-composition ring (~900 "
                     "frames); F7 dumps it to logs/scene_ring_<ts>.csv for "
                     "diffing 1-2 frame artifacts no capture can catch")
@@ -6518,12 +6522,6 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     uint32_t cen_vb = 0;
     uint32_t cen_bytes = 0;
     std::vector<std::array<float, 4>> cen;
-    // Last RENDERED pose on this ring (post-interpolation / raw fallback):
-    // the flick detector's reference. Vehicles only (fam 6/7).
-    std::vector<float> last_final;
-    uint64_t last_final_frame = 0;
-    uint8_t last_final_src = 0;
-    bool last_final_caster = false;
     // Timestamp of the last PERSPECTIVE-sourced (non-caster, non-retained)
     // sample ingested: decides whether a caster pose tracks (caster-only
     // stream) or holds (perspective stream fresh; interleaving the two
@@ -6735,92 +6733,6 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     if (skinned) {
       ensure_cen(h, item.bones.size() / 12);
     }
-    // Flick FIREWALL ("vehicle suddenly points sideways/upright"): compare
-    // the pose about to RENDER against last frame's rendered pose on this
-    // ring. No vehicle chassis legally rotates ~45 deg in one frame at any
-    // sim rate, while every bad-palette path (mis-located ortho rows,
-    // foreign bank, mispaired clone, bad rescue) rotates the whole chassis
-    // - minimum over the centroid-weighted bones, so spinning wheels can
-    // never trip it. Returns true = suppress this frame's draws (the
-    // reference pose is KEPT so a one-off bad palette never renders); four
-    // consecutive suppressions accept the new pose stream (a real teleport
-    // or respawn appears ~30 ms late instead of never).
-    const auto flick_check = [&](const char* path) -> bool {
-      if (!skinned || (item.char_family != 6 && item.char_family != 7)) {
-        return false;
-      }
-      if (h.last_final_frame + 1 == s_frame &&
-          h.last_final.size() == item.bones.size()) {
-        const size_t nb = item.bones.size() / 12;
-        const size_t ncen = std::min(h.cen.size(), nb);
-        float min_ang = 1e9f;
-        float move_at_min = 0.0f;
-        int checked = 0;
-        for (size_t b = 0; b < nb; ++b) {
-          if (ncen != 0 && (b >= ncen || h.cen[b][0] <= 0.5f)) {
-            continue;  // not vertex-weighted (junk palette row)
-          }
-          const size_t bi = b * 12;
-          double tr = 0.0, na = 0.0, nb2 = 0.0;
-          for (int r = 0; r < 3; ++r) {
-            for (int c2 = 0; c2 < 3; ++c2) {
-              const double av = item.bones[bi + r * 4 + c2];
-              const double bv = h.last_final[bi + r * 4 + c2];
-              tr += av * bv;
-              na += av * av;
-              nb2 += bv * bv;
-            }
-          }
-          // Orthonormal 3x3 rows sum to 3; anything far off is not a
-          // rotation and cannot be angle-compared.
-          if (na < 1.5 || na > 6.0 || nb2 < 1.5 || nb2 > 6.0) {
-            continue;
-          }
-          const double cth = std::clamp((tr - 1.0) * 0.5, -1.0, 1.0);
-          const float ang = float(std::acos(cth) * 57.2957795);
-          if (ang < min_ang) {
-            min_ang = ang;
-            const float dx = item.bones[bi + 3] - h.last_final[bi + 3];
-            const float dy = item.bones[bi + 7] - h.last_final[bi + 7];
-            const float dz = item.bones[bi + 11] - h.last_final[bi + 11];
-            move_at_min = std::sqrt(dx * dx + dy * dy + dz * dz);
-          }
-          ++checked;
-        }
-        if (checked > 0 && min_ang > 40.0f) {
-          // Detector only, suppression is retired: the sighting logs
-          // showed every trigger was a clone RING-SWAP (the sort lists
-          // reshuffle same-mesh clones; poses 20-75 m apart are different
-          // vehicles' VALID poses), so hiding them blinked legit traffic,
-          // while the real artifact (per-bone garbage) slides under the
-          // min-over-sane-bones angle and is handled by the bone repair
-          // above.
-          static std::atomic<uint64_t> s_flicks{0};
-          const uint64_t n = s_flicks.fetch_add(1, std::memory_order_relaxed);
-          if (n < 24 || (n & 127u) == 0) {
-            const float* c0 = item.bones.data();
-            const float* p0 = h.last_final.data();
-            REXLOG_INFO(
-                "native-scene FLICK: mesh={:08X} fam={} path={} ang={:.0f} "
-                "move={:.2f} cur[src={} pend={} caster={} retained={}] "
-                "prev[src={} caster={}] ring[count={} age_ms={:.0f}] "
-                "cur_r0=({:.3f},{:.3f},{:.3f},{:.2f}) "
-                "prev_r0=({:.3f},{:.3f},{:.3f},{:.2f}) (n={})",
-                item.mesh, item.char_family, path, min_ang, move_at_min,
-                item.dbg_src, item.pending ? 1 : 0, item.caster_bank ? 1 : 0,
-                item.retained ? 1 : 0, h.last_final_src,
-                h.last_final_caster ? 1 : 0, h.count,
-                h.count > 0 ? (now - h.ring[h.newest].t) * 1e3 : -1.0, c0[0],
-                c0[1], c0[2], c0[3], p0[0], p0[1], p0[2], p0[3], n);
-          }
-        }
-      }
-      h.last_final = item.bones;
-      h.last_final_frame = s_frame;
-      h.last_final_src = item.dbg_src;
-      h.last_final_caster = item.caster_bank;
-      return false;
-    };
     const DynPose& latest = h.ring[h.newest];
     // Per-bone palette repair (vehicles): the sighting captures carried
     // garbage on SOME weighted bones, world positions in the rotation
@@ -7015,9 +6927,6 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       }
     }
     if (h.count < 3 || now - h.ring[h.newest].t > 0.1) {
-      if (flick_check("raw")) {
-        item.draws.clear();
-      }
       continue;  // not enough history yet: raw stepped pose (one-time snap)
     }
     // Evaluate the ring's piecewise-linear pose signal at time tt into
@@ -7099,9 +7008,6 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       ok = accum_at(play_e, 1.0f, acc.data(), wacc);
     }
     if (!ok) {
-      if (flick_check("raw-size")) {
-        item.draws.clear();
-      }
       continue;  // palette-size mismatch in the window: raw pose this frame
     }
     // Fast-spinning bones (skateboard wheels: hundreds of degrees inside
@@ -7444,9 +7350,6 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           add_gen(s1, a);
         }
       }
-    }
-    if (flick_check("interp")) {
-      item.draws.clear();
     }
     if (bs_rec) {
       BoneSigAppend(1, key, now, play_e,
@@ -17559,7 +17462,7 @@ void RenderOutlineComposite(const NativeGuestOutputRenderContext& context,
 void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
                    uint32_t drawn_2d, uint32_t drawn_spline, bool shadow_ready,
                    uint32_t shadow_draws) {
-  if (frames % 600 == 0) {
+  if (frames % 600 == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     // CPU-side perf snapshot for this 600-frame window. guest_fps is derived
     // from the guest frame interval; capture/build run on the guest render
     // thread (they extend guest frame time directly), render/items/shadow on
