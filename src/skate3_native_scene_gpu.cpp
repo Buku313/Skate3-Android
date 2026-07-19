@@ -33,7 +33,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
-#include <rex/graphics/ultrawide_debug.h>
+#include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
 
 #include "native/skate3_native_diag.h"
@@ -4609,7 +4609,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   static bool s_in_loading = false;
   static bool s_seen_gameplay = false;
   static bool s_pause_native = false;
-  const bool in_menus = rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0;
+  const bool in_menus = rex::kernel::guest_presence::GameplayContextValue() == 0;
   // Render-thread mirror for the 2D texture resolver: menu screens shorten
   // the content-liveness recheck cadence (see resolve_2d_texture) so
   // in-place rewrites of UI textures (the one-shot skater-portrait resolves)
@@ -9945,6 +9945,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
+  // Hor+ ultrawide: the 2D stream and the guest screenshot raster are
+  // authored for the 16:9 frontbuffer. On a wide output the 2D replay
+  // scales clip-space X by this factor (centering ortho HUD/menu/FMV draws
+  // in a pillarboxed 16:9 band and narrowing perspective SimpleDraw markers
+  // to match the widened scene projection - one operation covers both), and
+  // the photo grab center-crops the same band.
+  const float out_aspect2d =
+      float(context.guest_output_width) / float(context.guest_output_height);
+  const float wide_2d_scale =
+      out_aspect2d > (16.0f / 9.0f) * 1.01f ? (16.0f / 9.0f) / out_aspect2d : 1.0f;
+
   // ---- Native photo grab (photo_grab_native) ----
   // Consume: CPU-tile the newest fence-completed readback into the guest
   // screenshot target. Produce: downsample this frame's finished output
@@ -10055,10 +10066,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         cmd->SetScissor(grab_sc);
         cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
         cmd->SetPipeline(g_r.pso_blur_down);
-        const float grab_consts[4] = {1.0f / float(context.guest_output_width),
+        // Source UV rect (second register): the centered 16:9 band on a
+        // wide output; the guest screenshot raster is 16:9.
+        const float grab_consts[8] = {1.0f / float(context.guest_output_width),
                                       1.0f / float(context.guest_output_height),
-                                      0.0f, 0.0f};
-        cmd->SetRootConstants(0, 4, grab_consts, 0);
+                                      0.0f,
+                                      0.0f,
+                                      wide_2d_scale,
+                                      1.0f,
+                                      (1.0f - wide_2d_scale) * 0.5f,
+                                      0.0f};
+        cmd->SetRootConstants(0, 8, grab_consts, 0);
         cmd->SetTexture(1, g_r.output_srv_slot);
         cmd->Draw(3, 0);
         // blur_tex[0] -> the readback buffer; restore steady states.
@@ -10144,9 +10162,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cmd->SetViewport(blur_vp);
     cmd->SetScissor(blur_sc);
     cmd->SetPipeline(g_r.pso_blur_down);
-    const float d_consts[4] = {1.0f / float(context.guest_output_width),
-                               1.0f / float(context.guest_output_height), 0.0f, 0.0f};
-    cmd->SetRootConstants(0, 4, d_consts, 0);
+    // Full-frame source rect: the blur squeezes the whole wide frame into
+    // the 1152x640 blur space and the final stretch-back undoes it.
+    const float d_consts[8] = {1.0f / float(context.guest_output_width),
+                               1.0f / float(context.guest_output_height),
+                               0.0f,
+                               0.0f,
+                               1.0f,
+                               1.0f,
+                               0.0f,
+                               0.0f};
+    cmd->SetRootConstants(0, 8, d_consts, 0);
     cmd->SetTexture(1, g_r.output_srv_slot);
     cmd->Draw(3, 0);
     // H: blur_tex[0] -> blur_tex[1].
@@ -10242,6 +10268,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
         float constants[40];
         std::memcpy(constants, d.consts, sizeof(d.consts));
+        // Wide output: scale the staged projection's clip.x row (the VS
+        // computes clip.x = dot(wp, c0)) so the 16:9-authored stream lands
+        // centered (see wide_2d_scale).
+        if (wide_2d_scale != 1.0f) {
+          constants[0] *= wide_2d_scale;
+          constants[1] *= wide_2d_scale;
+          constants[2] *= wide_2d_scale;
+          constants[3] *= wide_2d_scale;
+        }
         // 2D ortho draws have no translation row in the projection (c3 ==
         // (0,0,0,1)); perspective view-proj rows do. Half-pixel applies to
         // the former only.
@@ -10252,12 +10287,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // (see the cvar; the shader gates on actual fetch magnification).
         constants[37] = float(std::clamp(
             REXCVAR_GET(skate3_native_render_scene_2d_sharp), 0.0, 2.0));
-        // m[9].zw: unused. The D3D9 half-pixel shift is derived in the VS
-        // from the draw's own ortho scale (+0.5 GUEST pixel down-right,
-        // matching the emulated path's half_pixel_offset reversal); the
-        // old up-left OUTPUT-pixel nudge staged here left a see-through
-        // sliver along the bottom/right of edge-to-edge loading quads.
-        constants[38] = 0.0f;
+        // m[9].z: clip-space X extent of the 2D band, the edge-snap
+        // boundary in the VS (0 = full target). m[9].w: unused. The D3D9
+        // half-pixel shift is derived in the VS from the draw's own ortho
+        // scale (+0.5 GUEST pixel down-right, matching the emulated path's
+        // half_pixel_offset reversal); the old up-left OUTPUT-pixel nudge
+        // staged here left a see-through sliver along the bottom/right of
+        // edge-to-edge loading quads.
+        constants[38] = wide_2d_scale != 1.0f ? wide_2d_scale : 0.0f;
         constants[39] = 0.0f;
         cmd->SetRootConstants(0, 40, constants, 0);
         cmd->SetTexture(1, srv_view);

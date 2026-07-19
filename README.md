@@ -62,9 +62,9 @@ Create a `dlc` folder either beside the executable, inside the installed game fo
 or in the user data folder. Place the DLC package files in that
 folder and start the game.
 
-## True 21:9 Ultrawide
+## True Ultrawide
 
-The builds include an experimental true ultrawide aspect ratio mode at 21:9. You may notice occasional visual bugs or graphical glitches, especially around shadows. Performance is somewhat reduced.
+The builds include an experimental true ultrawide mode: the native renderer draws the world at your display's full aspect ratio (21:9 and wider) with a matching wider field of view, while the HUD and menus stay centered and undistorted. Enable it via the Aspect Ratio setting or `skate3_ultrawide = true`. It requires the native renderer; with the emulated renderer the game presents in standard 16:9. Rendering more of the scene costs proportionally more GPU time.
 
 ## Controls
 
@@ -210,8 +210,7 @@ SKATE3_MNK=1 ./scripts/run-linux.sh
 Fullscreen is on by default. Pass `--no-fullscreen` to start windowed.
 On Windows, ultrawide displays are detected automatically in fullscreen. For an
 ultrawide window, pass matching `--window_width` and `--window_height` values;
-the renderer keeps the guest frontbuffer at a stable 16:9 size while applying
-ultrawide presentation and Hor+ correction without stretching.
+the native renderer then draws true widescreen frames at that aspect.
 
 To run the Linux development executable directly:
 

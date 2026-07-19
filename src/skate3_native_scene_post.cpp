@@ -32,7 +32,6 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
-#include <rex/graphics/ultrawide_debug.h>
 #include <rex/logging.h>
 
 #include "native/skate3_native_diag.h"

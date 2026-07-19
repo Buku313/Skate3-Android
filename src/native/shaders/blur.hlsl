@@ -48,13 +48,17 @@ float4 ps_main(VSOut i) : SV_Target {
 // taps covers reduction ratios up to ~4x (4K -> 1152 is 3.33x); narrower
 // footprints undersampled the scale and the aliased detail crawled as the
 // scene animated: the whole blurred backdrop shimmered, worst around
-// high-contrast edges.
+// high-contrast edges. This pass reads the second constant register as the
+// source UV rect (xy = scale, zw = offset): the photo grab center-crops the
+// 16:9 band out of a wide output; (1,1,0,0) = full frame.
 float4 ps_down(VSOut i) : SV_Target {
+  float4 rect = tint;
+  float2 uv = i.uv * rect.xy + rect.zw;
   float3 c = 0.0;
   [unroll] for (int y = 0; y < 4; ++y) {
     [unroll] for (int x = 0; x < 4; ++x) {
       float2 off = float2(float(x) - 1.5, float(y) - 1.5) * dir.xy;
-      c += src.SampleLevel(smp_clamp, i.uv + off, 0).rgb;
+      c += src.SampleLevel(smp_clamp, uv + off, 0).rgb;
     }
   }
   return float4(c / 16.0, 1.0);

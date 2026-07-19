@@ -33,7 +33,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
-#include <rex/graphics/ultrawide_debug.h>
+#include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
 
 #include "native/skate3_native_diag.h"
@@ -9853,7 +9853,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // behind a live menu). The editor's _nis shader heartbeat separates the
   // two: editor draws stamp it every frame, portrait passes use the
   // _default compiles and never do.
-  if (rex::graphics::ultrawide_debug::Skate3GameplayContextValue() == 0 &&
+  if (rex::kernel::guest_presence::GameplayContextValue() == 0 &&
       !scene.items.empty() && scene.items.size() <= 48 &&
       !CasEditorActive(base)) {
     bool all_char = true;

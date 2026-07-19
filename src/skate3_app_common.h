@@ -12,7 +12,6 @@
 
 #include <rex/rex_app.h>
 #include <rex/ui/overlay/simple_settings_overlay.h>
-#include <rex/ui/overlay/ultrawide_targets_overlay.h>
 
 #include "skate3_native_debug_dialog.h"
 
@@ -40,7 +39,6 @@ class Skate3BaseApp : public rex::ReXApp {
   void InstallBigDeviceAliases();
   void InstallDlcPackages();
   void ToggleSimpleSettings();
-  void ToggleUltrawideTargets();
   void ToggleNativeDebug();
   void ApplySettingsCursorMode();
   void ApplyGameplayCursorMode();
@@ -60,7 +58,6 @@ class Skate3BaseApp : public rex::ReXApp {
   std::filesystem::path user_settings_path_;
   std::filesystem::path profiles_path_;
   std::unique_ptr<rex::ui::SimpleSettingsDialog> simple_settings_dialog_;
-  std::unique_ptr<rex::ui::UltrawideTargetsDialog> ultrawide_targets_dialog_;
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
   bool recipe_overlay_installed_ = false;

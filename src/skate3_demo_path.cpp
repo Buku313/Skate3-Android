@@ -13,7 +13,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
-#include <rex/graphics/ultrawide_debug.h>
+#include <rex/kernel/guest_presence.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/input_injection.h>
@@ -356,7 +356,7 @@ void StartGameplayInputWorkerIfNeeded() {
   }
   g_input_worker = std::thread([tokens, settle_ms] {
     // Wait for the gameplay presence context (0x8001 == 1).
-    while (rex::graphics::ultrawide_debug::Skate3GameplayContextValue() != 1) {
+    while (rex::kernel::guest_presence::GameplayContextValue() != 1) {
       if (!InterruptibleSleepMs(100)) {
         return;
       }

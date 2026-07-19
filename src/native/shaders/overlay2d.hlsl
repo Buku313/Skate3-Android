@@ -7,7 +7,10 @@ cbuffer C : register(b0) {
   float4 m[10];  // m[0..3] proj rows, m[4..7] world rows, m[8] color,
                  // m[9].x = apply D3D9 half-pixel (2D ortho draws only),
                  // m[9].y = sharp-magnification amount (0 = plain bilinear),
-                 // m[9].zw = unused (the D3D9 half-pixel shift is derived
+                 // m[9].z = clip-space X extent of the 2D band (0 = full
+                 // target; < 1 when a wide output centers the 16:9 stream
+                 // in a pillarboxed band, see the emit_draw column-0 scale),
+                 // m[9].w = unused (the D3D9 half-pixel shift is derived
                  // in the VS from the draw's own ortho scale)
 };
 Texture2D<float4> tex : register(t0);
@@ -55,8 +58,11 @@ VSOut vs_main(float4 p : POSITION, float2 uv : TEXCOORD0, float4 color : COLOR0)
     float2 gpx = float2(abs(m[0].x), abs(m[1].y));  // one guest px in NDC
     float2 ndc = o.pos.xy / o.pos.w;
     float2 eps = 0.75 * gpx;
-    if (ndc.x <= 1.0 && ndc.x > 1.0 - eps.x) ndc.x = 1.0;
-    if (ndc.x >= -1.0 && ndc.x < -1.0 + eps.x) ndc.x = -1.0;
+    // The horizontal boundary is the 2D band edge: +-1 normally, +-m[9].z
+    // when a wide output pillarboxes the 16:9 stream.
+    float edge_x = m[9].z > 0.0 ? m[9].z : 1.0;
+    if (ndc.x <= edge_x && ndc.x > edge_x - eps.x) ndc.x = edge_x;
+    if (ndc.x >= -edge_x && ndc.x < -edge_x + eps.x) ndc.x = -edge_x;
     if (ndc.y <= 1.0 && ndc.y > 1.0 - eps.y) ndc.y = 1.0;
     if (ndc.y >= -1.0 && ndc.y < -1.0 + eps.y) ndc.y = -1.0;
     o.pos.xy = ndc * o.pos.w;
