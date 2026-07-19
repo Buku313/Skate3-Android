@@ -4245,10 +4245,13 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
                 .count();
         ring.push_back(
             {r.buffers.dyn_seq, now_s, std::move(r.buffers.ropa_verts)});
-        // 16 generations = ~114 ms at a 140 Hz guest: the 8-tap boxcar
-        // kernel reaches filter_w/2 (~25 ms) past the play clock (itself
-        // ~2 guest periods behind), plus decode-latency slack.
-        while (ring.size() > 16) {
+        // The 8-tap boxcar kernel reaches filter_w/2 (~25 ms) past the
+        // play clock (itself ~2 guest periods behind), plus decode-latency
+        // slack. Generations arrive per rendered frame while the cloth sim
+        // runs (the pose/shape pairing depends on that cadence), so the
+        // retention must scale with the highest supported render rate:
+        // 48 slots keep the kernel's ~55 ms reach covered up to ~800 fps.
+        while (ring.size() > 48) {
           ring.pop_front();
         }
         if (g_r.ropa_shapes.size() > 64) {
@@ -7925,7 +7928,21 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         g_r.ropa_ring_offset += (bytes + 255u) & ~255u;
         g_ropa_blend_drawn.fetch_add(1, std::memory_order_relaxed);
       } else {
+        // Fallback to the raw resident shape. Rate-limited detail log: an
+        // ALTERNATION of these with blended frames renders the garment
+        // hopping between the play-clock drape and the zero-lag drape.
         g_ropa_blend_miss.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_blend_miss_log{0};
+        const uint32_t ln =
+            s_blend_miss_log.fetch_add(1, std::memory_order_relaxed);
+        if (ln < 64 || (ln & 63u) == 0) {
+          REXLOG_INFO(
+              "native-scene: ropa blend MISS mesh={:08X} sc={} ng={} "
+              "total={:.2f} stride={} ring={} ring_off={} (n={})",
+              item.mesh, item.shape_count, ng, total, buffers.vb_view.stride,
+              rit != g_r.ropa_shapes.end() ? rit->second.size() : size_t(0),
+              g_r.ropa_ring_offset, ln);
+        }
       }
     }
     cmd->SetVertexBuffer(item_vbv.buffer, item_vbv.offset, item_vbv.size_bytes,

@@ -194,7 +194,9 @@ struct DrawItem {
   // filtered body left the same period-scaled mismatch; the two filters
   // answer the same 60 Hz limb signal with different frequency responses,
   // so the kernels must match exactly.
-  static constexpr int kShapeGens = 10;
+  // 16 = the hard bound: the 8-tap kernel contributes at most two distinct
+  // generations per tap, so no ingest cadence can overflow this.
+  static constexpr int kShapeGens = 16;
   uint64_t shape_seq[kShapeGens] = {};
   float shape_w[kShapeGens] = {};
   int shape_count = 0;

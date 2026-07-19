@@ -844,6 +844,14 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_mesh_revalidate, true, "Skate 3",
                     "Re-decode cached meshes when their payload fingerprint changes "
                     "(streaming arena reuse; also picks up CPU-animated buffers)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_char_track, false, "Skate 3",
+    "Per-frame diagnostic log line tracking the main character's body and "
+    "ropa garment through the motion-smoothing pipeline: pre/post-interp "
+    "reference positions, ring state, ingest/reset/claim events, resolved "
+    "mode, shape-kernel state, and the garment<->body offset. Heavy "
+    "(one line per rendered frame), for artifact diagnosis runs.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_smooth_camera, true, "Skate 3",
                     "Re-time the camera on the host clock: the guest publishes new "
                     "camera poses on its own sim tick (~170-240 Hz, irregular: "
@@ -5775,6 +5783,19 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   return true;
 }
 
+// Minimum time spacing (seconds) between dynamic-pose ring ingests. The
+// ring is consumed per CHANGE, and above ~200 fps the guest re-packs poses
+// every rendered frame; without a spacing floor the ring's fixed capacity
+// covers ever less real time as the frame rate climbs, until the smoothing
+// kernel's ~55 ms reach falls off the old end (the high-fps skater/board
+// rubberband). 3.5 ms keeps the kept signal finer than the guest's
+// ~200 Hz pose tick while bounding capacity use; at ~285 fps and below
+// every change still ingests, so the tuned mid-rate behavior is untouched.
+// Applies to POSE ingests only: ropa cloth-decode enqueues must NOT be
+// decimated (see the enqueue block; pose/shape pairing relies on their
+// per-frame cadence).
+constexpr double kMinDynIngestSpacing = 0.0035;
+
 // Interpolate the DYNAMIC items' per-draw state (bone palettes; rigid
 // non-identity world matrices) at the camera's playback time. Without this
 // the smoothed camera glides while the skater/NPCs/props snap at the guest
@@ -5788,12 +5809,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
   // Per-entity pose RING, like the camera's: the playback clock sits ~2 sim
   // periods behind `now`, so a two-pose history never brackets it (the
   // interpolation alpha pinned at 0 and entities rendered STALE STEPPED
-  // poses: "the skater still judders and looks blurry"). Sixteen poses
-  // cover ~115 ms at 140 fps: the camera filter pushes the play clock
-  // ~(W/2 + period) back AND the entity boxcar (below) reaches another W/2
-  // past that. The shared g_smooth_play keeps entities in phase with the
-  // camera.
-  constexpr int kRing = 16;
+  // poses, visible judder and motion blur). The camera filter
+  // pushes the play clock ~(W/2 + period) back AND the entity boxcar
+  // (below) reaches another W/2 past that (~55 ms total at the default
+  // 50 ms window). With ingests spaced at least kMinDynIngestSpacing apart,
+  // 24 slots guarantee >= ~80 ms of coverage at ANY render rate. The shared
+  // g_smooth_play keeps entities in phase with the camera.
+  constexpr int kRing = 24;
   struct DynPose {
     double t = 0.0;
     std::vector<float> b;  // bone palette (skinned), raw captured rows
@@ -5838,8 +5860,82 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
   // detached thread once the window closes.
   const bool bs_rec = BoneSigTick(now);
   static const float kIdent[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  // ---- char_track diagnostics (skate3_native_render_scene_char_track) ----
+  // One log line per frame following the main character's ropa garment and
+  // body through this function: which events fired, what the ring held, and
+  // where the item actually rendered. Selection: garment = nearest ropa
+  // item to the camera; body = the highest-bone-count skinned non-ropa
+  // character item within 5 m (bone count separates the body from the
+  // board/accessories at equal distance).
+  struct CharTrack {
+    int idx = -1;
+    float raw[3] = {};     // pre-interp reference position (bone 0 / world t)
+    int ing = 0;           // 1 = pose ingested, 2 = change skipped (spacing)
+    int rst = 0;           // discontinuity reset fired
+    int clm = 0;           // 1 = claimed another ring, 2 = fresh ring slot
+    int hold = 0;          // caster/retained hold replaced the pose
+    int raw_render = 0;    // 0 = interpolated; 1 = ring<3/stale, 2 = size
+                           // mismatch, 3 = hidden (unrepairable)
+    int ring_n = 0;        // ring occupancy at entry
+    float age_ms = -1.0f;  // ring-newest age at entry
+    float per_ms = -1.0f;  // ring period EMA
+    float ba = -1.0f;      // pair-lerp alpha at the playback point
+    int box = 0;           // took the 8-tap boxcar
+    int detach = 0;        // ropa DETACH repair fired
+    float sw = 0.0f;       // shape-kernel total weight (garment only)
+  };
+  CharTrack trk_shirt, trk_body;
+  const bool trk_on = REXCVAR_GET(skate3_native_render_scene_char_track);
+  if (trk_on) {
+    float best_s = 25.0f;  // 5 m gate, squared
+    uint32_t best_b_bones = 0;
+    float best_b_d2 = 25.0f;
+    for (size_t i = 0; i < scene.items.size(); ++i) {
+      const DrawItem& it = scene.items[i];
+      const bool skn = it.skinned && it.bones.size() >= 12;
+      float p[3];
+      if (skn) {
+        p[0] = it.bones[3];
+        p[1] = it.bones[7];
+        p[2] = it.bones[11];
+      } else {
+        p[0] = it.world[12];
+        p[1] = it.world[13];
+        p[2] = it.world[14];
+      }
+      const float dx = p[0] - scene.cam_pos[0];
+      const float dy = p[1] - scene.cam_pos[1];
+      const float dz = p[2] - scene.cam_pos[2];
+      const float d2 = dx * dx + dy * dy + dz * dz;
+      if (it.ropa) {
+        if (d2 < best_s) {
+          best_s = d2;
+          trk_shirt.idx = int(i);
+          std::memcpy(trk_shirt.raw, p, sizeof(p));
+        }
+      } else if (skn && it.char_family >= 1 && it.char_family <= 5 &&
+                 d2 < 25.0f) {
+        const uint32_t nb = uint32_t(it.bones.size() / 12);
+        if (nb > best_b_bones || (nb == best_b_bones && d2 < best_b_d2)) {
+          best_b_bones = nb;
+          best_b_d2 = d2;
+          trk_body.idx = int(i);
+          std::memcpy(trk_body.raw, p, sizeof(p));
+        }
+      }
+    }
+  }
   std::unordered_map<uint32_t, uint32_t> occurrence;
   for (DrawItem& item : scene.items) {
+    CharTrack* trk = nullptr;
+    if (trk_on) {
+      const int idx = int(&item - scene.items.data());
+      if (idx == trk_shirt.idx) {
+        trk = &trk_shirt;
+      } else if (idx == trk_body.idx) {
+        trk = &trk_body;
+      }
+    }
     const bool skinned = item.skinned && !item.bones.empty();
     const bool rigid_dyn =
         !skinned && std::memcmp(item.world, kIdent, sizeof(kIdent)) != 0;
@@ -5998,7 +6094,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       // tick (18 m/s at 60 Hz), while clone placements sit >= 0.78 m apart;
       // a rigid item with no history inside 0.3 m starts a fresh ring and
       // renders raw at its correct placement instead.
-      const float claim_cap = skinned ? 2.25f : 0.09f;
+      const float claim_cap = skinned || item.ropa ? 2.25f : 0.09f;
       float best = std::min(own_d2, claim_cap);
       DynHist* alt = nullptr;
       uint64_t alt_key = key;
@@ -6023,7 +6119,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       if (alt != nullptr) {
         hp = alt;
         key = alt_key;
+        if (trk != nullptr) {
+          trk->clm = 1;
+        }
       } else if (hp->seen == s_frame && fresh_k < 256) {
+        if (trk != nullptr) {
+          trk->clm = 2;
+        }
         // The k-th slot already belongs to another clone this frame and no
         // history matches: start a fresh ring instead of corrupting the
         // claimed one with interleaved poses.
@@ -6033,6 +6135,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     }
     DynHist& h = *hp;
     h.seen = s_frame;
+    if (trk != nullptr) {
+      trk->ring_n = h.count;
+      trk->per_ms = float(h.period * 1e3);
+      if (h.count > 0) {
+        trk->age_ms = float((now - h.ring[h.newest].t) * 1e3);
+      }
+    }
     if (skinned) {
       ensure_cen(h, item.bones.size() / 12);
     }
@@ -6141,12 +6250,33 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         }
       }
       item.bones = latest.b;
+      if (trk != nullptr) {
+        trk->hold = caster_stale_jump ? 2 : 1;
+      }
     }
     const bool changed =
         h.count == 0 ||
         (skinned ? latest.b != item.bones
                  : std::memcmp(latest.w, item.world, sizeof(item.world)) != 0);
-    if (changed) {
+    // Timestamp for a new ring pose: the camera sampler's latest sim tick
+    // when fresh; this entity's pose changed on the same sim tick, and
+    // frame-grid timestamps alias against the sim rate once the render
+    // loop is paced (the same problem the camera sampler solves). Frame
+    // time otherwise.
+    const double stamp =
+        (g_latest_cam_tick > 0.0 && now - g_latest_cam_tick < 0.02)
+            ? g_latest_cam_tick
+            : now;
+    // Ingest spacing floor: past ~285 fps the pose changes every rendered
+    // frame, FASTER than the ~200 Hz camera tick, so consecutive changed
+    // poses would stamp with the SAME tick time (degenerate interpolation
+    // spans: the collapsed-bone / cloth-shape pair-lerp alpha pins and the
+    // output steps once per slot) while the ring's real-time coverage
+    // shrinks below the kernel's reach. Changes closer than the floor to
+    // the newest slot are not ingested (their bytes still feed the repair
+    // and teleport gates); the next qualifying change carries the signal.
+    if (changed &&
+        !(h.count > 0 && stamp - latest.t < kMinDynIngestSpacing)) {
       // Discontinuities reset the history (pose-size change = LOD/garment
       // swap; long gap = the entity was gone). CRUCIALLY also a translation
       // jump no entity makes in one sim tick (> 1.5 m): clones pair by
@@ -6174,8 +6304,16 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           }
           // Rigid uses the same tight one-tick bound as the claim cap
           // above: 0.78 m clone placements sit inside the vehicles' 1.5 m
-          // gate, and lerping across a mispair IS the prop jitter.
-          discontinuity = d2 > (skinned ? 2.25f : 0.09f);
+          // gate, and lerping across a mispair IS the prop jitter. Ropa
+          // garments are EXEMPT from the tight bound even in rigid mode:
+          // they ride a character (verified entity-exact worlds, no clone
+          // twins to mispair with), and with ingests spaced at the floor a
+          // fast skater's world legitimately moves > 0.3 m between ring
+          // poses; the tight gate then resets the ring every ingest at
+          // speed and the garment renders raw/zero-lag while the body keeps
+          // its smoothed lag (the speed-scaled garment jumping). Genuine
+          // teleports/respawns still clear the 1.5 m character gate.
+          discontinuity = d2 > (skinned || item.ropa ? 2.25f : 0.09f);
           if (discontinuity && !skinned && d2 < 2.25f) {
             // A rigid step that only the tightened bound caught = a
             // close-clone mispair that would have LERPED (the prop jitter).
@@ -6192,18 +6330,18 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         }
         if (discontinuity) {
           h.count = 0;
+          if (trk != nullptr) {
+            trk->rst = 1;
+          }
         }
+      }
+      if (trk != nullptr) {
+        trk->ing = 1;
       }
       const double prev_t = h.count > 0 ? h.ring[h.newest].t : 0.0;
       h.newest = h.count == 0 ? 0 : (h.newest + 1) % kRing;
       DynPose& p = h.ring[h.newest];
-      // Timestamp with the camera sampler's latest sim tick when fresh:
-      // this entity's pose changed on the same sim tick, and frame-grid
-      // timestamps alias against the sim rate once the render loop is
-      // paced (the same problem the camera sampler solves).
-      p.t = (g_latest_cam_tick > 0.0 && now - g_latest_cam_tick < 0.02)
-                ? g_latest_cam_tick
-                : now;
+      p.t = stamp;
       if (prev_t > 0.0) {
         // Track the entity's OWN pose-change period (see DynHist::period).
         const double dt = p.t - prev_t;
@@ -6228,8 +6366,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
                       skinned ? item.bones.data() : item.world,
                       skinned ? uint32_t(item.bones.size()) : 16u);
       }
+    } else if (changed && trk != nullptr) {
+      trk->ing = 2;  // change withheld by the ingest spacing floor
     }
     if (h.count < 3 || now - h.ring[h.newest].t > 0.1) {
+      if (trk != nullptr) {
+        trk->raw_render = 1;
+      }
       continue;  // not enough history yet: raw stepped pose (one-time snap)
     }
     // Evaluate the ring's piecewise-linear pose signal at time tt into
@@ -6311,7 +6454,13 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       ok = accum_at(play_e, 1.0f, acc.data(), wacc);
     }
     if (!ok) {
+      if (trk != nullptr) {
+        trk->raw_render = 2;
+      }
       continue;  // palette-size mismatch in the window: raw pose this frame
+    }
+    if (trk != nullptr) {
+      trk->box = filter_w > 0.0005 && h.count >= 4 ? 1 : 0;
     }
     // Fast-spinning bones (skateboard wheels: hundreds of degrees inside
     // the window) COLLAPSE under componentwise averaging; the rotation
@@ -6346,6 +6495,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     const DynPose& q1 = h.ring[b_hi];
     const double bspan = std::max(q1.t - q0.t, 0.0005);
     const float ba = float(std::clamp((play_e - q0.t) / bspan, 0.0, 1.0));
+    if (trk != nullptr) {
+      trk->ba = ba;
+    }
     if (skinned) {
       if (q0.b.size() == item.bones.size() && q1.b.size() == item.bones.size()) {
         // Pass 1: flag collapsed bones (the churning staged-constant rows
@@ -6556,6 +6708,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             }
             item.world[15] = 1.0f;
             rigid_world_boxcar = false;
+            if (trk != nullptr) {
+              trk->detach = 1;
+            }
           }
         }
       }
@@ -6627,9 +6782,8 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           item.shape_w[item.shape_count] = wgt;
           ++item.shape_count;
         }
-        // Overflow: the weight is dropped; the draw renormalizes over the
-        // generations it has (kShapeGens=10 covers the 8-tap window's
-        // distinct brackets even at a 140 Hz guest).
+        // Unreachable: the 8 taps contribute at most two distinct
+        // generations each, and kShapeGens holds all 16.
       };
       if (rigid_world_boxcar &&
           REXCVAR_GET(skate3_native_render_scene_ropa_boxcar)) {
@@ -6653,11 +6807,89 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           add_gen(s1, a);
         }
       }
+      if (trk != nullptr) {
+        for (int k = 0; k < item.shape_count; ++k) {
+          trk->sw += item.shape_w[k];
+        }
+      }
     }
     if (bs_rec) {
       BoneSigAppend(1, key, now, play_e,
                     skinned ? item.bones.data() : item.world,
                     skinned ? uint32_t(item.bones.size()) : 16u);
+    }
+  }
+  // char_track emit: two lines per frame (body, then garment). rp = the
+  // pre-interp capture, fp = the post-interp (rendered) reference position,
+  // off = |garment - body| rendered offset; its frame-to-frame stability
+  // IS the artifact metric.
+  if (trk_on && (trk_shirt.idx >= 0 || trk_body.idx >= 0)) {
+    const auto fpos = [&](const CharTrack& t, const DrawItem*& it,
+                          float p[3]) {
+      it = nullptr;
+      p[0] = p[1] = p[2] = 0.0f;
+      if (t.idx < 0 || size_t(t.idx) >= scene.items.size()) {
+        return;
+      }
+      it = &scene.items[size_t(t.idx)];
+      if (it->skinned && it->bones.size() >= 12) {
+        p[0] = it->bones[3];
+        p[1] = it->bones[7];
+        p[2] = it->bones[11];
+      } else {
+        p[0] = it->world[12];
+        p[1] = it->world[13];
+        p[2] = it->world[14];
+      }
+    };
+    const DrawItem* si = nullptr;
+    const DrawItem* bi = nullptr;
+    float sp[3], bp[3];
+    fpos(trk_shirt, si, sp);
+    fpos(trk_body, bi, bp);
+    if (bi != nullptr) {
+      const CharTrack& t = trk_body;
+      REXLOG_INFO(
+          "char-track f={} body mesh={:08X} ctx={:08X} fam={} src={} cb={} "
+          "rp=({:.3f},{:.3f},{:.3f}) fp=({:.3f},{:.3f},{:.3f}) ring[n={} "
+          "age={:.1f} per={:.1f} ing={} rst={} clm={} hold={} raw={}] "
+          "ba={:.2f} box={} play={:.1f}",
+          s_frame, bi->mesh, bi->ctx, bi->char_family, bi->dbg_src,
+          bi->caster_bank ? 1 : 0, t.raw[0], t.raw[1], t.raw[2], bp[0], bp[1],
+          bp[2], t.ring_n, t.age_ms, t.per_ms, t.ing, t.rst, t.clm, t.hold,
+          t.raw_render, t.ba, t.box, (now - g_smooth_play) * 1e3);
+    }
+    if (si != nullptr) {
+      const CharTrack& t = trk_shirt;
+      float ent_t[3] = {0.0f, 0.0f, 0.0f};
+      int ent_ok = 0;
+      if (si->ctx != 0) {
+        float rows[12];
+        if (skate3::native_entity::ReadEntityWorldRows(base, si->ctx, rows)) {
+          ent_t[0] = rows[3];
+          ent_t[1] = rows[7];
+          ent_t[2] = rows[11];
+          ent_ok = 1;
+        }
+      }
+      const float off =
+          bi != nullptr
+              ? std::sqrt((sp[0] - bp[0]) * (sp[0] - bp[0]) +
+                          (sp[1] - bp[1]) * (sp[1] - bp[1]) +
+                          (sp[2] - bp[2]) * (sp[2] - bp[2]))
+              : -1.0f;
+      REXLOG_INFO(
+          "char-track f={} shirt mesh={:08X} ctx={:08X} fam={} src={} skn={} "
+          "cb={} rt={} rp=({:.3f},{:.3f},{:.3f}) fp=({:.3f},{:.3f},{:.3f}) "
+          "ent=({:.3f},{:.3f},{:.3f},{}) ring[n={} age={:.1f} per={:.1f} "
+          "ing={} rst={} clm={} hold={} raw={}] ba={:.2f} box={} sc={} "
+          "sw={:.2f} det={} off={:.3f}",
+          s_frame, si->mesh, si->ctx, si->char_family, si->dbg_src,
+          si->skinned && !si->bones.empty() ? 1 : 0, si->caster_bank ? 1 : 0,
+          si->retained ? 1 : 0, t.raw[0], t.raw[1], t.raw[2], sp[0], sp[1],
+          sp[2], ent_t[0], ent_t[1], ent_t[2], ent_ok, t.ring_n, t.age_ms,
+          t.per_ms, t.ing, t.rst, t.clm, t.hold, t.raw_render, t.ba, t.box,
+          si->shape_count, t.sw, t.detach, off);
     }
   }
   // Prune entities not seen recently (map otherwise grows with streaming).
@@ -8107,8 +8339,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // late instead of hitching the frame it streams in on. GuestTryCopy is
   // safe here: the game just drew from these payloads this frame.
   {
-    // mesh -> last enqueued fingerprint (guest render thread only). Static
-    // skinned meshes enqueue once; ropa every frame.
+    // mesh -> last enqueued dedup key (guest render thread only). Static
+    // skinned meshes enqueue once; ropa re-enqueues whenever its cloth
+    // payload changed: EVERY rendered frame while the sim runs. That
+    // cadence is load-bearing: each pose the interp ring ingests pairs with
+    // the SAME-frame generation via g_ropa_last_seq (a constant zero
+    // enqueue offset). Do not decimate these enqueues on a timer of their
+    // own; an enqueue clock that slips independently of the pose-ring
+    // ingest clock makes the pairing offset jitter by a frame, and the
+    // drape blends against shapes from the wrong instant (speed-scaled
+    // garment flicker). High-rate capacity lives in the CONSUMERS instead
+    // (the resident generation ring and kShapeGens).
     static std::unordered_map<uint32_t, uint64_t> s_dyn_fp_sent;
     static uint64_t s_dyn_seq = 0;
     if (s_dyn_fp_sent.size() > 4096) {
@@ -8139,8 +8380,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           ((item.ropa && item.skinned && !item.bones.empty()) ? 1u : 0u);
       const auto prev = s_dyn_fp_sent.find(item.mesh);
       const bool first_sight = prev == s_dyn_fp_sent.end();
-      const uint64_t prev_fp = first_sight ? 0 : prev->second;
-      if (!first_sight && prev_fp == fp_key) {
+      if (!first_sight && prev->second == fp_key) {
         continue;
       }
       DynDecodeJob job;
@@ -8155,7 +8395,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       if (!GuestTryCopy(job.ib.data(), base + item.ib_addr, job.ib.size())) {
         continue;
       }
-      s_dyn_fp_sent[item.mesh] = item.fingerprint;
+      s_dyn_fp_sent[item.mesh] = fp_key;
       if (item.ropa) {
         // The pose <-> shape pairing key (see DynPose::shape_seq). Recorded
         // at CREATION (the delay queue below postpones submission, not
