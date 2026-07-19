@@ -213,6 +213,7 @@ void SetRestartArgument(std::vector<std::string>& args, std::string name, std::s
 constexpr std::string_view kUserDirectoryName = "skate3";
 constexpr std::string_view kSettingsFilename = "settings.toml";
 constexpr std::string_view kDlcDirectoryName = "dlc";
+constexpr std::string_view kSavesDirectoryName = "saves";
 constexpr double kSixteenNineAspect = 16.0 / 9.0;
 constexpr double kUltrawideAspectEpsilon = 0.01;
 
@@ -806,6 +807,20 @@ void Skate3BaseApp::OnPostSetup() {
 
   if (std::getenv("SKATE3_DISABLE_BIG_ALIASES") == nullptr) {
     InstallBigDeviceAliases();
+  }
+  // Portable saves: a "saves" folder next to the executable takes over
+  // saved-game content when it exists (launcher-managed installs). Layout is
+  // flattened to saves/<xuid>/<save>; nothing is migrated from the user
+  // content tree, and without the folder the default location is unchanged.
+  {
+    const auto portable_saves =
+        rex::filesystem::GetExecutableFolder() / std::string(kSavesDirectoryName);
+    if (std::filesystem::is_directory(portable_saves) && runtime()->kernel_state() &&
+        runtime()->kernel_state()->content_manager()) {
+      runtime()->kernel_state()->content_manager()->SetContentTypeRoot(
+          rex::system::XContentType::kSavedGame, portable_saves);
+      REXLOG_INFO("Skate 3 saves: using portable folder {}", portable_saves.string());
+    }
   }
   InstallDlcPackages();
   InstallRecipeOverlay();
