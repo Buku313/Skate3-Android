@@ -2,7 +2,7 @@
 
 #include "native/skate3_native_entity.h"
 #include "native/skate3_native_lw.h"
-#include "native/skate3_native_v3_shadow.h"
+#include "native/skate3_native_palette.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
 
@@ -723,25 +723,12 @@ extern "C" REX_FUNC(sub_82B82E08) {
 extern "C" REX_FUNC(sub_82C9A618) {
   if (skate3::native_render::Enabled()) {
     skate3::native_scene::OnRegisterTexture(ctx.r4.u64, ctx.r5.u32);
-    skate3::native_v3::OnRegisterTexture(base, ctx.r4.u64, ctx.r5.u32);
   }
   __imp__sub_82C9A618(ctx, base);
 }
 
-// ---- v3 Phase 2 shadow-mode reader hooks (observers only; see
-// native/skate3_native_v3_shadow.h). Each fires POST-call so the structure
-// it reads is in its settled per-frame state.
-
-// RenderMan::RenderModeScene: the pass sequencer. At exit every
-// SceneRenderView has sorted and submitted its lists: the coherent per-frame
-// read point of the v3 architecture.
-extern "C" REX_FUNC(sub_827FF7D0) {
-  const uint32_t renderman = ctx.r3.u32;
-  __imp__sub_827FF7D0(ctx, base);
-  if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnRenderModeSceneExit(base, renderman);
-  }
-}
+// ---- palette snapshot hooks (native/skate3_native_palette.h). Each fires
+// POST-call, when m_matrices holds the settled packed upload palette.
 
 // cModelInstance::PackAndMultiplyMatricesForUpload(Matrix44& localToWorld):
 // post-call, m_matrices (+0x14) holds exactly the packed 4x3 column-major
@@ -750,61 +737,41 @@ extern "C" REX_FUNC(sub_827E5B30) {
   const uint32_t instance = ctx.r3.u32;
   __imp__sub_827E5B30(ctx, base);
   if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnPackPalette(base, instance);
+    skate3::native_palette::OnPackPalette(base, instance);
   }
 }
 
 // Sk8::UpdateBoneTransforms(cModelInstance* parts, uint count, Matrix44*
 // srcPalette, uint** remaps, Matrix44& out): r3 is an ARRAY of
-// cModelInstance part records (stride 0x28). The v3 shadow reader's
-// secondary instance enumeration (LOD pedestrians never reach the pack
-// function above).
+// cModelInstance part records (stride 0x28): the player skater's per-piece
+// palette source (its parts never reach the pack function above).
 extern "C" REX_FUNC(sub_827A52C8) {
   const uint32_t parts = ctx.r3.u32;
   const uint32_t count = ctx.r4.u32;
-  const uint32_t src_palette = ctx.r5.u32;
-  const uint32_t out_mat = ctx.r7.u32;
   __imp__sub_827A52C8(ctx, base);
   if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnBoneTransforms(base, parts, count, src_palette, out_mat);
+    skate3::native_palette::OnBoneTransforms(base, parts, count);
   }
 }
 
 // Sk8::cLivingWorldPresEntity::Update: post-call, this+528 holds the
 // entity's evaluated spawn/distance fade opacity (x = alpha), this+16 the
-// current LOD index. Feeds BOTH the v3 shadow fade comparison and the
-// LW entity store (per-instance ctx -> alpha/identity, the serving path).
+// current LOD index. Feeds the LW entity store (per-instance ctx ->
+// alpha/identity, the serving path).
 extern "C" REX_FUNC(sub_827C1188) {
   const uint32_t entity = ctx.r3.u32;
   __imp__sub_827C1188(ctx, base);
   if (skate3::native_render::Enabled()) {
     skate3::native_lw::OnLwEntityTick(base, entity);
-    skate3::native_v3::OnLivingWorldUpdate(base, entity);
   }
 }
 
-// Sk8::Actor::UpdateSkaterOpacity(float): post-call, Actor+1868 is the
-// animated current player-skater opacity.
-extern "C" REX_FUNC(sub_82594488) {
-  const uint32_t actor = ctx.r3.u32;
-  __imp__sub_82594488(ctx, base);
-  if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnSkaterOpacity(base, actor);
-  }
-}
-
-// Sk8::SkaterPresEntity::StartJobs: post-call, the per-garment ROPA CPU/GPU
-// mode fields and deformed-VB double buffer are the frame's live values.
-// Bracketed as a pack owner: UpdateBoneTransforms calls inside stamp their
-// snapshots with this entity.
+// Sk8::SkaterPresEntity::StartJobs, bracketed as a pack owner:
+// UpdateBoneTransforms calls inside stamp their snapshots with this entity.
 extern "C" REX_FUNC(sub_827825B0) {
-  const uint32_t skater = ctx.r3.u32;
-  const uint32_t prev_owner = skate3::native_v3::ExchangePackOwner(skater);
+  const uint32_t prev_owner = skate3::native_palette::ExchangePackOwner(ctx.r3.u32);
   __imp__sub_827825B0(ctx, base);
-  skate3::native_v3::ExchangePackOwner(prev_owner);
-  if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnRopaStartJobs(base, skater);
-  }
+  skate3::native_palette::ExchangePackOwner(prev_owner);
 }
 
 // Sk8::SkaterPresEntity::DoubleBuffer(garment index): runs once per
@@ -826,9 +793,9 @@ extern "C" REX_FUNC(sub_82783038) {
 // Bracketed as a pack owner so those snapshots carry the entity.
 extern "C" REX_FUNC(sub_82782818) {
   const uint32_t prev_owner =
-      skate3::native_v3::ExchangePackOwner(ctx.r3.u32);
+      skate3::native_palette::ExchangePackOwner(ctx.r3.u32);
   __imp__sub_82782818(ctx, base);
-  skate3::native_v3::ExchangePackOwner(prev_owner);
+  skate3::native_palette::ExchangePackOwner(prev_owner);
 }
 
 // Skater-family virtual UBT+Pack driver (vtable slot +16): the remaining
@@ -836,32 +803,25 @@ extern "C" REX_FUNC(sub_82782818) {
 // StartJobs/EndJobs pair). Bracketed as a pack owner.
 extern "C" REX_FUNC(sub_82785778) {
   const uint32_t prev_owner =
-      skate3::native_v3::ExchangePackOwner(ctx.r3.u32);
+      skate3::native_palette::ExchangePackOwner(ctx.r3.u32);
   __imp__sub_82785778(ctx, base);
-  skate3::native_v3::ExchangePackOwner(prev_owner);
+  skate3::native_palette::ExchangePackOwner(prev_owner);
 }
 
 // Sk8::RenderPresentation::AddEntityToRenderViews / RmvEntityFrmRenderViews
-// - r3 is the RenderPresentation instance itself: the direct capture source
-// for the RP pointer (the 0x83063C38/0x83063C60 scene globals read ZERO at
-// runtime; the chain assumption did not hold live). r4 is the
-// PresentationEntity being (de)registered: the identity store's
+// - r4 is the PresentationEntity being (de)registered: the identity store's
 // scene-membership/lifetime signal (native/skate3_native_entity.h).
 extern "C" REX_FUNC(sub_827A6C50) {
-  const uint32_t rp = ctx.r3.u32;
   const uint32_t entity = ctx.r4.u32;
   if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnRenderPresentation(base, rp);
     skate3::native_entity::OnEntityViewAdd(entity);
   }
   __imp__sub_827A6C50(ctx, base);
 }
 
 extern "C" REX_FUNC(sub_827A6CE8) {
-  const uint32_t rp = ctx.r3.u32;
   const uint32_t entity = ctx.r4.u32;
   if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnRenderPresentation(base, rp);
     skate3::native_entity::OnEntityViewRemove(entity);
   }
   __imp__sub_827A6CE8(ctx, base);
@@ -1237,14 +1197,14 @@ extern "C" REX_FUNC(sub_82B79FC0) {
 
 // LivingWorld batch pack writer (unnamed; called per entity per sim tick
 // from the tail of cLivingWorldPresEntityManager::Update), the LOD-
-// pedestrian skinning-palette source: fused UpdateBoneTransforms+Pack writing the
-// concatenated per-mesh 4x3 palettes into cModelInstance.m_matrices. r3 =
-// the cLivingWorldPresEntity-derived entity; post-call m_matrices holds the
-// packed rows.
+// pedestrian skinning-palette source: fused UpdateBoneTransforms+Pack
+// writing the concatenated per-mesh 4x3 palettes into
+// cModelInstance.m_matrices. r3 = the cLivingWorldPresEntity-derived
+// entity; post-call m_matrices holds the packed rows.
 extern "C" REX_FUNC(sub_827C1D38) {
   const uint32_t entity = ctx.r3.u32;
   __imp__sub_827C1D38(ctx, base);
   if (skate3::native_render::Enabled()) {
-    skate3::native_v3::OnLwPack(base, entity);
+    skate3::native_palette::OnLwPack(base, entity);
   }
 }

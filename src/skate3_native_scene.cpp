@@ -34,7 +34,7 @@
 #include "native/skate3_native_entity.h"
 #include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_lw.h"
-#include "native/skate3_native_v3_shadow.h"
+#include "native/skate3_native_palette.h"
 // Offline-compiled SPIR-V for the native shaders (compiled from the HLSL
 // sources with DXC): the Vulkan RHI backend consumes these blobs; the D3D12
 // backend runtime-compiles the embedded HLSL as before.
@@ -8167,14 +8167,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // refused/pending capture re-publishes with the cached palette (one frame
   // of pose lag instead of a one-frame disappearance).
   if (REXCVAR_GET(skate3_native_render_scene_dynamic_items)) {
-    // v3 Phase 3 palette flip: serve every mapped skinned character item its
-    // instance's own packed m_matrices rows (snapshotted at the game's
+    // Authoritative palette serve: give every mapped skinned character item
+    // its instance's own packed m_matrices rows (snapshotted at the game's
     // Pack/UpdateBoneTransforms exits, the exact bytes the VS upload
     // consumes; per piece, one sim tick, coherent by construction). Runs
     // FIRST so the sanity gate below validates the authoritative rows and
     // the rescue caches learn them; unmapped items keep the bank pipeline.
     const auto pal_t0 = PerfClock::now();
-    g_pal_served_frame = skate3::native_v3::ServeAuthoritativePalettes(base, scene);
+    g_pal_served_frame = skate3::native_palette::ServeAuthoritativePalettes(base, scene);
     g_frame_bpal_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    PerfClock::now() - pal_t0)
                                    .count());
@@ -9653,12 +9653,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     g_frame_draw_fetch.clear();
   }
 
-  // Frame tail: rotate the bone-palette snapshot ring (and run its optional
-  // shadow-mode compares). Timed as its own block in the perf line; this
-  // tail runs on the guest render thread, where spikes are visible stutter.
+  // Frame tail: rotate the bone-palette snapshot ring. Timed as its own
+  // block in the perf line; this tail runs on the guest render thread,
+  // where spikes are visible stutter.
   {
     const auto v3_t0 = PerfClock::now();
-    skate3::native_v3::OnFrameBuilt(base, records, count, scene);
+    skate3::native_palette::OnFrameBuilt();
     g_frame_v3_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  PerfClock::now() - v3_t0)
                                  .count());

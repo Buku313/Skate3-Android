@@ -13,7 +13,7 @@
 //    stride 0x50), mesh count = u16 at model+0x32. This is the alpha the
 //    character-family shaders output (c13.x / c21.x / c22.x / c20.x).
 //
-// The walk below mirrors SnapshotLwEntity (skate3_native_v3_shadow.cpp),
+// The walk below mirrors SnapshotLwEntity (skate3_native_palette.cpp),
 // whose ctx containment matching against DrawItem::ctx was live-proven
 // (measured zero unmapped palettes).
 
