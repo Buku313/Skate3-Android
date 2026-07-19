@@ -17,6 +17,52 @@
 
 #include <rex/logging.h>
 
+#include <cinttypes>
+#include <string>
+
+#include <rex/cvar.h>
+
+#include "generated/skate3_init.h"
+#include "skate3_screenshot.h"
+
+#if defined(_WIN32)
+#include <windows.h>
+// Xbox-controller capture combos (see the hotkey block): the artifacts under
+// investigation are too brief to reach the keyboard from the pad.
+#include <Xinput.h>
+#pragma comment(lib, "xinput9_1_0.lib")
+#endif
+
+REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_min_meshes, 0, "Skate 3",
+                     "One-shot guest memory snapshot: trigger on the first frame with at "
+                     "least this many RenderMesh submissions (0 = disabled)")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_frames, 4, "Skate 3",
+                     "Number of frames of RenderMesh records to collect before writing "
+                     "the snapshot")
+    .range(1, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Defined in skate3_native_scene.cpp (the recording filter lives there).
+REXCVAR_DECLARE(bool, skate3_native_render_snapshot_all_draws);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_photo_compose_trace, false, "Skate 3",
+    "Auto-capture an F10-style diagnostic recording (all draws, ~360 "
+    "frames + memory snapshot) the first time a photo display card comes "
+    "up in a session. Captures the game's one-shot framed-card compose "
+    "pass: its draws, source textures (frame art / logo / caption) and "
+    "geometry, for offline analysis. Writes ~100 MB into "
+    "native_render_snapshots once per session.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_snapshot_stride, 1, "Skate 3",
+                     "Record every Nth frame while collecting (long viewer recordings: "
+                     "e.g. 12 = ~12 recorded frames/sec at 144fps)")
+    .range(1, 32)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(skate3_native_render_snapshot_dir, "native_render_snapshots", "Skate 3",
+                      "Directory for native-render guest memory snapshots and metadata")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace skate3::native_scene {
 
 // ---- Offline-analysis recording ---------------------------------------------
@@ -394,4 +440,391 @@ void SynPanView(double angle_deg, float view_out[16]) {
   view_out[15] = 1.0f;
 }
 
+
+// ---- Frame-end capture diagnostics (hotkeys + guest-memory snapshots) ------
+// Moved verbatim from the frame-boundary hook: arming (cvar/hotkey/pad/
+// trigger-file/photo-trace), per-frame record collection, and the .gsnap +
+// metadata writers. Runs under the hook layer's record lock.
+
+namespace {
+
+struct FrameRecords {
+  uint64_t frame_index;
+  std::vector<SubmitRecord> records;
+};
+std::vector<FrameRecords> g_collected_frames;
+uint64_t g_collect_counter = 0;
+bool g_collecting = false;
+// F10 immediate mode: capture exactly one frame regardless of the snapshot
+// frames/stride cvars.
+bool g_immediate = false;
+bool g_snapshot_written = false;
+
+std::filesystem::path SnapshotDir() {
+  std::filesystem::path dir{std::string(REXCVAR_GET(skate3_native_render_snapshot_dir))};
+  if (dir.empty()) {
+    dir = "native_render_snapshots";
+  }
+  return dir;
+}
+
+std::string SnapshotStem() {
+  const auto now = std::chrono::system_clock::now();
+  const auto seconds =
+      std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+  char stem[64];
+  std::snprintf(stem, sizeof(stem), "snapshot_%" PRId64, static_cast<int64_t>(seconds));
+  return stem;
+}
+
+// Guest memory snapshot format (.gsnap):
+//   char magic[8] = "SK3GSNP1"
+//   repeated regions: u64 guest_offset (little-endian), u64 size, raw bytes
+//   terminator region: guest_offset == 0xFFFFFFFFFFFFFFFF, size == 0
+// guest_offset is the offset from the guest base mapping. Guest virtual
+// address A maps to file region offset A for A < 0xE0000000 and A + 0x1000
+// above that (REX_PHYS_HOST_OFFSET physical mirror shift).
+bool WriteMemorySnapshot(uint8_t* base, const std::filesystem::path& path) {
+#if defined(_WIN32)
+  std::ofstream out(path, std::ios::binary);
+  if (!out) {
+    REXLOG_ERROR("native-render snapshot: cannot open {}", path.string());
+    return false;
+  }
+  out.write("SK3GSNP1", 8);
+
+  uint64_t total_bytes = 0;
+  uint32_t region_count = 0;
+  uint64_t offset = 0;
+  while (offset < REX_MEMORY_SIZE) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(base + offset, &info, sizeof(info)) == 0) {
+      break;
+    }
+    const uint64_t region_size = static_cast<uint64_t>(info.RegionSize);
+    const bool readable =
+        info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 &&
+        (info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
+    if (readable) {
+      const uint64_t clamped =
+          region_size > REX_MEMORY_SIZE - offset ? REX_MEMORY_SIZE - offset : region_size;
+      out.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
+      out.write(reinterpret_cast<const char*>(&clamped), sizeof(clamped));
+      out.write(reinterpret_cast<const char*>(base + offset),
+                static_cast<std::streamsize>(clamped));
+      total_bytes += clamped;
+      ++region_count;
+    }
+    offset += region_size;
+  }
+
+  const uint64_t terminator_offset = ~0ull;
+  const uint64_t terminator_size = 0;
+  out.write(reinterpret_cast<const char*>(&terminator_offset), sizeof(terminator_offset));
+  out.write(reinterpret_cast<const char*>(&terminator_size), sizeof(terminator_size));
+  out.close();
+  if (!out) {
+    REXLOG_ERROR("native-render snapshot: write failed for {}", path.string());
+    return false;
+  }
+  REXLOG_INFO("native-render snapshot: {} regions, {} MiB -> {}", region_count,
+              total_bytes >> 20, path.string());
+  return true;
+#else
+  (void)base;
+  REXLOG_WARN("native-render snapshot: only implemented on Windows, skipping {}",
+              path.string());
+  return false;
+#endif
+}
+
+bool WriteMetadata(const std::filesystem::path& path,
+                   const std::vector<FrameRecords>& frames) {
+  std::ofstream out(path);
+  if (!out) {
+    REXLOG_ERROR("native-render snapshot: cannot open {}", path.string());
+    return false;
+  }
+  out << "{\"type\":\"header\",\"image_base\":\"0x82000000\","
+      << "\"phys_mirror_note\":\"guest addr A -> file offset A, plus 0x1000 for A >= "
+         "0xE0000000\","
+      << "\"record_fields\":[\"kind\",\"a\",\"b\",\"c\"],"
+      << "\"kinds\":{\"0\":\"RenderMesh a=ctx b=vps c=dyn\",\"1\":\"SceneDrawList a=ctx "
+         "b=list_offset c=view\",\"2\":\"WorldPathCapture a=ctx b=view c=dyn\","
+         "\"3\":\"QuadListDraw a=key c=dyn\"}}\n";
+  for (const FrameRecords& frame : frames) {
+    out << "{\"type\":\"frame\",\"index\":" << frame.frame_index << ",\"records\":[";
+    for (size_t i = 0; i < frame.records.size(); ++i) {
+      const SubmitRecord& r = frame.records[i];
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%s[%u,\"%08X\",\"%08X\",\"%08X\"]", i ? "," : "",
+                    r.kind, r.a, r.b, r.c);
+      out << buf;
+    }
+    out << "]}\n";
+  }
+  out.close();
+  return static_cast<bool>(out);
+}
+
+void WriteSnapshotLocked(uint8_t* base) {
+  const std::filesystem::path dir = SnapshotDir();
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  const std::string stem = SnapshotStem();
+  const bool meta_ok = WriteMetadata(dir / (stem + ".meta.jsonl"), g_collected_frames);
+  const bool snap_ok = WriteMemorySnapshot(base, dir / (stem + ".gsnap"));
+  WriteRecording(dir.string().c_str(), stem.c_str());
+  REXLOG_INFO("native-render snapshot: {} ({} frames of records, meta_ok={} snap_ok={})",
+              stem, g_collected_frames.size(), meta_ok, snap_ok);
+  g_collected_frames.clear();
+  g_snapshot_written = true;
+}
+
+}  // namespace
+
+bool SnapshotWritten() { return g_snapshot_written; }
+
+void OnCaptureFrameEnd(uint8_t* base, uint64_t frame_index,
+                       std::vector<SubmitRecord>& current_frame) {
+  const size_t mesh_count = current_frame.size();
+  if (!g_snapshot_written) {
+    const int32_t min_meshes = REXCVAR_GET(skate3_native_render_snapshot_min_meshes);
+    if (!g_collecting && min_meshes > 0 &&
+        mesh_count >= static_cast<size_t>(min_meshes)) {
+      g_collecting = true;
+      g_collect_counter = 0;
+      StartRecording(
+          uint32_t(REXCVAR_GET(skate3_native_render_snapshot_stride)));
+      REXLOG_INFO("native-render snapshot: armed at frame {} ({} meshes)", frame_index,
+                  mesh_count);
+    }
+  }
+  // Manual triggers (work repeatedly): press F9 (window recording per the
+  // snapshot cvars), F10 (IMMEDIATE single-frame capture: full memory
+  // snapshot + this frame's records/draws, for catching a broken object the
+  // moment it is on screen), or create <snapshot_dir>\trigger.
+#if defined(_WIN32)
+  if (!g_collecting) {
+    static bool f9_was_down = false;
+    const bool f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9_down && !f9_was_down) {
+      g_collecting = true;
+      g_collect_counter = 0;
+      StartRecording(
+          uint32_t(REXCVAR_GET(skate3_native_render_snapshot_stride)));
+      REXLOG_INFO("native-render snapshot: F9, armed at frame {} ({} meshes)",
+                  frame_index, mesh_count);
+    }
+    f9_was_down = f9_down;
+    // F8: flush the native texture + mesh caches. Debug/bisect aid, and the
+    // reproducible worst-case decode burst for perf work (everything visible
+    // re-decodes at once; the decode workers should absorb it with a brief
+    // white/pop-in instead of a render-thread freeze).
+    static bool f8_was_down = false;
+    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (f8_down && !f8_was_down) {
+      FlushTextureCache();
+      FlushMeshCache();
+      REXLOG_INFO("native-render: F8, texture + mesh caches flushed");
+    }
+    f8_was_down = f8_down;
+    // F7: dump the rolling scene-composition ring (last ~900 frames of
+    // per-item signatures); press within a few seconds of SEEING a 1-2
+    // frame artifact; diffing the artifact frame against neighbors in the
+    // CSV names the item that flashed.
+    static bool f7_was_down = false;
+    const bool f7_down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (f7_down && !f7_was_down) {
+      RequestSceneRingDump();
+      REXLOG_INFO("native-render: F7, scene ring dump requested");
+    }
+    f7_was_down = f7_down;
+    static bool f10_was_down = false;
+    const bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (f10_down && !f10_was_down) {
+      g_collecting = true;
+      g_immediate = true;
+      g_collect_counter = 0;
+      StartRecording(1);
+      // Simultaneous screenshot: the recorded scene/draw data alone cannot
+      // prove what was on screen (render-stage state is not captured);
+      // the paired PNG anchors every diagnostic to the visible frame.
+      skate3::screenshot::CaptureWindow(skate3::screenshot::RememberedWindow(),
+                                        "f10");
+      REXLOG_INFO("native-render snapshot: F10, immediate single-frame capture at frame {}",
+                  frame_index);
+    }
+    f10_was_down = f10_down;
+    // Xbox controller capture combos (the artifacts are too brief to reach
+    // the keyboard from the pad): RB+X = F10-style immediate capture,
+    // RB+A = F7 scene-ring dump (retroactive ~17 s, so a slightly late
+    // press still contains the flash frame). Pad 0; disconnected pads
+    // re-probe on a backoff; XInputGetState is slow for absent devices.
+    {
+      static bool combo_x_was = false;
+      static bool combo_a_was = false;
+      static uint32_t pad_retry = 0;
+      static bool pad_seen = true;
+      if (pad_seen || ++pad_retry >= 240) {
+        pad_retry = 0;
+        XINPUT_STATE xs{};
+        if (XInputGetState(0, &xs) == ERROR_SUCCESS) {
+          pad_seen = true;
+          const WORD b = xs.Gamepad.wButtons;
+          const bool rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+          const bool cx = rb && (b & XINPUT_GAMEPAD_X) != 0;
+          const bool ca = rb && (b & XINPUT_GAMEPAD_A) != 0;
+          if (cx && !combo_x_was) {
+            g_collecting = true;
+            g_immediate = true;
+            g_collect_counter = 0;
+            StartRecording(1);
+            skate3::screenshot::CaptureWindow(
+                skate3::screenshot::RememberedWindow(), "rbx");
+            REXLOG_INFO(
+                "native-render snapshot: RB+X, immediate single-frame capture "
+                "at frame {}",
+                frame_index);
+          }
+          combo_x_was = cx;
+          if (ca && !combo_a_was) {
+            RequestSceneRingDump();
+            REXLOG_INFO("native-render: RB+A, scene ring dump requested");
+          }
+          combo_a_was = ca;
+        } else {
+          pad_seen = false;
+          combo_x_was = combo_a_was = false;
+        }
+      }
+    }
+  }
+  // F11: paired A/B parity capture; one keypress produces
+  // shot_<ts>_native.png + shot_<ts>_emulated.png (same viewpoint, ~half a
+  // second apart while the renderer toggles) + an immediate F10-style
+  // capture taken back in native mode. Sequenced across guest frames so
+  // each renderer has settled before its screenshot (the emulated pipeline
+  // needs to recompose after suppression lifts).
+  {
+    enum class AbState { kIdle, kNativeSettle, kEmulatedSettle, kBackToNative };
+    static AbState ab_state = AbState::kIdle;
+    static uint64_t ab_resume_frame = 0;
+    static char ab_tag[24] = {};
+    static bool f11_was_down = false;
+    const bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    constexpr uint64_t kSettleFrames = 60;
+    switch (ab_state) {
+      case AbState::kIdle:
+        if (f11_down && !f11_was_down && !g_collecting) {
+          const std::time_t t = std::time(nullptr);
+          std::tm tm{};
+          localtime_s(&tm, &t);
+          std::snprintf(ab_tag, sizeof(ab_tag), "%02d%02d%02d", tm.tm_hour, tm.tm_min,
+                        tm.tm_sec);
+          // Ensure the sequence starts in NATIVE mode (the gsnap capture at
+          // the end must record native-path scene data).
+          if (!Enabled()) {
+            ToggleSceneEnabled();
+          }
+          ab_state = AbState::kNativeSettle;
+          ab_resume_frame = frame_index + kSettleFrames;
+          REXLOG_INFO("native-render A/B capture: F11, tag {}", ab_tag);
+        }
+        break;
+      case AbState::kNativeSettle:
+        if (frame_index >= ab_resume_frame) {
+          char tag[40];
+          std::snprintf(tag, sizeof(tag), "%s_native", ab_tag);
+          skate3::screenshot::CaptureWindow(skate3::screenshot::RememberedWindow(), tag);
+          ToggleSceneEnabled();  // -> emulated
+          ab_state = AbState::kEmulatedSettle;
+          ab_resume_frame = frame_index + kSettleFrames;
+        }
+        break;
+      case AbState::kEmulatedSettle:
+        if (frame_index >= ab_resume_frame) {
+          char tag[40];
+          std::snprintf(tag, sizeof(tag), "%s_emulated", ab_tag);
+          skate3::screenshot::CaptureWindow(skate3::screenshot::RememberedWindow(), tag);
+          ToggleSceneEnabled();  // -> native
+          ab_state = AbState::kBackToNative;
+          ab_resume_frame = frame_index + kSettleFrames;
+        }
+        break;
+      case AbState::kBackToNative:
+        if (frame_index >= ab_resume_frame && !g_collecting) {
+          g_collecting = true;
+          g_immediate = true;
+          g_collect_counter = 0;
+          StartRecording(1);
+          REXLOG_INFO(
+              "native-render A/B capture: screenshots tagged {} done, immediate "
+              "capture armed",
+              ab_tag);
+          ab_state = AbState::kIdle;
+        }
+        break;
+    }
+    f11_was_down = f11_down;
+  }
+#endif
+  if (!g_collecting && frame_index % 32 == 0) {
+    const std::filesystem::path trigger = SnapshotDir() / "trigger";
+    std::error_code ec;
+    if (std::filesystem::exists(trigger, ec)) {
+      std::filesystem::remove(trigger, ec);
+      g_collecting = true;
+      g_collect_counter = 0;
+      StartRecording(
+          uint32_t(REXCVAR_GET(skate3_native_render_snapshot_stride)));
+      REXLOG_INFO("native-render snapshot: trigger file, armed at frame {} ({} meshes)",
+                  frame_index, mesh_count);
+    }
+  }
+  // Photo display-card compose auto-trace: the first time the framed card
+  // comes up in a session, record EVERY draw for ~360 frames + the memory
+  // snapshot; the game's one-shot card compose (frame art / logo / caption
+  // stamped over the photo) fires at an unpredictable moment within this
+  // window, and the capture pins its draws, source textures and geometry.
+  if (!g_collecting && REXCVAR_GET(skate3_native_render_photo_compose_trace)) {
+    static bool s_compose_trace_done = false;
+    if (!s_compose_trace_done && PhotoCardVisible()) {
+      s_compose_trace_done = true;
+      REXCVAR_SET(skate3_native_render_snapshot_frames, 360);
+      REXCVAR_SET(skate3_native_render_snapshot_stride, 1);
+      REXCVAR_SET(skate3_native_render_snapshot_all_draws, true);
+      g_collecting = true;
+      g_collect_counter = 0;
+      StartRecording(1);
+      REXLOG_INFO(
+          "native-render snapshot: photo display card up - compose trace "
+          "armed at frame {} (360 frames, all draws; snapshot cvars stay "
+          "changed for this session)",
+          frame_index);
+    }
+  }
+  if (g_collecting) {
+    // Immediate (F10) captures skip the arming frame: the scene-side
+    // recording was only armed after this frame's BuildFrameScene ran, so
+    // the first fully-recorded frame is the next one.
+    const auto stride = g_immediate
+        ? uint64_t(2)
+        : static_cast<uint64_t>(REXCVAR_GET(skate3_native_render_snapshot_stride));
+    if (++g_collect_counter % stride == 0) {
+      g_collected_frames.push_back({frame_index, std::move(current_frame)});
+      const auto wanted = g_immediate
+          ? size_t(1)
+          : static_cast<size_t>(REXCVAR_GET(skate3_native_render_snapshot_frames));
+      if (g_collected_frames.size() >= wanted) {
+        g_collecting = false;
+        g_immediate = false;
+        WriteSnapshotLocked(base);
+      }
+    }
+  }
+}
+
 }  // namespace skate3::native_scene
+

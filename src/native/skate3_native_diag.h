@@ -20,6 +20,16 @@
 
 namespace skate3::native_scene {
 
+// ---- Frame-end capture diagnostics (skate3_native_diagnostics.cpp) --------
+// Hotkey/cvar/pad-armed guest-memory snapshots (.gsnap + metadata) and the
+// per-frame record collection windows. Called from the frame-boundary hook
+// under its record lock; may move the frame's records into an open capture
+// window. SnapshotWritten() reports whether a one-shot snapshot completed.
+void OnCaptureFrameEnd(uint8_t* base, uint64_t frame_index,
+                       std::vector<SubmitRecord>& current_frame);
+bool SnapshotWritten();
+
+
 // ---- Offline-analysis recording (see StartRecording/WriteRecording) --------
 // The full per-draw constant bank stream is the ground truth for what the
 // game's shaders saw; the per-frame item lists are what our pipeline made of
