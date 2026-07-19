@@ -57,45 +57,10 @@ cbuffer C : register(b0) {
   float4 vs2;   // tonemap: xyz = sun direction in AO view space (toward the
                 // sun), w = haze density (1 / view unit)
 };
-// Per-frame shadow constant slice (the scene pass's b1; see scene.hlsl for
-// the authoritative layout); ps_vol_shafts samples sun visibility with the
-// exact receiver math the materials use. Declared through the native static
-// sun-shadow rows; the water/ocean material rows in between are padding.
-cbuffer S : register(b1) {
-  float4 sh_x;      // light-space X row (xyz) + translation (w)
-  float4 sh_y;      // light-space Y row
-  float4 sh_z;      // depth row (height ramp)
-  float4 sh_c1;     // cascade 1 scale.xy + offset.zw
-  float4 sh_c2;     // cascade 2 scale.xy + offset.zw
-  float4 sh_color;  // shadow color rgb + luma
-  float4 sh_misc;   // x = depth bias, y = enable, zw = atlas dimensions
-  float4 sh_sun;    // xyz = sun direction (toward the sun), w = exposure
-  float4 sh_env;
-  float4 sh_fogp;
-  float4 sh_fogc;
-  float4 dyn_sun;
-  float4 dyn_amb;
-  float4 dyn_misc;  // y = static world-shadow floor
-  float4 sh_char;
-  float4 sh_v2;
-  float4 dyn_wsx;   // static world-shadow rows: u = dot(wp4, wsx)*0.5+0.5,
-  float4 dyn_wsy;   // v = dot(wp4, wsy)*-0.5+0.5,
-  float4 dyn_wsz;   // ray depth = dot(wp4, wsz)
-  // Rows 19-33 carry water/ocean material state, not consumed here.
-  float4 s_water[15];
-  float4 sh_pcss;   // contact-hardening knobs (surface receivers only)
-  float4 sh_pcss2;
-  // Native static sun-shadow map transform (authoritative layout and
-  // receiver math in scene.hlsl SampleStaticSun): world -> far-tile rows
-  // uc = dot(nsm_*.xyz, wp) + nsm_*.w, depth = dot(nsm_z.xyz, wp) + nsm_z.w.
-  // nsm_p.x = strength (0 = feature off / map not rendered this frame),
-  // nsm_p2.x = base receiver bias, nsm_p2.w = tile size in pixels.
-  float4 nsm_x;
-  float4 nsm_y;
-  float4 nsm_z;
-  float4 nsm_p;
-  float4 nsm_p2;
-};
+// Per-frame shadow / lighting constant slice (the scene pass's b1) -
+// ps_vol_shafts samples sun visibility with the exact receiver rows
+// the materials use.
+#include "scene_frame_cb.hlsli"
 Texture2D<float4> tex0 : register(t0);  // per-pass primary input
 #ifdef VOL_MSAA
 Texture2DMS<float> depth_ms : register(t0);  // ps_vol_linearize MSAA depth

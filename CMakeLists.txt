@@ -286,6 +286,10 @@ set(SKATE3_NATIVE_SHADER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/hdr.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ssr.hlsl
 )
+# Shared .hlsli headers, inlined into the embedded sources by
+# EmbedShaders.cmake: the embed must rerun when any of them changes.
+file(GLOB SKATE3_NATIVE_SHADER_INCLUDES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/*.hlsli)
 set(SKATE3_NATIVE_SHADER_HEADER
     ${CMAKE_CURRENT_BINARY_DIR}/include/skate3_native_shaders.h)
 add_custom_command(
@@ -295,6 +299,7 @@ add_custom_command(
         -DOUT=${SKATE3_NATIVE_SHADER_HEADER}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake
     DEPENDS ${SKATE3_NATIVE_SHADER_SOURCES}
+        ${SKATE3_NATIVE_SHADER_INCLUDES}
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake
     COMMENT "Embedding native renderer shaders"
     VERBATIM)

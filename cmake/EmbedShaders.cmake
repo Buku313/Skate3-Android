@@ -38,6 +38,26 @@ string(APPEND content "#pragma once\n\n")
 
 foreach(var file IN ZIP_LISTS SHADER_VARS SHADER_FILES)
     file(READ "${SHADER_DIR}/${file}" src)
+    # Inline `#include "x.hlsli"` directives so every embedded shader stays a
+    # single self-contained string: the D3D12 backend hands the text to
+    # D3DCompile without an include handler, and the shader bytecode cache
+    # hashes the full text; pre-expanding means an include edit changes the
+    # embedded source and invalidates cached bytecode naturally. The loop
+    # rescans after each replacement, so nested includes expand too; the
+    # iteration guard catches cycles.
+    set(guard 0)
+    while(src MATCHES "#include \"([^\"]+)\"")
+        set(inc "${CMAKE_MATCH_1}")
+        if(NOT EXISTS "${SHADER_DIR}/${inc}")
+            message(FATAL_ERROR "${file}: include not found: ${inc}")
+        endif()
+        file(READ "${SHADER_DIR}/${inc}" inc_src)
+        string(REPLACE "#include \"${inc}\"" "${inc_src}" src "${src}")
+        math(EXPR guard "${guard} + 1")
+        if(guard GREATER 32)
+            message(FATAL_ERROR "${file}: include expansion did not converge (cycle?)")
+        endif()
+    endwhile()
     string(FIND "${src}" ")__hlsl__" collision)
     if(NOT collision EQUAL -1)
         message(FATAL_ERROR "${file} contains the raw-string delimiter )__hlsl__")
