@@ -830,8 +830,8 @@ float4 ps_main(VSOut i) : SV_Target {
           // the console fetches the nm at its 640p gradient LOD (blurrier,
           // weaker bump tilts), so the matching bias is the remaining
           // reflection-rotation candidate. Default stays SHARP (bias 0):
-          // an unconditional misc.y bias visibly degraded the glass;
-          // tune with the
+          // an unconditional misc.y bias visibly degraded the glass
+          // reflections; tune with the
           // slider first, promote the found value to a default after.
           float nm_bias = misc.z > 5.5 ? misc.w : 0.0;
           float3 nmv = normal_map.SampleBias(smp, i.uv, nm_bias).rgb;
