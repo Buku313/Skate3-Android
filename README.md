@@ -68,7 +68,8 @@ The builds include an experimental true ultrawide mode: the native renderer draw
 
 ## Controls
 
-- Standard Xbox controls using an Xbox controller are the preferred and main input method. DualShock and others are untested, but are likely to work with Steam Input through XInput.
+- Standard Xbox controls using an Xbox controller are the preferred and main input method.
+- PlayStation (DualShock/DualSense), Switch and most generic controllers are supported through the SDL controller backend: set Settings > Controls > Controller Backend to SDL and restart the game. Steam Input through XInput also works. On Linux and macOS the SDL backend is always used, so these controllers work out of the box.
 - Keyboard controls can be enabled in the game settings menu.
 - Press Escape on keyboard or (RB + Start) on the controller to open the game settings menu. The chord can be changed in Settings > Controls.
 
