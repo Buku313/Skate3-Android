@@ -217,9 +217,21 @@ bool ReadStableTexWords(uint8_t* base, uint32_t tex_ptr, uint32_t out[6]) {
 // Store LRU eviction, run once per frame: superseded words states (old mip
 // levels, pre-demote detail sets, one-shot UI art) hold SRV slots + GPU
 // memory until nothing has routed to them for a while. Never evicts
-// entries touched within the last few frames.
+// entries touched within the last few frames. Amortized: once over the cap,
+// a bounded batch of oldest entries goes per frame until the store is back
+// under the low-water mark (the previous evict-half-in-one-frame sweep
+// retired ~1500 textures in a single frame, a measured recurring hitch).
+constexpr size_t kTexEvictPerFrame = 64;
+
 void EvictTexStore(uint64_t frame_number, uint64_t submission) {
-  if (g_r.tex_store.size() <= kTexStoreCap) {
+  static bool s_evicting = false;
+  const size_t low_water = kTexStoreCap - kTexStoreCap / 8;
+  if (g_r.tex_store.size() > kTexStoreCap) {
+    s_evicting = true;
+  } else if (g_r.tex_store.size() <= low_water) {
+    s_evicting = false;
+  }
+  if (!s_evicting) {
     return;
   }
   std::vector<std::pair<uint64_t, uint64_t>> ages;  // (last-used frame, key)
@@ -229,8 +241,8 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
       ages.emplace_back(t.last_used_frame, k);
     }
   }
-  const size_t excess = g_r.tex_store.size() - kTexStoreCap / 2;
-  const size_t n = std::min(ages.size(), excess);
+  const size_t excess = g_r.tex_store.size() - low_water;
+  const size_t n = std::min({ages.size(), excess, kTexEvictPerFrame});
   if (n == 0) {
     return;
   }
@@ -243,6 +255,53 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
     }
   }
   g_store_evicted.fetch_add(n, std::memory_order_relaxed);
+}
+
+// Mesh cache LRU, same amortized shape: without it every streamed arena's
+// meshes accumulated for the whole session (observed: 61k live buffers
+// after a few minutes of map changes). The age guard keeps everything the
+// camera might re-reveal quickly; an evicted mesh re-decodes on the workers
+// like any first sight (1-2 frames late for a freshly revealed area, the
+// normal streaming behavior).
+constexpr size_t kMeshStoreCap = 6144;
+constexpr size_t kMeshEvictPerFrame = 64;
+// Must exceed the NSM rebuild cadence (600 frames) with margin: cascade
+// casters outside the view frustum are only touched at rebuilds.
+constexpr uint64_t kMeshEvictMinIdleFrames = 1800;
+
+void EvictMeshStore(uint64_t frame_number) {
+  static bool s_evicting = false;
+  const size_t low_water = kMeshStoreCap - kMeshStoreCap / 8;
+  if (g_r.meshes.size() > kMeshStoreCap) {
+    s_evicting = true;
+  } else if (g_r.meshes.size() <= low_water) {
+    s_evicting = false;
+  }
+  if (!s_evicting) {
+    return;
+  }
+  std::vector<std::pair<uint64_t, uint32_t>> ages;  // (last-used frame, key)
+  ages.reserve(g_r.meshes.size());
+  for (const auto& [k, m] : g_r.meshes) {
+    if (m.last_used_frame + kMeshEvictMinIdleFrames < frame_number) {
+      ages.emplace_back(m.last_used_frame, k);
+    }
+  }
+  const size_t excess = g_r.meshes.size() - low_water;
+  const size_t n = std::min({ages.size(), excess, kMeshEvictPerFrame});
+  if (n == 0) {
+    return;
+  }
+  std::nth_element(ages.begin(), ages.begin() + (n - 1), ages.end());
+  for (size_t i = 0; i < n; ++i) {
+    const auto it = g_r.meshes.find(ages[i].second);
+    if (it != g_r.meshes.end()) {
+      g_r.device->DestroyDeferred(it->second.vb);
+      g_r.device->DestroyDeferred(it->second.ib);
+      g_r.ropa_shapes.erase(it->first);
+      g_r.meshes.erase(it);
+    }
+  }
 }
 
 // ---- Staged texture decode (worker-thread half) ---------------------------
@@ -293,6 +352,12 @@ void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
   }
   context.cmd->Barrier(gt.texture, nrhi::ResourceState::kCopyDest,
                        nrhi::ResourceState::kPixelShaderResource);
+  // The copies are recorded; the staging buffer has no further use (the
+  // in-place update path recreates its own on demand), and holding it for
+  // the cache entry's lifetime doubled the store's memory. Destruction is
+  // deferred until the recorded submission completes.
+  g_r.device->DestroyDeferred(gt.upload);
+  gt.upload = nullptr;
   nrhi::TextureViewDesc vd;
   vd.format = sc.srv_format;
   for (uint32_t c = 0; c < 4; ++c) {
@@ -374,11 +439,60 @@ float HalfToFloat(uint16_t h) {
   return std::bit_cast<float>(sign | ((exp + 112) << 23) | (mant << 13));
 }
 
-nrhi::Buffer* CreateUploadBuffer(nrhi::Device* device, size_t size) {
+nrhi::Buffer* CreateUploadBuffer(
+    nrhi::Device* device, size_t size,
+    nrhi::BufferBindClass bind_class = nrhi::BufferBindClass::kFull) {
   nrhi::BufferDesc desc;
   desc.size = size;
   desc.heap = nrhi::HeapKind::kUpload;
+  desc.bind_class = bind_class;
   return device->CreateBuffer(desc);  // nullptr on failure, like the old helper
+}
+
+// ---- Dynamic-mesh buffer reuse pool ---------------------------------------
+// Cloth/ropa garments and streaming heals replace their VB/IB every commit;
+// creating and destroying upload buffers per frame churns the allocator and
+// contends with the decode workers. Replaced buffers park here keyed by
+// exact byte size and are reused once the GPU is past the submission that
+// last referenced them (a stable garment then alternates between two
+// allocations). Thread-safe: decode workers and the render thread both
+// acquire and retire.
+struct PooledMeshBuffer {
+  nrhi::Buffer* buffer = nullptr;
+  uint64_t retire_submission = 0;
+};
+std::mutex g_mesh_pool_mutex;
+std::vector<PooledMeshBuffer> g_mesh_pool;
+constexpr size_t kMeshPoolCap = 96;
+
+void PoolMeshBuffer(nrhi::Device* device, nrhi::Buffer* buffer) {
+  if (buffer == nullptr) return;
+  nrhi::Buffer* overflow = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mesh_pool_mutex);
+    if (g_mesh_pool.size() >= kMeshPoolCap) {
+      overflow = g_mesh_pool.front().buffer;
+      g_mesh_pool.erase(g_mesh_pool.begin());
+    }
+    g_mesh_pool.push_back({buffer, device->CurrentSubmission()});
+  }
+  device->DestroyDeferred(overflow);
+}
+
+nrhi::Buffer* AcquireMeshUploadBuffer(nrhi::Device* device, size_t size) {
+  {
+    const uint64_t completed = device->CompletedSubmission();
+    std::lock_guard<std::mutex> lock(g_mesh_pool_mutex);
+    for (auto it = g_mesh_pool.begin(); it != g_mesh_pool.end(); ++it) {
+      if (it->buffer->size() == size && it->retire_submission < completed) {
+        nrhi::Buffer* buffer = it->buffer;
+        *it = g_mesh_pool.back();
+        g_mesh_pool.pop_back();
+        return buffer;
+      }
+    }
+  }
+  return CreateUploadBuffer(device, size, nrhi::BufferBindClass::kVertexIndex);
 }
 
 uint16_t SwapU16(uint16_t v) { return uint16_t((v >> 8) | (v << 8)); }
@@ -429,11 +543,11 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     }
     ib_payload = ib_scratch.data();
   }
-  nrhi::Buffer* vb = CreateUploadBuffer(device, size_t(num_verts) * 56);
-  nrhi::Buffer* ib = CreateUploadBuffer(device, size_t(item.ib_count) * 2);
+  nrhi::Buffer* vb = AcquireMeshUploadBuffer(device, size_t(num_verts) * 56);
+  nrhi::Buffer* ib = AcquireMeshUploadBuffer(device, size_t(item.ib_count) * 2);
   if (!vb || !ib) {
-    device->DestroyDeferred(vb);
-    device->DestroyDeferred(ib);
+    PoolMeshBuffer(device, vb);
+    PoolMeshBuffer(device, ib);
     return false;
   }
 
@@ -1172,7 +1286,7 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
   if (out.texture == nullptr) {
     return false;
   }
-  out.upload = CreateUploadBuffer(device, upload_size);
+  out.upload = CreateUploadBuffer(device, upload_size, nrhi::BufferBindClass::kCopySrc);
   if (!out.upload) {
     device->DestroyDeferred(out.texture);
     out.texture = nullptr;
@@ -1207,6 +1321,10 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
     }
     context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
                          nrhi::ResourceState::kPixelShaderResource);
+    // Copies recorded: release the staging buffer (deferred until the
+    // submission completes); the in-place path recreates its own on demand.
+    device->DestroyDeferred(out.upload);
+    out.upload = nullptr;
 
     nrhi::TextureViewDesc srv;
     srv.dimension = nrhi::ViewDimension::k2D;
@@ -1457,7 +1575,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   if (out.texture == nullptr) {
     return false;
   }
-  out.upload = CreateUploadBuffer(device, upload_size);
+  out.upload = CreateUploadBuffer(device, upload_size, nrhi::BufferBindClass::kCopySrc);
   g_tex_dec_create_ns += PerfNsSince(create_t0);
   if (!out.upload) {
     device->DestroyDeferred(out.texture);
@@ -1634,6 +1752,10 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     }
     context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
                          nrhi::ResourceState::kPixelShaderResource);
+    // Copies recorded: release the staging buffer (deferred until the
+    // submission completes); the in-place path recreates its own on demand.
+    device->DestroyDeferred(out.upload);
+    out.upload = nullptr;
 
     // SRV view with the composed swizzle.
     nrhi::TextureViewDesc srv;
@@ -1775,7 +1897,7 @@ bool UpdateGuestTexture2DInPlace(const NativeGuestOutputRenderContext& context,
     up = nullptr;
   }
   if (up == nullptr) {
-    up = CreateUploadBuffer(device, upload_size);
+    up = CreateUploadBuffer(device, upload_size, nrhi::BufferBindClass::kCopySrc);
     if (up == nullptr) {
       return false;
     }
@@ -2040,7 +2162,7 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
     if (out.texture == nullptr) {
       return false;
     }
-    out.upload = CreateUploadBuffer(device, face_upload * 6);
+    out.upload = CreateUploadBuffer(device, face_upload * 6, nrhi::BufferBindClass::kCopySrc);
     if (!out.upload) {
       device->DestroyDeferred(out.texture);
       out.texture = nullptr;
@@ -2175,6 +2297,10 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
     }
     context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
                          nrhi::ResourceState::kPixelShaderResource);
+    // Copies recorded: release the staging buffer (deferred until the
+    // submission completes).
+    device->DestroyDeferred(out.upload);
+    out.upload = nullptr;
     nrhi::TextureViewDesc srv;
     srv.dimension = nrhi::ViewDimension::kCube;
     srv.format = nrhi::Format::kR8G8B8A8_UNORM;
@@ -2210,7 +2336,7 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   if (out.texture == nullptr) {
     return false;
   }
-  out.upload = CreateUploadBuffer(device, face_upload * 6);
+  out.upload = CreateUploadBuffer(device, face_upload * 6, nrhi::BufferBindClass::kCopySrc);
   if (!out.upload) {
     device->DestroyDeferred(out.texture);
     out.texture = nullptr;
@@ -2293,6 +2419,10 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   }
   context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
                        nrhi::ResourceState::kPixelShaderResource);
+  // Copies recorded: release the staging buffer (deferred until the
+  // submission completes).
+  device->DestroyDeferred(out.upload);
+  out.upload = nullptr;
   nrhi::TextureViewDesc srv;
   srv.dimension = nrhi::ViewDimension::kCube;
   srv.format = host.srv_format;
@@ -3116,7 +3246,8 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
       // Upload: 32 rows of 32 texels x 32 slices, 256-byte row pitch.
       const uint32_t row_pitch = 256;
       const uint32_t slice_pitch = row_pitch * 32;
-      g_r.pfx_lut_upload = CreateUploadBuffer(device, size_t(slice_pitch) * 32);
+      g_r.pfx_lut_upload =
+          CreateUploadBuffer(device, size_t(slice_pitch) * 32, nrhi::BufferBindClass::kCopySrc);
       if (g_r.pfx_lut_upload == nullptr) {
         return fail("LUT upload");
       }
@@ -3518,7 +3649,7 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
-    g_r.white.upload = CreateUploadBuffer(device, 256);
+    g_r.white.upload = CreateUploadBuffer(device, 256, nrhi::BufferBindClass::kCopySrc);
     if (!g_r.white.upload) {
       g_r.failed = true;
       return false;
@@ -3530,6 +3661,8 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
                                      0, 256, 1, 1, 1);
     context.cmd->Barrier(g_r.white.texture, nrhi::ResourceState::kCopyDest,
                          nrhi::ResourceState::kPixelShaderResource);
+    g_r.device->DestroyDeferred(g_r.white.upload);
+    g_r.white.upload = nullptr;
     nrhi::TextureViewDesc vd;
     vd.mip_levels = 1;
     g_r.white.srv = device->CreateTextureView(g_r.white.texture, vd);
@@ -3553,7 +3686,7 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
-    g_r.white_cube.upload = CreateUploadBuffer(device, 512 * 6);
+    g_r.white_cube.upload = CreateUploadBuffer(device, 512 * 6, nrhi::BufferBindClass::kCopySrc);
     if (!g_r.white_cube.upload) {
       g_r.failed = true;
       return false;
@@ -3570,6 +3703,8 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
     }
     context.cmd->Barrier(g_r.white_cube.texture, nrhi::ResourceState::kCopyDest,
                          nrhi::ResourceState::kPixelShaderResource);
+    g_r.device->DestroyDeferred(g_r.white_cube.upload);
+    g_r.white_cube.upload = nullptr;
     nrhi::TextureViewDesc vd;
     vd.dimension = nrhi::ViewDimension::kCube;
     vd.mip_levels = 1;
@@ -3872,8 +4007,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
         REXLOG_DEBUG("native-scene: settle mesh REVALIDATE mesh={:08X} fp {:016X}->{:016X}",
                      item.mesh, mit->second.fingerprint, item.fingerprint);
       }
-      g_r.device->DestroyDeferred(mit->second.vb);
-      g_r.device->DestroyDeferred(mit->second.ib);
+      PoolMeshBuffer(g_r.device, mit->second.vb);
+      PoolMeshBuffer(g_r.device, mit->second.ib);
       g_r.meshes.erase(mit);
       need_mesh = true;
     } else {
@@ -3888,6 +4023,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       MeshBuffers buffers;
       if (DecodeMesh(g_r.device, base, item, buffers)) {
         buffers.fingerprint = item.fingerprint;
+        buffers.last_used_frame = frame_number;
         g_r.meshes.emplace(item.mesh, buffers);
       }
       // Failures retry through the draw path (logged + counted there).
@@ -4432,16 +4568,18 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         // landed (multi-worker reordering must not step the cloth
         // backwards): the staged buffers were never referenced by any
         // submission.
-        g_r.device->DestroyDeferred(r.buffers.vb);
-        g_r.device->DestroyDeferred(r.buffers.ib);
+        PoolMeshBuffer(g_r.device, r.buffers.vb);
+        PoolMeshBuffer(g_r.device, r.buffers.ib);
+        mit->second.last_used_frame = frame_number;
       } else {
         if (mit != g_r.meshes.end()) {
           // Stale decode (miss-driven revalidation heal): swap it out. The
           // old buffers may be referenced by the in-flight submission.
-          g_r.device->DestroyDeferred(mit->second.vb);
-          g_r.device->DestroyDeferred(mit->second.ib);
+          PoolMeshBuffer(g_r.device, mit->second.vb);
+          PoolMeshBuffer(g_r.device, mit->second.ib);
           g_r.meshes.erase(mit);
         }
+        r.buffers.last_used_frame = frame_number;
         g_r.meshes.emplace(r.item.mesh, r.buffers);
       }
     }
@@ -5593,6 +5731,13 @@ void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context)
       if (m.ib) g_r.device->DestroyDeferred(m.ib);
     }
     g_r.meshes.clear();
+    {
+      std::lock_guard<std::mutex> lock(g_mesh_pool_mutex);
+      for (const PooledMeshBuffer& p : g_mesh_pool) {
+        g_r.device->DestroyDeferred(p.buffer);
+      }
+      g_mesh_pool.clear();
+    }
     ClearItemCache();  // decode-affecting toggles should re-walk items too
     REXLOG_INFO("native-scene: mesh cache flushed (debug dialog)");
   }
@@ -5888,6 +6033,9 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
             mit->second.fingerprint != rec.fingerprint) {
           continue;
         }
+        // NSM casters cover a wide radius the main pass never draws; touch
+        // the LRU clock so the cascades keep their meshes resident.
+        mit->second.last_used_frame = frame_number;
         // Cull by the mesh bbox footprint in (far) map space.
         float umin = std::numeric_limits<float>::max(), umax = -umin;
         float vmin = umin, vmax = -umin;
@@ -7137,8 +7285,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // decode lifting behind the load is unchanged from the yielded path.
   PrewarmCommit(context, frame_number, /*loading=*/loading_native);
   // Content-store LRU: superseded words states (old mip levels, pre-demote
-  // detail sets, one-shot UI art) age out once nothing routes to them.
+  // detail sets, one-shot UI art) age out once nothing routes to them; the
+  // mesh cache ages out streamed-out arenas the same way.
   EvictTexStore(frame_number, context.device->CurrentSubmission());
+  EvictMeshStore(frame_number);
 
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
@@ -7606,8 +7756,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
         REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
       if (item.cloth_quads || ropa_inline) {
-        g_r.device->DestroyDeferred(it->second.vb);
-        g_r.device->DestroyDeferred(it->second.ib);
+        PoolMeshBuffer(g_r.device, it->second.vb);
+        PoolMeshBuffer(g_r.device, it->second.ib);
         g_r.meshes.erase(it);
         it = g_r.meshes.end();
       } else if (!dynamic_payload) {
@@ -7647,6 +7797,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       buffers.fingerprint = item.fingerprint;
       it = g_r.meshes.emplace(item.mesh, buffers).first;
     }
+    it->second.last_used_frame = frame_number;
     const MeshBuffers& buffers = it->second;
 
     // Double-sided sheet props draw with backface culling; without it the
@@ -9698,12 +9849,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     if (pfx_ok) {
-      // Identity grade-LUT upload (once).
+      // Identity grade-LUT upload (once); the staging buffer is done after
+      // the copy is recorded.
       if (!g_r.pfx_lut_uploaded) {
         cmd->CopyBufferToTexture(g_r.pfx_lut, 0, 0, g_r.pfx_lut_upload, 0, 256,
                                  32, 32, 32);
         cmd->Barrier(g_r.pfx_lut, nrhi::ResourceState::kCopyDest,
                      nrhi::ResourceState::kPixelShaderResource);
+        g_r.device->DestroyDeferred(g_r.pfx_lut_upload);
+        g_r.pfx_lut_upload = nullptr;
         g_r.pfx_lut_uploaded = true;
       }
       // Native depth SRV (re-pointed when the depth texture is rebuilt on

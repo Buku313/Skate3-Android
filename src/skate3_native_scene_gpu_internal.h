@@ -60,6 +60,10 @@ struct MeshBuffers {
   // ROPA only: the decoded vertex array (num_verts x 14 floats, the scene
   // VS layout) retained for draw-time shape blending onto the play clock.
   std::vector<float> ropa_verts;
+  // Store LRU clock: last frame this entry served a draw. Meshes of
+  // streamed-out areas age out instead of accumulating across map changes;
+  // an evicted mesh re-decodes on miss exactly like first sight.
+  uint64_t last_used_frame = 0;
 };
 
 struct GuestTexture {
