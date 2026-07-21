@@ -1132,6 +1132,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ring, false, "Skate 3",
                     "frames); F7 dumps it to logs/scene_ring_<ts>.csv for "
                     "diffing 1-2 frame artifacts no capture can catch")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dyn_gap_fill, true, "Skate 3",
+                    "Re-publish character/cloth/skinned items for up to two "
+                    "missed publish frames (high-frame-rate body flicker)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace skate3::native_scene {
 namespace {
 
@@ -8654,12 +8659,21 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
-  // Publish-gap telemetry ("skater flickered invisible for a moment"): a
-  // skinned/ropa/character mesh that published recently, vanished for 1-3
-  // built frames, and came back. Rate-limited log names the mesh and gap so
-  // the next flicker sighting is diagnosable from the log alone.
+  // Publish-gap telemetry and fill ("skater flickered invisible for a
+  // moment"): a skinned/ropa/character mesh that published recently can
+  // vanish from the publish stream for 1-2 built frames at high render
+  // rates (the body serve races the sim; more frequent the faster the
+  // renderer runs, so Vulkan flickered worst). Re-publish the previous
+  // frame's capture for up to two missed frames - a one-frame-old pose is
+  // imperceptible at those rates, and a real despawn stops the fill at the
+  // cap. The rate-limited log keeps naming mesh and gap so sightings stay
+  // diagnosable.
   {
-    static std::unordered_map<uint32_t, uint64_t> s_last_pub;
+    struct PubTrack {
+      uint64_t frame = 0;
+      DrawItem item;
+    };
+    static std::unordered_map<uint32_t, PubTrack> s_last_pub;
     static uint64_t s_pub_frame = 0;
     ++s_pub_frame;
     if (s_last_pub.size() > 4096) {
@@ -8670,12 +8684,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             (item.skinned && !item.bones.empty()))) {
         continue;
       }
-      auto [it, fresh] = s_last_pub.try_emplace(item.mesh, s_pub_frame);
-      if (fresh) {
-        continue;
-      }
-      const uint64_t gap = s_pub_frame - it->second;
-      it->second = s_pub_frame;
+      PubTrack& t = s_last_pub[item.mesh];
+      const uint64_t gap = t.frame != 0 ? s_pub_frame - t.frame : 0;
+      t.frame = s_pub_frame;
+      t.item = item;
       if (gap >= 2 && gap <= 4) {
         g_dyn_gap.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<uint32_t> gap_logged{0};
@@ -8686,6 +8698,27 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
               "ropa={} skinned={} fam={} src={}",
               item.mesh, gap - 1, item.ropa ? 1 : 0, item.skinned ? 1 : 0,
               item.char_family, item.dbg_src);
+        }
+      }
+    }
+    if (REXCVAR_GET(skate3_native_render_scene_dyn_gap_fill)) {
+      for (auto& [mesh, t] : s_last_pub) {
+        if (t.frame == 0 || t.frame == s_pub_frame) {
+          continue;  // published this frame (or placeholder)
+        }
+        const uint64_t gap = s_pub_frame - t.frame;
+        if (gap <= 2) {
+          // t.frame stays at the last REAL publish, so the fill self-limits
+          // to two frames and the telemetry above still sees the true gap
+          // when the stream resumes.
+          scene.items.push_back(t.item);
+          static std::atomic<uint64_t> s_gap_filled{0};
+          const uint64_t n = s_gap_filled.fetch_add(1, std::memory_order_relaxed);
+          if (n < 8 || (n & 1023u) == 0) {
+            REXLOG_INFO(
+                "native-scene: dyn gap fill mesh={:08X} age={} ropa={} fam={} (n={})",
+                mesh, gap, t.item.ropa ? 1 : 0, t.item.char_family, n + 1);
+          }
         }
       }
     }
