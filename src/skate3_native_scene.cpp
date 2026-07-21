@@ -249,9 +249,19 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shafts_reach, 40.0, "Skate 3",
     .range(5.0, 300.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_shafts_steps, 64, "Skate 3",
-                     "Sun-shaft march steps per pixel (half-res pass). More steps "
-                     "resolve thinner shadow volumes at proportional GPU cost.")
+                     "Sun-shaft march step ceiling per pixel; rays shorter than "
+                     "the full reach take proportionally fewer steps at the same "
+                     "per-meter density. More steps resolve thinner shadow "
+                     "volumes at proportional GPU cost.")
     .range(8, 64)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shafts_res, 4, "Skate 3",
+                     "Sun-shaft march resolution divisor (2 = half res, 4 = "
+                     "quarter res). The march output is low frequency (jittered "
+                     "average under a tent blur) and upsamples depth-aware, so "
+                     "higher divisors trade little quality for a proportional "
+                     "GPU saving.")
+    .range(2, 8)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_sun_override, false, "Skate 3",
                     "Lighting lab: replace the captured sun direction with the "

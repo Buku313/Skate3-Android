@@ -71,6 +71,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shafts_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shafts_reach);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shafts_steps);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shafts_res);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao_debug);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao_full_res);
 REXCVAR_DECLARE(double, skate3_native_render_scene_ssao_intensity);
@@ -1087,9 +1088,13 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
     }
   }
 
-  // ---- Shaft planes (half res, march + blurred), rebuilt on resize.
-  const uint32_t vw = std::max(1u, (width + 1) / 2);
-  const uint32_t vh = std::max(1u, (height + 1) / 2);
+  // ---- Shaft planes (march + blurred), rebuilt on resize or divisor
+  // change; the tonemap upsample reads the divisor from vs0.x.
+  const uint32_t vol_div = uint32_t(
+      std::clamp<int32_t>(REXCVAR_GET(skate3_native_render_scene_shafts_res),
+                          2, 8));
+  const uint32_t vw = std::max(1u, (width + vol_div - 1) / vol_div);
+  const uint32_t vh = std::max(1u, (height + vol_div - 1) / vol_div);
   if (shafts &&
       (g_r.vol_width != vw || g_r.vol_height != vh || g_r.vol_tex == nullptr ||
        g_r.vol_tex_b == nullptr)) {
@@ -1272,7 +1277,7 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
   g_r.vol_rows[1] = std::fabs(pr[5]);
   g_r.vol_rows[2] = pr[10];
   g_r.vol_rows[3] = pr[14];
-  g_r.vol_rows[4] = 0.0f;
+  g_r.vol_rows[4] = float(vol_div);
   g_r.vol_rows[5] = 0.0f;
   g_r.vol_rows[6] = 0.0f;
   g_r.vol_rows[7] = shaft_plane ? shaft_int : 0.0f;

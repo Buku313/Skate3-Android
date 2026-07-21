@@ -52,7 +52,8 @@ cbuffer C : register(b0) {
   // strength / phase g, p1.xy = proj m22 / m32, vp/vs0/vs1/vs2 = the
   // row-vector inverse view-projection (world = clip * M).
   float4 vp;    // tonemap/linearize: x = |m00|, y = |m11|, z = m22, w = m32
-  float4 vs0;   // tonemap: w = shaft intensity (xyz unused)
+  float4 vs0;   // tonemap: x = shaft plane resolution divisor (>= 2),
+                // w = shaft intensity (yz unused)
   float4 vs1;   // tonemap: xyz = haze tint (xe space), w = haze intensity
   float4 vs2;   // tonemap: xyz = sun direction in AO view space (toward the
                 // sun), w = haze density (1 / view unit)
@@ -248,7 +249,14 @@ float4 ps_vol_shafts(VSOut i) : SV_Target {
   float dist = length(ray);
   float3 rdir = ray / max(dist, 1e-4);
   float reach = min(dist, src.w);
-  float steps = clamp(p0.x, 8.0, 64.0);
+  // Constant per-meter sample density: a short ray to near geometry needs
+  // proportionally fewer steps for the same marched quality (the fixed
+  // count oversampled a 5 m ray 8x versus the full-reach case), and the
+  // path-fraction scale keeps near-surface terms small enough that the
+  // extra variance stays under the tent blur.
+  float steps_max = clamp(p0.x, 8.0, 64.0);
+  float steps = clamp(ceil(steps_max * reach / max(src.w, 1.0)), 8.0,
+                      steps_max);
   float jitter = Ign(i.pos.xy);
   float lit = 0.0;
   float tot = 0.0;
@@ -400,7 +408,8 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   bool sc_vol = sc_mask < 0 || (sc_mask & 64) != 0;
   if (vs0.w > 0.0 && sc_vol) {
     float dpix = lin_depth.SampleLevel(smp_point, i.uv, 0);
-    float2 vt = size.zw * 2.0;  // one shaft-plane texel in uv
+    // One shaft-plane texel in uv (vs0.x = the march resolution divisor).
+    float2 vt = size.zw * max(vs0.x, 2.0);
     float2 base = (floor(i.uv / vt - 0.5) + 0.5) * vt;
     float2 f = saturate((i.uv - base) / vt);
     float acc = 0.0;
