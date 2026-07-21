@@ -9,6 +9,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
+#include <rex/logging.h>
 #include <rex/ui/presenter.h>
 
 #include "skate3_native_scene.h"
@@ -253,6 +254,14 @@ void SetMaxQuality(bool enable) {
   }
   s.active = enable;
 }
+
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_maxq_cycle, 0, "Skate 3",
+    "DEBUG: auto-toggle MAX QUALITY every N native-scene frames (0 = off). "
+    "Stress-tests the hot pipeline/target/shadow-map rebuild path; pair "
+    "with Vulkan validation layers when hunting stale bindings.")
+    .range(0, 1000000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 void DrawMaxQualityToggle() {
   bool on = s_max_quality.active;
@@ -1095,6 +1104,24 @@ void DrawCachesSection() {
 }
 
 }  // namespace
+
+void MaxQualityAutoCycle(uint64_t frame_number) {
+  const int32_t period = REXCVAR_GET(skate3_native_render_scene_maxq_cycle);
+  if (period <= 0) {
+    return;
+  }
+  static uint64_t next_frame = 0;
+  if (next_frame == 0) {
+    next_frame = frame_number + uint64_t(period);
+    return;
+  }
+  if (frame_number >= next_frame) {
+    next_frame = frame_number + uint64_t(period);
+    SetMaxQuality(!s_max_quality.active);
+    REXLOG_INFO("native-scene: max-quality auto-cycle -> {}",
+                s_max_quality.active ? "ON" : "OFF");
+  }
+}
 
 void NativeDebugDialog::Show() {
   visible_ = true;

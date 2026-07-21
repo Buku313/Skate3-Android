@@ -279,6 +279,11 @@ struct DrawItem {
   // only their exact cached decodes: no guest-memory reads, no heals, no
   // miss enqueues.
   bool retained = false;
+  // Captured through the dynamic-entity paths (characters, props, cloth,
+  // quad-list garments) rather than the world sort lists. Set at capture so
+  // every later copy (merges, rescues, retention re-publishes) inherits it;
+  // the build-up showcase's dynamic-entities layer keys off it.
+  bool dyn_entity = false;
   // Bone palette snapshot taken on the game thread: raw staged rows, 3
   // float4s per bone (column-vector affine [R | t], model -> world). The
   // guest staging bank is reused draw to draw, hence the copy.
@@ -443,6 +448,15 @@ struct SubmitRecord {
 // window (skate3_native_debug_dialog.cpp). The material bits are
 // progressive looks (materials subsumes lighting subsumes albedo); the
 // rest are independent and can reveal in any order or grouping.
+// The decals and dyn layers are SUBTRACTIVE: their content is part of the
+// normal frame and the layer hides it until revealed. When such a layer is
+// left out of the order (or '-'disabled), the sequencer folds its bit into
+// every step so the run matches the non-showcase frame from clay onward.
+// The decal/grime composite only renders on the full material look, so the
+// decals layer reads best placed after materials.
+// Bit 1024 (blackout) is NOT an orderable layer: the sequencer brackets
+// every run with it (snap to black at start, wipe to black at the end) as
+// the recording cut marker.
 struct ShowcaseLayer {
   const char* token;
   uint32_t bit;
@@ -452,6 +466,8 @@ inline constexpr ShowcaseLayer kShowcaseLayers[] = {
     {"albedo", 1u, "albedo textures"},
     {"lighting", 2u, "baked lighting"},
     {"materials", 4u, "materials & surface detail"},
+    {"decals", 256u, "decals & grime"},
+    {"dyn", 512u, "dynamic entities"},
     {"shadows", 8u, "dynamic shadows"},
     {"ao", 16u, "ambient occlusion"},
     {"ssr", 32u, "reflections"},
@@ -460,8 +476,10 @@ inline constexpr ShowcaseLayer kShowcaseLayers[] = {
 };
 inline constexpr size_t kShowcaseLayerCount =
     sizeof(kShowcaseLayers) / sizeof(kShowcaseLayers[0]);
+// Bits of the subtractive layers (see above).
+inline constexpr uint32_t kShowcaseSubtractiveMask = 256u | 512u;
 inline constexpr const char* kShowcaseOrderDefault =
-    "albedo,lighting,materials,shadows+ao,ssr,vol+bloom";
+    "albedo,lighting,materials,decals,dyn,shadows+ao,ssr,vol+bloom";
 
 bool Enabled();
 

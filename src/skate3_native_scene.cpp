@@ -294,10 +294,13 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_haze_density, 0.005,
     .range(0.0, 0.05)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_showcase, false, "Skate 3",
-                    "Run the graphics build-up showcase: the scene is stripped to "
-                    "flat clay geometry, then rebuilt layer by layer, each layer "
-                    "revealed by a vertical split wiping across the screen with "
-                    "both sides rendered live. Layer order and grouping come from "
+                    "Run the graphics build-up showcase: the screen snaps to "
+                    "black, flat clay geometry wipes in, the scene is rebuilt "
+                    "layer by layer (each layer revealed by a vertical split "
+                    "wiping across the screen with both sides rendered live), "
+                    "and the run closes by wiping back to black. The black "
+                    "bookends double as cut markers for screen recordings. "
+                    "Layer order and grouping come from "
                     "skate3_native_render_scene_showcase_order (edited in the F12 "
                     "showcase setup window). Clears itself when the sequence "
                     "finishes; set to false mid-run to cancel. Also on "
@@ -310,10 +313,16 @@ REXCVAR_DEFINE_STRING(
     skate3::native_scene::kShowcaseOrderDefault, "Skate 3",
     "Showcase layer order: comma-separated reveal steps, '+' joins layers "
     "into one wipe, a '-' prefix disables a layer while keeping its "
-    "position. Tokens: albedo, lighting, materials, shadows, ao, ssr, vol, "
-    "bloom (the run always starts from clay geometry, and a final "
-    "full-render step is appended when the list leaves layers unrevealed). "
-    "Example: \"albedo,lighting,materials,shadows+ao,-ssr,vol+bloom\".")
+    "position. Tokens: albedo, lighting, materials, decals, dyn, shadows, "
+    "ao, ssr, vol, bloom (the run always starts from clay geometry, and a "
+    "final full-render step is appended when the list leaves layers "
+    "unrevealed). decals (graffiti/paint art + macro weathering; renders on "
+    "the full material look, so place it after materials) and dyn (dynamic "
+    "entities: characters, props, cloth) HIDE their content until revealed; "
+    "left out or disabled, that content renders from clay onward as usual. "
+    "The CSM atlas is shared by both sides of the split, so a dyn step "
+    "AFTER shadows shows entity shadows before their owners; order dyn "
+    "first. Example: \"albedo,lighting,materials,decals,dyn,shadows+ao\".")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_showcase_hold, 2.5, "Skate 3",
                       "Showcase: seconds each build-up stage holds fullscreen "
@@ -4100,6 +4109,7 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   }
   item.shadow_caster =
       ortho_submit || (ctx != 0 && g_frame_ortho_ctx.count(ctx) != 0);
+  item.dyn_entity = true;
   g_frame_dynitems.push_back(std::move(item));
   const size_t index = g_frame_dynitems.size() - 1;
   if (g_frame_dynitems[index].pending ||
@@ -4204,6 +4214,7 @@ uint32_t CaptureClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6,
 
   // Distinct draw ranges within one ring buffer are distinct garments.
   *out_key = garment_key;
+  item.dyn_entity = true;
   std::lock_guard<std::mutex> lock(g_palette_mutex);
   g_frame_dynitems.push_back(std::move(item));
   return uint32_t(g_frame_dynitems.size());

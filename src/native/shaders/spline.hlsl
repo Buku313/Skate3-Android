@@ -11,7 +11,10 @@ cbuffer C : register(b0) {
   float4 vp1;
   float4 vp2;
   float4 vp3;
-  float4 intensity;  // i_intensity as staged (x = default gain, y = darken gain)
+  float4 intensity;  // x/y = i_intensity as staged (default/darken gain).
+                     // zw = showcase blackout gate, staged CPU-side over the
+                     // guest row's unused lanes: z = split x (output pixels),
+                     // w = left|right visibility bits (3 = fully visible).
 };
 Texture2D<float4> tex : register(t0);
 SamplerState smp : register(s0);
@@ -48,12 +51,25 @@ float3 SplineOut(float3 c) {
   return c;
 #endif
 }
+// Showcase blackout gate: the spline pass draws outside the scene shaders,
+// so ps_main's blackout stage (scene.hlsl, mask bit 1024) cannot cover it;
+// without this the neon lines leak over the black recording bookends.
+bool SplineVisible(float px_x) {
+  int bits = (int)(intensity.w + 0.5);
+  return ((px_x < intensity.z ? 1 : 2) & bits) != 0;
+}
 float4 ps_default(VSOut i) : SV_Target {
+  if (!SplineVisible(i.pos.x)) {
+    clip(-1.0);
+  }
   float4 c = tex.Sample(smp, i.uv);
   float3 sq = c.rgb * c.rgb * (intensity.x * i.fade / max(c.a, 1.0 / 255.0));
   return float4(SplineOut(sqrt(abs(sq))), 1.0);
 }
 float4 ps_darken(VSOut i) : SV_Target {
+  if (!SplineVisible(i.pos.x)) {
+    clip(-1.0);
+  }
   float4 c = tex.Sample(smp, i.uv);
   float3 rgb = sqrt(abs(c.rgb * c.rgb * intensity.y));
   float a = sqrt(abs(c.a * intensity.y * i.fade));

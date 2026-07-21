@@ -148,12 +148,24 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
 //    1 albedo textures    2 baked lighting     4 materials & surface detail
 //    8 dynamic shadows   16 ambient occlusion 32 reflections (SSR)
 //   64 volumetrics      128 bloom
+//  256 decals & grime   512 dynamic entities
+// 1024 blackout: the run's opening/closing bookends (ps_main renders every
+// draw black; doubles as the recording cut marker), not an orderable layer.
 // The material bits are progressive looks (materials subsumes lighting
 // subsumes albedo); the rest are independent, so the sequencer can reveal
-// them in any order or grouping. Returns -1 when the showcase is off.
+// them in any order or grouping. 256/512 are SUBTRACTIVE layers: their
+// content belongs to the normal frame and stays hidden until the bit
+// reveals (the sequencer folds their bits into every step when the layer
+// is not part of the run). Returns -1 when the showcase is off.
 int ShowcaseMask(float px_x) {
   float v = px_x < sh_v2.w ? sh_v2.y : sh_v2.z;
   return v < 255.5 ? -1 : (int)(v + 0.5) - 256;
+}
+// True when the given layer bit is revealed on this pixel's side of the
+// split (or the showcase is off entirely).
+bool ShowcaseLayerOn(float px_x, int bit) {
+  int m = ShowcaseMask(px_x);
+  return m < 0 || (m & bit) != 0;
 }
 #include "scene_shadows.hlsli"
 #include "scene_common.hlsli"
@@ -292,12 +304,15 @@ float4 ShadePixel(VSOut i) {
       // against (CSM s + shadow color), kd, phong spec vs the shader's
       // fixed literal light, cube reflection on 5/6.
       float3 ov = float3(1.0, 1.0, 1.0);
+      // Decals-&-grime build-up layer (bit 256): macro weathering and decal
+      // art both render neutral until revealed.
+      bool sc_decals = ShowcaseLayerOn(i.pos.x, 256);
       // Fam 13 (transparentenvironmentreflective) carries no macro term.
-      if (overlay.z > 0.0 && fam < 12.5) {
+      if (overlay.z > 0.0 && fam < 12.5 && sc_decals) {
         float3 mo = macro.Sample(smp, i.uv * overlay.x).rgb;
         ov = saturate((mo - 0.5) * overlay.y + 0.5);
       }
-      if (fam > 2.5 && fam < 4.5 && overlay.w > 0.5) {
+      if (fam > 2.5 && fam < 4.5 && overlay.w > 0.5 && sc_decals) {
         // overlay.w == 0 = art unresolved (white fallback alpha 1 would
         // whitewash the whole surface).
         float4 dk = overlay.w > 1.5 ? decal_art.Sample(smp, i.uv3)
@@ -553,7 +568,10 @@ float4 ShadePixel(VSOut i) {
   // macro overlay: the weathering applies over the paint too
   // (ApplyOverlay(cOverlay, ApplyDecal(...)); the old order left the paint
   // unweathered, the too-white ramp stencils).
-  if (overlay.w > 0.0) {
+  // Decals-&-grime build-up layer (bit 256): art and macro weathering both
+  // render neutral until revealed.
+  bool sc_decals = ShowcaseLayerOn(i.pos.x, 256);
+  if (overlay.w > 0.0 && sc_decals) {
     // overlay.w == 2 marks environment.decal_tileable: the art tiles across
     // the surface (rock/cliff faces) and must WRAP; clamp stretched the
     // border texels into giant streaks. Single placements clamp (their
@@ -569,7 +587,8 @@ float4 ShadePixel(VSOut i) {
   // linear (squared) color space, so the gamma-space equivalent is
   // sqrt(m); a direct multiply doubles the darkening (harsh black
   // patchwork vs the emulated subtle weathering).
-  if (overlay.z > 0.0 && misc.x < 1.5) {  // water reuses overlay.z (ripple map flag)
+  if (overlay.z > 0.0 && misc.x < 1.5 &&  // water reuses overlay.z (ripple map flag)
+      sc_decals) {
     float4 m = macro.Sample(smp, i.uv * overlay.x);
     albedo.rgb *= lerp(float3(1.0, 1.0, 1.0), sqrt(m.rgb), overlay.y * m.a);
   }
@@ -701,8 +720,22 @@ float4 ShadePixel(VSOut i) {
   return float4(PassGamma(lit), 1.0);
 }
 float4 ps_main(VSOut i) : SV_Target {
-  float4 c = ShadePixel(i);
   int mask = ShowcaseMask(i.pos.x);
+  // Dynamic-entities build-up layer (bit 512): entity draws (tint.a < 0,
+  // staged CPU-side from DrawItem::dyn_entity) drop out entirely until the
+  // bit reveals on this pixel's side of the split; no color and no depth,
+  // so the world behind them renders as if they were never published.
+  if (mask >= 0 && (mask & 512) == 0 && tint.a < -0.5) {
+    clip(-1.0);
+    return float4(0.0, 0.0, 0.0, 0.0);
+  }
+  float4 c = ShadePixel(i);
+  // Blackout stage (bit 1024, the showcase's opening/closing bookends and
+  // the recording cut marker): every draw renders black, keeping its own
+  // alpha so coverage, alpha test and blend routing stay intact.
+  if (mask >= 0 && (mask & 1024) != 0) {
+    return float4(0.0, 0.0, 0.0, c.a);
+  }
   if (mask < 0 || (mask & 4) != 0) {
     return c;  // showcase off, or the full material layer is revealed
   }

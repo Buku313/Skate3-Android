@@ -840,6 +840,11 @@ struct RendererState {
   bool static_sun_in_srv = false;
   bool static_sun_valid = false;
   uint32_t static_sun_size = 0;
+  // The per-tile size this map was requested at (post backend-limit clamp,
+  // pre allocation-failure fallback). The hot-size-change retire keys on
+  // this, not static_sun_size: a map that allocated smaller than requested
+  // must not be retired and re-tried every frame.
+  uint32_t static_sun_requested = 0;
   float nsm_rows[12] = {};
   float nsm_depth_range = 1.0f;  // meters per depth-map unit
   float nsm_radius = 1.0f;       // far-tile ortho half-extent in meters

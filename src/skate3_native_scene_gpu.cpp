@@ -3,6 +3,7 @@
 // it through the RHI (D3D12 / Vulkan) into the guest output texture. Shared
 // cross-thread state lives in skate3_native_scene_state.h.
 
+#include "skate3_native_debug_dialog.h"
 #include "skate3_native_scene.h"
 
 #include "generated/skate3_init.h"
@@ -69,6 +70,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_boot_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_cas_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_char_shadow_exact);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_decals);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_dynamic_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynobj_v2);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_entity_fade);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_native);
@@ -3282,9 +3284,17 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     g_r.world_shadow_in_srv = false;
     g_r.world_shadow_primed = false;
   }
-  const uint32_t want_static_size = uint32_t(std::clamp(
+  uint32_t want_static_size = uint32_t(std::clamp(
       REXCVAR_GET(skate3_native_render_scene_shadow_static_size), 1024, 8192));
-  if (g_r.static_sun != nullptr && g_r.static_sun_size != want_static_size) {
+  if (device->backend() == nrhi::Backend::kD3D12) {
+    // The 3-tile cascade row must fit D3D12's 16384 2D-texture width cap:
+    // per-tile sizes above 5461 cannot allocate there (the 8192 setting
+    // asks for 24576x8192), while desktop Vulkan allows 32768-wide.
+    while (want_static_size * 3 > 16384) {
+      want_static_size /= 2;
+    }
+  }
+  if (g_r.static_sun != nullptr && g_r.static_sun_requested != want_static_size) {
     // Hot size change: retire the map; recreated below. The recreated map
     // is uninitialized, so force the cross-frame cache to re-render it
     // (RenderStaticSunMap rebuilds whenever nsm_built_radius <= 0).
@@ -3302,6 +3312,7 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     // tiles side by side: inner (r/6, centimeter contact detail with
     // useful reach), mid (r/2) and far (full radius, large-caster
     // coverage); size is per tile.
+    g_r.static_sun_requested = want_static_size;
     g_r.static_sun_size = want_static_size;
     nrhi::TextureDesc desc;
     desc.width = g_r.static_sun_size * 3;
@@ -3312,6 +3323,19 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     desc.clear_color[0] = 1.0f;  // depth: far = lit
     desc.clear_color[1] = 1.0f;
     g_r.static_sun = device->CreateTexture(desc);
+    // Allocation-failure fallback (VRAM pressure, driver limits): a
+    // coarser static sun map beats marking the whole renderer failed and
+    // dropping the session to emulated output.
+    while (g_r.static_sun == nullptr && g_r.static_sun_size > 1024) {
+      g_r.static_sun_size /= 2;
+      desc.width = g_r.static_sun_size * 3;
+      desc.height = g_r.static_sun_size;
+      REXLOG_WARN(
+          "native-scene: static sun-shadow map allocation failed, retrying "
+          "at {}x{}",
+          g_r.static_sun_size * 3, g_r.static_sun_size);
+      g_r.static_sun = device->CreateTexture(desc);
+    }
     if (g_r.static_sun != nullptr) {
       nrhi::TextureViewDesc vd;
       vd.mip_levels = 1;
@@ -3571,6 +3595,23 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
       g_r.targets_scene_fmt != want_scene_fmt ||
       g_r.targets_msaa != g_r.msaa) {
     if (g_r.depth) {
+      // The AO/SSR/volumetric scene-depth SRVs alias this texture and
+      // re-point on pointer identity; heap reuse can hand the NEW depth
+      // texture the OLD one's address, so that comparison must never be
+      // the only invalidation. Retire the views with the buffer they view:
+      // a stale view kept sampling the retired depth image (still in
+      // attachment layout), a GPU fault and device hang on Vulkan.
+      nrhi::TextureView** depth_views[3] = {
+          &g_r.ao_depth_srv, &g_r.ssr_depth_srv, &g_r.vol_depth_srv};
+      nrhi::Texture** depth_views_of[3] = {
+          &g_r.ao_depth_srv_of, &g_r.ssr_depth_srv_of, &g_r.vol_depth_srv_of};
+      for (int v = 0; v < 3; ++v) {
+        if (*depth_views[v] != nullptr) {
+          g_r.device->DestroyDeferred(*depth_views[v]);
+          *depth_views[v] = nullptr;
+        }
+        *depth_views_of[v] = nullptr;
+      }
       g_r.device->DestroyDeferred(g_r.depth);
       g_r.depth = nullptr;
     }
@@ -6630,7 +6671,8 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
     }
     // Layer availability: the material looks need nothing; the shadow and
     // post layers join only when their feature is enabled (the post gates
-    // live in the HDR tonemap, so they need the HDR chain).
+    // live in the HDR tonemap, so they need the HDR chain). The subtractive
+    // layers need their content published/composited at all.
     const auto layer_available = [&](uint32_t bit) -> bool {
       switch (bit) {
         case 8u:
@@ -6644,6 +6686,10 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
                             REXCVAR_GET(skate3_native_render_scene_haze));
         case 128u:
           return hdr_on && REXCVAR_GET(skate3_native_render_scene_bloom);
+        case 256u:
+          return REXCVAR_GET(skate3_native_render_scene_decals);
+        case 512u:
+          return REXCVAR_GET(skate3_native_render_scene_dynamic_items);
         default:
           return true;
       }
@@ -6658,8 +6704,14 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
     // the skate3_native_render_scene_showcase_order cvar description):
     // comma-separated steps, '+' joins layers into one wipe, '-' prefix =
     // disabled. Unknown, unavailable and duplicate tokens drop out; steps
-    // left empty are skipped. The run always starts from clay.
+    // left empty are skipped. The run opens ON black (mask bit 1024; a
+    // snap, not a wipe - see the step-0 timing below), wipes clay in from
+    // it, and closes by wiping back out to black. The >= hold_s stretches
+    // of pure black double as machine-findable cut markers for screen
+    // recordings (local/scripts/cut_showcase_clips.py pairs them with
+    // ffmpeg blackdetect).
     s.steps.clear();
+    s.steps.push_back({float(256u + 1024u), "black (start marker)"});
     s.steps.push_back({256.0f, "clay geometry"});
     uint32_t cum = 0;
     const std::string order =
@@ -6715,14 +6767,28 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
         s.steps.push_back({float(256u + cum), std::move(label)});
       }
     }
+    // Subtractive layers (decals/grime, dynamic entities) left out of the
+    // order or '-'disabled are not build-up beats: fold their bits into
+    // every step, clay included, so their content renders from the first
+    // frame exactly as in the non-showcase frame. An UNAVAILABLE layer
+    // needs no fold; its feature cvar already removes the content itself.
+    const uint32_t always = kShowcaseSubtractiveMask & avail_mask & ~cum;
+    if (always != 0u) {
+      for (Step& st : s.steps) {
+        st.value = float(256u + ((uint32_t(st.value) - 256u) | always));
+      }
+    }
     // A final full-render reveal when the list leaves layers unrevealed
     // (the materials look subsumes the albedo/lighting bits, so those two
-    // stop counting once materials is in).
+    // stop counting once materials is in; the subtractive bits are either
+    // revealed steps or folded in above, so they never force the step).
     const bool covered =
         (cum & 4u) != 0 && ((avail_mask & ~cum) & 0xF8u) == 0u;
     if (!covered) {
       s.steps.push_back({0.0f, "full render"});
     }
+    // Closing blackout bookend (the end-of-run cut marker).
+    s.steps.push_back({float(256u + 1024u), "black (end marker)"});
     // Durations snapshot at start so a live cvar edit cannot jump the
     // elapsed-time -> step mapping mid-run.
     s.wipe_s = std::max(0.2, REXCVAR_GET(skate3_native_render_scene_showcase_wipe));
@@ -6743,7 +6809,20 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
   const double elapsed =
       std::chrono::duration<double>(PerfClock::now() - s.t0).count();
   const double per_step = s.wipe_s + s.hold_s;
-  const int idx = int(elapsed / per_step);
+  // Step 0 (the blackout start bookend) SNAPS to black instead of wiping
+  // from the live frame and lasts hold_s only: the recording cut lands on
+  // a hard black edge, and the build-up proper starts with clay wiping in
+  // from black.
+  int idx;
+  double phase;
+  if (elapsed < s.hold_s) {
+    idx = 0;
+    phase = s.wipe_s;  // past the wipe window: hold, no split
+  } else {
+    const double e = elapsed - s.hold_s;
+    idx = 1 + int(e / per_step);
+    phase = e - double(idx - 1) * per_step;
+  }
   if (idx >= int(s.steps.size())) {
     s.active = false;
     REXCVAR_SET(skate3_native_render_scene_showcase, false);
@@ -6757,7 +6836,6 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
     s.logged = idx;
   }
   const float prev = idx == 0 ? 0.0f : s.steps[idx - 1].value;
-  const double phase = elapsed - double(idx) * per_step;
   if (phase < s.wipe_s) {
     float f = float(phase / s.wipe_s);
     f = f * f * (3.0f - 2.0f * f);  // ease the sweep in and out
@@ -6776,6 +6854,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       (context.backend != NativeGuestOutputBackend::kD3D12 &&
        context.backend != NativeGuestOutputBackend::kVulkan)) {
     return false;
+  }
+  {
+    // Debug stress driver (skate3_native_render_scene_maxq_cycle): cycles
+    // the max-quality toggle to exercise the hot rebuild path.
+    static uint64_t s_maxq_cycle_frame = 0;
+    skate3::MaxQualityAutoCycle(++s_maxq_cycle_frame);
   }
   // While the game reports menus / loading (presence context 0x8001 == 0),
   // yield to the emulated output, EXCEPT the in-game pause menu (world
@@ -8036,7 +8120,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // alpha-clipped (their VS skinning branch is inert: zero weights).
       constants[33] = (bones_bound || item.ropa) ? 1.0f : 0.0f;
       constants[34] = item.unlit ? 1.0f : 0.0f;
-      constants[35] = 0.0f;
+      // tint.a < 0 marks dynamic-entity items for the showcase dyn layer
+      // (ps_main clips them until the bit reveals); the solid-color
+      // early-out only ever reads tint.a > 0.
+      constants[35] = item.dyn_entity ? -1.0f : 0.0f;
     }
     constants[36] = scene.cam_pos[0];
     constants[37] = scene.cam_pos[1];
@@ -9362,6 +9449,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       float spline_consts[20];
       std::memcpy(spline_consts, scene.view_proj, sizeof(float) * 16);
       std::memcpy(spline_consts + 16, s.consts + 149 * 4, sizeof(float) * 4);
+      // intensity.zw = showcase blackout gate (the guest row's unused
+      // lanes): z = split x, w = left|right visibility bits. The spline PS
+      // draws outside the scene shaders, so the blackout stage must gate
+      // it here or the neon lines leak over the black recording bookends.
+      const auto side_visible = [](float v) {
+        return v < 255.5f || ((uint32_t(v + 0.5f) - 256u) & 1024u) == 0u;
+      };
+      spline_consts[18] = g_r.showcase_rows[2];
+      spline_consts[19] =
+          float((side_visible(g_r.showcase_rows[0]) ? 1 : 0) |
+                (side_visible(g_r.showcase_rows[1]) ? 2 : 0));
       cmd->SetRootConstants(0, 20, spline_consts, 0);
       cmd->SetTexture(1, spline_tex->srv);
       cmd->SetVertexBuffer(g_r.ui_ring, ui_region + ui_offset, bytes, 28);
