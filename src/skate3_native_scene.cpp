@@ -710,17 +710,6 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
                      "~9 cm. Applies live: the map recreates on change.")
     .range(1024, 8192)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_debug_fail_static_sun, 0,
-                     "Skate 3",
-                     "DEBUG: make static sun-shadow map creation fail as if "
-                     "the allocation had been rejected, driving the "
-                     "renderer's unrecoverable-failure path (sticky fallback "
-                     "to emulated output). 0 = off, 1 = fail every creation, "
-                     "2 = fail only hot recreates (size changes after a "
-                     "successful first build). Exercises the failure "
-                     "indicator and the shutdown path from the failed state.")
-    .range(0, 2)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_pcss, true, "Skate 3",
                     "Contact-hardening soft shadows (PCSS): a blocker search "
                     "estimates the caster distance per pixel and the filter "
