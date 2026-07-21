@@ -4795,6 +4795,14 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
                 t.gt.fetch_words[5]);
           }
         }
+        // Fresh commits must enter the store with a live LRU stamp: an
+        // unstamped (0) clock sorts as the oldest entry, and with the store
+        // over cap the eviction latch would retire brand-new decodes before
+        // their first draw ever stamps them - a commit/evict/re-decode loop
+        // that starved dense areas of all new content.
+        if (t.gt.last_used_frame == 0) {
+          t.gt.last_used_frame = frame_number;
+        }
         g_r.tex_store.emplace(t.words_key, t.gt);
         continue;
       }
