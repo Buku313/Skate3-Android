@@ -364,8 +364,17 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   // 256 + the layer mask left/right of the split at sh_v2.w (output
   // pixels), 0 = off. Post layers reveal per pixel by their mask bits:
   // AO 16, volumetrics 64, bloom 128 (SSR gates in its own composite).
+  // Compiled in only for the SHOWCASE=1 variant; the default build folds
+  // the mask to off and every gate below dead-strips.
+#ifndef SHOWCASE
+#define SHOWCASE 0
+#endif
+#if SHOWCASE
   float scv = i.pos.x < sh_v2.w ? sh_v2.y : sh_v2.z;
   int sc_mask = scv < 255.5 ? -1 : (int)(scv + 0.5) - 256;
+#else
+  const int sc_mask = -1;
+#endif
   float ao = ao_plane.SampleLevel(smp_linear, i.uv, 0);
   if (sc_mask >= 0 && (sc_mask & 16) == 0) {
     ao = 1.0;
@@ -446,6 +455,7 @@ float4 ps_tonemap(VSOut i) : SV_Target {
   // overpass) saturated to a solid black void.
   float3 outc =
       ToneMapScene((x + haze) * (1.0 - 0.55 * saturate(shaft)) + bloom);
+#if SHOWCASE
   // Showcase divider: a soft white line at the split while a wipe is in
   // flight (the two sides show different stages).
   if (sh_v2.w > 0.5 && abs(sh_v2.y - sh_v2.z) > 0.5) {
@@ -454,5 +464,6 @@ float4 ps_tonemap(VSOut i) : SV_Target {
     outc = lerp(outc, float3(1.0, 1.0, 1.0),
                 saturate(1.0 - d / half_w) * 0.85);
   }
+#endif
   return float4(outc, 1.0);
 }

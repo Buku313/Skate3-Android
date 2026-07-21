@@ -2656,15 +2656,31 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   }
 
   // HDR=1 switches the pixel shader's output encode to pre-tonemap linear
-  // (see scene.hlsl ToneOut/PassGamma).
-  const nrhi::ShaderMacro hdr_defs[] = {{"HDR", "1"}, {nullptr, nullptr}};
+  // (see scene.hlsl ToneOut/PassGamma); SHOWCASE=1 compiles the build-up
+  // split/mask gates in (swapped in only while a run is live). The variant
+  // string is the canonical ";"-joined macro signature the offline SPIR-V
+  // matrix uses.
+  nrhi::ShaderMacro ps_defs[3];
+  uint32_t ps_def_count = 0;
+  if (g_r.hdr_active) {
+    ps_defs[ps_def_count++] = {"HDR", "1"};
+  }
+  if (g_r.showcase_shaders) {
+    ps_defs[ps_def_count++] = {"SHOWCASE", "1"};
+  }
+  ps_defs[ps_def_count] = {nullptr, nullptr};
+  char ps_variant[24];
+  std::snprintf(ps_variant, sizeof(ps_variant), "%s%s%s",
+                g_r.hdr_active ? "HDR=1" : "",
+                g_r.hdr_active && g_r.showcase_shaders ? ";" : "",
+                g_r.showcase_shaders ? "SHOWCASE=1" : "");
   nrhi::Shader* vs = device->CreateShader(
       MakeShaderDesc(nrhi::ShaderStage::kVertex, "scene.hlsl", kShaderSource,
                      "vs_main", nullptr, ""));
   nrhi::Shader* ps = device->CreateShader(
       MakeShaderDesc(nrhi::ShaderStage::kPixel, "scene.hlsl", kShaderSource,
-                     "ps_main", g_r.hdr_active ? hdr_defs : nullptr,
-                     g_r.hdr_active ? "HDR=1" : ""));
+                     "ps_main", ps_def_count != 0 ? ps_defs : nullptr,
+                     ps_variant));
   if (vs == nullptr || ps == nullptr) {
     REXLOG_ERROR("native-scene: shader compile failed");
     g_r.failed = true;
@@ -2995,18 +3011,34 @@ bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context) {
         *p = nullptr;
       }
     }
-    const nrhi::ShaderMacro hdr_defs[] = {{"HDR", "1"}, {nullptr, nullptr}};
-    const nrhi::ShaderMacro* sp_defs = g_r.hdr_active ? hdr_defs : nullptr;
-    const char* sp_variant = g_r.hdr_active ? "HDR=1" : "";
+    // SHOWCASE=1 compiles the blackout gate in (see spline.hlsl
+    // SplineVisible); like the scene family, the variant follows the
+    // showcase swap so normal sessions carry no gate at all.
+    nrhi::ShaderMacro sp_defs[3];
+    uint32_t sp_def_count = 0;
+    if (g_r.hdr_active) {
+      sp_defs[sp_def_count++] = {"HDR", "1"};
+    }
+    if (g_r.showcase_shaders) {
+      sp_defs[sp_def_count++] = {"SHOWCASE", "1"};
+    }
+    sp_defs[sp_def_count] = {nullptr, nullptr};
+    char sp_variant[24];
+    std::snprintf(sp_variant, sizeof(sp_variant), "%s%s%s",
+                  g_r.hdr_active ? "HDR=1" : "",
+                  g_r.hdr_active && g_r.showcase_shaders ? ";" : "",
+                  g_r.showcase_shaders ? "SHOWCASE=1" : "");
     nrhi::Shader* svs = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kVertex, "spline.hlsl",
                        kShaderSplineSource, "vs_main", nullptr, ""));
     nrhi::Shader* spd = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kPixel, "spline.hlsl",
-                       kShaderSplineSource, "ps_default", sp_defs, sp_variant));
+                       kShaderSplineSource, "ps_default",
+                       sp_def_count != 0 ? sp_defs : nullptr, sp_variant));
     nrhi::Shader* spk = device->CreateShader(
         MakeShaderDesc(nrhi::ShaderStage::kPixel, "spline.hlsl",
-                       kShaderSplineSource, "ps_darken", sp_defs, sp_variant));
+                       kShaderSplineSource, "ps_darken",
+                       sp_def_count != 0 ? sp_defs : nullptr, sp_variant));
     if (svs == nullptr || spd == nullptr || spk == nullptr) {
       REXLOG_ERROR("native-scene: spline shader compile failed");
       g_r.failed = true;
@@ -3981,7 +4013,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   if (!g_r.pso || g_r.rtv_format != context.guest_output->format() ||
       g_r.hdr_active != hdr_want ||
       (hdr_want && g_r.hdr_scene_format != hdr_fmt_want) ||
-      g_r.msaa != msaa_want) {
+      g_r.msaa != msaa_want ||
+      g_r.showcase_shaders != g_r.showcase_shaders_want) {
     if (g_r.msaa != msaa_want && g_r.pfx_ready) {
       // The photo-postfx depth-pack pass is compiled against the depth
       // buffer's sample count (PFX_MSAA variant); retire the chain's PSOs
@@ -3997,14 +4030,24 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     g_r.hdr_active = hdr_want;
     g_r.hdr_scene_format = hdr_fmt_want;
     g_r.msaa = msaa_want;
+    g_r.showcase_shaders = g_r.showcase_shaders_want;
     if (!EnsureScenePsoFamily(context) || !EnsureResolvePso(context) ||
         !EnsureBlurPsos(context) || !EnsureOutlineEdgePso(context) ||
         !Ensure2dPso(context) || !EnsureSplinePsos(context) ||
         !EnsureShadowPsos(context)) {
+      if (g_r.showcase_shaders) {
+        // A showcase-variant build failure must not pin the sticky failure
+        // latch: drop the swap request so the F5 retry rebuilds the
+        // standard shaders.
+        g_r.showcase_shaders_want = false;
+        g_r.showcase_shaders = false;
+        REXCVAR_SET(skate3_native_render_scene_showcase, false);
+      }
       return false;
     }
-    REXLOG_INFO("native-scene: pipelines created (MSAA x{}, {})", g_r.msaa,
-                g_r.hdr_active ? "HDR" : "classic");
+    REXLOG_INFO("native-scene: pipelines created (MSAA x{}, {}{})", g_r.msaa,
+                g_r.hdr_active ? "HDR" : "classic",
+                g_r.showcase_shaders ? ", showcase variants" : "");
     g_r.rtv_format = context.guest_output->format();
   }
 
@@ -6946,6 +6989,18 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
   const bool want = REXCVAR_GET(skate3_native_render_scene_showcase);
   if (!s.active) {
     if (!want) {
+      // No run pending: release the showcase shader swap (the next
+      // EnsurePipeline rebuild returns the family to the standard
+      // variants with the showcase code compiled out).
+      g_r.showcase_shaders_want = false;
+      return;
+    }
+    // The run's shaders carry the split/mask gates only in their
+    // SHOWCASE=1 variants: request the swap and hold the start until the
+    // next EnsurePipeline rebuild has them live (rows stay zero, so the
+    // waiting frames render normally).
+    g_r.showcase_shaders_want = true;
+    if (!g_r.showcase_shaders) {
       return;
     }
     // Layer availability: the material looks need nothing; the shadow and
@@ -7082,6 +7137,7 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
   }
   if (!want) {
     s.active = false;
+    g_r.showcase_shaders_want = false;
     REXLOG_INFO("native-scene: showcase cancelled");
     return;
   }
@@ -7104,6 +7160,7 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
   }
   if (idx >= int(s.steps.size())) {
     s.active = false;
+    g_r.showcase_shaders_want = false;
     REXCVAR_SET(skate3_native_render_scene_showcase, false);
     REXLOG_INFO("native-scene: showcase finished");
     return;

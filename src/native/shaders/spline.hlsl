@@ -54,9 +54,18 @@ float3 SplineOut(float3 c) {
 // Showcase blackout gate: the spline pass draws outside the scene shaders,
 // so ps_main's blackout stage (scene.hlsl, mask bit 1024) cannot cover it;
 // without this the neon lines leak over the black recording bookends.
+// Compiled in only for the SHOWCASE=1 variant swapped in during a run; the
+// default build folds to visible and the gate dead-strips.
+#ifndef SHOWCASE
+#define SHOWCASE 0
+#endif
 bool SplineVisible(float px_x) {
+#if SHOWCASE
   int bits = (int)(intensity.w + 0.5);
   return ((px_x < intensity.z ? 1 : 2) & bits) != 0;
+#else
+  return true;
+#endif
 }
 float4 ps_default(VSOut i) : SV_Target {
   if (!SplineVisible(i.pos.x)) {

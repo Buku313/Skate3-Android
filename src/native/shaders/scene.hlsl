@@ -157,9 +157,20 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
 // content belongs to the normal frame and stays hidden until the bit
 // reveals (the sequencer folds their bits into every step when the layer
 // is not part of the run). Returns -1 when the showcase is off.
+// The showcase code compiles in only for the SHOWCASE=1 shader variants,
+// which the pipeline family swaps in for the duration of a run. The default
+// build folds the mask to the off value, so every showcase branch
+// dead-strips and the program matches the pre-showcase compile exactly.
+#ifndef SHOWCASE
+#define SHOWCASE 0
+#endif
 int ShowcaseMask(float px_x) {
+#if SHOWCASE
   float v = px_x < sh_v2.w ? sh_v2.y : sh_v2.z;
   return v < 255.5 ? -1 : (int)(v + 0.5) - 256;
+#else
+  return -1;
+#endif
 }
 // True when the given layer bit is revealed on this pixel's side of the
 // split (or the showcase is off entirely).

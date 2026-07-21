@@ -636,6 +636,17 @@ struct RendererState {
   nrhi::Pipeline* pso_bloom_up = nullptr;     // additive ONE/ONE tent upsample
   nrhi::Pipeline* pso_tonemap = nullptr;
   nrhi::Format hdr_pso_out_format = nrhi::Format::kUnknown;
+  // Showcase shader swap: while a build-up run is live the pipeline family
+  // rebuilds with the SHOWCASE=1 shader variants (the split/mask gates
+  // compiled in); every other session runs shaders with the showcase code
+  // compiled out entirely, so normal rendering carries none of it. _want is
+  // set by TickShowcase (a run needs the variants BEFORE its first frame),
+  // applied by the EnsurePipeline rebuild block; the per-pass built flags
+  // let the lazily-built tonemap/SSR pipelines follow the swap.
+  bool showcase_shaders_want = false;
+  bool showcase_shaders = false;
+  bool hdr_showcase = false;
+  bool ssr_showcase = false;
   // 1x float scene plane: the MSAA resolve destination (or the scene target
   // itself when MSAA is off); the AO composite, bloom extract and tonemap
   // all consume/write it.

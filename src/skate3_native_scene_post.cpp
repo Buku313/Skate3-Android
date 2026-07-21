@@ -460,7 +460,8 @@ bool EnsureSsrPipeline(const NativeGuestOutputRenderContext& context) {
     return false;
   }
   if (g_r.pso_ssr_march != nullptr && g_r.ssr_msaa == g_r.msaa &&
-      g_r.ssr_scene_fmt == g_r.hdr_scene_format) {
+      g_r.ssr_scene_fmt == g_r.hdr_scene_format &&
+      g_r.ssr_showcase == g_r.showcase_shaders) {
     return true;
   }
   nrhi::Device* device = context.device;
@@ -519,9 +520,13 @@ bool EnsureSsrPipeline(const NativeGuestOutputRenderContext& context) {
   nrhi::Shader* ps_march = device->CreateShader(
       MakeShaderDesc(nrhi::ShaderStage::kPixel, "ssr.hlsl", kSsrShaderSource,
                      "ps_march", nullptr, ""));
-  nrhi::Shader* ps_comp = device->CreateShader(
-      MakeShaderDesc(nrhi::ShaderStage::kPixel, "ssr.hlsl", kSsrShaderSource,
-                     "ps_composite", nullptr, ""));
+  // The composite follows the showcase shader swap (its SHOWCASE=1 variant
+  // carries the per-side reveal gate).
+  const nrhi::ShaderMacro sc_defs[] = {{"SHOWCASE", "1"}, {nullptr, nullptr}};
+  nrhi::Shader* ps_comp = device->CreateShader(MakeShaderDesc(
+      nrhi::ShaderStage::kPixel, "ssr.hlsl", kSsrShaderSource, "ps_composite",
+      g_r.showcase_shaders ? sc_defs : nullptr,
+      g_r.showcase_shaders ? "SHOWCASE=1" : ""));
   const bool shaders_ok = scene_vs != nullptr && ps_gbuf != nullptr &&
                           vs != nullptr && ps_lin != nullptr &&
                           ps_march != nullptr && ps_comp != nullptr;
@@ -591,6 +596,7 @@ bool EnsureSsrPipeline(const NativeGuestOutputRenderContext& context) {
   }
   g_r.ssr_msaa = g_r.msaa;
   g_r.ssr_scene_fmt = g_r.hdr_scene_format;
+  g_r.ssr_showcase = g_r.showcase_shaders;
   REXLOG_INFO("native-scene: ssr pipeline created (MSAA x{})", g_r.msaa);
   return true;
 }
@@ -1315,7 +1321,8 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
     return false;
   }
   if (g_r.pso_tonemap != nullptr &&
-      g_r.hdr_pso_out_format == context.guest_output->format()) {
+      g_r.hdr_pso_out_format == context.guest_output->format() &&
+      g_r.hdr_showcase == g_r.showcase_shaders) {
     return true;
   }
   nrhi::Device* device = context.device;
@@ -1384,9 +1391,13 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
   nrhi::Shader* ps_up = device->CreateShader(
       MakeShaderDesc(nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
                      "ps_bloom_up", nullptr, ""));
-  nrhi::Shader* ps_tone = device->CreateShader(
-      MakeShaderDesc(nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource,
-                     "ps_tonemap", nullptr, ""));
+  // The tonemap follows the showcase shader swap (its SHOWCASE=1 variant
+  // carries the post-layer gates and the split divider).
+  const nrhi::ShaderMacro sc_defs[] = {{"SHOWCASE", "1"}, {nullptr, nullptr}};
+  nrhi::Shader* ps_tone = device->CreateShader(MakeShaderDesc(
+      nrhi::ShaderStage::kPixel, "hdr.hlsl", kHdrShaderSource, "ps_tonemap",
+      g_r.showcase_shaders ? sc_defs : nullptr,
+      g_r.showcase_shaders ? "SHOWCASE=1" : ""));
   const bool shaders_ok = vs != nullptr && ps_first != nullptr &&
                           ps_down != nullptr && ps_up != nullptr &&
                           ps_tone != nullptr;
@@ -1428,6 +1439,7 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
     return fail("pso");
   }
   g_r.hdr_pso_out_format = context.guest_output->format();
+  g_r.hdr_showcase = g_r.showcase_shaders;
   REXLOG_INFO("native-scene: HDR post pipeline created");
   return true;
 }

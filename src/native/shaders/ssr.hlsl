@@ -285,11 +285,17 @@ float4 ps_march(VSOut i) : SV_Target {
 }
 
 float4 ps_composite(VSOut i) : SV_Target {
+#ifndef SHOWCASE
+#define SHOWCASE 0
+#endif
+#if SHOWCASE
   // Showcase gate: alpha 0 leaves the scene plane untouched on a side
-  // whose build-up stage has not revealed reflections yet.
+  // whose build-up stage has not revealed reflections yet. Compiled in
+  // only for the SHOWCASE=1 variant swapped in during a run.
   if ((i.pos.x < p2.x ? p2.y : p2.z) < 0.5f) {
     return float4(0.0f, 0.0f, 0.0f, 0.0f);
   }
+#endif
   float4 g = tex1c.SampleLevel(smp_point, i.uv, 0);
   float wrefl = abs(g.a);
   float dbg = p0.w;
