@@ -6801,6 +6801,7 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
         cmd->ClearRenderTarget(g_r.world_shadow, ws_clear);
         std::memcpy(g_r.world_shadow_rows, scene.dynobj_ws,
                     sizeof(g_r.world_shadow_rows));
+        g_r.world_shadow_drawn.clear();
         if (!g_r.world_shadow_primed) {
           REXLOG_INFO(
               "native-scene: world-shadow map primed (dynobj c5/c6/c7 rows)");
@@ -6841,6 +6842,21 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
         }
         auto mit = g_r.meshes.find(item.mesh);
         if (mit == g_r.meshes.end()) {
+          continue;
+        }
+        // Accumulate each item exactly once per map generation: MIN-blend
+        // re-draws are idempotent, so anything already in the map is pure
+        // redundant work (the whole static item list re-rendered every 4th
+        // frame paced this pass). Keyed on mesh + content fingerprint +
+        // world transform; an in-place content swap or a moved instance
+        // reads as new and lands on the next accumulation frame.
+        uint64_t ws_key = 1469598103934665603ull ^ item.mesh;
+        ws_key = (ws_key ^ mit->second.fingerprint) * 1099511628211ull;
+        const uint8_t* wb = reinterpret_cast<const uint8_t*>(item.world);
+        for (size_t bi = 0; bi < sizeof(item.world); ++bi) {
+          ws_key = (ws_key ^ wb[bi]) * 1099511628211ull;
+        }
+        if (!g_r.world_shadow_drawn.insert(ws_key).second) {
           continue;
         }
         float constants[52] = {};

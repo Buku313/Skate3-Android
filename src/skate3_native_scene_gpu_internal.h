@@ -8,6 +8,8 @@
 
 #include "skate3_native_scene_state.h"
 
+#include <unordered_set>
+
 #if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
 
 #include <rex/graphics/native_guest_renderer.h>
@@ -915,6 +917,13 @@ struct RendererState {
   bool world_shadow_primed = false;
   float world_shadow_rows[12] = {};
   static constexpr uint32_t kWorldShadowSize = 512;
+  // Items already accumulated into the current map (mesh + world-transform
+  // hash): MIN-blend re-draws of the same geometry are idempotent, so each
+  // static item needs to land exactly once per map generation. The periodic
+  // accumulation pass then only draws newly streamed/decoded items (normally
+  // zero) instead of the whole static item list. Reset on re-prime (clear).
+  // Render thread only.
+  std::unordered_set<uint64_t> world_shadow_drawn;
   static constexpr uint32_t kUiRegionSize = 1u << 20;
   static constexpr uint32_t kUiRegions = 8;
   nrhi::Buffer* ui_ring = nullptr;
