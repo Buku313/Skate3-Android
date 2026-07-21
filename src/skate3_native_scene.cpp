@@ -8687,13 +8687,34 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     if (s_last_pub.size() > 4096) {
       s_last_pub.clear();
     }
-    for (const DrawItem& item : scene.items) {
+    for (DrawItem& item : scene.items) {
       if (!(item.ropa || item.char_family != 0 ||
             (item.skinned && !item.bones.empty()))) {
         continue;
       }
       PubTrack& t = s_last_pub[item.mesh];
       const uint64_t gap = t.frame != 0 ? s_pub_frame - t.frame : 0;
+      if (item.char_family != 0 && item.caster_bank) {
+        // The main-pass fixup missed and this piece reached publish as its
+        // raw ortho-bank capture (shadow-pass constants, no lighting rows):
+        // consumers reading its rows misjudge it for the frame (the caster
+        // fade gate skipped the piece, blinking the skater's shadow off).
+        // Serve the previous frame's main-view capture instead, and never
+        // store shadow-bank state as the good copy.
+        if (t.frame != 0 && gap <= 2 && !t.item.caster_bank) {
+          item = t.item;
+          t.frame = s_pub_frame;
+          static std::atomic<uint64_t> s_bank_swaps{0};
+          const uint64_t n = s_bank_swaps.fetch_add(1, std::memory_order_relaxed);
+          if (n < 8 || (n & 255u) == 0) {
+            REXLOG_INFO(
+                "native-scene: caster-bank publish swapped for last main-view "
+                "capture mesh={:08X} fam={} (n={})",
+                item.mesh, item.char_family, n + 1);
+          }
+        }
+        continue;
+      }
       t.frame = s_pub_frame;
       t.item = item;
       if (gap >= 2 && gap <= 4) {
