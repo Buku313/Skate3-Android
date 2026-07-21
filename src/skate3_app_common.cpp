@@ -909,7 +909,11 @@ void Skate3BaseApp::ToggleSimpleSettings() {
   // zeroes guest-facing input while the settings screen is open.
   auto poll_gamepad = [this]() {
     rex::ui::SimpleSettingsGamepad pad;
-    auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system());
+    // The dialog can be painted (and thus poll) during a frame that races
+    // runtime teardown at close time, when runtime() is already gone.
+    auto* rt = runtime();
+    auto* input_system =
+        rt ? static_cast<rex::input::InputSystem*>(rt->input_system()) : nullptr;
     if (input_system) {
       rex::input::X_INPUT_GAMEPAD state;
       if (input_system->GetUiGamepadState(&state)) {
