@@ -7727,6 +7727,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                 sizeof(ring_frame->family_rows));
     ring_frame->sky_height = scene.sky_height;
     ring_frame->shadow_valid = scene.shadow_valid;
+    ring_frame->shadow_ready = shadow_ready;
+    ring_frame->shadow_draws = uint16_t(std::min<uint32_t>(shadow_draws, 0xFFFFu));
+    ring_frame->static_sun_valid = g_r.static_sun_valid;
     ring_frame->items.reserve(scene.items.size());
     ring_map.reserve(scene.items.size());
   }

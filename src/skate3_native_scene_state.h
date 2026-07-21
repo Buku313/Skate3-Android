@@ -680,6 +680,12 @@ struct SceneRingFrame {
   float family_rows[4] = {};
   float sky_height = 0.0f;
   bool shadow_valid = false;
+  // Shadow-atlas outcome for the frame: a character shadow blinking off
+  // for one frame with the item composition identical lives in this pass,
+  // and nothing else in the ring could see it.
+  bool shadow_ready = false;
+  uint16_t shadow_draws = 0;
+  bool static_sun_valid = false;
   std::vector<SceneRingItem> items;
 };
 inline std::deque<SceneRingFrame> g_scene_ring;  // render thread only
@@ -709,7 +715,7 @@ inline void MaybeDumpSceneRing() {
     std::snprintf(line, sizeof(line),
                   "F,%llu,cam,%.2f,%.2f,%.2f,items,%zu,fog,%.5f,%.4f,"
                   "%.3f,%.4f,%.4f,%.4f,fam,%.4f,%.4f,%.4f,%.4f,sky,%.1f,"
-                  "shadow,%d\n",
+                  "shadow,%d,atlas,%d,%u,nsm,%d\n",
                   static_cast<unsigned long long>(fr.frame), double(fr.cam[0]),
                   double(fr.cam[1]), double(fr.cam[2]),
                   fr.items.size(), double(fr.fog[0]), double(fr.fog[1]),
@@ -717,7 +723,8 @@ inline void MaybeDumpSceneRing() {
                   double(fr.fog[5]), double(fr.family_rows[0]),
                   double(fr.family_rows[1]), double(fr.family_rows[2]),
                   double(fr.family_rows[3]), double(fr.sky_height),
-                  fr.shadow_valid ? 1 : 0);
+                  fr.shadow_valid ? 1 : 0, fr.shadow_ready ? 1 : 0,
+                  unsigned(fr.shadow_draws), fr.static_sun_valid ? 1 : 0);
     f << line;
     for (const SceneRingItem& it : fr.items) {
       std::snprintf(line, sizeof(line),
