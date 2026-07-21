@@ -53,7 +53,9 @@ vulkan_push_constants_descriptors = false
 # frame-time regressions on others. Leave disabled unless testing it explicitly.
 vulkan_deferred_resolve_clears = false
 # Scaled-resolve texture load fast paths introduced in v1.0.4 can be faster on
-# some drivers, but they increase pressure on scaled resolve buffers.
+# some drivers, but they increase pressure on scaled resolve buffers and have
+# been implicated in severe frame-time regressions on others. Off by default
+# (matching the code default); enable only to test on a known-good driver.
 vulkan_texel_buffer_texture_loads = false
 vulkan_storage_image_texture_loads = false
 

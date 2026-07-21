@@ -3345,7 +3345,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
       static std::atomic<uint32_t> rej_log{0};
       const uint32_t n = rej_log.fetch_add(1, std::memory_order_relaxed);
       if (n < 16 || (n & 2047u) == 0) {
-        REXLOG_INFO(
+        REXLOG_DEBUG(
             "native-scene: char capture REJECTED fam={} light=({:.3f},{:.3f},{:.3f}) "
             "expo={:.3f} key=({:.3f},{:.3f},{:.3f})",
             fam, light[0], light[1], light[2], expo, key[0], key[1], key[2]);
@@ -4929,7 +4929,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         if (s_edge_logged < 20 && s_total_logged < 100) {
           ++s_edge_logged;
           ++s_total_logged;
-          REXLOG_INFO(
+          REXLOG_DEBUG(
               "native-scene: blur ramp k=({:.3f},{:.3f}) c1=({:.3f},{:.3f},{:.3f}) {}",
               k0, k1, c1[0], c1[1], c1[2], kernel_ok ? "accepted" : "held");
         }
