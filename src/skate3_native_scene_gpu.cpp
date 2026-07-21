@@ -186,16 +186,17 @@ void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
 // reuse) is just different keys, so both states of any transition stay
 // resident and no rebind can ever serve another binding's art.
 std::atomic<uint64_t> g_store_evicted{0};
-constexpr size_t kTexStoreCap = 6144;
+constexpr size_t kTexStoreCap = 12288;
 
 uint32_t SwapU32(uint32_t v);  // defined with the decode helpers below
 
 // (kTexStoreCap sizing: dense areas with the extended draw distance hold a
-// ~3000-4000 entry live working set, so the previous 3072 cap kept the
-// eviction latch cycling and re-decoding mip states the player was about
-// to face again - re-promoted content resolved visibly late. Entries no
-// longer retain their staging buffers, so 6144 costs the VRAM the old
-// 3072 did.)
+// ~3000-4000 entry live working set, and a map switch stacks two working
+// sets; a 6144 cap kept the eviction latch cycling every ~20 s in dense
+// areas, re-decoding content the player was about to face again (visible
+// pop-in / late resolves). The count cap is a wide entry-bloat backstop
+// now: the byte budget (skate3_native_render_scene_tex_store_mb) is the
+// real VRAM bound and engages first on texture-heavy content.)
 
 // Seqlock-stable read of a texture object's six fetch words, guest -> host
 // order. The streamer rewrites the words word-by-word on its own thread; a
@@ -260,7 +261,7 @@ void UpdateEvictFpsEstimate(uint64_t frame_number) {
 // working set exceeds the cap parks over it instead of thrash-evicting
 // live content into a re-decode loop.
 constexpr size_t kTexEvictPerFrame = 64;
-constexpr double kTexEvictMinIdleSeconds = 20.0;
+constexpr double kTexEvictMinIdleSeconds = 45.0;
 
 // Byte-budget layer over the count caps: the caps above bound ENTRY counts,
 // but per-entry sizes differ per map, and after a map switch the union of
@@ -414,7 +415,11 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
 // meshes the player has not seen yet; evicting them defeats the prewarm
 // and turns panning into a re-decode churn loop); an evicted mesh
 // re-decodes on the workers like any first sight.
-constexpr size_t kMeshStoreCap = 6144;
+// (Cap sizing: dense maps prewarm ~21k meshes at ~13 KB average, ~280 MB
+// total - a 6144 cap forced the whole prewarm through a churn funnel for
+// trivial VRAM. The count cap is an entry backstop; the byte budget
+// (skate3_native_render_scene_mesh_store_mb) is the VRAM bound.)
+constexpr size_t kMeshStoreCap = 24576;
 constexpr size_t kMeshEvictPerFrame = 64;
 constexpr double kMeshEvictMinIdleSeconds = 90.0;
 
