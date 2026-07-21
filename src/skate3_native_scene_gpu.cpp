@@ -7615,6 +7615,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
+  // GPU-time attribution: every pass below marks its start; the backend's
+  // timestamp-bucket profiler (d3d12/vulkan_gpu_timestamp_buckets) reports
+  // per-pass spans. The first mark starts here so the frame's store commits
+  // and evictions are attributed separately from the render passes.
+  cmd->ProfileRegion(nrhi::ProfileStage::kCommit);
+
   if (!g_r.announced) {
     g_r.announced = true;
     REXLOG_INFO("native-scene: rendering natively ({} items, {}x{})", scene.items.size(),
@@ -7644,10 +7650,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   const auto shadow_t0 = PerfClock::now();
   const float* sh = scene.shadow_rows;
   const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
+  cmd->ProfileRegion(nrhi::ProfileStage::kShadow);
   shadow_ready =
       RenderShadowAtlas(context, scene, bone_region, debug_mode, &shadow_draws);
+  cmd->ProfileRegion(nrhi::ProfileStage::kStaticSun);
   RenderStaticSunMap(context, scene, bone_region, debug_mode, frame_number);
   g_pw_shadow.Add(perf_ns_since(shadow_t0));
+  cmd->ProfileRegion(nrhi::ProfileStage::kMain);
   // Scene-level flicker probe: the shadow cascade rows (or validity/readiness)
   // returning EXACTLY to the previous-but-one frame's state; hair samples the
   // atlas, so an alternating cascade capture darkens/lightens it per frame.
@@ -10060,6 +10069,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
+  cmd->ProfileRegion(nrhi::ProfileStage::kResolve);
   if (msaa_on) {
     // Resolve: average the MSAA samples into the 1x scene plane (the float
     // HDR plane, or the guest output on the classic path) with a fullscreen
@@ -10096,6 +10106,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // main layout latched from the scene pass.
   bool post_ran = false;
   bool ssao_ran = false;
+  cmd->ProfileRegion(nrhi::ProfileStage::kAmbientOcclusion);
   if (use_depth && !loading_native &&
       REXCVAR_GET(skate3_native_render_scene_ssao) &&
       ApplySsaoPass(context, cmd, scene, viewport, scissor)) {
@@ -10109,6 +10120,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // directly-visible scenery. The reflection G-buffer was drawn inside the
   // scene pass (ssr_gbuf_ready); the SSAO linear-depth plane is reused when
   // AO ran this frame.
+  cmd->ProfileRegion(nrhi::ProfileStage::kSsr);
   if (g_r.ssr_gbuf_ready &&
       ApplySsrPass(context, cmd, scene, viewport, scissor, ssao_ran)) {
     post_ran = true;
@@ -10119,6 +10131,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // the static world-shadow map), plus the constant staging for the
   // directional haze; both terms join in ps_tonemap after the AO multiply,
   // so they bloom and tonemap like scene light.
+  cmd->ProfileRegion(nrhi::ProfileStage::kVolumetrics);
   if (hdr_on && use_depth && !loading_native &&
       ApplyVolumetricPass(context, cmd, scene, viewport, scissor, ssao_ran,
                           frame_number)) {
@@ -10130,6 +10143,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // game's shared tone chain once into the guest output, which every later
   // consumer (photo chain, 2D overlay, blur, grab) reads exactly as on the
   // classic path.
+  cmd->ProfileRegion(nrhi::ProfileStage::kBloom);
   if (hdr_on) {
     ApplyHdrPost(context, cmd, viewport, scissor, loading_native,
                  frame_number);
@@ -10574,6 +10588,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       float(context.guest_output_width) / float(context.guest_output_height);
   const float wide_2d_scale =
       out_aspect2d > (16.0f / 9.0f) * 1.01f ? (16.0f / 9.0f) / out_aspect2d : 1.0f;
+
+  cmd->ProfileRegion(nrhi::ProfileStage::k2d);
 
   // ---- Native photo grab (photo_grab_native) ----
   // Consume: CPU-tile the newest fence-completed readback into the guest
@@ -11139,6 +11155,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   cmd->Barrier(context.guest_output, nrhi::ResourceState::kRenderTarget,
                nrhi::ResourceState::kGuestOutput);
   cmd->FlushBarriers();
+  cmd->ProfileRegion(nrhi::ProfileStage::kTail);
 
   g_pw_2d.Add(perf_ns_since(twod_t0));
   g_pw_tail.Add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
