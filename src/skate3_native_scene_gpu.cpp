@@ -106,6 +106,7 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_sun_deg);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug_fail_static_sun);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
@@ -3312,6 +3313,13 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     // tiles side by side: inner (r/6, centimeter contact detail with
     // useful reach), mid (r/2) and far (full radius, large-caster
     // coverage); size is per tile.
+    // Forced-failure debug hook (see the cvar's help text): mode 1 fails
+    // every creation, mode 2 only hot recreates; retries are skipped so the
+    // sticky-failed path below engages like a hard driver rejection.
+    const int32_t debug_fail =
+        REXCVAR_GET(skate3_native_render_scene_debug_fail_static_sun);
+    const bool force_fail =
+        debug_fail == 1 || (debug_fail == 2 && g_r.static_sun_requested != 0);
     g_r.static_sun_requested = want_static_size;
     g_r.static_sun_size = want_static_size;
     nrhi::TextureDesc desc;
@@ -3322,11 +3330,11 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     desc.initial_state = nrhi::ResourceState::kRenderTarget;
     desc.clear_color[0] = 1.0f;  // depth: far = lit
     desc.clear_color[1] = 1.0f;
-    g_r.static_sun = device->CreateTexture(desc);
+    g_r.static_sun = force_fail ? nullptr : device->CreateTexture(desc);
     // Allocation-failure fallback (VRAM pressure, driver limits): a
     // coarser static sun map beats marking the whole renderer failed and
     // dropping the session to emulated output.
-    while (g_r.static_sun == nullptr && g_r.static_sun_size > 1024) {
+    while (!force_fail && g_r.static_sun == nullptr && g_r.static_sun_size > 1024) {
       g_r.static_sun_size /= 2;
       desc.width = g_r.static_sun_size * 3;
       desc.height = g_r.static_sun_size;
@@ -10633,6 +10641,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 
 }  // namespace
 
+bool SceneFailed() { return g_r.failed; }
+
+void ResetSceneFailure() {
+  if (g_r.failed) {
+    g_r.failed = false;
+    REXLOG_INFO(
+        "native-scene: sticky pipeline failure cleared; the next frame "
+        "retries the full pipeline build");
+  }
+}
+
 void Install() {
   // Registered even when the scene cvar starts off: RenderScene yields to the
   // emulated output while disabled, and the runtime toggle (F5) can flip the
@@ -10652,6 +10671,8 @@ void Install() {
 
 namespace skate3::native_scene {
 void Install() {}
+bool SceneFailed() { return false; }
+void ResetSceneFailure() {}
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12 || REX_HAS_VULKAN

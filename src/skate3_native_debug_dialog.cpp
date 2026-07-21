@@ -1221,12 +1221,14 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
 
 void RenderModeIndicator::OnDraw(ImGuiIO& io) {
   // Force-show while the native scene renderer is switched off (F5, the
-  // settings Renderer row, or the boot-time hook-layer master): running
-  // emulated is a degraded state the player should be able to see even with
-  // the indicator cvar off. Natural per-frame yields while the scene
-  // renderer is enabled (menus/loading) do not trigger this.
+  // settings Renderer row, or the boot-time hook-layer master) or has hit an
+  // unrecoverable failure and permanently yields to the emulated output:
+  // running emulated is a degraded state the player should be able to see
+  // even with the indicator cvar off. Natural per-frame yields while the
+  // scene renderer is enabled (menus/loading) do not trigger this.
   const bool scene_off = !REXCVAR_GET(skate3_native_render) ||
-                         !REXCVAR_GET(skate3_native_render_scene);
+                         !REXCVAR_GET(skate3_native_render_scene) ||
+                         skate3::native_scene::SceneFailed();
   if (!REXCVAR_GET(skate3_native_render_mode_indicator) && !scene_off) {
     return;
   }

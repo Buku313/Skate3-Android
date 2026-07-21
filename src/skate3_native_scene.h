@@ -650,6 +650,17 @@ void Install();
 // layer was not enabled at boot.
 bool ToggleSceneEnabled();
 
+// True once the scene renderer has hit an unrecoverable pipeline/resource
+// failure and yields to the emulated output until re-enabled. Surfaced so
+// the render-mode indicator can show the degraded state even though the
+// renderer cvars are still enabled.
+bool SceneFailed();
+
+// Clears the sticky failure so the next frame retries the full pipeline
+// build (ToggleSceneEnabled calls this on re-enable: a transient allocation
+// failure can succeed on retry; a persistent one simply re-latches).
+void ResetSceneFailure();
+
 // Debug-dialog cache flushes (F12 native-render debug menu): retire every
 // cached GPU texture / mesh decode so hot-toggled decode settings (mip
 // chains, revalidation, ...) rebuild immediately.
