@@ -753,14 +753,12 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_bias, 0.08,
                       "static shadows visibly detach from their casters.")
     .range(0.0, 0.5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_bias_vk, 0.05,
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_bias_vk, 0.0,
                       "Skate 3",
                       "Additional static sun-shadow receiver bias in METERS "
-                      "applied on the Vulkan backend only. The caster and "
-                      "receiver depth terms compile through different "
-                      "toolchains per backend; their rounding differences "
-                      "left borderline texels flipping at map rebuilds on "
-                      "Vulkan (triangular ground flicker while moving).")
+                      "applied on the Vulkan backend only (a tuning margin "
+                      "for backend shader-toolchain rounding differences; "
+                      "raise only if acne appears on Vulkan specifically).")
     .range(0.0, 0.5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_char_shadow_exact, true,
@@ -9937,14 +9935,34 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
   // Game shadow-pass parity (see g_frame_ortho_ctx): mark the items whose
-  // ctx the game submitted through an ortho caster bank this frame. Runs
-  // after every item source (merge, rescues, gap fill) and is OR-only:
-  // fresh captures default false, rescued/gap copies keep their stored
-  // flag, so a frame whose shadow capture was refused doesn't blink the
-  // entity's shadow off.
-  for (DrawItem& item : scene.items) {
-    if (item.ctx != 0 && ortho_ctx.count(item.ctx) != 0) {
-      item.shadow_caster = true;
+  // ctx the game submitted through an ortho caster bank. Runs after every
+  // item source (merge, rescues, gap fill) and is OR-only. The ortho
+  // capture races the publish (more often the higher the render rate), and
+  // a fresh capture defaults false: marking from THIS frame's set alone
+  // blinked the skater's shadow off for single frames while the body kept
+  // rendering. A ctx therefore counts as a caster while it was
+  // ortho-submitted within the last kOrthoHoldFrames build frames;
+  // never-submitted pieces (the trucker hat) stay non-casters forever.
+  {
+    static std::unordered_map<uint32_t, uint64_t> s_ortho_last;
+    static uint64_t s_ortho_frame = 0;
+    ++s_ortho_frame;
+    if (s_ortho_last.size() > 4096) {
+      s_ortho_last.clear();
+    }
+    for (uint32_t ctx : ortho_ctx) {
+      s_ortho_last[ctx] = s_ortho_frame;
+    }
+    constexpr uint64_t kOrthoHoldFrames = 60;
+    for (DrawItem& item : scene.items) {
+      if (item.ctx == 0) {
+        continue;
+      }
+      const auto it = s_ortho_last.find(item.ctx);
+      if (it != s_ortho_last.end() &&
+          s_ortho_frame - it->second <= kOrthoHoldFrames) {
+        item.shadow_caster = true;
+      }
     }
   }
   g_last_publish_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
