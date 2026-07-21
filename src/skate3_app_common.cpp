@@ -81,6 +81,7 @@ extern const rex::PPCImageInfo eawebkit_PPCImageConfig;
 extern "C" REX_FUNC(__restgprlr_19);
 
 // Defined in skate3_native_scene.cpp; toggled by the showcase hotkey below.
+REXCVAR_DECLARE(bool, skate3_native_render_capture_hotkeys);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_showcase);
 // Defined in skate3_native_scene.cpp; the freecam hotkey below toggles it,
 // and while it captures input the guest input system is gated off.
@@ -728,6 +729,13 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         });
   rex::ui::RegisterBind("bind_skate3_showcase", "Ctrl+Shift+B",
                         "Graphics build-up showcase", [] {
+                          // A capture/recording tool, not a player feature:
+                          // like the capture hotkeys, the bind is inert
+                          // unless the diagnostics cvar opts in (the F12
+                          // Showcase Setup window still starts runs).
+                          if (!REXCVAR_GET(skate3_native_render_capture_hotkeys)) {
+                            return;
+                          }
                           REXCVAR_SET(
                               skate3_native_render_scene_showcase,
                               !REXCVAR_GET(skate3_native_render_scene_showcase));

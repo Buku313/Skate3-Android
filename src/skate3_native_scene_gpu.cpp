@@ -8417,8 +8417,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[34] = item.unlit ? 1.0f : 0.0f;
       // tint.a < 0 marks dynamic-entity items for the showcase dyn layer
       // (ps_main clips them until the bit reveals); the solid-color
-      // early-out only ever reads tint.a > 0.
-      constants[35] = item.dyn_entity ? -1.0f : 0.0f;
+      // early-out only ever reads tint.a > 0. Staged only while a showcase
+      // frame is live (nonzero split rows) so normal rendering never
+      // carries the marker at all.
+      constants[35] = (item.dyn_entity && (g_r.showcase_rows[0] != 0.0f ||
+                                           g_r.showcase_rows[1] != 0.0f))
+                          ? -1.0f
+                          : 0.0f;
     }
     constants[36] = scene.cam_pos[0];
     constants[37] = scene.cam_pos[1];
