@@ -686,6 +686,12 @@ struct SceneRingFrame {
   bool shadow_ready = false;
   uint16_t shadow_draws = 0;
   bool static_sun_valid = false;
+  // The frame's captured cascade rows: receivers project through these, so
+  // a single-frame foreign capture moves every dynamic shadow off-target
+  // with the composition and the atlas identical. They vary legitimately
+  // with the camera, so only a recorded per-frame trace can tell an
+  // outlier from drift.
+  float shadow_rows[48] = {};
   std::vector<SceneRingItem> items;
 };
 inline std::deque<SceneRingFrame> g_scene_ring;  // render thread only
@@ -726,6 +732,12 @@ inline void MaybeDumpSceneRing() {
                   fr.shadow_valid ? 1 : 0, fr.shadow_ready ? 1 : 0,
                   unsigned(fr.shadow_draws), fr.static_sun_valid ? 1 : 0);
     f << line;
+    f << "S," << fr.frame;
+    for (float v : fr.shadow_rows) {
+      std::snprintf(line, sizeof(line), ",%.6g", double(v));
+      f << line;
+    }
+    f << "\n";
     for (const SceneRingItem& it : fr.items) {
       std::snprintf(line, sizeof(line),
                     "I,%llu,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,"

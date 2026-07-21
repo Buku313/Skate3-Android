@@ -7730,6 +7730,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     ring_frame->shadow_ready = shadow_ready;
     ring_frame->shadow_draws = uint16_t(std::min<uint32_t>(shadow_draws, 0xFFFFu));
     ring_frame->static_sun_valid = g_r.static_sun_valid;
+    std::memcpy(ring_frame->shadow_rows, scene.shadow_rows,
+                sizeof(ring_frame->shadow_rows));
     ring_frame->items.reserve(scene.items.size());
     ring_map.reserve(scene.items.size());
   }
