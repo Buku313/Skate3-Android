@@ -5889,14 +5889,61 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
                   scene.shadow_rows[26]};
   const float slen =
       std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
-  if (slen < 0.5f) {
+  bool sun_usable = slen >= 0.5f;
+  if (sun_usable) {
+    for (float& v : sun) {
+      v /= slen;
+    }
+    sun_usable = sun[1] >= 0.08f;  // at/below the horizon = no sun term
+  }
+  // Single-frame capture outliers (a foreign light bank riding the row
+  // capture, or a mid-transition frame) must not flap the term or the
+  // built axis: dropping the whole map for one frame flashed every static
+  // shadow lighter, and an unratelimited axis-delta rebuild rebuilt the map
+  // along the outlier axis and back. Serve the cached map through short
+  // outlier runs; a persistent change (genuine dusk, time-of-day scripts)
+  // passes after a few frames.
+  static uint32_t s_unusable_run = 0;
+  if (!sun_usable) {
+    if (g_r.nsm_built_radius > 0.0f && ++s_unusable_run <= 30) {
+      g_r.static_sun_valid = true;  // hold the cached map + stored rows
+      static std::atomic<uint32_t> s_hold_logs{0};
+      const uint32_t n = s_hold_logs.fetch_add(1, std::memory_order_relaxed);
+      if (n < 8 || (n & 255u) == 0) {
+        REXLOG_INFO(
+            "native-scene: static sun capture unusable (len={:.2f} y={:.2f}) - "
+            "serving cached map (run={} n={})",
+            slen, slen >= 0.5f ? sun[1] : 0.0f, s_unusable_run, n + 1);
+      }
+    }
     return;
   }
-  for (float& v : sun) {
-    v /= slen;
-  }
-  if (sun[1] < 0.08f) {
-    return;  // sun at/below the horizon: no usable static sun term
+  s_unusable_run = 0;
+  if (g_r.nsm_built_radius > 0.0f) {
+    const float held_dot = sun[0] * g_r.nsm_sun[0] + sun[1] * g_r.nsm_sun[1] +
+                           sun[2] * g_r.nsm_sun[2];
+    if (held_dot < 0.999995f) {
+      // The captured axis disagrees with the built one: require it to
+      // persist two consecutive build frames before it can drive a
+      // rebuild; until then keep working along the held axis.
+      static float s_cand[3] = {};
+      static uint64_t s_cand_frame = 0;
+      const float cand_dot =
+          sun[0] * s_cand[0] + sun[1] * s_cand[1] + sun[2] * s_cand[2];
+      const bool confirmed = s_cand_frame + 1 == frame_number && cand_dot > 0.9999f;
+      std::memcpy(s_cand, sun, sizeof(s_cand));
+      s_cand_frame = frame_number;
+      if (!confirmed) {
+        static std::atomic<uint32_t> s_jump_logs{0};
+        const uint32_t n = s_jump_logs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n & 255u) == 0) {
+          REXLOG_INFO(
+              "native-scene: static sun axis jump held (dot={:.6f} n={})",
+              held_dot, n + 1);
+        }
+        std::memcpy(sun, g_r.nsm_sun, sizeof(sun));
+      }
+    }
   }
   const float zl[3] = {-sun[0], -sun[1], -sun[2]};
   float xl[3] = {zl[2], 0.0f, -zl[0]};
