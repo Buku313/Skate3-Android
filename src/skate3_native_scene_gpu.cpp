@@ -183,9 +183,16 @@ void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
 // reuse) is just different keys, so both states of any transition stay
 // resident and no rebind can ever serve another binding's art.
 std::atomic<uint64_t> g_store_evicted{0};
-constexpr size_t kTexStoreCap = 3072;
+constexpr size_t kTexStoreCap = 6144;
 
 uint32_t SwapU32(uint32_t v);  // defined with the decode helpers below
+
+// (kTexStoreCap sizing: dense areas with the extended draw distance hold a
+// ~3000-4000 entry live working set, so the previous 3072 cap kept the
+// eviction latch cycling and re-decoding mip states the player was about
+// to face again - re-promoted content resolved visibly late. Entries no
+// longer retain their staging buffers, so 6144 costs the VRAM the old
+// 3072 did.)
 
 // Seqlock-stable read of a texture object's six fetch words, guest -> host
 // order. The streamer rewrites the words word-by-word on its own thread; a
