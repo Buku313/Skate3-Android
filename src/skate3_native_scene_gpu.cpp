@@ -104,6 +104,7 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_max_m);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_min_texel);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_sun_deg);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias_vk);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
@@ -7548,8 +7549,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                 float(REXCVAR_GET(
                     skate3_native_render_scene_shadow_pcss_min_texel)) /
                 float(std::max(1u, g_r.static_sun_size));
-      const float bias_m = float(
+      float bias_m = float(
           REXCVAR_GET(skate3_native_render_scene_shadow_static_bias));
+      if (context.device->backend() == nrhi::Backend::kVulkan) {
+        // The two backends compile the caster/receiver depth math through
+        // different shader toolchains; their rounding differences leave
+        // borderline texels flipping at map rebuilds without this margin.
+        bias_m += float(
+            REXCVAR_GET(skate3_native_render_scene_shadow_static_bias_vk));
+      }
       cb[160] = bias_m / g_r.nsm_depth_range;  // base receiver bias
       cb[161] = bias_m / g_r.nsm_depth_range;  // slope-scaled term
       cb[162] = 0.0f;  // reserved (cascade ratios are shader constants)

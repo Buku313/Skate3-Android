@@ -753,6 +753,16 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_bias, 0.08,
                       "static shadows visibly detach from their casters.")
     .range(0.0, 0.5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_bias_vk, 0.05,
+                      "Skate 3",
+                      "Additional static sun-shadow receiver bias in METERS "
+                      "applied on the Vulkan backend only. The caster and "
+                      "receiver depth terms compile through different "
+                      "toolchains per backend; their rounding differences "
+                      "left borderline texels flipping at map rebuilds on "
+                      "Vulkan (triangular ground flicker while moving).")
+    .range(0.0, 0.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_char_shadow_exact, true,
                     "Skate 3",
                     "Characters sample the CSM atlas with the game's own math: "
