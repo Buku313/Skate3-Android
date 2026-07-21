@@ -339,7 +339,7 @@ std::filesystem::path DefaultRoamingUserRoot() {
 }
 
 std::filesystem::path ResolveSkate3UserRoot(const rex::PathConfig& paths) {
-  const auto executable_root = rex::filesystem::GetExecutableFolder();
+  const auto executable_root = rex::filesystem::GetAppRootFolder();
   if (std::filesystem::exists(executable_root / "portable.txt")) {
     return executable_root;
   }
@@ -778,7 +778,7 @@ void Skate3BaseApp::OnPostSetup() {
   // content tree, and without the folder the default location is unchanged.
   {
     const auto portable_saves =
-        rex::filesystem::GetExecutableFolder() / std::string(kSavesDirectoryName);
+        rex::filesystem::GetAppRootFolder() / std::string(kSavesDirectoryName);
     if (std::filesystem::is_directory(portable_saves) && runtime()->kernel_state() &&
         runtime()->kernel_state()->content_manager()) {
       runtime()->kernel_state()->content_manager()->SetContentTypeRoot(
@@ -1271,7 +1271,7 @@ void Skate3BaseApp::InstallDlcPackages() {
   }
 
   const auto source_dirs =
-      DiscoverDlcSourceDirectories(rex::filesystem::GetExecutableFolder(),
+      DiscoverDlcSourceDirectories(rex::filesystem::GetAppRootFolder(),
                                    runtime()->game_data_root(), runtime()->user_data_root());
   std::unordered_set<std::string> seen_packages;
   size_t installed_count = 0;

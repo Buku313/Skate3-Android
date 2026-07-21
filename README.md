@@ -48,7 +48,7 @@ Notes:
 
 1. Download the latest release Skate3Recomp-macOS.zip from the releases page.
 2. Extract it anywhere you like, to a folder you control.
-3. Run the game by opening the "Skate 3 Recomp" app (or "./skate3" from a terminal). The app must stay in the extracted folder next to the other files.
+3. Run the game by opening the Skate3Recomp app. Game files, saves and settings are kept in the folder containing the app, so keep it in a folder you control rather than in Downloads or Applications.
 4. The first time, right-click the app and choose Open, or approve it under System Settings > Privacy & Security, before macOS will allow it to run.
 5. Click "Select ISO" to select your legally obtained copy of Skate 3.
 6. Wait for the installer to extract the game files.
