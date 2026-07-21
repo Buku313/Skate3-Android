@@ -129,6 +129,11 @@ struct GuestTexture {
   // words states (old mip levels, pre-demote detail sets) age out once
   // nothing routes to them.
   uint64_t last_used_frame = 0;
+  // Estimated GPU footprint of the committed texture (all mips/faces),
+  // memoized by the store byte-accounting scan; 0 until first scanned or
+  // while no texture is committed. Retained staging buffers are counted
+  // live at scan time, not here.
+  uint32_t gpu_bytes = 0;
   // A tiled mip's padded macro-row copy faulted and fell back to the
   // reported size; blocks beyond it uploaded as ZERO (the half-black
   // banner mip: tiled addressing puts the image's bottom rows past

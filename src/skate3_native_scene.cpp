@@ -970,6 +970,21 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_detail_hold, 240, "Skate 3",
                      "guest binding verbatim (the console's own detail pop).")
     .range(0, 2000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_tex_store_mb, 1280, "Skate 3",
+                     "Texture content-store GPU byte budget in MB. The store "
+                     "is count-capped, but per-entry sizes differ per map and "
+                     "the idle guards keep a superseded map's working set "
+                     "resident for minutes after a switch; over this budget "
+                     "the LRU drains oldest-first with a shortened idle "
+                     "guard so VRAM does not accumulate across map changes.")
+    .range(256, 16384)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_mesh_store_mb, 1024, "Skate 3",
+                     "Mesh cache GPU byte budget in MB (vertex + index "
+                     "buffers of cached decodes). Same byte-pressure LRU "
+                     "behavior as the texture-store budget.")
+    .range(256, 16384)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_retain_offscreen, true, "Skate 3",
                     "Keep recently seen static items in the scene while the game "
                     "view-culls them: the re-timed (smoothed) render camera trails "

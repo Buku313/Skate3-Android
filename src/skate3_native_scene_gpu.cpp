@@ -147,6 +147,7 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_detail_hold);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_hdr_debug);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_menu_rtt_scope);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_mesh_decode_budget);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_mesh_store_mb);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_msaa);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_photo_native_accum);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_photo_native_debug);
@@ -156,6 +157,7 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_settle_max_frames);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_tile);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_ssr_debug);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_ssr_steps);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_tex_store_mb);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_budget_ms);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_min_items);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_mesh);
@@ -260,28 +262,107 @@ void UpdateEvictFpsEstimate(uint64_t frame_number) {
 constexpr size_t kTexEvictPerFrame = 64;
 constexpr double kTexEvictMinIdleSeconds = 20.0;
 
+// Byte-budget layer over the count caps: the caps above bound ENTRY counts,
+// but per-entry sizes differ per map, and after a map switch the union of
+// the old and new maps' working sets sits under the idle guards for minutes
+// at full size. Each store therefore also tracks an estimated GPU byte
+// total (rescanned periodically, decremented per eviction); crossing the
+// byte budget latches the same amortized LRU, and while the total is over
+// the budget's low-water mark the idle guard shortens so the superseded
+// map's content drains promptly instead of stacking VRAM across switches.
+// The pressure guard stays multi-second so a live working set (stamped
+// every frame it serves) is never evicted into a re-decode loop.
+constexpr uint64_t kStoreByteScanIntervalFrames = 120;
+constexpr double kEvictPressureIdleSeconds = 5.0;
+uint64_t g_tex_store_bytes = 0;
+uint64_t g_mesh_store_bytes = 0;
+
+// Estimated bytes of one surface in the host formats the store decodes to.
+uint64_t FormatSurfaceBytes(nrhi::Format format, uint32_t w, uint32_t h) {
+  switch (format) {
+    case nrhi::Format::kBC1_UNORM:
+    case nrhi::Format::kBC4_UNORM:
+      return uint64_t((w + 3) / 4) * ((h + 3) / 4) * 8;
+    case nrhi::Format::kBC2_UNORM:
+    case nrhi::Format::kBC3_UNORM:
+    case nrhi::Format::kBC5_UNORM:
+      return uint64_t((w + 3) / 4) * ((h + 3) / 4) * 16;
+    case nrhi::Format::kR8_UNORM:
+      return uint64_t(w) * h;
+    case nrhi::Format::kR8G8_UNORM:
+    case nrhi::Format::kB5G6R5_UNORM:
+      return uint64_t(w) * h * 2;
+    default:  // kR8G8B8A8_UNORM and anything unanticipated
+      return uint64_t(w) * h * 4;
+  }
+}
+
+// Committed-texture footprint estimate (base level + the mip chain's
+// asymptotic 1/3; cube entries carry 6 faces). Accuracy at the few-percent
+// level is enough: this feeds the eviction budget, not an allocator.
+uint32_t GuestTextureGpuBytes(const GuestTexture& t, uint32_t faces = 1) {
+  if (t.texture == nullptr) {
+    return 0;
+  }
+  uint64_t bytes = FormatSurfaceBytes(t.texture->format(), t.texture->width(),
+                                      t.texture->height());
+  if (t.srv_mips != 1) {
+    bytes += bytes / 3;
+  }
+  bytes *= faces;
+  return bytes > UINT32_MAX ? UINT32_MAX : uint32_t(bytes);
+}
+
 void EvictTexStore(uint64_t frame_number, uint64_t submission) {
   static bool s_evicting = false;
   static uint64_t s_next_scan_frame = 0;
   static uint64_t s_evicted_run = 0;
+  static uint64_t s_next_bytes_frame = 0;
+  if (frame_number >= s_next_bytes_frame) {
+    s_next_bytes_frame = frame_number + kStoreByteScanIntervalFrames;
+    uint64_t total = 0;
+    for (auto& [k, t] : g_r.tex_store) {
+      if (t.gpu_bytes == 0) {
+        t.gpu_bytes = GuestTextureGpuBytes(t);
+      }
+      total += t.gpu_bytes;
+      // In-place-update entries retain their staging ping-pong buffers,
+      // which land in device-local memory on resizable-BAR systems.
+      if (t.upload != nullptr) {
+        total += t.upload->size();
+      }
+      if (t.upload_b != nullptr) {
+        total += t.upload_b->size();
+      }
+    }
+    g_tex_store_bytes = total;
+  }
+  const uint64_t byte_cap =
+      uint64_t(std::max(256, REXCVAR_GET(skate3_native_render_scene_tex_store_mb)))
+      << 20;
+  const uint64_t byte_low = byte_cap - byte_cap / 8;
   const size_t low_water = kTexStoreCap - kTexStoreCap / 8;
   const bool was_evicting = s_evicting;
-  if (g_r.tex_store.size() > kTexStoreCap) {
+  if (g_r.tex_store.size() > kTexStoreCap || g_tex_store_bytes > byte_cap) {
     s_evicting = true;
-  } else if (g_r.tex_store.size() <= low_water) {
+  } else if (g_r.tex_store.size() <= low_water && g_tex_store_bytes <= byte_low) {
     s_evicting = false;
   }
+  const bool byte_pressure = g_tex_store_bytes > byte_low;
   const uint64_t min_idle_frames = std::max<uint64_t>(
-      4, uint64_t(g_evict_fps_estimate * kTexEvictMinIdleSeconds));
+      4, uint64_t(g_evict_fps_estimate * (byte_pressure ? kEvictPressureIdleSeconds
+                                                        : kTexEvictMinIdleSeconds)));
   if (was_evicting != s_evicting) {
     if (s_evicting) {
       s_evicted_run = 0;
       REXLOG_INFO(
-          "native-scene: tex store LRU start (size={} cap={} min_idle={}f @ {:.0f}fps)",
-          g_r.tex_store.size(), kTexStoreCap, min_idle_frames, g_evict_fps_estimate);
+          "native-scene: tex store LRU start (size={} cap={} mb={} cap_mb={} "
+          "min_idle={}f @ {:.0f}fps)",
+          g_r.tex_store.size(), kTexStoreCap, g_tex_store_bytes >> 20,
+          byte_cap >> 20, min_idle_frames, g_evict_fps_estimate);
     } else {
-      REXLOG_INFO("native-scene: tex store LRU done (size={} evicted={})",
-                  g_r.tex_store.size(), s_evicted_run);
+      REXLOG_INFO("native-scene: tex store LRU done (size={} mb={} evicted={})",
+                  g_r.tex_store.size(), g_tex_store_bytes >> 20, s_evicted_run);
     }
   }
   if (!s_evicting || frame_number < s_next_scan_frame) {
@@ -294,7 +375,17 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
       ages.emplace_back(t.last_used_frame, k);
     }
   }
-  const size_t excess = g_r.tex_store.size() - low_water;
+  size_t excess = g_r.tex_store.size() > low_water
+                      ? g_r.tex_store.size() - low_water
+                      : 0;
+  if (byte_pressure) {
+    // Keep draining while over the byte budget even with the count under
+    // its cap: convert the byte excess into entries via the average size.
+    const uint64_t avg =
+        std::max<uint64_t>(1, g_tex_store_bytes /
+                                  std::max<size_t>(1, g_r.tex_store.size()));
+    excess = std::max(excess, size_t((g_tex_store_bytes - byte_low) / avg) + 1);
+  }
   const size_t n = std::min({ages.size(), excess, kTexEvictPerFrame});
   if (n == 0) {
     // Everything over the cap is recent (a dense area's live working set):
@@ -306,6 +397,8 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
   for (size_t i = 0; i < n; ++i) {
     const auto it = g_r.tex_store.find(ages[i].second);
     if (it != g_r.tex_store.end()) {
+      g_tex_store_bytes -= std::min<uint64_t>(g_tex_store_bytes,
+                                              it->second.gpu_bytes);
       RetireGuestTexture(it->second, submission);
       g_r.tex_store.erase(it);
     }
@@ -329,24 +422,44 @@ void EvictMeshStore(uint64_t frame_number) {
   static bool s_evicting = false;
   static uint64_t s_next_scan_frame = 0;
   static uint64_t s_evicted_run = 0;
+  static uint64_t s_next_bytes_frame = 0;
+  if (frame_number >= s_next_bytes_frame) {
+    s_next_bytes_frame = frame_number + kStoreByteScanIntervalFrames;
+    uint64_t total = 0;
+    for (const auto& [k, m] : g_r.meshes) {
+      total += uint64_t(m.vb_view.size_bytes) + m.ib_view.size_bytes;
+    }
+    g_mesh_store_bytes = total;
+  }
+  const uint64_t byte_cap =
+      uint64_t(std::max(256, REXCVAR_GET(skate3_native_render_scene_mesh_store_mb)))
+      << 20;
+  const uint64_t byte_low = byte_cap - byte_cap / 8;
   const size_t low_water = kMeshStoreCap - kMeshStoreCap / 8;
   const bool was_evicting = s_evicting;
-  if (g_r.meshes.size() > kMeshStoreCap) {
+  if (g_r.meshes.size() > kMeshStoreCap || g_mesh_store_bytes > byte_cap) {
     s_evicting = true;
-  } else if (g_r.meshes.size() <= low_water) {
+  } else if (g_r.meshes.size() <= low_water && g_mesh_store_bytes <= byte_low) {
     s_evicting = false;
   }
+  const bool byte_pressure = g_mesh_store_bytes > byte_low;
   const uint64_t min_idle_frames =
-      std::max<uint64_t>(1800, uint64_t(g_evict_fps_estimate * kMeshEvictMinIdleSeconds));
+      byte_pressure
+          ? std::max<uint64_t>(
+                240, uint64_t(g_evict_fps_estimate * kEvictPressureIdleSeconds))
+          : std::max<uint64_t>(
+                1800, uint64_t(g_evict_fps_estimate * kMeshEvictMinIdleSeconds));
   if (was_evicting != s_evicting) {
     if (s_evicting) {
       s_evicted_run = 0;
       REXLOG_INFO(
-          "native-scene: mesh store LRU start (size={} cap={} min_idle={}f @ {:.0f}fps)",
-          g_r.meshes.size(), kMeshStoreCap, min_idle_frames, g_evict_fps_estimate);
+          "native-scene: mesh store LRU start (size={} cap={} mb={} cap_mb={} "
+          "min_idle={}f @ {:.0f}fps)",
+          g_r.meshes.size(), kMeshStoreCap, g_mesh_store_bytes >> 20,
+          byte_cap >> 20, min_idle_frames, g_evict_fps_estimate);
     } else {
-      REXLOG_INFO("native-scene: mesh store LRU done (size={} evicted={})",
-                  g_r.meshes.size(), s_evicted_run);
+      REXLOG_INFO("native-scene: mesh store LRU done (size={} mb={} evicted={})",
+                  g_r.meshes.size(), g_mesh_store_bytes >> 20, s_evicted_run);
     }
   }
   if (!s_evicting || frame_number < s_next_scan_frame) {
@@ -359,7 +472,13 @@ void EvictMeshStore(uint64_t frame_number) {
       ages.emplace_back(m.last_used_frame, k);
     }
   }
-  const size_t excess = g_r.meshes.size() - low_water;
+  size_t excess =
+      g_r.meshes.size() > low_water ? g_r.meshes.size() - low_water : 0;
+  if (byte_pressure) {
+    const uint64_t avg = std::max<uint64_t>(
+        1, g_mesh_store_bytes / std::max<size_t>(1, g_r.meshes.size()));
+    excess = std::max(excess, size_t((g_mesh_store_bytes - byte_low) / avg) + 1);
+  }
   const size_t n = std::min({ages.size(), excess, kMeshEvictPerFrame});
   if (n == 0) {
     // Everything over the cap is in recent use (a dense map's population):
@@ -371,6 +490,9 @@ void EvictMeshStore(uint64_t frame_number) {
   for (size_t i = 0; i < n; ++i) {
     const auto it = g_r.meshes.find(ages[i].second);
     if (it != g_r.meshes.end()) {
+      g_mesh_store_bytes -= std::min<uint64_t>(
+          g_mesh_store_bytes,
+          uint64_t(it->second.vb_view.size_bytes) + it->second.ib_view.size_bytes);
       g_r.device->DestroyDeferred(it->second.vb);
       g_r.device->DestroyDeferred(it->second.ib);
       g_r.ropa_shapes.erase(it->first);
@@ -378,6 +500,33 @@ void EvictMeshStore(uint64_t frame_number) {
     }
   }
   s_evicted_run += n;
+}
+
+// Environment-cube cache LRU: a handful of cubes serve any one area, but
+// entries are keyed by guest object address and accumulated across every
+// map/park visited in the session. Amortized one eviction per frame; the
+// idle guard keeps anything recently sampled resident.
+constexpr size_t kCubeStoreCap = 48;
+
+void EvictCubeStore(uint64_t frame_number, uint64_t submission) {
+  if (g_r.cube_textures.size() <= kCubeStoreCap) {
+    return;
+  }
+  const uint64_t min_idle_frames = std::max<uint64_t>(
+      4, uint64_t(g_evict_fps_estimate * kTexEvictMinIdleSeconds));
+  auto oldest = g_r.cube_textures.end();
+  for (auto it = g_r.cube_textures.begin(); it != g_r.cube_textures.end(); ++it) {
+    if (it->second.last_used_frame + min_idle_frames < frame_number &&
+        (oldest == g_r.cube_textures.end() ||
+         it->second.last_used_frame < oldest->second.last_used_frame)) {
+      oldest = it;
+    }
+  }
+  if (oldest != g_r.cube_textures.end()) {
+    RetireGuestTexture(oldest->second, submission);
+    g_r.cube_textures.erase(oldest);
+    g_store_evicted.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 // ---- Staged texture decode (worker-thread half) ---------------------------
@@ -4270,6 +4419,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
         c = GuestTexture{};
         c.valid = false;
       }
+      c.last_used_frame = frame_number;
       g_r.cube_textures.emplace(item.water_env, c);
     }
   }
@@ -4747,6 +4897,9 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         if (t.valid) {
           CommitStagedGuestTexture(context, t.gt, t.commit);
           committed_tex = true;
+        }
+        if (t.gt.last_used_frame == 0) {
+          t.gt.last_used_frame = frame_number;
         }
         g_r.cube_textures.emplace(t.key, t.gt);
         continue;
@@ -6907,7 +7060,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     REXLOG_INFO(
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
-        "2d[other={} dropped={} askip={} astale={} textures={}] cached_meshes={} textures={} "
+        "2d[other={} dropped={} askip={} astale={} textures={}] cached_meshes={} mesh_mb={} textures={} tex_mb={} "
         "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} relax={} caster={} incoh={} stretch={} blend={} blendmiss={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
@@ -6923,7 +7076,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(),
         g_2d_async_skip.load(), g_2d_async_stale.load(), g_r.tex_store.size(),
-        g_r.meshes.size(), g_r.tex_store.size(),
+        g_r.meshes.size(), g_mesh_store_bytes >> 20, g_r.tex_store.size(),
+        g_tex_store_bytes >> 20,
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
         g_ropa_rigid.load(), g_ropa_stale.load(), g_ropa_rescued.load(),
         g_ropa_relaxed.load(), g_ropa_caster.load(), g_pub_incoherent.load(),
@@ -7478,6 +7632,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   UpdateEvictFpsEstimate(frame_number);
   EvictTexStore(frame_number, context.device->CurrentSubmission());
   EvictMeshStore(frame_number);
+  EvictCubeStore(frame_number, context.device->CurrentSubmission());
 
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
@@ -8570,6 +8725,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       } else if (cit->second.valid) {
         cube_tex = &cit->second;
+        cit->second.last_used_frame = frame_number;
       }
     }
     const GuestTexture* decal_tex = item.decal && item.decal_art != 0 &&
