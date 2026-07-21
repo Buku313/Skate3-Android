@@ -214,36 +214,84 @@ bool ReadStableTexWords(uint8_t* base, uint32_t tex_ptr, uint32_t out[6]) {
   return true;
 }
 
+// Frames-per-second estimate for the eviction age guards. The LRU clocks
+// are frame-stamped, so wall-clock idle thresholds must convert through the
+// live frame rate: a fixed frame count that means 30 seconds at 60 fps
+// passes in 3 seconds on a 600 fps loading screen, which made a whole
+// map's freshly prewarmed working set eviction-eligible at takeover.
+double g_evict_fps_estimate = 240.0;
+
+void UpdateEvictFpsEstimate(uint64_t frame_number) {
+  static double s_last_t = 0.0;
+  static uint64_t s_last_f = 0;
+  const double now = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+  if (s_last_t != 0.0 && now > s_last_t + 0.5) {
+    const double rate = double(frame_number - s_last_f) / (now - s_last_t);
+    if (rate > 1.0 && rate < 2000.0) {
+      g_evict_fps_estimate = g_evict_fps_estimate * 0.7 + rate * 0.3;
+    }
+  }
+  if (s_last_t == 0.0 || now > s_last_t + 0.5) {
+    s_last_t = now;
+    s_last_f = frame_number;
+  }
+}
+
 // Store LRU eviction, run once per frame: superseded words states (old mip
 // levels, pre-demote detail sets, one-shot UI art) hold SRV slots + GPU
-// memory until nothing has routed to them for a while. Never evicts
-// entries touched within the last few frames. Amortized: once over the cap,
-// a bounded batch of oldest entries goes per frame until the store is back
-// under the low-water mark (the previous evict-half-in-one-frame sweep
-// retired ~1500 textures in a single frame, a measured recurring hitch).
+// memory until nothing has routed to them for a while. Amortized: once over
+// the cap, a bounded batch of oldest entries goes per frame until the store
+// is back under the low-water mark (the previous evict-half-in-one-frame
+// sweep retired ~1500 textures in a single frame, a measured recurring
+// hitch). The idle guard is wall-clock scaled: entries used within the
+// last kTexEvictMinIdleSeconds are never candidates, so a dense area whose
+// working set exceeds the cap parks over it instead of thrash-evicting
+// live content into a re-decode loop.
 constexpr size_t kTexEvictPerFrame = 64;
+constexpr double kTexEvictMinIdleSeconds = 20.0;
 
 void EvictTexStore(uint64_t frame_number, uint64_t submission) {
   static bool s_evicting = false;
+  static uint64_t s_next_scan_frame = 0;
+  static uint64_t s_evicted_run = 0;
   const size_t low_water = kTexStoreCap - kTexStoreCap / 8;
+  const bool was_evicting = s_evicting;
   if (g_r.tex_store.size() > kTexStoreCap) {
     s_evicting = true;
   } else if (g_r.tex_store.size() <= low_water) {
     s_evicting = false;
   }
-  if (!s_evicting) {
+  const uint64_t min_idle_frames = std::max<uint64_t>(
+      4, uint64_t(g_evict_fps_estimate * kTexEvictMinIdleSeconds));
+  if (was_evicting != s_evicting) {
+    if (s_evicting) {
+      s_evicted_run = 0;
+      REXLOG_INFO(
+          "native-scene: tex store LRU start (size={} cap={} min_idle={}f @ {:.0f}fps)",
+          g_r.tex_store.size(), kTexStoreCap, min_idle_frames, g_evict_fps_estimate);
+    } else {
+      REXLOG_INFO("native-scene: tex store LRU done (size={} evicted={})",
+                  g_r.tex_store.size(), s_evicted_run);
+    }
+  }
+  if (!s_evicting || frame_number < s_next_scan_frame) {
     return;
   }
   std::vector<std::pair<uint64_t, uint64_t>> ages;  // (last-used frame, key)
   ages.reserve(g_r.tex_store.size());
   for (const auto& [k, t] : g_r.tex_store) {
-    if (t.last_used_frame + 4 < frame_number) {
+    if (t.last_used_frame + min_idle_frames < frame_number) {
       ages.emplace_back(t.last_used_frame, k);
     }
   }
   const size_t excess = g_r.tex_store.size() - low_water;
   const size_t n = std::min({ages.size(), excess, kTexEvictPerFrame});
   if (n == 0) {
+    // Everything over the cap is recent (a dense area's live working set):
+    // park and re-scan later instead of burning a full-store scan per frame.
+    s_next_scan_frame = frame_number + 120;
     return;
   }
   std::nth_element(ages.begin(), ages.begin() + (n - 1), ages.end());
@@ -254,42 +302,61 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
       g_r.tex_store.erase(it);
     }
   }
+  s_evicted_run += n;
   g_store_evicted.fetch_add(n, std::memory_order_relaxed);
 }
 
 // Mesh cache LRU, same amortized shape: without it every streamed arena's
 // meshes accumulated for the whole session (observed: 61k live buffers
-// after a few minutes of map changes). The age guard keeps everything the
-// camera might re-reveal quickly; an evicted mesh re-decodes on the workers
-// like any first sight (1-2 frames late for a freshly revealed area, the
-// normal streaming behavior).
+// after a few minutes of map changes). The wall-clock idle guard keeps the
+// current map's prewarmed set resident (prewarm decodes thousands of
+// meshes the player has not seen yet; evicting them defeats the prewarm
+// and turns panning into a re-decode churn loop); an evicted mesh
+// re-decodes on the workers like any first sight.
 constexpr size_t kMeshStoreCap = 6144;
 constexpr size_t kMeshEvictPerFrame = 64;
-// Must exceed the NSM rebuild cadence (600 frames) with margin: cascade
-// casters outside the view frustum are only touched at rebuilds.
-constexpr uint64_t kMeshEvictMinIdleFrames = 1800;
+constexpr double kMeshEvictMinIdleSeconds = 90.0;
 
 void EvictMeshStore(uint64_t frame_number) {
   static bool s_evicting = false;
+  static uint64_t s_next_scan_frame = 0;
+  static uint64_t s_evicted_run = 0;
   const size_t low_water = kMeshStoreCap - kMeshStoreCap / 8;
+  const bool was_evicting = s_evicting;
   if (g_r.meshes.size() > kMeshStoreCap) {
     s_evicting = true;
   } else if (g_r.meshes.size() <= low_water) {
     s_evicting = false;
   }
-  if (!s_evicting) {
+  const uint64_t min_idle_frames =
+      std::max<uint64_t>(1800, uint64_t(g_evict_fps_estimate * kMeshEvictMinIdleSeconds));
+  if (was_evicting != s_evicting) {
+    if (s_evicting) {
+      s_evicted_run = 0;
+      REXLOG_INFO(
+          "native-scene: mesh store LRU start (size={} cap={} min_idle={}f @ {:.0f}fps)",
+          g_r.meshes.size(), kMeshStoreCap, min_idle_frames, g_evict_fps_estimate);
+    } else {
+      REXLOG_INFO("native-scene: mesh store LRU done (size={} evicted={})",
+                  g_r.meshes.size(), s_evicted_run);
+    }
+  }
+  if (!s_evicting || frame_number < s_next_scan_frame) {
     return;
   }
   std::vector<std::pair<uint64_t, uint32_t>> ages;  // (last-used frame, key)
   ages.reserve(g_r.meshes.size());
   for (const auto& [k, m] : g_r.meshes) {
-    if (m.last_used_frame + kMeshEvictMinIdleFrames < frame_number) {
+    if (m.last_used_frame + min_idle_frames < frame_number) {
       ages.emplace_back(m.last_used_frame, k);
     }
   }
   const size_t excess = g_r.meshes.size() - low_water;
   const size_t n = std::min({ages.size(), excess, kMeshEvictPerFrame});
   if (n == 0) {
+    // Everything over the cap is in recent use (a dense map's population):
+    // park and re-scan later instead of burning a full-store scan per frame.
+    s_next_scan_frame = frame_number + 120;
     return;
   }
   std::nth_element(ages.begin(), ages.begin() + (n - 1), ages.end());
@@ -302,6 +369,7 @@ void EvictMeshStore(uint64_t frame_number) {
       g_r.meshes.erase(it);
     }
   }
+  s_evicted_run += n;
 }
 
 // ---- Staged texture decode (worker-thread half) ---------------------------
@@ -7287,6 +7355,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // Content-store LRU: superseded words states (old mip levels, pre-demote
   // detail sets, one-shot UI art) age out once nothing routes to them; the
   // mesh cache ages out streamed-out arenas the same way.
+  UpdateEvictFpsEstimate(frame_number);
   EvictTexStore(frame_number, context.device->CurrentSubmission());
   EvictMeshStore(frame_number);
 
