@@ -825,6 +825,9 @@ inline std::atomic<uint64_t> g_rigid_rescued{0};
 // Rigid worlds served from the guest instance matrix (ReadCtxInstanceWorld)
 // instead of a constant bank.
 inline std::atomic<uint64_t> g_rigid_ctx_world{0};
+// Sort-list piece copies published with the instance matrix (see
+// g_dyn_dispatch_meshes).
+inline std::atomic<uint64_t> g_sortlist_local_pub{0};
 // Last published world per rigid dynamic context. Guest render thread only.
 // Same-mesh piece clones (park-editor venues submit dozens) share (ib,vb),
 // and their hook-time captures defer to the post-draw fixup whenever the
@@ -839,6 +842,17 @@ struct RigidWorldCache {
   uint64_t frame = 0;
 };
 inline std::unordered_map<uint32_t, RigidWorldCache> g_rigid_world_cache;
+// Meshes seen on the per-entity dynamic dispatch (kind-0 captures), stamped
+// with the guest frame of the last sighting. The game batches FAR instances
+// of such pieces through the static sort lists instead of dispatching them
+// per entity; their fmt-57 vertices are MESH-LOCAL, so the world-item
+// path's identity world collapses them at the origin (the far-corner
+// "teardown": one sub-mesh of each distant piece went invisible). A
+// sort-list record whose mesh is fresh here publishes with the ctx owner's
+// instance matrix instead. The freshness window doubles as map-change
+// hygiene: a mesh address reused by a later load expires out on its own.
+// Guest render thread only.
+inline std::unordered_map<uint32_t, uint64_t> g_dyn_dispatch_meshes;
 // Model-space props in the world sort lists, excluded from the identity
 // world path (their placed copies come from the kind-2 capture).
 inline std::atomic<uint64_t> g_world_props{0};

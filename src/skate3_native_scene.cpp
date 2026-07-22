@@ -4209,6 +4209,15 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   // invisibly at the origin). Defer those to the post-draw fixup, like
   // skinned palettes.
   if (!item.skinned) {
+    if (!world_path && item.ctx != 0) {
+      // Mark the mesh as dynamically dispatched (see g_dyn_dispatch_meshes):
+      // far clones of it arriving through the static sort lists need their
+      // instance matrix, not the world-item identity.
+      if (g_dyn_dispatch_meshes.size() > 16384) {
+        g_dyn_dispatch_meshes.clear();
+      }
+      g_dyn_dispatch_meshes[item.mesh] = g_guest_frame;
+    }
     // The instance's own matrix (ReadCtxInstanceWorld) outranks the bank:
     // own_draw_last only proves SOME clone of this mesh drew last (clones
     // share (ib,vb)), so under batched dispatch the bank world routinely
@@ -8474,6 +8483,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // Per-instance rigid candidates whose post-draw world fixup never landed
   // this frame; rescued with their cached world (see g_rigid_world_cache).
   std::unordered_map<uint32_t, const DrawItem*> pending_rigid_by_ctx;
+  // Sort-list records of dynamically-dispatched piece meshes (see
+  // g_dyn_dispatch_meshes): built here, published AFTER the record loop with
+  // the ctx owner's instance matrix, and only for ctxs no live dynamic
+  // capture already covered this frame.
+  std::unordered_map<uint32_t, DrawItem> sortlist_local_by_ctx;
   const auto total_indices = [](const DrawItem& d) {
     uint64_t n = 0;
     for (const DrawEntry& e : d.draws) n += e.index_count;
@@ -8633,6 +8647,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         // has; rendered here with identity it collapses at the world
         // origin. The capture handles it (or it is dropped when pending).
         g_world_props.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      const auto dit = g_dyn_dispatch_meshes.find(item.mesh);
+      if (dit != g_dyn_dispatch_meshes.end() &&
+          g_guest_frame - dit->second <= 1800) {
+        // Instance-transformed piece batched through the static sort lists
+        // (the game hands FAR clones of dynamically-dispatched pieces to
+        // the batcher): fmt-57 but MESH-LOCAL, so the identity world of
+        // this path collapses it at the origin. Defer; the post-loop
+        // publish serves the ctx owner's instance matrix, and only for
+        // ctxs no live dynamic capture covered this frame.
+        sortlist_local_by_ctx.try_emplace(r.a, std::move(item));
         continue;
       }
       scene.items.push_back(std::move(item));
@@ -8841,6 +8867,25 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       ++pub_count[rescued.mesh];
       dyn_slot.try_emplace(ctxk, scene.items.size() - 1);
       g_rigid_rescued.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Sort-list copies of dynamically-dispatched piece meshes (see
+    // g_dyn_dispatch_meshes): the game batches FAR clones through the
+    // static lists, where no per-entity capture carries their placement.
+    // Publish with the ctx owner's instance matrix; a live dynamic capture
+    // for the same ctx always wins (near clones arrive through both paths
+    // in the same frame, and double-publishing would z-fight).
+    for (auto& [ctxk, item] : sortlist_local_by_ctx) {
+      if (dyn_slot.find(ctxk) != dyn_slot.end()) {
+        continue;  // this instance published live
+      }
+      if (!ReadCtxInstanceWorld(base, ctxk, item.world)) {
+        g_world_props.fetch_add(1, std::memory_order_relaxed);
+        continue;  // no placement: dropping beats an origin ghost
+      }
+      ++pub_count[item.mesh];
+      scene.items.push_back(std::move(item));
+      dyn_slot.try_emplace(ctxk, scene.items.size() - 1);
+      g_sortlist_local_pub.fetch_add(1, std::memory_order_relaxed);
     }
     // Refused ropa captures re-publish last frame's resolved state: mode,
     // world AND palette together (mixing frames' interpretations is the
