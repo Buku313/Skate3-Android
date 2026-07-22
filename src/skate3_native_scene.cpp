@@ -2430,7 +2430,26 @@ void AdoptDrawFetchOverrides(uint8_t* base, DrawItem& item) {
                              phys_base(slot3[1]) == phys_base(lm_w1);
       // Dimension floor: never adopt a placeholder-sized s4 (an idle ad
       // rotation slot) over whatever the channel resolves to.
-      if (main_pass && (art_w >= 32 || art_h >= 32)) {
+      //
+      // Own-channel guard: on families whose s4 carries a surface map
+      // rather than art (environment.default binds its detail normal map
+      // there), the stub gate alone is not enough. A material demoted by
+      // the streamer has a stub-sized diffuse too, and adopting s4 then
+      // serves the material's OWN detail/spec/normal map as the diffuse
+      // (distant demoted tree trunks rendered as their flat blue normal
+      // map). Real event-ad art is never one of the material's own channel
+      // textures, so any s4 that matches one is a normal binding, not a
+      // rebind worth adopting.
+      const auto s4_is_own_channel = [&](uint32_t chan_tex) {
+        uint32_t own_w1 = 0;
+        return chan_tex != 0 &&
+               GuestTryLoadU32(base, chan_tex + 8 * 4, &own_w1) &&
+               phys_base(slot4[1]) == phys_base(own_w1);
+      };
+      const bool s4_is_own = s4_is_own_channel(item.detail_tex) ||
+                             s4_is_own_channel(item.spec_tex) ||
+                             s4_is_own_channel(item.water_normal);
+      if (main_pass && !s4_is_own && (art_w >= 32 || art_h >= 32)) {
         if (item.env_family == 3) {
           uint32_t da_w1 = 0;
           if (item.decal_art != 0 &&
