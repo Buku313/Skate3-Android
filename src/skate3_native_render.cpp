@@ -45,7 +45,7 @@ REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
                       "~1.5 ms before the target, then spin.")
     .range(0.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, false, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, true, "Skate 3",
                     "Derive the guest frame cap from the display the window is on: "
                     "cap at (refresh rate - 4) fps, the VRR recipe above, without "
                     "hand-tuning per monitor. Above the display refresh the extra "
