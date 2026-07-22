@@ -416,6 +416,26 @@ extern "C" REX_FUNC(sub_8247B3A0) {
       (list_mode != 0 && list_count != 0) || cell_size > 4096) {
     return;
   }
+  // Loading screens and the frontend stream one world set out and another
+  // in, then destroy the departing collection objects. Any probe record
+  // kept in the gather output here stays loaded past that teardown and its
+  // content leaks into the arriving map (the differ cannot unload a record
+  // whose collection object is already gone - the ProcessEntries sanitizer
+  // below drops such descriptors without an unload). Leave the output
+  // untouched so probe cells unload through the same differ passes as the
+  // departing vanilla set while their collections are still live, and drop
+  // the caches: their neighbourhood is the departing map's. The in-game
+  // pause menu keeps the world resident and reports false; it merges the
+  // cache below instead.
+  if (skate3::native_scene::LoadingOrFrontendActive()) {
+    if (debug && (g_probe_cache[0].count > 0 || g_probe_cache[1].count > 0)) {
+      REXLOG_INFO(
+          "draw_distance: stream probe caches dropped (loading/frontend)");
+    }
+    g_probe_cache[0] = {};
+    g_probe_cache[1] = {};
+    return;
+  }
 
   ProbeRecord records[192];
   size_t record_count = 0;
@@ -499,8 +519,12 @@ extern "C" REX_FUNC(sub_8247B3A0) {
   const bool set_resident = desc_total > 0 && desc_loaded >= desc_total;
   const bool in_gameplay =
       rex::kernel::guest_presence::GameplayContextValue() == 1;
-  if (cache_valid || (cache_usable && cache.count > 0 &&
-                      (!set_resident || !in_gameplay))) {
+  // An empty vanilla gather is the game clearing this focus (teardown or a
+  // transient); never inject on top of it - the differ is about to unload
+  // everything the focus held.
+  if (vanilla_count > 0 &&
+      (cache_valid || (cache_usable && cache.count > 0 &&
+                       (!set_resident || !in_gameplay)))) {
     // The neighbourhood cannot have changed (cell membership is quantized
     // to the grid): merge the cached probe results instead of re-running
     // the gather fan. Cached distances are slightly stale; they are only
@@ -525,10 +549,10 @@ extern "C" REX_FUNC(sub_8247B3A0) {
         ++record_count;
       }
     }
-  } else if (!set_resident || !in_gameplay) {
-    // Initial load, a fresh focus, or outside gameplay (loading screen /
-    // frontend): let the vanilla set finish streaming first; the fan
-    // starts on a later cycle.
+  } else if (vanilla_count == 0 || !set_resident || !in_gameplay) {
+    // Initial load, a fresh focus, an emptied focus, or outside gameplay:
+    // let the vanilla set finish streaming first; the fan starts on a
+    // later cycle.
   } else {
     // Full probe fan: every grid cell within the probe radius, stepped in
     // cell multiples. The 7x7 cap bounds the fan at 48 gather calls; the

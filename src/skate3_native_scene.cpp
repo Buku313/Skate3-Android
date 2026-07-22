@@ -6092,6 +6092,23 @@ bool FreecamGuestPose(float out_pos[3]) {
   return true;
 }
 
+bool LoadingOrFrontendActive() {
+  if (rex::kernel::guest_presence::GameplayContextValue() != 0) {
+    return false;
+  }
+  // Same publish-staleness window as YieldForMenus: the pause menu keeps
+  // the world resubmitting perspective scenes behind it, loading screens
+  // and the frontend stop publishing.
+  const int64_t last_ns = g_last_publish_ns.load(std::memory_order_relaxed);
+  if (last_ns < 0) {
+    return true;
+  }
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  return now_ns - last_ns >= 300'000'000;
+}
+
 // Guest render thread only. Returns true when vp_out/cam_out hold a
 // re-timed pose for `now`; false = keep the raw guest pose (no history yet,
 // or a cut/teleport snapped).

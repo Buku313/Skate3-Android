@@ -500,6 +500,15 @@ void GetCapturedSunDir(float out[3]);
 // SetViewMatrix override in skate3_native_scene.cpp.
 bool FreecamGuestPose(float out_pos[3]);
 
+// True while the guest sits on a loading screen or in the frontend: the
+// presence context is out of gameplay AND the world has stopped publishing
+// perspective scenes. The in-game pause menu keeps publishing behind the
+// menu and reports false. Mirrors the pause-vs-loading distinction in
+// YieldForMenus (same 300 ms publish-staleness window). With scene capture
+// disabled entirely, publishes never arrive and every out-of-gameplay
+// context reports true (the conservative side).
+bool LoadingOrFrontendActive();
+
 // The game's per-entity spawn/streaming fade as carried by the item's
 // validated character-lighting capture (peds c21.x, defaultcharacter c13.x,
 // cacstamp c22.x, vehicle body c20.x, hair strand scale). 1.0 for items
