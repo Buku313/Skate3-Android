@@ -964,6 +964,10 @@ inline std::atomic<uint64_t> g_vis_out_retained{0};  // out-of-frustum draws fro
 // skate3_native_render_scene_occlusion_cull cvar; reported on the frame
 // stats line like the other cumulative counters there).
 inline std::atomic<uint64_t> g_occl_culled{0};
+// Session-cumulative count of sort-list entries the guest-side dispatch
+// filter removed before the guest's draw-list renderer ran (see
+// skate3_native_render_scene_occlusion_cull_guest).
+inline std::atomic<uint64_t> g_occl_guest_skipped{0};
 // Guest render thread: decomposition of the per-item build walk.
 inline PerfWindow g_pw_bi_core;    // BuildItemFromMeshCached total (hit validate + misses)
 inline PerfWindow g_pw_bi_fp;      // ComputeItemFingerprint on the cache-hit path

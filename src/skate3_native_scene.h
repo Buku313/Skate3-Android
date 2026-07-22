@@ -523,6 +523,16 @@ float CharFadeAlpha(const DrawItem& item);
 // per-item profiling attribution.
 bool ItemOutsideFrustum(const DrawItem& it, const float vp[16], float margin);
 
+// Occlusion-cull handoff for the guest-side dispatch filter (defined in
+// skate3_native_scene_gpu.cpp): copies the most recent render frame's
+// culled-static MeshContext set (sorted ascending) into `out`, clearing it
+// instead when the last publish is older than a quarter second (native
+// render idle: menus, loading). Returns true when `out` is non-empty.
+bool CopyOcclusionCulledCtxs(std::vector<uint32_t>& out);
+// Counts sort-list entries the guest-side filter kept away from the guest
+// dispatcher (frame-stats telemetry).
+void AddGuestOcclSkipped(uint32_t n);
+
 // Called from the cProcessArenaAsset::RegisterTexture hook: guid -> guest
 // renderengine::Texture object.
 void OnRegisterTexture(uint64_t guid, uint32_t texture);

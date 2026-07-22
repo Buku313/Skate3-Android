@@ -1177,6 +1177,17 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull, true, "Skate 3",
                     "items.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_guest, true,
+                    "Skate 3",
+                    "Also skip the GUEST engine's draw-list dispatch for "
+                    "items the occlusion cull proved hidden (the dispatch "
+                    "builds command packets the native renderer suppresses "
+                    "anyway, and it is the frame-time-critical cost). "
+                    "Capture still sees every item, so shadows and scene "
+                    "state are unaffected. Requires "
+                    "skate3_native_render_scene_occlusion_cull.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_items, false, "Skate 3",
                     "Deep per-item CPU profiling: adds a perf-items log line "
                     "per perf window attributing per-item cost to pipeline "
@@ -2580,6 +2591,10 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
   if (prof) {
     g_pw_bi_fetch.Add(PerfNsSince(fetch_t0));
   }
+  // Identity for per-instance consumers (the occlusion cull's guest-side
+  // dispatch filter keys on it; the dynamic capture path overwrites it with
+  // its own value).
+  item.ctx = ctx;
 
   // Culled island draw list from the context.
   const uint32_t draw_count = REX_LOAD_U16(ctx + kCtxDrawCountU16);

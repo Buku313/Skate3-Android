@@ -8,9 +8,11 @@
 
 #include "generated/skate3_init.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -31,6 +33,7 @@ REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
 REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
                       "Pace the guest render loop to this frame rate (0 = uncapped). The "
                       "guest produces frames at irregular 2-9 ms intervals; the display "
@@ -120,6 +123,88 @@ void OnSceneDrawList(uint8_t* base, uint32_t view, uint32_t sort_vec, uint32_t f
       g_current_frame.push_back({2, mesh_context, view, dyn});
     }
   }
+}
+
+// ---- Guest-side occlusion dispatch filter ---------------------------------
+// The native renderer suppresses the guest's emulated draws, so for world
+// statics the sorted-list dispatch below (material setup, command-packet
+// building) produces nothing anyone consumes - yet it is the guest render
+// thread's dominant per-item cost. For MeshContexts the render-side
+// occlusion cull proved hidden last frame (published by RenderScene), the
+// hook compacts the entry segment before invoking the guest dispatcher and
+// restores it afterwards. Capture above has already recorded every entry,
+// so scene.items, the shadow caster caches, and all state capture stay
+// complete; the only guest work skipped is packet-building for draws that
+// were both suppressed and occlusion-culled anyway. Guest render thread
+// only.
+struct OcclDispatchFilter {
+  uint64_t stamp = ~0ull;          // g_frame_index of the ctx snapshot
+  std::vector<uint32_t> ctxs;      // sorted culled-ctx snapshot
+  std::vector<uint8_t> saved;      // original segment bytes for restore
+  uint32_t saved_addr = 0;
+  uint32_t saved_bytes = 0;
+  bool active = false;             // a filtered dispatch is in flight
+};
+OcclDispatchFilter g_occl_filter;
+
+// Compacts entries[first..first+count) in place, dropping culled ctxs, and
+// returns the kept count. Returns `count` unchanged (nothing saved) when
+// filtering is off, stale, empty, or nothing matched.
+uint32_t FilterSceneDrawList(uint8_t* base, uint32_t sort_vec, uint32_t first,
+                             uint32_t count) {
+  OcclDispatchFilter& f = g_occl_filter;
+  if (f.active || count == 0 || count > 100000 ||
+      !REXCVAR_GET(skate3_native_render_scene_occlusion_cull_guest)) {
+    return count;
+  }
+  if (f.stamp != g_frame_index) {
+    f.stamp = g_frame_index;
+    skate3::native_scene::CopyOcclusionCulledCtxs(f.ctxs);
+  }
+  if (f.ctxs.empty()) {
+    return count;
+  }
+  const uint32_t entries = REX_LOAD_U32(sort_vec);
+  if (entries == 0) {
+    return count;
+  }
+  const uint32_t seg = entries + first * 8;
+  f.saved.assign(base + seg, base + seg + size_t(count) * 8);
+  uint32_t kept = 0;
+  uint32_t skipped = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint8_t* src = f.saved.data() + size_t(i) * 8;
+    uint32_t ctx_be;
+    std::memcpy(&ctx_be, src + 4, 4);
+    const uint32_t mesh_context = __builtin_bswap32(ctx_be);
+    if (mesh_context != 0 &&
+        std::binary_search(f.ctxs.begin(), f.ctxs.end(), mesh_context)) {
+      ++skipped;
+      continue;
+    }
+    if (kept != i) {
+      std::memcpy(base + seg + size_t(kept) * 8, src, 8);
+    }
+    ++kept;
+  }
+  if (skipped == 0) {
+    f.saved.clear();
+    return count;
+  }
+  f.active = true;
+  f.saved_addr = seg;
+  f.saved_bytes = count * 8;
+  skate3::native_scene::AddGuestOcclSkipped(skipped);
+  return kept;
+}
+
+void RestoreSceneDrawList(uint8_t* base) {
+  OcclDispatchFilter& f = g_occl_filter;
+  if (!f.active) {
+    return;
+  }
+  std::memcpy(base + f.saved_addr, f.saved.data(), f.saved_bytes);
+  f.active = false;
 }
 
 // Non-indexed cloth patch draws (see native_scene::CaptureClothDraw). The
@@ -319,6 +404,18 @@ extern "C" REX_FUNC(sub_827FAF50) {
   if (skate3::native_render::Enabled()) {
     skate3::native_render::OnSceneDrawList(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
                                            ctx.r6.u32);
+    // Guest-side occlusion dispatch filter: capture above saw every entry;
+    // the dispatcher only gets the ones the occlusion cull did not prove
+    // hidden. The segment is restored after the call (the list object
+    // outlives this dispatch).
+    const uint32_t kept = skate3::native_render::FilterSceneDrawList(
+        base, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+    if (kept != ctx.r6.u32) {
+      ctx.r6.u64 = kept;
+      __imp__sub_827FAF50(ctx, base);
+      skate3::native_render::RestoreSceneDrawList(base);
+      return;
+    }
   }
   __imp__sub_827FAF50(ctx, base);
 }

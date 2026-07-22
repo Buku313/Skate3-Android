@@ -7139,7 +7139,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "reused={}] dynobj[valid={} drawn={}] water[valid={} drawn={}] "
         "lw[ctxs={} ents={} stamp={} fade0={} resc={} fill={} pal={} rows={}] "
         "refl[pair={} flat={} gate={:#x}] flips={} alt[bones={} shadow={}] "
-        "rows_inst={} pal_srv={} occl_culled={}",
+        "rows_inst={} pal_srv={} occl_culled={} guest_skip={}",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(),
@@ -7173,7 +7173,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_refl_pair.load(), g_refl_flat.load(), g_refl_gate.load(),
         g_hair_route_flips.load(), g_hair_bone_alternations.load(),
         g_shadow_alternations.load(), g_char_rows_inst_served.load(),
-        g_pal_served_total.load(), g_occl_culled.load());
+        g_pal_served_total.load(), g_occl_culled.load(),
+        g_occl_guest_skipped.load());
   }
 }
 
@@ -7472,6 +7473,36 @@ bool ItemOccludedByGrid(const DrawItem& it, float depth_margin) {
   }
   return true;
 }
+
+// Culled-ctx publication for the guest-side dispatch filter: the classify
+// loop collects the MeshContexts of statics it occlusion-culled and swaps
+// them in here once per rendered frame (empty when the cull is inactive, so
+// the guest filter clears within a frame). The timestamp lets the consumer
+// expire the set when the native render idles.
+std::mutex g_occl_pub_mutex;
+std::vector<uint32_t> g_occl_pub_ctxs;
+std::atomic<int64_t> g_occl_pub_ms{0};
+
+}  // namespace
+
+bool CopyOcclusionCulledCtxs(std::vector<uint32_t>& out) {
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  if (now_ms - g_occl_pub_ms.load(std::memory_order_relaxed) > 250) {
+    out.clear();
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_occl_pub_mutex);
+  out = g_occl_pub_ctxs;
+  return !out.empty();
+}
+
+void AddGuestOcclSkipped(uint32_t n) {
+  g_occl_guest_skipped.fetch_add(n, std::memory_order_relaxed);
+}
+
+namespace {
 
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
   if (!SceneEnabled() ||
@@ -9718,6 +9749,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     occl_cull_active = cam_d2 < 1.0f;
   }
+  std::vector<uint32_t> culled_ctxs;
+  if (occl_cull_active) {
+    culled_ctxs.reserve(scene.items.size() / 2);
+  }
   // Opaque items draw front-to-back (bbox-center distance): early-z rejects
   // occluded pixels before the heavy material PS runs. The game's sort-list
   // order is by render state, not depth; depth-write LESS_EQUAL makes the
@@ -9907,11 +9942,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // profiler): the 1 m depth margin on top of the conservative bbox test
     // keeps reveal edges safe at speed - deeply hidden mass sits many
     // meters behind its occluders, so the margin costs almost none of the
-    // win. Ring route 3 = culled.
+    // win. Ring route 3 = culled. Live-submitted culled ctxs (never
+    // retained ones: a re-appended item's ctx may already be freed, and a
+    // reused address would filter an unrelated new instance) feed the
+    // guest-side dispatch filter via the publication below.
     if (occl_cull_active && !item.skinned && !item.ropa &&
         !item.cloth_quads && item.bones.empty() &&
         ItemOccludedByGrid(item, 1.0f)) {
       g_occl_culled.fetch_add(1, std::memory_order_relaxed);
+      if (!item.retained && item.ctx != 0) {
+        culled_ctxs.push_back(item.ctx);
+      }
       stamp_route(3);
       continue;
     }
@@ -9933,6 +9974,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     opaque_items.emplace_back(view_dist2(item), &item);
     stamp_route(1);
+  }
+  // Publish the culled-ctx set every rendered frame, including empty ones:
+  // the guest filter must clear promptly when the cull stands down.
+  {
+    const int64_t now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    std::sort(culled_ctxs.begin(), culled_ctxs.end());
+    std::lock_guard<std::mutex> lock(g_occl_pub_mutex);
+    g_occl_pub_ctxs.swap(culled_ctxs);
+    g_occl_pub_ms.store(now_ms, std::memory_order_relaxed);
   }
   if (REXCVAR_GET(skate3_native_render_scene_sort_opaque) && debug_mode == 0) {
     std::stable_sort(opaque_items.begin(), opaque_items.end(),
