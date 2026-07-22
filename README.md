@@ -12,11 +12,11 @@ The new native renderer is early and is likely to have issues, I haven't tested 
 
 The project does not include Skate 3 retail game files. To run or build the project, you must provide files from your own legally obtained Xbox 360 copy of Skate 3.
 
-Gameplay (click to go to YouTube):
+Native Rendering Showcase (click to go to YouTube):
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=FHym2iQROa0">
-    <img src="https://img.youtube.com/vi/FHym2iQROa0/maxresdefault.jpg" alt="Skate 3 Recomp gameplay" width="420">
+  <a href="https://youtu.be/kAdZouj4KME">
+    <img src="https://img.youtube.com/vi/kAdZouj4KME/maxresdefault.jpg" alt="Skate 3 Recomp native rendering showcase" width="420">
   </a>
 </p>
 
