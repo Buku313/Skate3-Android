@@ -49,6 +49,7 @@
 #include <rex/cvar.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
+#include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
 
 #if defined(_WIN32)
@@ -458,6 +459,23 @@ extern "C" REX_FUNC(sub_8247B3A0) {
   const float fx = LoadGuestF32(base, focus + 0);
   const float fz = LoadGuestF32(base, focus + 8);
   ProbeCache& cache = g_probe_cache[focus_type == 2 ? 1 : 0];
+  // A focus more than two cells from where the fan last ran was teleported
+  // (map switch, fast travel): the focus object survives the transition, but
+  // its cached neighbourhood belongs to the departed position, and merging
+  // it below would make the arrival load wait on the old area's collections.
+  // Gameplay movement cannot cover two cells between gather cycles, so a
+  // jump this large is never ordinary mid-stream drift.
+  if (cache.focus == focus && cache.count > 0 &&
+      (std::abs(fx - cache.x) > float(cell_size) * 2.0f ||
+       std::abs(fz - cache.z) > float(cell_size) * 2.0f)) {
+    if (debug) {
+      REXLOG_INFO(
+          "draw_distance: stream probe type={} focus teleported "
+          "({}, {}) -> ({}, {}); cache dropped",
+          focus_type, cache.x, cache.z, fx, fz);
+    }
+    cache = {};
+  }
   const bool cache_usable = cache.focus == focus && cache.radius == probe;
   const bool cache_valid = cache_usable &&
                            std::abs(fx - cache.x) < float(cell_size) * 0.5f &&
@@ -467,14 +485,22 @@ extern "C" REX_FUNC(sub_8247B3A0) {
   // probe burst there multiplies the load time for content that is not
   // visible yet. The focus tracks loaded-vs-total descriptor counts from
   // its per-cycle rescan; once the vanilla set is resident the fan runs
-  // and the neighbourhood trickles in during play. A stale cache (moved
-  // more than half a cell while additions are still streaming) keeps being
-  // merged rather than refanned, so in-flight probe records are not
-  // dropped and re-requested by the differ.
+  // and the neighbourhood trickles in during play. The counts alone are
+  // not a sufficient gate: right after a teleport they still describe the
+  // previous position's fully-loaded set, so the fan additionally requires
+  // the gameplay presence context (0 = frontend/pause/loading) - loading
+  // flows always stream the pure vanilla set. A stale cache (moved more
+  // than half a cell while additions are still streaming, or paused with
+  // the context out of gameplay) keeps being merged rather than refanned,
+  // so in-flight probe records are not dropped and re-requested by the
+  // differ.
   const uint32_t desc_total = LoadGuestU32(base, focus + 336);
   const uint32_t desc_loaded = LoadGuestU32(base, focus + 340);
   const bool set_resident = desc_total > 0 && desc_loaded >= desc_total;
-  if (cache_valid || (cache_usable && cache.count > 0 && !set_resident)) {
+  const bool in_gameplay =
+      rex::kernel::guest_presence::GameplayContextValue() == 1;
+  if (cache_valid || (cache_usable && cache.count > 0 &&
+                      (!set_resident || !in_gameplay))) {
     // The neighbourhood cannot have changed (cell membership is quantized
     // to the grid): merge the cached probe results instead of re-running
     // the gather fan. Cached distances are slightly stale; they are only
@@ -499,9 +525,10 @@ extern "C" REX_FUNC(sub_8247B3A0) {
         ++record_count;
       }
     }
-  } else if (!set_resident) {
-    // Initial load (or a fresh focus): let the vanilla set finish
-    // streaming first; the fan starts on a later cycle.
+  } else if (!set_resident || !in_gameplay) {
+    // Initial load, a fresh focus, or outside gameplay (loading screen /
+    // frontend): let the vanilla set finish streaming first; the fan
+    // starts on a later cycle.
   } else {
     // Full probe fan: every grid cell within the probe radius, stepped in
     // cell multiples. The 7x7 cap bounds the fan at 48 gather calls; the
@@ -543,6 +570,11 @@ extern "C" REX_FUNC(sub_8247B3A0) {
     }
   }
 
+  if (record_count == vanilla_count) {
+    // Nothing beyond the vanilla set this cycle (the fan held off, or it
+    // found no new cells): leave the game's own gather output untouched.
+    return;
+  }
   std::sort(records, records + record_count,
             [](const ProbeRecord& a, const ProbeRecord& b) {
               return a.dist < b.dist;
