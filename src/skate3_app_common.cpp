@@ -394,11 +394,7 @@ bool DeveloperConfigHasResolutionScaleOverride(const std::filesystem::path& conf
                                                 "draw_resolution_scale_y"});
 }
 
-#if REX_PLATFORM_MAC
-constexpr int kDefaultResolutionScale = 1;
-#else
 constexpr int kDefaultResolutionScale = 2;
-#endif
 
 void ApplyFirstRunVideoDefaults(const std::filesystem::path& settings_path,
                                 const std::filesystem::path& developer_config_path) {
