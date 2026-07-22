@@ -430,6 +430,11 @@ struct FrameScene {
   };
   PhotoFx photo_fx;
   std::vector<DrawItem> items;
+  // MeshContexts the build-side occlusion skip left out of `items` this
+  // frame (see skate3_native_render_scene_occlusion_cull_build): the
+  // render thread re-publishes them as culled so the guest dispatch filter
+  // keeps excluding them between their staggered rebuild frames.
+  std::vector<uint32_t> occl_build_skipped;
 };
 
 // One frame submission record from the hook layer (see RenderMeshRecord).

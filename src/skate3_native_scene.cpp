@@ -1177,6 +1177,17 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull, true, "Skate 3",
                     "items.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_build, true,
+                    "Skate 3",
+                    "Also skip the per-frame scene-item rebuild for statics "
+                    "the occlusion cull proved hidden, on 3 of every 4 "
+                    "frames (staggered per instance). The every-4th-frame "
+                    "rebuild re-enters the item in the rendered scene so "
+                    "disocclusion is re-tested and the persistent shadow "
+                    "caster cache stays refreshed. Requires "
+                    "skate3_native_render_scene_occlusion_cull.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_guest, true,
                     "Skate 3",
                     "Also skip the GUEST engine's draw-list dispatch for "
@@ -8261,6 +8272,21 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (wloop_prof) {
     g_bi_records.fetch_add(count, std::memory_order_relaxed);
   }
+  // Build-side occlusion skip: the render thread's culled-ctx set (the same
+  // sticky snapshot the guest dispatch filter uses, expiring with it when
+  // the native render idles or the cull's motion gate stands down). A ctx
+  // in it skips the whole item rebuild on 3 of every 4 frames; the
+  // staggered rebuild frame re-enters it in scene.items so the render side
+  // re-tests occlusion (disocclusion drops it from the set) and the shadow
+  // caster caches keep refreshing.
+  static std::vector<uint32_t> s_build_culled;  // guest render thread only
+  s_build_culled.clear();
+  if (REXCVAR_GET(skate3_native_render_scene_occlusion_cull_build)) {
+    CopyOcclusionCulledCtxs(s_build_culled);
+    if (!s_build_culled.empty()) {
+      scene.occl_build_skipped.reserve(s_build_culled.size());
+    }
+  }
   for (size_t i = 0; i < count; ++i) {
     const SubmitRecord& r = records[i];
     // Primary opaque list of the chosen view only; other lists (shadow
@@ -8366,6 +8392,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       continue;
     }
     if (!seen.insert(r.a).second) {
+      continue;
+    }
+    if (!s_build_culled.empty() &&
+        ((g_guest_frame + ((r.a >> 4) * 2654435761u >> 8)) & 3u) != 0u &&
+        std::binary_search(s_build_culled.begin(), s_build_culled.end(),
+                           r.a)) {
+      scene.occl_build_skipped.push_back(r.a);
+      g_occl_build_skipped.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     if (!REXCVAR_GET(skate3_native_render_scene_world_items)) {

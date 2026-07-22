@@ -7143,7 +7143,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "reused={}] dynobj[valid={} drawn={}] water[valid={} drawn={}] "
         "lw[ctxs={} ents={} stamp={} fade0={} resc={} fill={} pal={} rows={}] "
         "refl[pair={} flat={} gate={:#x}] flips={} alt[bones={} shadow={}] "
-        "rows_inst={} pal_srv={} occl_culled={} guest_skip={}",
+        "rows_inst={} pal_srv={} occl_culled={} guest_skip={} build_skip={}",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(),
@@ -7178,7 +7178,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_hair_route_flips.load(), g_hair_bone_alternations.load(),
         g_shadow_alternations.load(), g_char_rows_inst_served.load(),
         g_pal_served_total.load(), g_occl_culled.load(),
-        g_occl_guest_skipped.load());
+        g_occl_guest_skipped.load(), g_occl_build_skipped.load());
   }
 }
 
@@ -9980,8 +9980,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     stamp_route(1);
   }
   // Publish the culled-ctx set every rendered frame, including empty ones:
-  // the guest filter must clear promptly when the cull stands down.
+  // the guest filter must clear promptly when the cull stands down. Ctxs
+  // the build-side skip left out of this scene stay culled by re-inclusion
+  // (they could not be re-tested; their staggered rebuild frame is when
+  // they re-enter scene.items and get a fresh verdict) - but only while
+  // the cull is ACTIVE: on stand-down (debug views, the camera-motion
+  // gate, teleports) the set must drain so every skipped item resumes
+  // building on the next guest frame.
   {
+    if (occl_cull_active) {
+      culled_ctxs.insert(culled_ctxs.end(), scene.occl_build_skipped.begin(),
+                         scene.occl_build_skipped.end());
+    }
     const int64_t now_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch())

@@ -968,6 +968,9 @@ inline std::atomic<uint64_t> g_occl_culled{0};
 // filter removed before the guest's draw-list renderer ran (see
 // skate3_native_render_scene_occlusion_cull_guest).
 inline std::atomic<uint64_t> g_occl_guest_skipped{0};
+// Session-cumulative count of item rebuilds the build-side occlusion skip
+// left out (see skate3_native_render_scene_occlusion_cull_build).
+inline std::atomic<uint64_t> g_occl_build_skipped{0};
 // Guest render thread: decomposition of the per-item build walk.
 inline PerfWindow g_pw_bi_core;    // BuildItemFromMeshCached total (hit validate + misses)
 inline PerfWindow g_pw_bi_fp;      // ComputeItemFingerprint on the cache-hit path
