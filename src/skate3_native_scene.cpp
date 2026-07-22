@@ -6801,7 +6801,21 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       const float dx = item.world[12] - lp.w[12];
       const float dy = item.world[13] - lp.w[13];
       const float dz = item.world[14] - lp.w[14];
-      return dx * dx + dy * dy + dz * dz;
+      const float d2 = dx * dx + dy * dy + dz * dz;
+      // Rotation-aware for rigid: mirrored clone twins can sit at the SAME
+      // translation (railing pairs), and a translation-only metric pairs
+      // their rings freely - the interpolator then lerps across the flip.
+      // Fold the rotation delta in as an equivalent distance; a mispair
+      // (elementwise delta up to 2.0) lands far outside every claim cap,
+      // while a physics prop's one-tick rotation stays well inside.
+      float rd = 0.0f;
+      for (int r = 0; r < 3; ++r) {
+        for (int c2 = 0; c2 < 3; ++c2) {
+          rd = std::max(rd, std::fabs(item.world[r * 4 + c2] -
+                                      lp.w[r * 4 + c2]));
+        }
+      }
+      return std::max(d2, rd * rd * 4.0f);
     };
     // One-time bind-space vertex-centroid table for this entity (see the
     // pivot-boxcar comment at the collapse guard). Also computed EAGERLY on
@@ -6859,10 +6873,18 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     // list clone reshuffles cannot mispair an identity key, so the whole
     // positional claim search below is skipped for them. Mesh stays in the
     // key so a model/LOD swap on the same instance starts a fresh ring
-    // (pose sizes differ). Legacy (mesh, occurrence) pairing continues to
-    // serve everything without a store entry (player, CAC, non-LW).
-    bool lw_keyed = item.lw_entity != 0 && item.ctx != 0 &&
-                    REXCVAR_GET(skate3_native_render_scene_lw_identity);
+    // (pose sizes differ). RIGID items with a ctx take the identity key
+    // too: park-editor venues submit dozens of same-mesh piece clones,
+    // including mirrored twins at the SAME translation, and any camera pan
+    // reshuffles the occurrence ordinals - the positional claim below then
+    // swaps the twins' rings every frame (translation distance 0) and the
+    // interpolator lerps their 180-degree-apart rotations, the visible
+    // piece spin. Legacy (mesh, occurrence) pairing continues to serve
+    // everything without a usable ctx (player, CAC, ctx-less captures).
+    bool lw_keyed = item.ctx != 0 &&
+                    ((item.lw_entity != 0 &&
+                      REXCVAR_GET(skate3_native_render_scene_lw_identity)) ||
+                     !skinned);
     uint64_t key = lw_keyed ? ((1ull << 63) | (uint64_t(item.ctx) << 32) |
                                uint64_t(item.mesh))
                             : ((uint64_t(item.mesh) << 8) | (k & 0xFF));
@@ -7108,6 +7130,16 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             const float dy = item.world[13] - latest.w[13];
             const float dz = item.world[14] - latest.w[14];
             d2 = dx * dx + dy * dy + dz * dz;
+            // Same rotation fold as hist_dist2: a same-spot mirrored-twin
+            // mispair must reset the ring, not lerp across the flip.
+            float rd = 0.0f;
+            for (int r = 0; r < 3; ++r) {
+              for (int c2 = 0; c2 < 3; ++c2) {
+                rd = std::max(rd, std::fabs(item.world[r * 4 + c2] -
+                                            latest.w[r * 4 + c2]));
+              }
+            }
+            d2 = std::max(d2, rd * rd * 4.0f);
           }
           // Rigid uses the same tight one-tick bound as the claim cap
           // above: 0.78 m clone placements sit inside the vehicles' 1.5 m
