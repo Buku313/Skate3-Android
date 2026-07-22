@@ -1833,6 +1833,49 @@ bool GuestTryLoadU64(uint8_t* base, uint32_t addr, uint64_t* out) {
   return true;
 }
 
+// Per-instance world straight from the guest MeshContext: the owning model
+// object at ctx+0x30 keeps the instance's row-major 4x4 (translation in row
+// 3) at +0xA0. Verified 426/426 against placed captures in a park-editor
+// venue, 180-degree-rotated clones included. This is the only per-INSTANCE
+// transform source available at capture time: constant banks are shared by
+// every clone of a mesh (clones share (ib,vb)), so a bank world can belong
+// to whichever clone drew last. Validation mirrors TryRow4x4; callers fall
+// back to the bank paths when the owner layout does not match.
+bool ReadCtxInstanceWorld(uint8_t* base, uint32_t ctx, float* out) {
+  uint32_t owner = 0;
+  if (ctx == 0 || !GuestTryLoadU32(base, ctx + 0x30, &owner) ||
+      owner < 0x10000) {
+    return false;
+  }
+  uint32_t raw[16];
+  if (!GuestTryCopy(raw, REX_RAW_ADDR(owner + 0xA0), sizeof(raw))) {
+    return false;
+  }
+  float f[16];
+  for (int i = 0; i < 16; ++i) {
+    f[i] = std::bit_cast<float>(__builtin_bswap32(raw[i]));
+    if (!(f[i] > -1e7f && f[i] < 1e7f)) {
+      return false;
+    }
+  }
+  if (f[3] != 0.0f || f[7] != 0.0f || f[11] != 0.0f || f[15] != 1.0f) {
+    return false;
+  }
+  for (int r = 0; r < 3; ++r) {
+    const float n = f[r * 4] * f[r * 4] + f[r * 4 + 1] * f[r * 4 + 1] +
+                    f[r * 4 + 2] * f[r * 4 + 2];
+    if (!(n > 0.0025f && n < 400.0f)) {
+      return false;
+    }
+  }
+  if (!(f[12] > -20000.f && f[12] < 20000.f && f[13] > -20000.f &&
+        f[13] < 20000.f && f[14] > -20000.f && f[14] < 20000.f)) {
+    return false;
+  }
+  std::memcpy(out, f, sizeof(f));
+  return true;
+}
+
 namespace {
 
 // Guarded bounded C-string read (`out` gets up to cap-1 chars + NUL, tail
@@ -4166,13 +4209,41 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   // invisibly at the origin). Defer those to the post-draw fixup, like
   // skinned palettes.
   if (!item.skinned) {
+    // The instance's own matrix (ReadCtxInstanceWorld) outranks the bank:
+    // own_draw_last only proves SOME clone of this mesh drew last (clones
+    // share (ib,vb)), so under batched dispatch the bank world routinely
+    // belongs to another clone - pieces visibly swap placements and flip
+    // per frame (the park-editor shuffle). The bank still wins while it
+    // AGREES with the instance matrix (movables: the bank is the exact
+    // value the pass consumed this frame); a disagreement beyond small
+    // motion is the wrong-clone signature.
+    float ctx_world[16];
+    const bool have_ctx_world =
+        ReadCtxInstanceWorld(base, item.ctx, ctx_world);
     // Aux perspective passes (portrait RTTs) stage worlds at the off-map
     // portrait stage; defer like a foreign bank (see BankIsAuxPerspective).
-    if (!own_draw_last || BankIsAuxPerspective(base, bank) ||
-        !BankRigidWorld(base, bank, item.world)) {
+    const bool bank_ok = own_draw_last && !BankIsAuxPerspective(base, bank) &&
+                         BankRigidWorld(base, bank, item.world);
+    if (bank_ok && have_ctx_world) {
+      // Translation-only trigger: wrong-clone worlds sit meters apart;
+      // physics-animated props (dumpsters) can carry live ROTATION in the
+      // bank that the instance matrix trails, so same-spot rotation
+      // deltas keep the bank.
+      const float dx = item.world[12] - ctx_world[12];
+      const float dy = item.world[13] - ctx_world[13];
+      const float dz = item.world[14] - ctx_world[14];
+      if (dx * dx + dy * dy + dz * dz > 0.0625f) {
+        std::memcpy(item.world, ctx_world, sizeof(ctx_world));
+        g_rigid_ctx_world.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if (have_ctx_world) {
+      std::memcpy(item.world, ctx_world, sizeof(ctx_world));
+      g_rigid_ctx_world.fetch_add(1, std::memory_order_relaxed);
+    } else if (!bank_ok) {
       item.pending = true;
       g_rigid_pending.fetch_add(1, std::memory_order_relaxed);
-    } else if (item.ctx != 0) {
+    }
+    if (!item.pending && item.ctx != 0) {
       if (g_rigid_world_cache.size() > 32768) {
         g_rigid_world_cache.clear();  // map-change growth backstop
       }
@@ -5639,11 +5710,31 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     }
     d.caster_bank = BankIsOrtho(base, bank);
   } else {
-    // Deferred rigid prop: the world matrix is wherever this draw's layout
-    // keeps it (pre-pass c4..c7, main-pass c8..c11). Not plausible -> wait
-    // for a later draw with these buffers. Aux perspective passes (portrait
-    // RTTs) stage off-map portrait-stage worlds; skip those draws too.
-    if (BankIsAuxPerspective(base, bank) || !BankRigidWorld(base, bank, d.world)) {
+    // Deferred rigid prop: the instance's own matrix disambiguates clones
+    // (they share these buffers, so the bank can be another clone's; see
+    // ReadCtxInstanceWorld), while a same-spot bank keeps winning for its
+    // live physics rotation. Bank layout: pre-pass c4..c7, main-pass
+    // c8..c11. Neither plausible -> wait for a later draw with these
+    // buffers. Aux perspective passes (portrait RTTs) stage off-map
+    // portrait-stage worlds; those never serve.
+    float bank_world[16];
+    const bool fb_bank = !BankIsAuxPerspective(base, bank) &&
+                         BankRigidWorld(base, bank, bank_world);
+    const bool fb_ctx = ReadCtxInstanceWorld(base, d.ctx, d.world);
+    if (fb_bank && fb_ctx) {
+      const float dx = bank_world[12] - d.world[12];
+      const float dy = bank_world[13] - d.world[13];
+      const float dz = bank_world[14] - d.world[14];
+      if (dx * dx + dy * dy + dz * dz <= 0.0625f) {
+        std::memcpy(d.world, bank_world, sizeof(bank_world));
+      } else {
+        g_rigid_ctx_world.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if (fb_bank) {
+      std::memcpy(d.world, bank_world, sizeof(bank_world));
+    } else if (fb_ctx) {
+      g_rigid_ctx_world.fetch_add(1, std::memory_order_relaxed);
+    } else {
       return;
     }
     d.caster_bank = false;

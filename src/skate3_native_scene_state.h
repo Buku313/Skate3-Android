@@ -822,6 +822,9 @@ inline std::atomic<uint64_t> g_rigid_dropped{0};
 // Pending rigid clones re-published with their cached world at merge time
 // (see g_rigid_world_cache).
 inline std::atomic<uint64_t> g_rigid_rescued{0};
+// Rigid worlds served from the guest instance matrix (ReadCtxInstanceWorld)
+// instead of a constant bank.
+inline std::atomic<uint64_t> g_rigid_ctx_world{0};
 // Last published world per rigid dynamic context. Guest render thread only.
 // Same-mesh piece clones (park-editor venues submit dozens) share (ib,vb),
 // and their hook-time captures defer to the post-draw fixup whenever the
