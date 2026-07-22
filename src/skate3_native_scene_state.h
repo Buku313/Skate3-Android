@@ -973,6 +973,13 @@ inline PerfWindow g_pw_bi_core;    // BuildItemFromMeshCached total (hit validat
 inline PerfWindow g_pw_bi_fp;      // ComputeItemFingerprint on the cache-hit path
 inline PerfWindow g_pw_bi_walk;    // full BuildItemFromMesh rebuilds (cache miss)
 inline PerfWindow g_pw_bi_fetch;   // AdoptDrawFetchOverrides per-frame guest reads
+// Whole submit-record loop of BuildFrameScene (one Add per frame). Contains
+// bi_core/bi_fetch plus everything they do not: per-record hash-set
+// bookkeeping, the dynamic merge, draw-list copies and DrawItem churn.
+// build - b2d - bspl - wloop - bpal - retain - remainder = the post-loop
+// tail (camera smoothing, capture blocks, publish).
+inline PerfWindow g_pw_bi_wloop;
+inline std::atomic<uint64_t> g_bi_records{0};  // submit records per window
 // Off-screen retention pass (always measured, one Add per frame: two clock
 // reads): its cost and how many items it re-appends beyond the guest's own
 // submission are core visibility-culling telemetry, not deep profiling.

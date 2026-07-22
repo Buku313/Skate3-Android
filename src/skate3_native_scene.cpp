@@ -8236,6 +8236,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   FrameScene scene;
   scene.items.reserve(count);
   std::unordered_set<uint32_t> seen;
+  // Pre-size the per-frame bookkeeping: these fill with thousands of
+  // entries every frame, and growing from empty rehashes repeatedly.
+  seen.reserve(count);
   // Dynamic contexts are submitted several times per frame (once per pass);
   // each submission carries that pass's culled island list. Keep the fullest
   // one; a shadow-pass list can be missing body parts the main view needs.
@@ -8253,6 +8256,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     for (const DrawEntry& e : d.draws) n += e.index_count;
     return n;
   };
+  const bool wloop_prof = REXCVAR_GET(skate3_native_render_scene_perf_items);
+  const auto wloop_t0 = wloop_prof ? PerfClock::now() : PerfClock::time_point{};
+  if (wloop_prof) {
+    g_bi_records.fetch_add(count, std::memory_order_relaxed);
+  }
   for (size_t i = 0; i < count; ++i) {
     const SubmitRecord& r = records[i];
     // Primary opaque list of the chosen view only; other lists (shadow
@@ -8399,6 +8407,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         REXLOG_INFO("native-scene: world item build FAILED ctx={:08X}", r.a);
       }
     }
+  }
+  if (wloop_prof) {
+    g_pw_bi_wloop.Add(PerfNsSince(wloop_t0));
   }
   // Cross-frame palette rescue + cache refresh (see g_bones_cache_ctx and
   // g_ropa_state_cache): published copies refresh their cache entries; a

@@ -7081,7 +7081,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
           "grid[valid={} age={}] "
           "stages_us[mesh={:.2f} tex={:.2f} const={:.2f} submit={:.2f} n={}] "
           "build_us[core n={} av={:.2f} fp n={} av={:.2f} walk n={} av={:.2f} "
-          "fetch av={:.2f}] retain[{:.2f}/{:.2f}ms app={} live={}]",
+          "fetch av={:.2f}] wloop[{:.2f}/{:.2f}ms recs={}] "
+          "retain[{:.2f}/{:.2f}ms app={} live={}]",
           g_pw_di_in.count.load(std::memory_order_relaxed), avg_us(g_pw_di_in),
           g_pw_di_in.MaxMs(),
           g_pw_di_occ.count.load(std::memory_order_relaxed),
@@ -7101,8 +7102,10 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
           avg_us(g_pw_bi_core),
           g_pw_bi_fp.count.load(std::memory_order_relaxed), avg_us(g_pw_bi_fp),
           g_pw_bi_walk.count.load(std::memory_order_relaxed),
-          avg_us(g_pw_bi_walk), avg_us(g_pw_bi_fetch), g_pw_bi_retain.AvgMs(),
-          g_pw_bi_retain.MaxMs(),
+          avg_us(g_pw_bi_walk), avg_us(g_pw_bi_fetch), g_pw_bi_wloop.AvgMs(),
+          g_pw_bi_wloop.MaxMs(),
+          g_bi_records.exchange(0, std::memory_order_relaxed),
+          g_pw_bi_retain.AvgMs(), g_pw_bi_retain.MaxMs(),
           g_retained_appended.exchange(0, std::memory_order_relaxed),
           g_retained_live.load(std::memory_order_relaxed));
     }
@@ -7114,7 +7117,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
                           &g_pw_di_in, &g_pw_di_occ, &g_pw_di_out,
                           &g_pw_di_mesh, &g_pw_di_tex, &g_pw_di_const,
                           &g_pw_di_submit, &g_pw_bi_core, &g_pw_bi_fp,
-                          &g_pw_bi_walk, &g_pw_bi_fetch, &g_pw_bi_retain}) {
+                          &g_pw_bi_walk, &g_pw_bi_fetch, &g_pw_bi_wloop,
+                          &g_pw_bi_retain}) {
       w->Reset();
     }
     // Refill the settle offender-log + slow-frame budgets for the next window.
