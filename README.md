@@ -15,8 +15,8 @@ The project does not include Skate 3 retail game files. To run or build the proj
 Native Rendering Showcase (click to go to YouTube):
 
 <p align="center">
-  <a href="https://youtu.be/kAdZouj4KME">
-    <img src="https://img.youtube.com/vi/kAdZouj4KME/maxresdefault.jpg" alt="Skate 3 Recomp native rendering showcase" width="420">
+  <a href="https://youtu.be/ETXCOsip1Uo">
+    <img src="https://img.youtube.com/vi/ETXCOsip1Uo/maxresdefault.jpg" alt="Skate 3 Recomp native rendering showcase" width="420">
   </a>
 </p>
 
