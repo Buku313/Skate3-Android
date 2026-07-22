@@ -4839,6 +4839,17 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
                  rows[45] < 16.0f;
         }
         if (sane) {
+          // Scene-exposure transition log (c10.x): the game's auto-exposure
+          // holds this at the per-zone maximum (2.5 in daytime zones) while
+          // luminance readbacks are unavailable, enforced by the
+          // skate3_autoexposure_pin hook. Transitions are rare and mark
+          // either a zone change or an adaptation leak, so log them.
+          if (g_shadow_have &&
+              std::fabs(rows[40] - g_shadow_rows[40]) > 0.02f * rows[40]) {
+            REXLOG_INFO(
+                "native-scene: world scene exposure changed {:.3f} -> {:.3f}",
+                g_shadow_rows[40], rows[40]);
+          }
           std::memcpy(g_shadow_rows, rows, sizeof(rows));
           g_shadow_have = true;
           g_shadow_frame_done = true;

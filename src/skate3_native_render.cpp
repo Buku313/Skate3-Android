@@ -685,6 +685,88 @@ extern "C" REX_FUNC(sub_824FD4B0) {
   __imp__sub_824FD4B0(ctx, base);
 }
 
+namespace skate3::native_scene {
+// Fault-guarded guest read (defined in skate3_native_scene.cpp).
+bool GuestTryLoadU32(uint8_t* base, uint32_t addr, uint32_t* out);
+}  // namespace skate3::native_scene
+
+REXCVAR_DEFINE_BOOL(
+    skate3_autoexposure_pin, true, "Skate 3",
+    "Pin the game's auto-exposure at its per-zone maximum. The game "
+    "adapts world exposure from a GPU luminance measurement it reads "
+    "back from memory; with resolve readbacks disabled (the native "
+    "renderer's standard configuration) that measurement reads empty and "
+    "exposure settles at the maximum anyway - but windows that "
+    "temporarily enable readbacks (the photo shutter) can leak one real "
+    "measurement of a bright frame, after which the frozen measurement "
+    "drags exposure to the minimum clamp permanently (the stuck world "
+    "darkening after photo missions). Pinning removes the dependence on "
+    "measurement availability. Turn OFF only when running with full "
+    "resolve readbacks enabled, where live per-frame measurements make "
+    "the game's own adaptation behave as on console.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// World auto-exposure evaluator (per frame): reads the GPU luminance
+// measurement (sum / area of a resolved measurement surface), adapts the
+// scene exposure toward the target luminance and clamps it to the
+// per-zone [min, max] from the tuning block at [this+2468]+120..132
+// (target, min, max, rate). Without resolve readbacks the measurement
+// reads empty and exposure settles at the maximum; a readback window
+// that briefly lets one bright measurement through (the photo shutter
+// burst) leaves a frozen too-bright measurement that drags exposure to
+// the minimum clamp permanently. The hook re-pins the adapted exposure
+// (the evaluator's internal state and both published outputs, honoring
+// the same ownership gates the game checks) to the per-zone maximum.
+extern "C" REX_FUNC(sub_827F0D00) {
+  const uint32_t self = ctx.r3.u32;
+  __imp__sub_827F0D00(ctx, base);
+  if (!REXCVAR_GET(skate3_autoexposure_pin) || self < 0x10000) {
+    return;
+  }
+  uint32_t aux = 0, inst_a = 0, inst_b = 0, max_bits = 0;
+  if (!skate3::native_scene::GuestTryLoadU32(base, self + 2468, &aux) ||
+      aux < 0x10000 ||
+      !skate3::native_scene::GuestTryLoadU32(base, aux + 128, &max_bits) ||
+      !skate3::native_scene::GuestTryLoadU32(base, self + 2484, &inst_a) ||
+      !skate3::native_scene::GuestTryLoadU32(base, self + 2500, &inst_b)) {
+    return;
+  }
+  float max_expo;
+  std::memcpy(&max_expo, &max_bits, sizeof(max_expo));
+  if (!(max_expo > 0.0f) || max_expo > 16.0f) {
+    return;
+  }
+  uint32_t prev_bits = REX_LOAD_U32(self + 3240);
+  float prev;
+  std::memcpy(&prev, &prev_bits, sizeof(prev));
+  static std::atomic<int64_t> s_last_log_ns{-1};
+  if (prev > 0.0f && prev < max_expo * 0.98f) {
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    const int64_t last = s_last_log_ns.load(std::memory_order_relaxed);
+    if (last < 0 || now_ns - last > 60'000'000'000) {
+      s_last_log_ns.store(now_ns, std::memory_order_relaxed);
+      REXLOG_INFO(
+          "native-render: auto-exposure re-pinned at zone max {:.3f} "
+          "(adaptation had moved it to {:.3f}; luminance measurement "
+          "unavailable without resolve readbacks)",
+          max_expo, prev);
+    }
+  }
+  REX_STORE_U32(self + 3240, max_bits);
+  REX_STORE_U32(self + 3392, max_bits);
+  const uint32_t own_a = REX_LOAD_U8(self + 3397);
+  const uint32_t own_b = REX_LOAD_U8(self + 3396);
+  if (own_a == 0 && inst_a >= 0x10000) {
+    REX_STORE_U32(inst_a + 48, max_bits);
+  }
+  if (own_b == 0 && inst_b >= 0x10000) {
+    REX_STORE_U32(inst_b + 56, max_bits);
+  }
+}
+
 // rw::movie::MovieDecoder::Decode(int, VideoRenderable**,
 // SubtitleRenderable*): fires per decoded FMV frame while any movie plays
 // (boot intro logos and all other rw::movie playback). Heartbeat for the
