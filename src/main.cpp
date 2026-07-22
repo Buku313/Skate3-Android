@@ -32,7 +32,12 @@ class Skate3PureApp : public Skate3BaseApp {
   }
 
   std::string GetWindowTitle() const override {
+#if defined(__APPLE__)
+    // Match the macOS bundle name so the title bar and the .app agree.
+    return "skate3recomp " SKATE3_BUILD_TITLE;
+#else
     return "Skate 3 " SKATE3_BUILD_TITLE;
+#endif
   }
 
   static std::unique_ptr<rex::ui::WindowedApp> Create(
