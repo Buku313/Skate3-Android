@@ -4172,6 +4172,14 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
         !BankRigidWorld(base, bank, item.world)) {
       item.pending = true;
       g_rigid_pending.fetch_add(1, std::memory_order_relaxed);
+    } else if (item.ctx != 0) {
+      if (g_rigid_world_cache.size() > 32768) {
+        g_rigid_world_cache.clear();  // map-change growth backstop
+      }
+      RigidWorldCache& rc = g_rigid_world_cache[item.ctx];
+      rc.mesh = item.mesh;
+      std::memcpy(rc.world, item.world, sizeof(rc.world));
+      rc.frame = g_guest_frame;
     }
   }
 
@@ -5540,6 +5548,47 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     }
     caster_refresh = true;
   }
+  // Rigid clone disambiguation: same-mesh piece clones share these buffers,
+  // and under batched dispatch (park-editor venues: every capture defers,
+  // 100+ pending rigids per frame) the FIFO capture order is NOT the draw
+  // order; pairing a draw with the wrong clone swaps piece worlds frame to
+  // frame (pieces visibly shuffle and flip 180 degrees). Prefer the pending
+  // clone whose LAST PUBLISHED world sits nearest this draw's world; FIFO
+  // stays the fallback for first-sight clones with no history. Movables stay
+  // matchable: they drift well under the 0.5 m bound per frame and the cache
+  // re-stamps on every resolved draw.
+  if (!caster_refresh && oldest->second < g_frame_dynitems.size() &&
+      !g_frame_dynitems[oldest->second].skinned) {
+    float w[16];
+    if (!BankIsAuxPerspective(base, bank) && BankRigidWorld(base, bank, w)) {
+      float best_d2 = 0.25f;
+      auto best = range.second;
+      for (auto it = range.first; it != range.second; ++it) {
+        if (it->second >= g_frame_dynitems.size()) {
+          continue;
+        }
+        const DrawItem& c = g_frame_dynitems[it->second];
+        if (!c.pending || c.skinned || c.ctx == 0) {
+          continue;
+        }
+        const auto cit = g_rigid_world_cache.find(c.ctx);
+        if (cit == g_rigid_world_cache.end() || cit->second.mesh != c.mesh) {
+          continue;
+        }
+        const float dx = cit->second.world[12] - w[12];
+        const float dy = cit->second.world[13] - w[13];
+        const float dz = cit->second.world[14] - w[14];
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < best_d2) {
+          best_d2 = d2;
+          best = it;
+        }
+      }
+      if (best != range.second) {
+        oldest = best;
+      }
+    }
+  }
   DrawItem& d = g_frame_dynitems[oldest->second];
   if (caster_refresh) {
     // Refresh of a caster-sourced capture from a later (ideally main-pass)
@@ -5598,6 +5647,12 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       return;
     }
     d.caster_bank = false;
+    if (d.ctx != 0) {
+      RigidWorldCache& rc = g_rigid_world_cache[d.ctx];
+      rc.mesh = d.mesh;
+      std::memcpy(rc.world, d.world, sizeof(rc.world));
+      rc.frame = g_guest_frame;
+    }
   }
   d.pending = false;
   d.dbg_src = 2;
@@ -8293,6 +8348,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // refused capture re-publishes with the instance's own last palette
   // (see g_bones_cache_ctx).
   std::unordered_map<uint32_t, const DrawItem*> pending_skinned_by_ctx;
+  // Per-instance rigid candidates whose post-draw world fixup never landed
+  // this frame; rescued with their cached world (see g_rigid_world_cache).
+  std::unordered_map<uint32_t, const DrawItem*> pending_rigid_by_ctx;
   const auto total_indices = [](const DrawItem& d) {
     uint64_t n = 0;
     for (const DrawEntry& e : d.draws) n += e.index_count;
@@ -8355,6 +8413,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           pending_ropa_by_mesh.try_emplace(cand.mesh, &cand);
         } else if (cand.skinned && cand.ctx != 0 && cand.char_family != 0) {
           pending_skinned_by_ctx.try_emplace(cand.ctx, &cand);
+        } else if (!cand.skinned && !cand.cloth_quads && cand.ctx != 0) {
+          pending_rigid_by_ctx.try_emplace(cand.ctx, &cand);
         }
         (cand.skinned ? g_skinned_skipped : g_rigid_dropped)
             .fetch_add(1, std::memory_order_relaxed);
@@ -8635,6 +8695,29 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       // publish the same instance this frame.
       dyn_slot.try_emplace(ctxk, scene.items.size() - 1);
       g_lw_ctx_rescued.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Rigid clone rescue: a piece whose world-bearing draw was missed this
+    // frame (culled, or claimed by another clone of the mesh) re-publishes
+    // with its own last published world instead of vanishing for a frame.
+    // Statics never move, and movables at most drift one frame behind; the
+    // mesh check keeps a reused ctx address from wearing a stale placement.
+    for (const auto& [ctxk, cand] : pending_rigid_by_ctx) {
+      if (dyn_slot.find(ctxk) != dyn_slot.end()) {
+        continue;  // this instance published live
+      }
+      const auto cit = g_rigid_world_cache.find(ctxk);
+      if (cit == g_rigid_world_cache.end() || cit->second.mesh != cand->mesh ||
+          g_guest_frame - cit->second.frame > 600) {
+        continue;  // no trusted placement; a dropped frame beats an origin ghost
+      }
+      scene.items.push_back(*cand);
+      DrawItem& rescued = scene.items.back();
+      std::memcpy(rescued.world, cit->second.world, sizeof(rescued.world));
+      rescued.pending = false;
+      rescued.dbg_src = 12;
+      ++pub_count[rescued.mesh];
+      dyn_slot.try_emplace(ctxk, scene.items.size() - 1);
+      g_rigid_rescued.fetch_add(1, std::memory_order_relaxed);
     }
     // Refused ropa captures re-publish last frame's resolved state: mode,
     // world AND palette together (mixing frames' interpretations is the

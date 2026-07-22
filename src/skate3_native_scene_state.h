@@ -819,6 +819,23 @@ inline std::atomic<uint64_t> g_skinned_skipped{0};
 // draws), and those still pending at frame end (dropped).
 inline std::atomic<uint64_t> g_rigid_pending{0};
 inline std::atomic<uint64_t> g_rigid_dropped{0};
+// Pending rigid clones re-published with their cached world at merge time
+// (see g_rigid_world_cache).
+inline std::atomic<uint64_t> g_rigid_rescued{0};
+// Last published world per rigid dynamic context. Guest render thread only.
+// Same-mesh piece clones (park-editor venues submit dozens) share (ib,vb),
+// and their hook-time captures defer to the post-draw fixup whenever the
+// venue batches dispatch (own_draw_last false); FIFO pairing there scrambles
+// clone worlds whenever capture order and draw order diverge - pieces
+// visibly swap placements and flip 180 degrees frame to frame. The fixup
+// pairs each draw to the pending clone whose cached world matches instead,
+// and clones whose draw never landed re-publish their cached world at merge.
+struct RigidWorldCache {
+  uint32_t mesh = 0;
+  float world[16] = {};
+  uint64_t frame = 0;
+};
+inline std::unordered_map<uint32_t, RigidWorldCache> g_rigid_world_cache;
 // Model-space props in the world sort lists, excluded from the identity
 // world path (their placed copies come from the kind-2 capture).
 inline std::atomic<uint64_t> g_world_props{0};
