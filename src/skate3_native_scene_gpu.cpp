@@ -88,6 +88,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_pause_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_perf_interval);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_display_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_grab_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_native);
@@ -7138,7 +7139,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "reused={}] dynobj[valid={} drawn={}] water[valid={} drawn={}] "
         "lw[ctxs={} ents={} stamp={} fade0={} resc={} fill={} pal={} rows={}] "
         "refl[pair={} flat={} gate={:#x}] flips={} alt[bones={} shadow={}] "
-        "rows_inst={} pal_srv={}",
+        "rows_inst={} pal_srv={} occl_culled={}",
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(),
@@ -7172,7 +7173,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_refl_pair.load(), g_refl_flat.load(), g_refl_gate.load(),
         g_hair_route_flips.load(), g_hair_bone_alternations.load(),
         g_shadow_alternations.load(), g_char_rows_inst_served.load(),
-        g_pal_served_total.load());
+        g_pal_served_total.load(), g_occl_culled.load());
   }
 }
 
@@ -9580,7 +9581,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // completed slot wins, every completed slot retires. A grid that stops
   // refreshing (AO off, loading flows) goes invalid instead of classifying
   // against ancient depth.
-  if (prof_items && !g_r.occl_failed && g_r.occl_readback_ptr[1] != nullptr) {
+  const bool occl_cull_wanted =
+      REXCVAR_GET(skate3_native_render_scene_occlusion_cull);
+  if ((prof_items || occl_cull_wanted) && !g_r.occl_failed &&
+      g_r.occl_readback_ptr[1] != nullptr) {
     const uint64_t occl_done = context.device->CompletedSubmission();
     int newest = -1;
     for (int i = 0; i < 2; ++i) {
@@ -9604,6 +9608,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       std::memcpy(g_r.occl_grid_vp, g_r.occl_vp[newest],
                   sizeof(g_r.occl_grid_vp));
+      std::memcpy(g_r.occl_grid_cam, g_r.occl_cam[newest],
+                  sizeof(g_r.occl_grid_cam));
       g_r.occl_grid_frame = frame_number;
       g_r.occl_grid_valid = true;
       for (int i = 0; i < 2; ++i) {
@@ -9691,6 +9697,27 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
            REXCVAR_GET(skate3_native_render_scene_entity_fade) &&
            CharFadeAlpha(it) < 0.999f;
   };
+  // Occlusion cull: statics provably hidden behind already-rendered
+  // geometry skip the color pass entirely (every scene.items consumer that
+  // must still see them - shadow casters, the world-shadow map, outline,
+  // warm-settle - iterates the list itself and is unaffected). Engaged only
+  // while the grid's camera matches this frame's within 1 m: the stored-
+  // frustum check inside ItemOccludedByGrid already keeps rotation safe
+  // (bounds outside the grid's view classify visible), and past 1 m of
+  // translation the 1-2 frame-old depth could hide content parallax has
+  // revealed. At gameplay speeds the grid refreshes well inside that
+  // budget, so the gate only stands the cull down across teleports and
+  // camera cuts.
+  bool occl_cull_active = occl_cull_wanted && debug_mode == 0 &&
+                          g_r.occl_grid_valid;
+  if (occl_cull_active) {
+    float cam_d2 = 0.0f;
+    for (int a = 0; a < 3; ++a) {
+      const float d = scene.cam_pos[a] - g_r.occl_grid_cam[a];
+      cam_d2 += d * d;
+    }
+    occl_cull_active = cam_d2 < 1.0f;
+  }
   // Opaque items draw front-to-back (bbox-center distance): early-z rejects
   // occluded pixels before the heavy material PS runs. The game's sort-list
   // order is by render state, not depth; depth-write LESS_EQUAL makes the
@@ -9876,6 +9903,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
     };
+    // Occlusion cull (statics only; same classifiability gate as the
+    // profiler): the 1 m depth margin on top of the conservative bbox test
+    // keeps reveal edges safe at speed - deeply hidden mass sits many
+    // meters behind its occluders, so the margin costs almost none of the
+    // win. Ring route 3 = culled.
+    if (occl_cull_active && !item.skinned && !item.ropa &&
+        !item.cloth_quads && item.bones.empty() &&
+        ItemOccludedByGrid(item, 1.0f)) {
+      g_occl_culled.fetch_add(1, std::memory_order_relaxed);
+      stamp_route(3);
+      continue;
+    }
     // The exact ocean surface (fam 31) is an OPAQUE draw in the game (its
     // PS outputs alpha 0 and it writes z-prepass depth); routing it through
     // the sorted alpha sub-pass would composite the blended horizon sheet

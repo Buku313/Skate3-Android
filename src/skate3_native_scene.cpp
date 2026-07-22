@@ -1167,6 +1167,16 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_perf_interval, 600, "Skate 3",
     .range(60, 6000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull, true, "Skate 3",
+                    "Skip drawing static world items whose bounds are "
+                    "provably hidden behind already-rendered geometry (depth-"
+                    "grid test, conservative: anything unprovable still "
+                    "draws). Shadow passes are exempt, so hidden geometry "
+                    "keeps casting shadows. Dense areas with extended world "
+                    "streaming spend roughly half their per-item CPU on such "
+                    "items.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_items, false, "Skate 3",
                     "Deep per-item CPU profiling: adds a perf-items log line "
                     "per perf window attributing per-item cost to pipeline "

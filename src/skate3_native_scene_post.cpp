@@ -58,6 +58,7 @@
 // Cvars defined in skate3_native_scene.cpp.
 REXCVAR_DECLARE(double, skate3_menu_blur_sigma);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_knee);
@@ -442,12 +443,15 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
                  nrhi::ResourceState::kRenderTarget);
   }
 
-  // Occlusion-attribution grid (perf-items profiling): while the linear
-  // depth is still bound as an SRV, tile-MAX reduce it into the small R32F
-  // grid and queue a never-waited copy into the readback ring (the
-  // photo-grab pattern; consumed 1-2 frames later by the item classifier
-  // in RenderScene). Any creation failure disables only this attribution.
-  if (REXCVAR_GET(skate3_native_render_scene_perf_items) && !g_r.occl_failed) {
+  // Occlusion grid (perf-items attribution AND the occlusion cull): while
+  // the linear depth is still bound as an SRV, tile-MAX reduce it into the
+  // small R32F grid and queue a never-waited copy into the readback ring
+  // (the photo-grab pattern; consumed 1-2 frames later by the item
+  // classifier / cull in RenderScene). Any creation failure disables only
+  // these consumers.
+  if ((REXCVAR_GET(skate3_native_render_scene_perf_items) ||
+       REXCVAR_GET(skate3_native_render_scene_occlusion_cull)) &&
+      !g_r.occl_failed) {
     if (g_r.pso_occl_reduce == nullptr) {
       nrhi::Shader* rvs = device->CreateShader(
           MakeShaderDesc(nrhi::ShaderStage::kVertex, "ssao.hlsl",
@@ -536,6 +540,7 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
                    nrhi::ResourceState::kRenderTarget);
       cmd->FlushBarriers();
       std::memcpy(g_r.occl_vp[w], scene.view_proj, sizeof(g_r.occl_vp[w]));
+      std::memcpy(g_r.occl_cam[w], scene.cam_pos, sizeof(g_r.occl_cam[w]));
       g_r.occl_submission[w] = device->CurrentSubmission();
       g_r.occl_pending[w] = true;
       g_r.occl_write_index = 1 - w;

@@ -642,12 +642,14 @@ struct RendererState {
   uint8_t* occl_readback_ptr[2] = {};
   uint64_t occl_submission[2] = {};
   float occl_vp[2][16] = {};
+  float occl_cam[2][3] = {};  // camera position the grid's frame rendered from
   bool occl_pending[2] = {};
   int occl_write_index = 0;
   bool occl_failed = false;
   // Newest completed grid, CPU-side (render thread only).
   std::vector<float> occl_grid;
   float occl_grid_vp[16] = {};
+  float occl_grid_cam[3] = {};
   uint64_t occl_grid_frame = 0;  // frame_number the grid was captured on
   bool occl_grid_valid = false;
   // HDR pipeline (hdr.hlsl): the scene renders pre-tonemap linear into a

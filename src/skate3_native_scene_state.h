@@ -960,6 +960,10 @@ inline std::atomic<uint64_t> g_vis_in_indices{0};   // indices submitted, visibl
 inline std::atomic<uint64_t> g_vis_occ_indices{0};  // indices submitted, occluded items
 inline std::atomic<uint64_t> g_vis_out_indices{0};  // indices submitted, out-of-frustum items
 inline std::atomic<uint64_t> g_vis_out_retained{0};  // out-of-frustum draws from retention
+// Session-cumulative count of statics skipped by the occlusion cull (the
+// skate3_native_render_scene_occlusion_cull cvar; reported on the frame
+// stats line like the other cumulative counters there).
+inline std::atomic<uint64_t> g_occl_culled{0};
 // Guest render thread: decomposition of the per-item build walk.
 inline PerfWindow g_pw_bi_core;    // BuildItemFromMeshCached total (hit validate + misses)
 inline PerfWindow g_pw_bi_fp;      // ComputeItemFingerprint on the cache-hit path
