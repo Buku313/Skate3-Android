@@ -7,6 +7,7 @@
 // guest output texture via the SDK native-guest-output hook, replacing the
 // emulated frame when active.
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
