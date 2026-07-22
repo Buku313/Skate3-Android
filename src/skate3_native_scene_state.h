@@ -291,6 +291,12 @@ inline float g_outline_color[4] = {0.21569f, 0.64706f, 1.0f, 1.0f};
 inline float g_shadow_rows[48] = {};
 inline bool g_shadow_have = false;
 inline bool g_shadow_frame_done = false;
+// Guest frame of the last SANE capture. Interior venues (the park-editor
+// warehouses) run a different environment shader whose bank never passes the
+// sanity gate (near-zero sun, exposure ~0.001), so the rows latch stale
+// outdoor state there; consumers that must not act on stale sun state key
+// off this freshness stamp (see FrameScene::shadow_fresh).
+inline uint64_t g_shadow_rows_frame = 0;
 // Frame-global rows of the tree / proxyworld shader families (see
 // FrameScene::family_rows), captured from their PS banks when a draw with
 // the matching debug path runs. Guest render thread only.

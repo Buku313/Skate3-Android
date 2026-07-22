@@ -7970,8 +7970,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           REXCVAR_GET(skate3_native_render_scene_shadow_pcss_min_texel));
     }
     // Native static sun-shadow rows (nsm_x/y/z + params, cb[144..163]);
-    // nsm_p.x = 0 disables the term in every branch.
-    if (g_r.static_sun_valid) {
+    // nsm_p.x = 0 disables the term in every branch (the scene receive, the
+    // character branch and the volumetric shafts all read this slice).
+    // Gated on FRESH world rows, not just shadow_valid: interior venues
+    // (park-editor warehouses) never produce a sane environment bank, so the
+    // sun direction here would be a stale outdoor capture. The map then
+    // shades the whole interior as roof-shadowed, and with no game shadow
+    // pass this frame sh_color is zero, so the exact env families clamp
+    // min(lm^2, s + sh_color) to pure black - the missing walls/floor.
+    // The game itself never sun-shadows static world geometry indoors;
+    // standing the map down restores its exact lm^2 shading.
+    if (g_r.static_sun_valid && scene.shadow_fresh) {
       std::memcpy(cb + 144, g_r.nsm_rows, sizeof(g_r.nsm_rows));
       cb[156] = std::clamp(
           float(REXCVAR_GET(skate3_native_render_scene_shadow_static_strength)),

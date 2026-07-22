@@ -321,6 +321,13 @@ struct FrameScene {
   // c5.x = depth bias, c8 = shadow color + floor; c6 = sun dir, c7 = camera,
   // captured for validation only).
   bool shadow_valid = false;
+  // True while the rows above were captured within the last ~2 s of guest
+  // frames. shadow_valid alone latches forever, so interior venues whose
+  // environment banks never pass the capture sanity gate (park-editor
+  // warehouses: near-zero sun, exposure ~0.001) serve stale outdoor rows;
+  // sun-derived features (the native static sun-shadow map) must stand down
+  // there instead of shading a sunless interior with an outdoor sun.
+  bool shadow_fresh = false;
   // Extended to c0..c11: c10.x = scene exposure (2.5), c11.y = the material
   // multiplier (1.0), consumed by the exact world-shading tone chain.
   float shadow_rows[48] = {};

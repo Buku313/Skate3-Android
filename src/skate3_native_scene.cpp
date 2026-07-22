@@ -4853,6 +4853,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
           std::memcpy(g_shadow_rows, rows, sizeof(rows));
           g_shadow_have = true;
           g_shadow_frame_done = true;
+          g_shadow_rows_frame = g_guest_frame;
         }
       }
       // tree / proxyworld frame rows (see FrameScene::family_rows): their PS
@@ -9815,6 +9816,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (g_shadow_have) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
+    // Same freshness pattern as the char CSM biases below: outdoor scenes
+    // re-capture every frame, so anything past a couple of seconds means the
+    // current venue's environment shader never produces a sane bank.
+    scene.shadow_fresh = g_guest_frame - g_shadow_rows_frame <= 120;
   }
   // Character CSM receive biases (see the header comment): frame-coherent,
   // served while fresh enough that a few capture-less frames don't flap the
