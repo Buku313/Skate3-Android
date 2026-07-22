@@ -1157,7 +1157,24 @@ REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_log, false, "Skate 3",
                     "Log periodic native-renderer performance breakdown lines "
-                    "(600-frame windows)")
+                    "(see skate3_native_render_scene_perf_interval)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_perf_interval, 600, "Skate 3",
+                     "Frames between native-scene perf/stats log lines. Lower "
+                     "values give finer windows for chasing transient frame-"
+                     "rate dips at the cost of log volume.")
+    .range(60, 6000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_items, false, "Skate 3",
+                    "Deep per-item CPU profiling: adds a perf-items log line "
+                    "per perf window attributing per-item cost to pipeline "
+                    "stages (mesh/texture/constants/submit; cache validate/"
+                    "fingerprint/walk/fetch) and splitting draw time between "
+                    "items inside vs outside the rendered view frustum. Adds "
+                    "measurable overhead at high item counts; leave off "
+                    "outside investigations.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ring, false, "Skate 3",
@@ -2451,6 +2468,7 @@ namespace {
 
 bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   const uint64_t frame = g_guest_frame;
+  const bool prof = REXCVAR_GET(skate3_native_render_scene_perf_items);
   {
     std::lock_guard<std::mutex> lock(g_item_cache_mutex);
     auto it = g_item_cache.find(mesh);
@@ -2479,7 +2497,12 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
         // registration invalidation immediately).
         const bool dynamic_payload = core.item.skinned || core.item.ropa;
         if (dynamic_payload || frame >= core.fp_frame) {
-          if (!ComputeItemFingerprint(base, core.item)) {
+          const auto fp_t0 = prof ? PerfClock::now() : PerfClock::time_point{};
+          const bool fp_ok = ComputeItemFingerprint(base, core.item);
+          if (prof) {
+            g_pw_bi_fp.Add(PerfNsSince(fp_t0));
+          }
+          if (!fp_ok) {
             g_rej_geom.fetch_add(1, std::memory_order_relaxed);
             g_item_cache.erase(it);
             return false;
@@ -2493,7 +2516,12 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
       g_item_cache.erase(it);
     }
   }
-  if (!BuildItemFromMesh(base, mesh, item)) {
+  const auto walk_t0 = prof ? PerfClock::now() : PerfClock::time_point{};
+  const bool walked = BuildItemFromMesh(base, mesh, item);
+  if (prof) {
+    g_pw_bi_walk.Add(PerfNsSince(walk_t0));
+  }
+  if (!walked) {
     return false;
   }
   g_item_cache_builds.fetch_add(1, std::memory_order_relaxed);
@@ -2526,12 +2554,22 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
     g_rej_chain.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
-  if (!BuildItemFromMeshCached(base, mesh, item)) {
+  const bool prof = REXCVAR_GET(skate3_native_render_scene_perf_items);
+  const auto core_t0 = prof ? PerfClock::now() : PerfClock::time_point{};
+  const bool built = BuildItemFromMeshCached(base, mesh, item);
+  if (prof) {
+    g_pw_bi_core.Add(PerfNsSince(core_t0));
+  }
+  if (!built) {
     return false;
   }
   // Draw-time fetch overrides are per-frame state, applied after the cached
   // core, on every build.
+  const auto fetch_t0 = prof ? PerfClock::now() : PerfClock::time_point{};
   AdoptDrawFetchOverrides(base, item);
+  if (prof) {
+    g_pw_bi_fetch.Add(PerfNsSince(fetch_t0));
+  }
 
   // Culled island draw list from the context.
   const uint32_t draw_count = REX_LOAD_U16(ctx + kCtxDrawCountU16);
@@ -9390,6 +9428,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (REXCVAR_GET(skate3_native_render_scene_retain_offscreen) &&
       g_synpan_active.load(std::memory_order_relaxed) == 0 &&
       !REXCVAR_GET(skate3_native_render_scene_freecam)) {
+    const auto retain_t0 = PerfClock::now();
+    uint64_t retain_appended = 0;
     if (g_retained_clear.exchange(false, std::memory_order_relaxed)) {
       g_retained_items.clear();
       g_dyn_retained.clear();
@@ -9446,9 +9486,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       // behind the camera stays retained but costs nothing.
       if (!ItemOutsideFrustum(r.item, scene.view_proj, 1.05f / wide_hor_scale)) {
         scene.items.push_back(r.item);
+        ++retain_appended;
       }
       ++rit;
     }
+    g_pw_bi_retain.Add(PerfNsSince(retain_t0));
+    g_retained_appended.fetch_add(retain_appended, std::memory_order_relaxed);
+    g_retained_live.store(g_retained_items.size(), std::memory_order_relaxed);
   }
 
   // Camera-signal recorder: per-frame raw + smoothed heading while the

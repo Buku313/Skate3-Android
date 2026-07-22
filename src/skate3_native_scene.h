@@ -516,6 +516,13 @@ bool LoadingOrFrontendActive();
 // by the render passes.
 float CharFadeAlpha(const DrawItem& item);
 
+// True when all 8 corners of the item's world-space bbox fall outside one
+// clip plane of `vp` (row-vector view*proj). `margin` scales the tested
+// frustum: < 1 shrinks it, > 1 widens it. Defined in
+// skate3_native_scene.cpp; consumed by the off-screen retention pass and the
+// per-item profiling attribution.
+bool ItemOutsideFrustum(const DrawItem& it, const float vp[16], float margin);
+
 // Called from the cProcessArenaAsset::RegisterTexture hook: guid -> guest
 // renderengine::Texture object.
 void OnRegisterTexture(uint64_t guid, uint32_t texture);

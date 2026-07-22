@@ -57,6 +57,7 @@
 
 // Cvars defined in skate3_native_scene.cpp.
 REXCVAR_DECLARE(double, skate3_menu_blur_sigma);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_knee);
@@ -439,6 +440,106 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
     cmd->Draw(3, 0);
     cmd->Barrier(g_r.ao_tex[0], nrhi::ResourceState::kPixelShaderResource,
                  nrhi::ResourceState::kRenderTarget);
+  }
+
+  // Occlusion-attribution grid (perf-items profiling): while the linear
+  // depth is still bound as an SRV, tile-MAX reduce it into the small R32F
+  // grid and queue a never-waited copy into the readback ring (the
+  // photo-grab pattern; consumed 1-2 frames later by the item classifier
+  // in RenderScene). Any creation failure disables only this attribution.
+  if (REXCVAR_GET(skate3_native_render_scene_perf_items) && !g_r.occl_failed) {
+    if (g_r.pso_occl_reduce == nullptr) {
+      nrhi::Shader* rvs = device->CreateShader(
+          MakeShaderDesc(nrhi::ShaderStage::kVertex, "ssao.hlsl",
+                         kSsaoShaderSource, "vs_main", nullptr, ""));
+      nrhi::Shader* rps = device->CreateShader(
+          MakeShaderDesc(nrhi::ShaderStage::kPixel, "ssao.hlsl",
+                         kSsaoShaderSource, "ps_depth_max", nullptr, ""));
+      if (rvs != nullptr && rps != nullptr) {
+        nrhi::GraphicsPipelineDesc rp;
+        rp.layout = g_r.ao_layout;
+        rp.vs = rvs;
+        rp.ps = rps;
+        rp.cull = nrhi::CullMode::kNone;
+        rp.sample_count = 1;
+        rp.rtv_format = nrhi::Format::kR32_FLOAT;
+        g_r.pso_occl_reduce = device->CreateGraphicsPipeline(rp);
+      }
+      if (rvs != nullptr) {
+        device->DestroyDeferred(rvs);
+      }
+      if (rps != nullptr) {
+        device->DestroyDeferred(rps);
+      }
+      if (g_r.pso_occl_reduce == nullptr) {
+        g_r.occl_failed = true;
+        REXLOG_WARN(
+            "native-scene: occlusion-grid PSO creation failed - occluded-item "
+            "attribution disabled");
+      }
+    }
+    if (!g_r.occl_failed && g_r.occl_tex == nullptr) {
+      nrhi::TextureDesc td;
+      td.width = RendererState::kOcclGridW;
+      td.height = RendererState::kOcclGridH;
+      td.mip_levels = 1;
+      td.format = nrhi::Format::kR32_FLOAT;
+      td.usage = nrhi::kTextureUsageRenderTarget;
+      td.initial_state = nrhi::ResourceState::kRenderTarget;
+      g_r.occl_tex = device->CreateTexture(td);
+      nrhi::BufferDesc bd;
+      bd.size = uint64_t(RendererState::kOcclRowPitch) * RendererState::kOcclGridH;
+      bd.heap = nrhi::HeapKind::kReadback;
+      for (int i = 0; i < 2 && g_r.occl_tex != nullptr; ++i) {
+        g_r.occl_readback[i] = device->CreateBuffer(bd);
+        if (g_r.occl_readback[i] == nullptr ||
+            (g_r.occl_readback_ptr[i] = static_cast<uint8_t*>(
+                 device->Map(g_r.occl_readback[i]))) == nullptr) {
+          break;
+        }
+      }
+      if (g_r.occl_tex == nullptr || g_r.occl_readback_ptr[1] == nullptr) {
+        g_r.occl_failed = true;
+        REXLOG_WARN(
+            "native-scene: occlusion-grid readback creation failed - "
+            "occluded-item attribution disabled");
+      }
+    }
+    // Skip the frame rather than ever waiting when both ring slots are
+    // still in flight (the consumer retires completed slots).
+    const int w = g_r.occl_write_index;
+    if (!g_r.occl_failed &&
+        (!g_r.occl_pending[w] ||
+         g_r.occl_submission[w] < device->CompletedSubmission())) {
+      float rc[4] = {float(width), float(height),
+                     float(RendererState::kOcclGridW),
+                     float(RendererState::kOcclGridH)};
+      cmd->SetRootConstants(0, 4, rc, 0);
+      cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f,
+                                      float(RendererState::kOcclGridW),
+                                      float(RendererState::kOcclGridH), 0.0f,
+                                      1.0f});
+      cmd->SetScissor(nrhi::Rect{0, 0, int32_t(RendererState::kOcclGridW),
+                                 int32_t(RendererState::kOcclGridH)});
+      cmd->SetRenderTargets(g_r.occl_tex, nullptr);
+      cmd->SetPipeline(g_r.pso_occl_reduce);
+      cmd->SetTexture(1, g_r.ao_lin_srv);
+      cmd->Draw(3, 0);
+      cmd->Barrier(g_r.occl_tex, nrhi::ResourceState::kRenderTarget,
+                   nrhi::ResourceState::kCopySource);
+      cmd->FlushBarriers();
+      cmd->CopyTextureToBuffer(g_r.occl_readback[w], 0,
+                               RendererState::kOcclRowPitch, g_r.occl_tex, 0,
+                               RendererState::kOcclGridW,
+                               RendererState::kOcclGridH);
+      cmd->Barrier(g_r.occl_tex, nrhi::ResourceState::kCopySource,
+                   nrhi::ResourceState::kRenderTarget);
+      cmd->FlushBarriers();
+      std::memcpy(g_r.occl_vp[w], scene.view_proj, sizeof(g_r.occl_vp[w]));
+      g_r.occl_submission[w] = device->CurrentSubmission();
+      g_r.occl_pending[w] = true;
+      g_r.occl_write_index = 1 - w;
+    }
   }
 
   // Restore intermediate steady states.

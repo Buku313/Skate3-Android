@@ -86,6 +86,8 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_unsuppress);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_pause_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_perf_interval);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_display_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_grab_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_native);
@@ -7014,13 +7016,15 @@ void RenderOutlineComposite(const NativeGuestOutputRenderContext& context,
                nrhi::ResourceState::kRenderTarget);
 }
 
-// 600-frame perf + telemetry log lines (verbatim from the former tail of
-// RenderScene).
+// Windowed perf + telemetry log lines (verbatim from the former tail of
+// RenderScene). Window length in frames = the perf-interval cvar.
 void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
                    uint32_t drawn_2d, uint32_t drawn_spline, bool shadow_ready,
                    uint32_t shadow_draws) {
-  if (frames % 600 == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
-    // CPU-side perf snapshot for this 600-frame window. guest_fps is derived
+  const uint64_t interval = uint64_t(
+      std::max(60, REXCVAR_GET(skate3_native_render_scene_perf_interval)));
+  if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
+    // CPU-side perf snapshot for this window. guest_fps is derived
     // from the guest frame interval; capture/build run on the guest render
     // thread (they extend guest frame time directly), render/items/shadow on
     // the command processor thread, decode inline on the render thread
@@ -7063,11 +7067,53 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_cam_changes.exchange(0, std::memory_order_relaxed),
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
         g_cam_max_streak.exchange(0, std::memory_order_relaxed));
+    // Deep per-item attribution (see the perf-items cvar): visibility-class
+    // draw costs, completed-draw stage split, build-walk decomposition, and
+    // the off-screen retention pass. Averages are per item (the windows Add
+    // once per item), so av= is the per-item unit cost in microseconds.
+    if (REXCVAR_GET(skate3_native_render_scene_perf_items)) {
+      const auto avg_us = [](const PerfWindow& w) { return w.AvgMs() * 1000.0; };
+      REXLOG_INFO(
+          "native-scene perf-items: draw[vis n={} av={:.2f}us mx={:.2f}ms | "
+          "occ n={} av={:.2f}us mx={:.2f}ms | out n={} av={:.2f}us "
+          "mx={:.2f}ms ret_out={}] idx_k[vis={} occ={} out={}] "
+          "grid[valid={} age={}] "
+          "stages_us[mesh={:.2f} tex={:.2f} const={:.2f} submit={:.2f} n={}] "
+          "build_us[core n={} av={:.2f} fp n={} av={:.2f} walk n={} av={:.2f} "
+          "fetch av={:.2f}] retain[{:.2f}/{:.2f}ms app={} live={}]",
+          g_pw_di_in.count.load(std::memory_order_relaxed), avg_us(g_pw_di_in),
+          g_pw_di_in.MaxMs(),
+          g_pw_di_occ.count.load(std::memory_order_relaxed),
+          avg_us(g_pw_di_occ), g_pw_di_occ.MaxMs(),
+          g_pw_di_out.count.load(std::memory_order_relaxed),
+          avg_us(g_pw_di_out), g_pw_di_out.MaxMs(),
+          g_vis_out_retained.exchange(0, std::memory_order_relaxed),
+          g_vis_in_indices.exchange(0, std::memory_order_relaxed) / 1000,
+          g_vis_occ_indices.exchange(0, std::memory_order_relaxed) / 1000,
+          g_vis_out_indices.exchange(0, std::memory_order_relaxed) / 1000,
+          g_r.occl_grid_valid ? 1 : 0,
+          g_r.occl_grid_valid ? frames - g_r.occl_grid_frame : 0,
+          avg_us(g_pw_di_mesh), avg_us(g_pw_di_tex), avg_us(g_pw_di_const),
+          avg_us(g_pw_di_submit),
+          g_pw_di_submit.count.load(std::memory_order_relaxed),
+          g_pw_bi_core.count.load(std::memory_order_relaxed),
+          avg_us(g_pw_bi_core),
+          g_pw_bi_fp.count.load(std::memory_order_relaxed), avg_us(g_pw_bi_fp),
+          g_pw_bi_walk.count.load(std::memory_order_relaxed),
+          avg_us(g_pw_bi_walk), avg_us(g_pw_bi_fetch), g_pw_bi_retain.AvgMs(),
+          g_pw_bi_retain.MaxMs(),
+          g_retained_appended.exchange(0, std::memory_order_relaxed),
+          g_retained_live.load(std::memory_order_relaxed));
+    }
     for (PerfWindow* w : {&g_pw_guest_dt, &g_pw_capture, &g_pw_build, &g_pw_pal_tail,
                           &g_pw_b2d, &g_pw_bspl, &g_pw_bpal,
                           &g_pw_render, &g_pw_items, &g_pw_shadow, &g_pw_pre,
                           &g_pw_settle, &g_pw_tail, &g_pw_2d, &g_pw_mesh_decode,
-                          &g_pw_tex_decode, &g_pw_commit}) {
+                          &g_pw_tex_decode, &g_pw_commit,
+                          &g_pw_di_in, &g_pw_di_occ, &g_pw_di_out,
+                          &g_pw_di_mesh, &g_pw_di_tex, &g_pw_di_const,
+                          &g_pw_di_submit, &g_pw_bi_core, &g_pw_bi_fp,
+                          &g_pw_bi_walk, &g_pw_bi_fetch, &g_pw_bi_retain}) {
       w->Reset();
     }
     // Refill the settle offender-log + slow-frame budgets for the next window.
@@ -7075,7 +7121,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     g_warm_tex_log_budget.store(4, std::memory_order_relaxed);
     g_slow_frame_log_budget.store(3, std::memory_order_relaxed);
   }
-  if (frames % 600 == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
+  if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     uint32_t lw_ctxs = 0, lw_ents = 0;
     skate3::native_lw::QueryLwStats(&lw_ctxs, &lw_ents);
     REXLOG_INFO(
@@ -7358,6 +7404,72 @@ static void TickShowcase(uint32_t output_width, bool hdr_on) {
     rows[0] = rows[1] = cur;
     rows[2] = 0.0f;
   }
+}
+
+// True when the item's world-space bbox is provably hidden behind already-
+// rendered geometry: its NEAREST corner view-depth is farther than the
+// FARTHEST scene depth (tile MAX) in every occlusion-grid tile it covers.
+// The corners are projected with the view_proj the grid's depth was
+// rendered with (1-2 frames old; see the reduce in ApplySsaoPass), keeping
+// bounds and depth consistent under camera motion. Anything not provable -
+// invalid grid, a near-plane crosser, bounds leaving that frame's frustum -
+// classifies as visible; the consumers (telemetry and the occlusion cull)
+// must never overstate occlusion. `depth_margin` is the extra distance (m)
+// the item must sit behind every tile's far depth: the telemetry uses a
+// small margin (0.25, enough that an item's own last-frame depth counts as
+// visible), the cull a larger one for disocclusion safety at speed.
+bool ItemOccludedByGrid(const DrawItem& it, float depth_margin) {
+  if (!g_r.occl_grid_valid ||
+      g_r.occl_grid.size() <
+          size_t(RendererState::kOcclGridW) * RendererState::kOcclGridH) {
+    return false;
+  }
+  const float* vp = g_r.occl_grid_vp;
+  float u0 = 1.0f, v0 = 1.0f, u1 = 0.0f, v1 = 0.0f;
+  float min_z = 3.4e38f;
+  for (int c = 0; c < 8; ++c) {
+    const float l[3] = {c & 1 ? it.bbox_max[0] : it.bbox_min[0],
+                        c & 2 ? it.bbox_max[1] : it.bbox_min[1],
+                        c & 4 ? it.bbox_max[2] : it.bbox_min[2]};
+    const float* w = it.world;
+    float p[3];
+    for (int k = 0; k < 3; ++k) {
+      p[k] = l[0] * w[0 * 4 + k] + l[1] * w[1 * 4 + k] + l[2] * w[2 * 4 + k] +
+             w[3 * 4 + k];
+    }
+    float clip[4];
+    for (int k = 0; k < 4; ++k) {
+      clip[k] = p[0] * vp[0 * 4 + k] + p[1] * vp[1 * 4 + k] +
+                p[2] * vp[2 * 4 + k] + vp[3 * 4 + k];
+    }
+    if (clip[3] < 0.25f || clip[2] < 0.0f || clip[0] < -clip[3] ||
+        clip[0] > clip[3] || clip[1] < -clip[3] || clip[1] > clip[3]) {
+      return false;
+    }
+    const float u = 0.5f + 0.5f * clip[0] / clip[3];
+    const float v = 0.5f - 0.5f * clip[1] / clip[3];
+    u0 = std::min(u0, u);
+    v0 = std::min(v0, v);
+    u1 = std::max(u1, u);
+    v1 = std::max(v1, v);
+    min_z = std::min(min_z, clip[3]);  // row-vector proj: w == view Z
+  }
+  const int gw = int(RendererState::kOcclGridW);
+  const int gh = int(RendererState::kOcclGridH);
+  const int tx0 = std::clamp(int(u0 * float(gw)), 0, gw - 1);
+  const int tx1 = std::clamp(int(u1 * float(gw)), 0, gw - 1);
+  const int ty0 = std::clamp(int(v0 * float(gh)), 0, gh - 1);
+  const int ty1 = std::clamp(int(v1 * float(gh)), 0, gh - 1);
+  const float need = min_z - depth_margin;
+  for (int ty = ty0; ty <= ty1; ++ty) {
+    const float* row = &g_r.occl_grid[size_t(ty) * gw];
+    for (int tx = tx0; tx <= tx1; ++tx) {
+      if (row[tx] >= need) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
@@ -8109,7 +8221,20 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       scene.proj[11] == 1.0f && scene.proj[0] != 0.0f &&
       scene.proj[5] != 0.0f && scene.proj[14] != 0.0f;
 
+  // Deep per-item profiling (perf-items log line): stage timestamps inside
+  // draw_item plus an in/out-of-frustum split of each item's total draw
+  // cost. Sampled once per RenderScene call; the per-item clock reads only
+  // happen while the cvar is on.
+  const bool prof_items = REXCVAR_GET(skate3_native_render_scene_perf_items);
   const auto draw_item = [&](const DrawItem& item) {
+    // Stage split points (profiling only): t0..t1 mesh serve, t1..t2 texture
+    // serve, t2..t3 constants assembly, t3..end binds + draw recording.
+    // Early returns skip the stage windows; the caller's in/out totals still
+    // capture them.
+    PerfClock::time_point di_t0{}, di_t1{}, di_t2{}, di_t3{};
+    if (prof_items) {
+      di_t0 = PerfClock::now();
+    }
     // NO per-frame inline decodes here. Static content (world geometry,
     // props) loads/heals on the decode workers via the miss queue; a
     // texture decode averages ~10 ms and panning surfaces dozens of new
@@ -8185,6 +8310,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     it->second.last_used_frame = frame_number;
     const MeshBuffers& buffers = it->second;
+    if (prof_items) {
+      di_t1 = PerfClock::now();
+    }
 
     // Double-sided sheet props draw with backface culling; without it the
     // front/back copies z-fight into lightmap flicker at range (banners/
@@ -8597,6 +8725,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // + material tint + overlay params + misc. tint.a > 0 selects debug
     // solid colors; tint.r > 0 marks a bound lightmap. For transparent
     // items misc.yzw carries the fog ramp and mat_tint the fog color.
+    if (prof_items) {
+      di_t2 = PerfClock::now();
+    }
     float constants[52] = {};
     std::memcpy(constants, item.world, sizeof(item.world));
     if (item.unlit) {
@@ -9257,6 +9388,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       si.item = &item;
       ssr_items.push_back(si);
     }
+    if (prof_items) {
+      di_t3 = PerfClock::now();
+    }
     cmd->SetRootConstants(0, 52, constants, 0);
 
     cmd->SetTexture(1, diffuse->srv);
@@ -9425,6 +9559,101 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           ++ring_frame->items[rit->second].drawn;
         }
       }
+    }
+    // Stage attribution for draws that reached submission (early returns
+    // above skip this; their time still lands in the caller's in/out
+    // windows).
+    if (prof_items && di_t3 != PerfClock::time_point{}) {
+      const auto di_t4 = PerfClock::now();
+      const auto ns = [](PerfClock::time_point a, PerfClock::time_point b) {
+        return uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+      };
+      g_pw_di_mesh.Add(ns(di_t0, di_t1));
+      g_pw_di_tex.Add(ns(di_t1, di_t2));
+      g_pw_di_const.Add(ns(di_t2, di_t3));
+      g_pw_di_submit.Add(ns(di_t3, di_t4));
+    }
+  };
+  // Profiling-mode consumption of the occlusion-grid readback ring (filled
+  // by the perf-items reduce in ApplySsaoPass on previous frames): newest
+  // completed slot wins, every completed slot retires. A grid that stops
+  // refreshing (AO off, loading flows) goes invalid instead of classifying
+  // against ancient depth.
+  if (prof_items && !g_r.occl_failed && g_r.occl_readback_ptr[1] != nullptr) {
+    const uint64_t occl_done = context.device->CompletedSubmission();
+    int newest = -1;
+    for (int i = 0; i < 2; ++i) {
+      if (g_r.occl_pending[i] && g_r.occl_submission[i] < occl_done &&
+          (newest < 0 ||
+           g_r.occl_submission[i] > g_r.occl_submission[newest])) {
+        newest = i;
+      }
+    }
+    if (newest >= 0) {
+      context.device->InvalidateForRead(
+          g_r.occl_readback[newest], 0,
+          uint64_t(RendererState::kOcclRowPitch) * RendererState::kOcclGridH);
+      g_r.occl_grid.resize(size_t(RendererState::kOcclGridW) *
+                           RendererState::kOcclGridH);
+      for (uint32_t row = 0; row < RendererState::kOcclGridH; ++row) {
+        std::memcpy(&g_r.occl_grid[size_t(row) * RendererState::kOcclGridW],
+                    g_r.occl_readback_ptr[newest] +
+                        size_t(row) * RendererState::kOcclRowPitch,
+                    RendererState::kOcclGridW * sizeof(float));
+      }
+      std::memcpy(g_r.occl_grid_vp, g_r.occl_vp[newest],
+                  sizeof(g_r.occl_grid_vp));
+      g_r.occl_grid_frame = frame_number;
+      g_r.occl_grid_valid = true;
+      for (int i = 0; i < 2; ++i) {
+        if (g_r.occl_pending[i] && g_r.occl_submission[i] < occl_done) {
+          g_r.occl_pending[i] = false;
+        }
+      }
+    } else if (g_r.occl_grid_valid &&
+               frame_number - g_r.occl_grid_frame > 240) {
+      g_r.occl_grid_valid = false;
+    }
+  }
+  // Per-draw wrapper for the profiling mode: attribute each item's total
+  // draw_item cost to its visibility class. Out-of-frustum items and
+  // occlusion-proven-hidden items cost CPU here but can never contribute
+  // pixels; a large share in either class is a visibility-culling gap, not
+  // a scene-density cost.
+  const auto timed_draw = [&](const DrawItem& item) {
+    if (!prof_items) {
+      draw_item(item);
+      return;
+    }
+    // Statics only (same gate as the retention pass): a skinned/ropa item's
+    // pose lives in its bone palette, its identity world + bind-pose bbox
+    // say nothing about where it is; those always classify as visible.
+    const bool classifiable = !item.skinned && !item.ropa &&
+                              !item.cloth_quads && item.bones.empty();
+    const bool off =
+        classifiable && ItemOutsideFrustum(item, scene.view_proj, 1.0f);
+    const bool occluded =
+        classifiable && !off && ItemOccludedByGrid(item, 0.25f);
+    uint64_t indices = 0;
+    for (const DrawEntry& e : item.draws) {
+      indices += e.index_count;
+    }
+    const auto t0 = PerfClock::now();
+    draw_item(item);
+    const uint64_t total_ns = perf_ns_since(t0);
+    if (off) {
+      g_pw_di_out.Add(total_ns);
+      g_vis_out_indices.fetch_add(indices, std::memory_order_relaxed);
+      if (item.retained) {
+        g_vis_out_retained.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else if (occluded) {
+      g_pw_di_occ.Add(total_ns);
+      g_vis_occ_indices.fetch_add(indices, std::memory_order_relaxed);
+    } else {
+      g_pw_di_in.Add(total_ns);
+      g_vis_in_indices.fetch_add(indices, std::memory_order_relaxed);
     }
   };
 
@@ -9671,7 +9900,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                      [](const auto& a, const auto& b) { return a.first < b.first; });
   }
   for (const auto& [dist, item] : opaque_items) {
-    draw_item(*item);
+    timed_draw(*item);
   }
   if (!transparent_items.empty() && g_r.pso_transparent != nullptr) {
     std::stable_sort(transparent_items.begin(), transparent_items.end(),
@@ -9694,7 +9923,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           cmd->SetPipeline(g_r.pso_fade);
           blend_bound = g_r.pso_fade;
         }
-        draw_item(*item);
+        timed_draw(*item);
         continue;
       }
       const bool hair = item->char_family >= 4 && item->char_family <= 5 &&
@@ -9704,9 +9933,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // same shader: keeps far-side strands from compositing over
         // near-side ones (one uncull(ed) pass reads as crunchy noise).
         cmd->SetPipeline(g_r.pso_hair_a);
-        draw_item(*item);
+        timed_draw(*item);
         cmd->SetPipeline(g_r.pso_hair_b);
-        draw_item(*item);
+        timed_draw(*item);
         cmd->SetPipeline(blend_bound);
         continue;
       }
@@ -9728,14 +9957,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           cmd->SetPipeline(want);
           blend_bound = want;
         }
-        draw_item(*item);
+        timed_draw(*item);
         continue;
       }
       if (blend_bound != (use_depth ? g_r.pso_transparent : g_r.pso_nodepth)) {
         blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
         cmd->SetPipeline(blend_bound);
       }
-      draw_item(*item);
+      timed_draw(*item);
     }
   }
   g_pw_items.Add(perf_ns_since(items_t0));

@@ -259,3 +259,25 @@ float4 ps_debug(VSOut i) : SV_Target {
   float ao = tex0.SampleLevel(smp_linear, i.uv, 0);
   return float4(ao, ao, ao, 1.0f);
 }
+
+// Tile MAX-reduce of the linear-depth plane (t0) into the small occlusion-
+// attribution grid the per-item profiler reads back to the CPU: a scene
+// item whose nearest bbox corner is farther than the FARTHEST depth in
+// every grid tile it covers cannot contribute pixels. b0 is repurposed for
+// this pass: size.xy = linear-depth dims, size.zw = grid dims. 8x8 point
+// taps spread across each tile's footprint (a ~24x24-texel tile at 4K is
+// sampled at stride ~3, so a sub-3-px background hole can be missed; the
+// consumer is telemetry, not culling, and errs toward "occluded" only
+// through such holes).
+float ps_depth_max(VSOut i) : SV_Target {
+  float2 half_tile = 0.5f / size.zw;
+  float m = 0.0f;
+  [unroll] for (int ty = 0; ty < 8; ++ty) {
+    [unroll] for (int tx = 0; tx < 8; ++tx) {
+      float2 f = (float2(float(tx), float(ty)) + 0.5f) / 8.0f;
+      float2 uv = i.uv + (f * 2.0f - 1.0f) * half_tile;
+      m = max(m, tex0.SampleLevel(smp_point, uv, 0));
+    }
+  }
+  return m;
+}

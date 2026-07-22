@@ -830,7 +830,7 @@ inline std::atomic<uint64_t> g_rej_geom{0};
 inline std::atomic<uint64_t> g_rej_draws{0};
 inline std::atomic<uint64_t> g_rej_bbox{0};
 
-// ---- Perf telemetry (windowed; logged + reset with the 600-frame stats) ----
+// ---- Perf telemetry (windowed; logged + reset with the interval stats) ----
 // Written by the guest render thread (capture/build) and the command
 // processor thread (render segments); read by the render thread's stats log.
 // Atomics with relaxed ordering: telemetry, not synchronization.
@@ -938,6 +938,39 @@ inline std::atomic<uint64_t> g_capture_foreign_bank{0};
 
 inline std::atomic<uint64_t> g_item_cache_hits{0};
 inline std::atomic<uint64_t> g_item_cache_builds{0};
+
+// ---- Per-item pipeline profiling (skate3_native_render_scene_perf_items) --
+// Deep attribution of the per-item CPU cost, logged as a perf-items line on
+// the perf-log interval. Two questions: where the per-item time goes (mesh
+// serve, texture serve, constants, submit on the render side; cache
+// validate, fingerprint, full walk, fetch overrides on the build side), and
+// whether it is spent on items the rendered frustum can actually see (in
+// vs out draw windows, indices, retained-item share). All of it is opt-in:
+// the extra clock reads cost real time at 2000+ items/frame.
+// Render thread (command processor): per-draw_item totals split by the
+// item's bbox-vs-frustum verdict, and per-stage sections of completed draws.
+inline PerfWindow g_pw_di_in;      // draw_item total, item potentially visible
+inline PerfWindow g_pw_di_occ;     // draw_item total, in-frustum but occlusion-grid-proven hidden
+inline PerfWindow g_pw_di_out;     // draw_item total, bbox fully outside the rendered frustum
+inline PerfWindow g_pw_di_mesh;    // mesh store lookup/heal (incl. rare inline decodes)
+inline PerfWindow g_pw_di_tex;     // texture route/serve section
+inline PerfWindow g_pw_di_const;   // constants assembly
+inline PerfWindow g_pw_di_submit;  // buffer binds + DrawIndexed recording
+inline std::atomic<uint64_t> g_vis_in_indices{0};   // indices submitted, visible items
+inline std::atomic<uint64_t> g_vis_occ_indices{0};  // indices submitted, occluded items
+inline std::atomic<uint64_t> g_vis_out_indices{0};  // indices submitted, out-of-frustum items
+inline std::atomic<uint64_t> g_vis_out_retained{0};  // out-of-frustum draws from retention
+// Guest render thread: decomposition of the per-item build walk.
+inline PerfWindow g_pw_bi_core;    // BuildItemFromMeshCached total (hit validate + misses)
+inline PerfWindow g_pw_bi_fp;      // ComputeItemFingerprint on the cache-hit path
+inline PerfWindow g_pw_bi_walk;    // full BuildItemFromMesh rebuilds (cache miss)
+inline PerfWindow g_pw_bi_fetch;   // AdoptDrawFetchOverrides per-frame guest reads
+// Off-screen retention pass (always measured, one Add per frame: two clock
+// reads): its cost and how many items it re-appends beyond the guest's own
+// submission are core visibility-culling telemetry, not deep profiling.
+inline PerfWindow g_pw_bi_retain;
+inline std::atomic<uint64_t> g_retained_appended{0};  // re-appended items this window
+inline std::atomic<uint64_t> g_retained_live{0};      // retained-map size after the sweep
 
 // ---- Photo-editor postfx capture (FrameScene::PhotoFx / photo_fx.hlsl) ----
 // While a photo flow is active (g_photo_flow_frame, armed by

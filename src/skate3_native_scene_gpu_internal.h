@@ -626,6 +626,30 @@ struct RendererState {
   // consume at t2 (replacing the classic full-res composite draw);
   // ApplyHdrPost restores it to RENDER_TARGET and clears the flag.
   bool ao_plane_in_psr = false;
+  // Occlusion-attribution grid (perf-items profiling only): a small
+  // conservative tile-MAX reduce of ao_lin_depth (ssao.hlsl ps_depth_max),
+  // read back through a two-deep never-waited ring (the photo-grab pattern)
+  // and consumed on the render thread 1-2 frames later to classify scene
+  // items as fully occluded by already-rendered geometry. Each slot stores
+  // the view_proj its depth was rendered with; the CPU test projects with
+  // THAT matrix so grid and bounds stay consistent under camera motion.
+  static constexpr uint32_t kOcclGridW = 160;
+  static constexpr uint32_t kOcclGridH = 90;
+  static constexpr uint32_t kOcclRowPitch = 768;  // 160*4 aligned to 256
+  nrhi::Pipeline* pso_occl_reduce = nullptr;
+  nrhi::Texture* occl_tex = nullptr;  // R32F grid, idles in RENDER_TARGET
+  nrhi::Buffer* occl_readback[2] = {};
+  uint8_t* occl_readback_ptr[2] = {};
+  uint64_t occl_submission[2] = {};
+  float occl_vp[2][16] = {};
+  bool occl_pending[2] = {};
+  int occl_write_index = 0;
+  bool occl_failed = false;
+  // Newest completed grid, CPU-side (render thread only).
+  std::vector<float> occl_grid;
+  float occl_grid_vp[16] = {};
+  uint64_t occl_grid_frame = 0;  // frame_number the grid was captured on
+  bool occl_grid_valid = false;
   // HDR pipeline (hdr.hlsl): the scene renders pre-tonemap linear into a
   // float intermediate (the MSAA color target and/or hdr_resolved), a bloom
   // pyramid extracts real HDR energy, and ps_tonemap applies the game's
