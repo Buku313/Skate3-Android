@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 1.0.1 LANGUAGES CXX)
+project(skate3 VERSION 2.0.0 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
