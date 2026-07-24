@@ -30,6 +30,15 @@ skate3_resolve_version(SKATE3_FULL_VERSION
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 string(REGEX REPLACE "-.*$" "" SKATE3_NUMERIC_VERSION "${SKATE3_FULL_VERSION}")
 
+# Four-part comma-separated form for Windows VERSIONINFO resources.
+string(REPLACE "." ";" SKATE3_RC_VERSION_PARTS "${SKATE3_NUMERIC_VERSION}")
+list(LENGTH SKATE3_RC_VERSION_PARTS SKATE3_RC_VERSION_PART_COUNT)
+while(SKATE3_RC_VERSION_PART_COUNT LESS 4)
+    list(APPEND SKATE3_RC_VERSION_PARTS 0)
+    list(LENGTH SKATE3_RC_VERSION_PARTS SKATE3_RC_VERSION_PART_COUNT)
+endwhile()
+list(JOIN SKATE3_RC_VERSION_PARTS "," SKATE3_RC_VERSION)
+
 set(SKATE3_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
 if(APPLE AND CMAKE_OSX_ARCHITECTURES)
     list(LENGTH CMAKE_OSX_ARCHITECTURES SKATE3_OSX_ARCH_COUNT)
@@ -218,6 +227,15 @@ configure_file(
 set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "Disable Tracy instrumentation for normal Skate 3 builds" FORCE)
 set(REXGLUE_ENABLE_PERF_COUNTERS OFF CACHE BOOL "Enable lightweight rexglue perf counter instrumentation")
 
+if(WIN32)
+    set(REXGLUE_RUNTIME_RC_VERSION "${SKATE3_RC_VERSION}")
+    set(REXGLUE_RUNTIME_RC_VERSION_STRING "${SKATE3_FULL_VERSION}")
+    set(REXGLUE_RUNTIME_RC_PRODUCT_NAME "Skate3Recomp")
+    set(REXGLUE_RUNTIME_RC_COMPANY "Skate3Recomp project")
+    set(REXGLUE_RUNTIME_RC_DESCRIPTION "Skate3Recomp guest runtime")
+    set(REXGLUE_RUNTIME_RC_COPYRIGHT "(c) Skate3Recomp contributors")
+endif()
+
 include(cmake/RexGlue.cmake)
 include(cmake/CodegenTargets.cmake)
 
@@ -262,6 +280,12 @@ if(WIN32)
         COPYONLY
     )
     target_link_options(skate3 PRIVATE LINKER:/MANIFESTINPUT:skate3_app.manifest)
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/skate3.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc
+        @ONLY
+    )
+    target_sources(skate3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc)
 else()
     add_executable(skate3 ${SKATE3_SOURCES})
 endif()
