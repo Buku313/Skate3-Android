@@ -3634,6 +3634,12 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     nrhi::TextureView** views[3] = {&g_r.shadow_srv_raw, &g_r.shadow_srv_mid,
                                     &g_r.shadow_srv_final};
     for (int t = 0; t < 3; ++t) {
+      // The raw and final tiles are the shadow-dump readback sources, so
+      // those two also need copy-source usage; the intermediate is never
+      // copied and stays render-target only.
+      desc.usage = nrhi::kTextureUsageRenderTarget |
+                   (t != 1 ? nrhi::kTextureUsageCopySource
+                           : nrhi::kTextureUsageNone);
       *targets[t] = device->CreateTexture(desc);
       if (*targets[t] == nullptr) {
         REXLOG_ERROR("native-scene: shadow atlas creation failed");

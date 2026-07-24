@@ -488,7 +488,11 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
       td.height = RendererState::kOcclGridH;
       td.mip_levels = 1;
       td.format = nrhi::Format::kR32_FLOAT;
-      td.usage = nrhi::kTextureUsageRenderTarget;
+      // The grid is read back to the CPU every frame, so it must declare
+      // copy-source usage: the Vulkan backend only requests TRANSFER_SRC for
+      // textures that ask for it, and both the transition to the copy-source
+      // state and the copy itself are invalid without it.
+      td.usage = nrhi::kTextureUsageRenderTarget | nrhi::kTextureUsageCopySource;
       td.initial_state = nrhi::ResourceState::kRenderTarget;
       g_r.occl_tex = device->CreateTexture(td);
       nrhi::BufferDesc bd;
