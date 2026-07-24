@@ -365,10 +365,15 @@ bool IsGameInstalled(const std::filesystem::path& game_root) {
 
 void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig runtime_paths,
                                  std::function<void(rex::PathConfig)> complete) {
+  // Copied up front: the constructor call below move-captures runtime_paths,
+  // and argument evaluation order is unspecified, so reading the path out of
+  // it in the same expression can observe the moved-from value.
+  const auto game_root = runtime_paths.game_data_root;
+
   auto pick_source = []() { return PickIsoFile(); };
-  auto install = [game_root = runtime_paths.game_data_root](
-                     const std::filesystem::path& source, std::atomic<uint64_t>& copied_bytes,
-                     std::atomic<uint64_t>& total_bytes, std::string& error) {
+  auto install = [game_root](const std::filesystem::path& source,
+                             std::atomic<uint64_t>& copied_bytes,
+                             std::atomic<uint64_t>& total_bytes, std::string& error) {
     XboxIsoReader iso;
     if (!iso.Open(source, error)) {
       return false;
@@ -387,7 +392,7 @@ void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig r
   new rex::ui::InstallWizardDialog(
       drawer, "Setup", "Game Files",
       "Skate 3 game files were not found. Select your Xbox 360 ISO to install them.",
-      runtime_paths.game_data_root.string(), std::move(pick_source), std::move(install),
+      game_root.string(), std::move(pick_source), std::move(install),
       [runtime_paths = std::move(runtime_paths), complete = std::move(complete)]() mutable {
         if (complete) {
           complete(std::move(runtime_paths));
