@@ -47,13 +47,18 @@ REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, true, "Skate 3",
                     "Derive the guest frame cap from the display the window is on: "
-                    "cap at (refresh rate - 4) fps, the VRR recipe above, without "
-                    "hand-tuning per monitor. Above the display refresh the extra "
-                    "frames cannot be shown anyway; refreshes beat-sample the "
-                    "frame stream and steady motion judders (measured: a "
-                    "mathematically perfect synthetic pan judders at 330 fps on a "
-                    "144 Hz panel and is smooth capped below it). Overrides "
-                    "skate3_guest_fps_cap while the display refresh is known.")
+                    "cap a safety margin below the refresh rate (4 fps or 5%, "
+                    "whichever is larger; see rex::ui::Window::AutoFrameCapHz), "
+                    "the VRR recipe above, without hand-tuning per monitor. Above "
+                    "the display refresh the extra frames cannot be shown anyway; "
+                    "refreshes beat-sample the frame stream and steady motion "
+                    "judders (measured: a mathematically perfect synthetic pan "
+                    "judders at 330 fps on a 144 Hz panel and is smooth capped "
+                    "below it). The margin must also absorb swap-to-present "
+                    "jitter: presents run with tearing allowed, so a present "
+                    "landing inside the panel's minimum refresh period tears even "
+                    "under VRR. Overrides skate3_guest_fps_cap while the display "
+                    "refresh is known.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_render {
@@ -228,9 +233,10 @@ void PaceGuestFrame() {
   if (REXCVAR_GET(skate3_guest_fps_cap_auto)) {
     // Refresh-derived cap (see the cvar). Falls through to the explicit cap
     // while the platform hasn't reported a refresh rate.
-    const double hz = double(rex::ui::Window::CachedDisplayRefreshHz());
-    if (hz >= 30.0) {
-      cap = hz - 4.0;
+    const double auto_cap = double(rex::ui::Window::AutoFrameCapHz(
+        rex::ui::Window::CachedDisplayRefreshHz()));
+    if (auto_cap > 0.0) {
+      cap = auto_cap;
     }
   }
   static std::chrono::steady_clock::time_point s_next{};
