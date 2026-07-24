@@ -4706,6 +4706,10 @@ void PrewarmWorkerLoop() {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
     }
+    // Decode workers only ever read guest memory on the renderer's behalf:
+    // keep them permanently armed for raw-load read-fault recovery (POSIX;
+    // no-op on Windows).
+    ArmGuestReadRecoveryForThread(base);
     if (have_dyn) {
       PrewarmResult res;
       res.mesh_valid =
@@ -7022,6 +7026,22 @@ void RenderOutlineComposite(const NativeGuestOutputRenderContext& context,
 void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
                    uint32_t drawn_2d, uint32_t drawn_spline, bool shadow_ready,
                    uint32_t shadow_draws) {
+  // Raw guest-load read-fault recoveries (POSIX only; always 0 on Windows).
+  // Each one is a streaming race that revoked a captured range mid-walk and
+  // would otherwise be a fatal SIGSEGV; a slowly growing count during heavy
+  // world streaming is expected and benign.
+  {
+    static uint64_t s_recov_reported = 0;
+    static uint64_t s_recov_frame = 0;
+    const uint64_t recov = GuestReadRecoveryCount();
+    if (recov != s_recov_reported &&
+        (s_recov_frame == 0 || frames - s_recov_frame >= 600)) {
+      REXLOG_INFO("native-scene: guest read faults recovered total={} (+{})",
+                  recov, recov - s_recov_reported);
+      s_recov_reported = recov;
+      s_recov_frame = frames;
+    }
+  }
   const uint64_t interval = uint64_t(
       std::max(60, REXCVAR_GET(skate3_native_render_scene_perf_interval)));
   if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
@@ -7532,6 +7552,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // flow renders yielded-emulated or native).
   uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
   if (base != nullptr) {
+    // The render thread reads guest memory for the rest of the frame (mesh
+    // decode, texture fingerprints, dynamic-item interpolation) and runs no
+    // guest code of its own: keep it permanently armed for raw-load
+    // read-fault recovery (POSIX; no-op on Windows).
+    ArmGuestReadRecoveryForThread(base);
     UpdatePhotoGrabWindow(base);
   }
   if (YieldForMenus(context)) {

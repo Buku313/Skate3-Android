@@ -35,6 +35,52 @@ struct SkinSampleVert {
 // open-coded __try{memcpy}__except compiles to an UNPROTECTED `jmp memcpy`.
 bool GuestTryCopy(void* dst, const void* src, size_t size);
 
+// Read-fault recovery for the renderer's RAW guest loads (the REX_LOAD-style
+// structure walks that do not route through GuestTryCopy). World streaming
+// can revoke a guest range between a pointer being captured and the renderer
+// dereferencing it; on POSIX that read is a fatal SIGSEGV/SIGBUS. While a
+// thread is armed, a handler on the runtime exception chain recovers a READ
+// fault inside the guest mapping by restoring read access to the faulted
+// host page and resuming the interrupted load, which then completes with
+// resident-but-meaningless bytes that the callers' existing plausibility
+// gates reject (the same "not ready, skip this item" outcome the guarded
+// copy produces). The handler resumes execution in place - no siglongjmp -
+// so arming carries NO destructor/unwind constraints and is safe at any
+// scope width, including around code that owns locks, vectors or strings.
+// Faults inside GuestTryCopy keep that function's fail-the-copy semantics
+// (the recovery handler declines them); write faults and faults outside the
+// guest mapping are never recovered. Windows builds compile these to no-ops
+// (raw reads there are served by the pagefile-backed guest mapping).
+//
+// GuestReadRecoveryScope: arm for one native-scene entry point on a GUEST
+// thread (capture hooks, frame build). Guest threads run recompiled game
+// code the rest of the time, and a genuine wild read there must still crash
+// loudly, hence the narrow scope. Nestable.
+//
+// ArmGuestReadRecoveryForThread: permanently arm a thread that only ever
+// reads guest memory on the renderer's behalf (the render thread, the
+// prewarm decode workers). Idempotent and cheap; call per frame/iteration.
+#if defined(_WIN32)
+class GuestReadRecoveryScope {
+ public:
+  explicit GuestReadRecoveryScope(uint8_t* /*base*/) {}
+};
+inline void ArmGuestReadRecoveryForThread(uint8_t* /*base*/) {}
+inline uint64_t GuestReadRecoveryCount() { return 0; }
+#else
+class GuestReadRecoveryScope {
+ public:
+  explicit GuestReadRecoveryScope(uint8_t* base);
+  ~GuestReadRecoveryScope();
+  GuestReadRecoveryScope(const GuestReadRecoveryScope&) = delete;
+  GuestReadRecoveryScope& operator=(const GuestReadRecoveryScope&) = delete;
+};
+void ArmGuestReadRecoveryForThread(uint8_t* base);
+// Total recovered reads since startup (telemetry; logged by the render
+// thread's frame stats when non-zero).
+uint64_t GuestReadRecoveryCount();
+#endif
+
 float GuestHalfToFloat(uint16_t h);
 
 // Bind-pose bbox diagonal of the item: the reference size every

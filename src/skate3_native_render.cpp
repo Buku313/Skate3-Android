@@ -2,6 +2,7 @@
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
+#include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_palette.h"
 #include "skate3_native_scene.h"
@@ -104,6 +105,7 @@ void OnSceneDrawList(uint8_t* base, uint32_t view, uint32_t sort_vec, uint32_t f
   if (count == 0 || count > 100000) {
     return;
   }
+  skate3::native_scene::GuestReadRecoveryScope guest_read_recovery(base);
   const uint32_t entries = REX_LOAD_U32(sort_vec);
   if (entries == 0) {
     return;
@@ -169,6 +171,7 @@ uint32_t FilterSceneDrawList(uint8_t* base, uint32_t sort_vec, uint32_t first,
   if (f.ctxs.empty()) {
     return count;
   }
+  skate3::native_scene::GuestReadRecoveryScope guest_read_recovery(base);
   const uint32_t entries = REX_LOAD_U32(sort_vec);
   if (entries == 0) {
     return count;
@@ -742,6 +745,7 @@ extern "C" REX_FUNC(sub_827F0D00) {
   if (!(max_expo > 0.0f) || max_expo > 16.0f) {
     return;
   }
+  skate3::native_scene::GuestReadRecoveryScope guest_read_recovery(base);
   uint32_t prev_bits = REX_LOAD_U32(self + 3240);
   float prev;
   std::memcpy(&prev, &prev_bits, sizeof(prev));

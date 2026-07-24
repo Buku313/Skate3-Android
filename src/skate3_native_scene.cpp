@@ -3356,6 +3356,7 @@ void OnSetViewport(uint8_t* base, uint32_t viewport_ptr) {
   if (viewport_ptr == 0) {
     return;
   }
+  GuestReadRecoveryScope guest_read_recovery(base);
   for (int i = 0; i < 6; ++i) {
     g_cur_viewport[i].store(REX_LOAD_U32(viewport_ptr + i * 4), std::memory_order_relaxed);
   }
@@ -3365,6 +3366,7 @@ void OnSetScissor(uint8_t* base, uint32_t rect_ptr) {
   if (rect_ptr == 0) {
     return;
   }
+  GuestReadRecoveryScope guest_read_recovery(base);
   for (int i = 0; i < 4; ++i) {
     g_cur_scissor[i].store(REX_LOAD_U32(rect_ptr + i * 4), std::memory_order_relaxed);
   }
@@ -4129,6 +4131,10 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   if (bank == 0) {
     return 0;
   }
+  // Streaming can revoke any pointer in the ctx/record/mesh chain between
+  // the game queueing the draw and this walk; recover raw-load read faults
+  // for the whole capture (POSIX; no-op on Windows).
+  GuestReadRecoveryScope guest_read_recovery(base);
   // Items drawn inside an AUX perspective pass (skater-portrait RTTs) never
   // enter the frame at all: they share (ib,vb) buffers with the on-screen
   // player, so letting them sit PENDING lets them steal the player's own
@@ -4373,6 +4379,7 @@ uint32_t CaptureClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6,
   if (!GuestReadableApprox(base, vb_obj)) {
     return 0;
   }
+  GuestReadRecoveryScope guest_read_recovery(base);
   const uint32_t addr = REX_LOAD_U32(vb_obj + 0x18) & 0xFFFFFFFC;
   const uint32_t size = REX_LOAD_U32(vb_obj + 0x20);
   constexpr uint32_t kStride = 24;
@@ -4512,6 +4519,9 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   if (bank == 0) {
     return;
   }
+  // The bank / PS-bank / pending-fixup reads below are raw loads; recover
+  // read faults for the whole post-draw path (POSIX; no-op on Windows).
+  GuestReadRecoveryScope guest_read_recovery(base);
   // Fog rows: grab c5/c6 from the first 3D draw whose bank c4 row matches
   // the last built scene's camera (main-pass layout; tolerant of one frame
   // of camera motion). See g_fog_rows. The same camera-keyed draws also
@@ -8286,6 +8296,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
   }
+  // The frame-end walks below chase captured pointers whose ranges world
+  // streaming may have revoked during the frame; recover raw-load read
+  // faults for the whole build (POSIX; no-op on Windows).
+  GuestReadRecoveryScope guest_read_recovery(base);
   // Published every frame (not just on world submissions): boot/menu frames
   // carry only 2D, and the render thread's 2D texture decodes need the
   // guest base from the very first natively rendered boot frame.

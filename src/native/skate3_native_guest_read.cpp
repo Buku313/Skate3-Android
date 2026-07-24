@@ -13,7 +13,11 @@
 #else
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <csetjmp>
 #include <mutex>
 
@@ -111,6 +115,108 @@ bool GuestTryCopy(void* dst, const void* src, size_t size) {
   std::memcpy(dst, src, size);
   tl_in_guest_copy = false;
   return true;
+}
+
+// ---- Raw-load read-fault recovery (see the header contract) ---------------
+// The handler must be async-signal-safe: TLS reads, atomics and the
+// mprotect/clock_gettime syscalls only. It resumes the interrupted load in
+// place (registers untouched, pc unchanged), so unlike the siglongjmp guard
+// above it never crosses C++ scopes and imposes no constraints on the armed
+// code. Recovery restores READ access only: a page the runtime keeps
+// write-protected (write watches) still traps guest writes exactly as
+// before.
+namespace {
+
+// Full span of the runtime's guest views measured from the virtual membase:
+// 4 GB of virtual address space plus the 512 MB physical-raw view mapped
+// directly above it (the SDK maps both from one backing object).
+constexpr uint64_t kGuestSpanBytes = 0x120000000ull;
+
+thread_local int tl_read_recovery_depth = 0;
+thread_local uint8_t* tl_read_recovery_base = nullptr;
+// Livelock breaker: a read fault that RECURS on the same page immediately
+// after a successful recovery means read access cannot actually be restored
+// there (e.g. SIGBUS from the backing object rather than page protection).
+// Distinct pages, and the same page faulting again later (streaming re-
+// revoked it), reset the streak.
+thread_local uintptr_t tl_read_recovery_page = 0;
+thread_local uint32_t tl_read_recovery_streak = 0;
+thread_local uint64_t tl_read_recovery_last_ns = 0;
+
+std::atomic<uint64_t> g_read_recoveries{0};
+size_t g_host_page_size = 4096;
+
+bool GuestReadFaultHandler(rex::arch::Exception* ex, void* /*data*/) {
+  if (tl_read_recovery_depth <= 0 || tl_in_guest_copy ||
+      ex->code() != rex::arch::Exception::Code::kAccessViolation ||
+      ex->access_violation_operation() !=
+          rex::arch::Exception::AccessViolationOperation::kRead) {
+    return false;  // not ours - keep dispatching down the chain
+  }
+  uint8_t* base = tl_read_recovery_base;
+  const uint64_t fault = ex->fault_address();
+  const uint64_t lo = uint64_t(reinterpret_cast<uintptr_t>(base));
+  if (base == nullptr || fault < lo || fault - lo >= kGuestSpanBytes) {
+    return false;
+  }
+  const uintptr_t page =
+      uintptr_t(fault) & ~(uintptr_t(g_host_page_size) - 1);
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  const uint64_t now_ns = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+  if (page == tl_read_recovery_page &&
+      now_ns - tl_read_recovery_last_ns < 10000000ull) {
+    if (++tl_read_recovery_streak > 16) {
+      return false;  // recovery is not sticking on this page: die loudly
+    }
+  } else {
+    tl_read_recovery_page = page;
+    tl_read_recovery_streak = 0;
+  }
+  tl_read_recovery_last_ns = now_ns;
+  if (mprotect(reinterpret_cast<void*>(page), g_host_page_size, PROT_READ) != 0) {
+    return false;
+  }
+  g_read_recoveries.fetch_add(1, std::memory_order_relaxed);
+  return true;  // resume: the faulted load retries against the readable page
+}
+
+void EnsureGuestReadRecoveryHandler() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps > 0) {
+      g_host_page_size = size_t(ps);
+    }
+    rex::arch::ExceptionHandler::Install(GuestReadFaultHandler, nullptr);
+  });
+}
+
+}  // namespace
+
+GuestReadRecoveryScope::GuestReadRecoveryScope(uint8_t* base) {
+  EnsureGuestReadRecoveryHandler();
+  if (tl_read_recovery_depth++ == 0) {
+    tl_read_recovery_base = base;
+  }
+}
+
+GuestReadRecoveryScope::~GuestReadRecoveryScope() {
+  if (--tl_read_recovery_depth == 0) {
+    tl_read_recovery_base = nullptr;
+  }
+}
+
+void ArmGuestReadRecoveryForThread(uint8_t* base) {
+  if (tl_read_recovery_depth == 0) {
+    EnsureGuestReadRecoveryHandler();
+    tl_read_recovery_depth = 1;
+    tl_read_recovery_base = base;
+  }
+}
+
+uint64_t GuestReadRecoveryCount() {
+  return g_read_recoveries.load(std::memory_order_relaxed);
 }
 #endif
 
