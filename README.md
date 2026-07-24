@@ -37,10 +37,6 @@ Notes:
 5. Wait for the installer to extract the game files.
 6. Click "Start Game".
 
-### Antivirus False Positives
-
-Some antivirus engines, including Microsoft Defender's cloud heuristics, occasionally flag rexruntime.dll with a generic detection. This is a false positive. The runtime reserves the console's full 4 GB address space, translates its page protections, and services page faults to recreate the Xbox 360 memory system, and that profile resembles patterns that heuristics watch for in unsigned, low-prevalence binaries. The runtime never creates executable memory at runtime; all game code is statically compiled into the binaries at build time. False-positive reports have been filed with the affected vendors, and releases can be checked against VirusTotal and built from source for verification. If your antivirus quarantines the file, restore it and add an exclusion for the game folder.
-
 ### Linux
 
 1. Download the latest release Skate3Recomp-Linux.zip from the releases page.
