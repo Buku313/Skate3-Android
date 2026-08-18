@@ -33,14 +33,14 @@ constexpr const char* kDefaultPenguinDir = "mods/penguin";
 
 REXCVAR_DEFINE_BOOL(skate3_penguin_mod, true, "Skate 3",
                     "Replace the playable create-a-skater model with the "
-                    "PalmWii penguin when its mod assets are installed")
+                    "Seiyu Paradise Penguin Mod when its assets are installed")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(skate3_penguin_mod_dir, kDefaultPenguinDir, "Skate 3",
                       "Directory containing base.obj and texture_diffuse.png "
-                      "for the playable penguin mod")
+                      "for the Seiyu Paradise Penguin Mod")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_DOUBLE(skate3_penguin_scale, 0.62, "Skate 3",
-                      "Playable penguin size relative to the original skater; "
+                      "Seiyu size relative to the original skater; "
                       "scaled around the live midpoint between both feet")
     .range(0.35, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

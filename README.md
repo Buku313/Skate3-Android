@@ -23,7 +23,7 @@ copy of Skate 3 and Title Update 3.
 - Saves and game data load from Android storage
 - RG406V performance profile included
 - High-end Android quality profile included
-- Optional PalmWii penguin character mod included
+- Optional Seiyu Paradise Penguin Mod included
 - Experimental direct-IP free-skate ghost included and disabled by default
 
 This is still early. Expect visual bugs, missing effects, device-specific
@@ -97,17 +97,17 @@ The APK is written to:
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## PalmWii penguin mod
+## SEIYU PARADISE PENGUIN MOD
 
-Place the user-supplied penguin files here:
+Place the user-supplied Seiyu model and texture here:
 
 ```text
 /sdcard/skate3/mods/penguin/base.obj
 /sdcard/skate3/mods/penguin/texture_diffuse.png
 ```
 
-The mod rigs the penguin to the live skater skeleton and keeps the skateboard
-visible. The model and texture are not included in this repository.
+The mod rigs Seiyu to the live skater skeleton and keeps the skateboard visible.
+The model and texture are not included in this repository.
 
 ## Credits
 
@@ -124,8 +124,8 @@ this repository.
 ### Buku313 / Antonio Seevers
 
 This fork contains the Android ARM64 port, SDL Android integration, RG406V
-bring-up and optimization, Android graphics profiles, PalmWii penguin mod, and
-the experimental free-skate networking work.
+bring-up and optimization, Android graphics profiles, the Seiyu Paradise
+Penguin Mod, and the experimental free-skate networking work.
 
 ### Projects used
 

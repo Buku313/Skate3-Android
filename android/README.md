@@ -18,9 +18,10 @@ handhelds and sufficiently fast phones may work, but the build is not currently
 universal: 32-bit devices, older ARM64 CPUs, Android 12 and older, and devices
 without the required Vulkan features are unsupported.
 
-This branch also contains the PalmWii penguin character replacement and a
-disabled-by-default milestone-one direct-IP UDP free-skate ghost. The networking
-prototype exchanges player poses and is not full Skate 3 online multiplayer.
+This branch also contains the Seiyu Paradise Penguin Mod character replacement
+and a disabled-by-default milestone-one direct-IP UDP free-skate ghost. The
+networking prototype exchanges player poses and is not full Skate 3 online
+multiplayer.
 
 ## Build prerequisites
 
@@ -95,7 +96,7 @@ High-End is deliberately demanding and is not guaranteed to sustain 60 FPS on
 every nominally compatible phone. If it overheats, crashes a GPU driver, or falls
 below full speed, return to the Performance profile.
 
-## Optional PalmWii penguin mod
+## Optional SEIYU PARADISE PENGUIN MOD
 
 Place the two user-supplied mod assets here:
 
@@ -104,6 +105,6 @@ Place the two user-supplied mod assets here:
 /sdcard/skate3/mods/penguin/texture_diffuse.png
 ```
 
-The renderer automatically rigs the mesh to the live skater skeleton while
+The renderer automatically rigs Seiyu to the live skater skeleton while
 preserving the skateboard. The assets themselves are intentionally not part of
 the repository.
