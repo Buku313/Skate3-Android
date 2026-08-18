@@ -34,8 +34,11 @@ The build uses these methods:
    constants, and frame data. The custom native scene renderer reconstructs
    that work with Vulkan shaders instead of directly running the original Xbox
    360 graphics pipeline.
-4. SDL3 supplies the Android window, controller, and audio integration. Android
-   storage glue lets the runtime read the user's files from `/sdcard/skate3`.
+4. SDL3 supplies the Android window, controller, and audio integration. The
+   phone installer reads the user's ISO through Android's system file picker,
+   extracts it locally, verifies the supported executables, installs the exact
+   Title Update 3 payload, and stores the result in private app storage. Older
+   `/sdcard/skate3` installations remain supported.
 5. The handheld profile lowers scene resolution and draw distance, simplifies
    materials, removes grass and costly post effects, reduces selected static
    rendering work, and uses native occlusion and frame pacing. Physics, player
@@ -108,21 +111,43 @@ Device Profile**, then use **Apply & Restart**.
 
 ## Game data
 
-The app reads game data from:
+### Phone-only setup
 
-```text
-/sdcard/skate3/
-```
+No laptop, command line, ISO extractor, or Android file manager is required:
 
-Copy your own extracted Skate 3 files into that folder. Full build and setup
-instructions are in [android/README.md](android/README.md).
+1. Install the Skate 3 Mobile APK.
+2. Open it and choose **Select My Skate 3 ISO**.
+3. Pick an ISO dumped from your own supported Xbox 360 copy.
+4. Keep the app open while it extracts about 6.0 GiB and downloads the verified
+   1.7 MiB Title Update 3.
+5. Press **Play Skate 3**.
+
+The ISO is read directly from Downloads, an SD card, or a USB drive through the
+Android file picker. It is never modified or uploaded. The extracted game stays
+inside this app's storage. You can delete the ISO after setup if you do not need
+it on the phone.
+
+Allow about 8 GiB of free device storage for the installed game. If the ISO is
+also copied to internal storage, temporary total use can be about 15 GiB until
+you remove the ISO. Uninstalling the app removes its app-owned game files, so
+keep your original dump.
+
+The installer accepts the currently supported USA/Europe retail executables and
+checks them with SHA-256 before launch. If the automatic title-update download
+is unavailable, it offers a button to select your own Title Update 3 package.
+
+Existing tester installs in `/sdcard/skate3` are detected and still work when
+the app already has Android's All files access permission.
+
+Full setup, storage, and developer build details are in
+[android/README.md](android/README.md).
 
 ## Build
 
 You need Android SDK 35, Android NDK r27c, JDK 17 or newer, CMake, Ninja,
 Clang, your extracted game dump, and Title Update 3.
 
-### No terminal required
+### Personal custom build without Terminal
 
 On an Apple Silicon Mac:
 
@@ -130,8 +155,10 @@ On an Apple Silicon Mac:
 2. Double-click `Setup Build Tools.command`.
 3. Double-click `Build Skate 3 Mobile.command` and choose your game files.
 
-The builder can create the APK by itself or build, install, and copy the game
-to a connected Android device. See the complete
+The Mac builder is only needed to make a fresh personal APK or modify native
+code. Normal players can use the phone-only setup above. The builder can create
+the APK by itself or build, install, and copy the game to a connected Android
+device. See the complete
 [non-coder build guide](docs/NONCODER_BUILD.md).
 
 ### One-command build

@@ -1,4 +1,26 @@
-# Build Skate 3 Mobile without using commands
+# Set up Skate 3 Mobile without using commands
+
+## Easiest route: Android only
+
+You do not need to build anything for ordinary setup:
+
+1. Put an ISO dumped from your own supported Skate 3 Xbox 360 copy on your
+   Android device, SD card, or USB drive.
+2. Install and open the Skate 3 Mobile APK.
+3. Tap **Select My Skate 3 ISO** and choose that ISO in Android's file picker.
+4. Keep the app open while it extracts and verifies about 6.0 GiB of game data.
+5. The app downloads and verifies Title Update 3 automatically.
+6. Tap **Play Skate 3**.
+
+No laptop, ISO extraction app, file-manager folder setup, or command line is
+needed. Your ISO is never modified or uploaded. Keep about 8 GiB free for the
+installed game. If the ISO is also on internal storage, allow about 15 GiB total
+until you move or delete the ISO.
+
+Keep the original ISO. Android deletes the app-owned extracted game when the app
+is uninstalled.
+
+## Optional: make a personal custom APK on Mac
 
 The current builder runs on Apple Silicon Macs. It creates a personal Android
 APK from game files you legally own. The game and Title Update are not included
@@ -54,8 +76,8 @@ If setup or the build fails, its log is selected in Finder. The logs are stored
 at `out/noncoder-setup.log` and `out/noncoder-build.log`. They contain the exact
 errors needed for troubleshooting.
 
-## First launch
+## First launch after developer staging
 
-When Android asks for All files access, grant it and return to Skate 3 Mobile.
-The application needs that permission to read your game data from
-`/sdcard/skate3`.
+If the Mac builder copied game files to `/sdcard/skate3`, grant All files access
+when Android asks and return to Skate 3 Mobile. Phone-only installations use
+app-specific storage and do not need that permission.

@@ -1,4 +1,4 @@
-# Skate 3 Native for Android
+# Skate 3 Mobile for Android
 
 This is the experimental ARM64 Android target for Skate3Recomp. The Xbox 360
 PowerPC guest code is statically recompiled to native AArch64 and linked with
@@ -22,6 +22,44 @@ This branch also contains the Seiyu Paradise Penguin Mod character replacement
 and a disabled-by-default milestone-one direct-IP UDP free-skate ghost. The
 networking prototype exchanges player poses and is not full Skate 3 online
 multiplayer.
+
+## Phone-only setup
+
+The normal setup does not need a computer:
+
+1. Install the APK and open **Skate 3 Mobile**.
+2. Choose **Select My Skate 3 ISO**.
+3. Use Android's file picker to select an ISO dumped from your own supported
+   Xbox 360 copy. The ISO may be in Downloads, on an SD card, or on a connected
+   USB drive.
+4. Leave the app open while it inspects and extracts the ISO.
+5. The app downloads the exact Title Update 3 package, verifies both patch
+   files, and finishes the installation.
+6. Choose **Play Skate 3**.
+
+The app does not modify or upload the ISO. It validates the supported
+USA/Europe `default.xex` and `data/webkit/EAWebkit.xex` with SHA-256. It also
+validates the size and SHA-256 of both Title Update 3 payloads before making the
+installation playable. A manual **Select Title Update File** fallback appears
+if the download cannot be completed.
+
+The extracted game uses app-specific external storage. Its usual location is:
+
+```text
+/storage/emulated/0/Android/data/chat.buku.skate3.dev/files/game/
+```
+
+Android protects this folder from ordinary file-manager access. That is normal.
+The installer and game can use it without All files access. Uninstalling the app
+removes this folder, so keep the original ISO somewhere safe.
+
+The extracted install is about 6.0 GiB. Keep about 8 GiB free for installation
+headroom. If the ISO is stored on the same internal storage, the phone may need
+about 15 GiB free in total until you delete or move the ISO.
+
+Older development installs in `/sdcard/skate3` are still recognized when the
+app already has All files access. New users do not need to create that folder or
+grant that permission.
 
 ## Build prerequisites
 
@@ -80,7 +118,7 @@ android/tools/build_android_libs.sh
 The manual build produces
 `android/app/build/outputs/apk/debug/app-debug.apk`.
 
-## Install and stage your game data
+## Legacy developer staging
 
 Install the package, then copy the contents of your own fully extracted game to
 the app's shared-storage directory:
@@ -99,8 +137,9 @@ adb shell mkdir -p /sdcard/skate3/data/webkit
 adb push out/build/android-release/game/data/webkit/EAWebkit.xexp /sdcard/skate3/data/webkit/EAWebkit.xexp
 ```
 
-On first launch, Android asks for All files access so the game can read
-`/sdcard/skate3`. Grant it and return to the app.
+This staging route is retained for development and existing test devices. It
+uses `/sdcard/skate3` and requires All files access. Normal users should use the
+phone-only installer instead.
 
 ## Handheld profile and controls
 

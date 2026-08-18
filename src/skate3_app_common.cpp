@@ -71,6 +71,10 @@
 #include <imgui.h>
 #include <toml++/toml.hpp>
 
+#if defined(__ANDROID__)
+#include <SDL3/SDL_system.h>
+#endif
+
 #if defined(__linux__) || defined(__APPLE__)
 extern char** environ;
 #endif
@@ -534,7 +538,20 @@ Skate3BaseApp::~Skate3BaseApp() = default;
 
 void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
 #if defined(__ANDROID__)
-  paths.game_data_root = "/storage/emulated/0/skate3";
+  // Existing development installs used /sdcard/skate3 and may already have
+  // All Files Access. Preserve those installs when readable. New phone-only
+  // installs use Android's app-specific external directory, selected by the
+  // Java setup activity without requesting broad storage access.
+  const std::filesystem::path legacy_root = "/storage/emulated/0/skate3";
+  if (skate3::IsGameInstalled(legacy_root) &&
+      skate3::IsTitleUpdateInstalled(legacy_root)) {
+    paths.game_data_root = legacy_root;
+  } else if (const char* external_root = SDL_GetAndroidExternalStoragePath();
+             external_root != nullptr && *external_root != '\0') {
+    paths.game_data_root = std::filesystem::path(external_root) / "game";
+  } else {
+    paths.game_data_root = legacy_root;
+  }
 #endif
   ConfigureSkate3UserPaths(paths, user_settings_path_, profiles_path_);
   config_path_ = paths.config_path;

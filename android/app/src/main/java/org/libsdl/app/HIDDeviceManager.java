@@ -1,5 +1,6 @@
 package org.libsdl.app;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.PendingIntent;
@@ -25,6 +26,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 
+@SuppressLint("MissingPermission")
 public class HIDDeviceManager {
     private static final String TAG = "hidapi";
     private static final String ACTION_USB_PERMISSION = "org.libsdl.app.USB_PERMISSION";
@@ -193,11 +195,9 @@ public class HIDDeviceManager {
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         filter.addAction(HIDDeviceManager.ACTION_USB_PERMISSION);
-        if (Build.VERSION.SDK_INT >= 33) { /* Android 13.0 (TIRAMISU) */
-            mContext.registerReceiver(mUsbBroadcast, filter, Context.RECEIVER_EXPORTED);
-        } else {
-            mContext.registerReceiver(mUsbBroadcast, filter);
-        }
+        // This app targets Android 13 and newer, where receiver export state is
+        // mandatory. The system USB service must be able to deliver the grant.
+        mContext.registerReceiver(mUsbBroadcast, filter, Context.RECEIVER_EXPORTED);
 
         for (UsbDevice usbDevice : mUsbManager.getDeviceList().values()) {
             handleUsbDeviceAttached(usbDevice);
@@ -413,11 +413,7 @@ public class HIDDeviceManager {
         IntentFilter filter = new IntentFilter();
         filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
         filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
-        if (Build.VERSION.SDK_INT >= 33) { /* Android 13.0 (TIRAMISU) */
-            mContext.registerReceiver(mBluetoothBroadcast, filter, Context.RECEIVER_EXPORTED);
-        } else {
-            mContext.registerReceiver(mBluetoothBroadcast, filter);
-        }
+        mContext.registerReceiver(mBluetoothBroadcast, filter, Context.RECEIVER_EXPORTED);
 
         if (mIsChromebook) {
             mHandler = new Handler(Looper.getMainLooper());
