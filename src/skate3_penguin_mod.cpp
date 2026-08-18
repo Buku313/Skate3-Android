@@ -296,8 +296,11 @@ const Asset& GetAsset() {
 
 void ObserveSkaterMesh(const native_scene::DrawItem& item, const float* vertices,
                        uint32_t vertex_count) {
-  if (!REXCVAR_GET(skate3_penguin_mod) || !item.skinned ||
-      (item.char_family != 2 && item.char_family != 4) ||
+  // Capture the original CAC bind data even while Original Skater is selected.
+  // Decoded guest meshes are cached, so waiting until Seiyu is enabled means
+  // there may be no later decode from which to build the live rig. This is a
+  // bounded, one-time CPU copy and makes the menu switch genuinely hot.
+  if (!item.skinned || (item.char_family != 2 && item.char_family != 4) ||
       IsSkateboardDeck(item) || vertices == nullptr || vertex_count == 0) {
     return;
   }
