@@ -1,8 +1,8 @@
-<p align="center">
-  <img src="docs/skate3-android-cover.png" alt="Skate 3 Android cover with Coach Frank and Android skaters" width="100%">
-</p>
+# SKATE 3 ANDROID
 
-# Skate 3 Android
+<p align="center">
+  <img src="docs/skate3-android-cover.png" alt="Android mascot skateboarding in front of the Skate 3 logo" width="100%">
+</p>
 
 Skate 3 running as native ARM64 code on Android through static recompilation.
 This is not an Xbox 360 emulator.
@@ -147,5 +147,3 @@ Skate 3, its characters, names, and related assets belong to their respective
 owners. Android is a trademark of Google LLC. This repository does not contain
 the game, title update, DLC, generated game code, or other copyrighted retail
 data.
-
-The cover image was generated with AI for this repository.
