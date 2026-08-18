@@ -3,6 +3,7 @@
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
 #include "skate3_iso_installer.h"
+#include "skate3_mp.h"
 #include "skate3_native_render.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
@@ -394,7 +395,11 @@ bool DeveloperConfigHasResolutionScaleOverride(const std::filesystem::path& conf
                                                 "draw_resolution_scale_y"});
 }
 
+#if defined(__ANDROID__)
+constexpr int kDefaultResolutionScale = 1;
+#else
 constexpr int kDefaultResolutionScale = 2;
+#endif
 
 void ApplyFirstRunVideoDefaults(const std::filesystem::path& settings_path,
                                 const std::filesystem::path& developer_config_path) {
@@ -519,9 +524,62 @@ static void Sub82EBAE4CImpl(PPCContext& ctx, uint8_t* base) {
 Skate3BaseApp::~Skate3BaseApp() = default;
 
 void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
+#if defined(__ANDROID__)
+  paths.game_data_root = "/storage/emulated/0/skate3";
+#endif
   ConfigureSkate3UserPaths(paths, user_settings_path_, profiles_path_);
   config_path_ = paths.config_path;
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
+#if defined(__ANDROID__)
+  // The Android native renderer owns its 512x288 handheld scene target and
+  // upscales it before the full-resolution HUD. Keep the guest frontbuffer at
+  // the game's expected 720p mode; Skate 3 creates that frontbuffer directly
+  // and ignores lower advertised video modes anyway.
+  rex::cvar::SetFlagByName("resolution_scale", "1");
+  rex::cvar::SetFlagByName("draw_resolution_scale_x", "1");
+  rex::cvar::SetFlagByName("draw_resolution_scale_y", "1");
+
+  // Saved settings can originate from a desktop install or from an older
+  // Android build whose curated defaults were still desktop-oriented.  In
+  // particular, a persisted 2x draw distance makes the guest vectorized
+  // culling and render-job pipeline process vastly more world pieces even
+  // though the native renderer discards the Xbox draw packets.  Apply one
+  // coherent handheld preset after loading settings so old config cannot
+  // silently defeat the CPU-oriented native renderer.  Large authored map
+  // surfaces remain; the shorter contribution range primarily removes
+  // distant small props and detail that is not legible at 360p.
+  constexpr std::pair<std::string_view, std::string_view> kHandheldPreset[] = {
+      {"skate3_native_render_scene_handheld_potato", "true"},
+      {"native_render_suppress_mode", "1"},
+      {"skate3_native_render_guest_static_refresh", "8"},
+      {"skate3_native_render_lw_update_refresh", "1"},
+      {"skate3_draw_distance_scale", "0.5"},
+      {"skate3_lod_distance_scale", "0.5"},
+      {"skate3_draw_distance_stream_probe", "0"},
+      {"skate3_native_render_scene_msaa", "1"},
+      {"skate3_native_render_scene_shadows", "false"},
+      {"skate3_native_render_scene_shadow_static_casters", "false"},
+      {"skate3_native_render_scene_shadow_pcss", "false"},
+      {"skate3_native_render_scene_ssao", "false"},
+      {"skate3_native_render_scene_hdr", "false"},
+      {"skate3_native_render_scene_bloom", "false"},
+      {"skate3_native_render_scene_shafts", "false"},
+      {"skate3_native_render_scene_haze", "false"},
+      {"skate3_native_render_scene_smooth_camera", "false"},
+      {"skate3_native_render_scene_occlusion_cull", "true"},
+      {"skate3_native_render_scene_occlusion_cull_build", "true"},
+      {"skate3_native_render_scene_occlusion_cull_guest", "true"},
+      {"skate3_native_render_scene_perf_log", "false"},
+      {"skate3_native_render_scene_perf_interval", "300"},
+      {"show_fps_counter", "true"},
+  };
+  for (const auto& [name, value] : kHandheldPreset) {
+    rex::cvar::SetFlagByName(std::string(name), std::string(value));
+  }
+  REXLOG_INFO(
+      "Android handheld performance preset: 288p, 0.5x world/LOD range, "
+      "potato materials, shadows and volumetrics disabled");
+#endif
   Skate3InitializeFieldOfViewOverride();
   ApplyUltrawideVideoDefaults();
   DisableActiveDebugDiagnostics();
@@ -746,6 +804,7 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 
 void Skate3BaseApp::OnPostSetup() {
   skate3::shader_disasm::RunIfRequested();
+  skate3::mp::Start();
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
 

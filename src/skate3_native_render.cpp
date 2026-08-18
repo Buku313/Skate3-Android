@@ -5,6 +5,7 @@
 #include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_palette.h"
+#include "skate3_mp.h"
 #include "skate3_native_scene.h"
 
 #include "generated/skate3_init.h"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -35,7 +37,42 @@ REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
-REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
+REXCVAR_DECLARE(bool, skate3_native_render_scene_handheld_potato);
+REXCVAR_DECLARE(bool, skate3_mp_enabled);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_guest_static_refresh,
+#if REX_PLATFORM_ANDROID
+    8,
+#else
+    1,
+#endif
+    "Skate 3",
+    "Run the guest Xbox renderer's static-world sorted-list dispatch once "
+    "per N frames while native handheld rendering is active. Native capture "
+    "still sees the full list every frame and dynamic/skater entries always "
+    "dispatch; only discarded static Xbox draw packets are decimated.")
+    .range(1, 16)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_lw_update_refresh,
+#if REX_PLATFORM_ANDROID
+    2,
+#else
+    1,
+#endif
+    "Skate 3",
+    "Update and repack ambient LivingWorld pedestrians/traffic once per N "
+    "guest frames in the handheld profile. The player, board, physics and "
+    "map remain full-rate; multiplayer disables this throttle.")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap,
+#if REX_PLATFORM_ANDROID
+                      60.0,
+#else
+                      0.0,
+#endif
+                      "Skate 3",
                       "Pace the guest render loop to this frame rate (0 = uncapped). The "
                       "guest produces frames at irregular 2-9 ms intervals; the display "
                       "(especially with G-Sync/VRR, which follows present times directly) "
@@ -46,7 +83,13 @@ REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
                       "~1.5 ms before the target, then spin.")
     .range(0.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto,
+#if REX_PLATFORM_ANDROID
+                    false,
+#else
+                    true,
+#endif
+                    "Skate 3",
                     "Derive the guest frame cap from the display the window is on: "
                     "cap a safety margin below the refresh rate (4 fps or 5%, "
                     "whichever is larger; see rex::ui::Window::AutoFrameCapHz), "
@@ -77,9 +120,36 @@ using RenderMeshRecord = skate3::native_scene::SubmitRecord;
 std::mutex g_mutex;
 std::vector<RenderMeshRecord> g_current_frame;
 uint64_t g_frame_index = 0;
+std::atomic<uint64_t> g_frame_epoch{0};
 std::atomic<bool> g_announced{false};
 
+// Populated by OnSceneDrawList immediately before FilterSceneDrawList runs on
+// the same guest render thread. During handheld static-dispatch decimation,
+// these are the contexts whose per-draw state is genuinely dynamic and must
+// still execute every frame.
+std::vector<uint32_t> g_dispatch_required_ctxs;
+bool g_dispatch_decimate_statics = false;
+
 bool Enabled() { return REXCVAR_GET(skate3_native_render); }
+
+bool ShouldUpdateLivingWorld(uint32_t entity) {
+#if REX_PLATFORM_ANDROID
+  if (Enabled() && REXCVAR_GET(skate3_native_render_scene_handheld_potato) &&
+      !REXCVAR_GET(skate3_mp_enabled)) {
+    const int32_t refresh =
+        std::clamp(REXCVAR_GET(skate3_native_render_lw_update_refresh), 1, 8);
+    if (refresh > 1) {
+      // Spread entities across phases so the manager never receives one
+      // large ambient-work spike. Each entity still advances regularly.
+      const uint64_t frame = g_frame_epoch.load(std::memory_order_relaxed);
+      const uint64_t phase = (uint64_t(entity >> 4) * 2654435761ull) %
+                             uint64_t(refresh);
+      return ((frame + phase) % uint64_t(refresh)) == 0;
+    }
+  }
+#endif
+  return true;
+}
 
 
 void OnRenderMesh(uint8_t* base, uint32_t mesh_context, uint32_t vertex_program_state,
@@ -102,6 +172,8 @@ void OnRenderMesh(uint8_t* base, uint32_t mesh_context, uint32_t vertex_program_
 // eventually consumes the mesh's buffers.
 void OnSceneDrawList(uint8_t* base, uint32_t view, uint32_t sort_vec, uint32_t first,
                      uint32_t count) {
+  g_dispatch_required_ctxs.clear();
+  g_dispatch_decimate_statics = false;
   if (count == 0 || count > 100000) {
     return;
   }
@@ -113,6 +185,32 @@ void OnSceneDrawList(uint8_t* base, uint32_t view, uint32_t sort_vec, uint32_t f
   // b = which of the view's sort lists this came from (sort_vec - view), so
   // the scene builder can select the primary opaque list (+20160).
   const uint32_t list_offset = sort_vec - view;
+  // A real screen view has the game's row-vector perspective marker and an
+  // aspect of at least 4:3. This excludes tall menu portrait RTTs, whose
+  // static presentation draws must never be decimated. Static map geometry
+  // and material state are immutable between streamer updates, so the Xbox
+  // packet builder only needs to refresh them periodically; native capture
+  // below still records the complete list on every frame.
+#if REX_PLATFORM_ANDROID
+  if (REXCVAR_GET(skate3_native_render_scene_handheld_potato)) {
+    const int32_t refresh =
+        std::clamp(REXCVAR_GET(skate3_native_render_guest_static_refresh), 1, 16);
+    if (refresh > 1 && (g_frame_index % uint64_t(refresh)) != 0) {
+      const uint32_t cam = REX_LOAD_U32(view + 0x08);
+      if (cam >= 0x10000) {
+        PPCRegister bits{};
+        bits.u32 = REX_LOAD_U32(cam + 0x60 + (2 * 4 + 3) * 4);
+        const float persp_w = bits.f32;
+        bits.u32 = REX_LOAD_U32(cam + 0x60 + 0 * 4);
+        const float m00 = std::fabs(bits.f32);
+        bits.u32 = REX_LOAD_U32(cam + 0x60 + (1 * 4 + 1) * 4);
+        const float m11 = std::fabs(bits.f32);
+        g_dispatch_decimate_statics =
+            persp_w == 1.0f && m00 > 1e-6f && m11 >= m00 * 1.2f;
+      }
+    }
+  }
+#endif
   std::lock_guard<std::mutex> lock(g_mutex);
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t entry = entries + (first + i) * 8;
@@ -124,11 +222,20 @@ void OnSceneDrawList(uint8_t* base, uint32_t view, uint32_t sort_vec, uint32_t f
     const uint32_t dyn =
         skate3::native_scene::CaptureDynamicState(base, mesh_context, /*world_path=*/true);
     if (dyn != 0) {
+      if (g_dispatch_decimate_statics) {
+        g_dispatch_required_ctxs.push_back(mesh_context);
+      }
       // b = the submitting view: shadow-cascade views submit their own
       // contexts for the same NPCs; rendering those creates ghost
       // duplicates (torso-less: their deferred skin passes never run).
       g_current_frame.push_back({2, mesh_context, view, dyn});
     }
+  }
+  if (g_dispatch_decimate_statics) {
+    std::sort(g_dispatch_required_ctxs.begin(), g_dispatch_required_ctxs.end());
+    g_dispatch_required_ctxs.erase(
+        std::unique(g_dispatch_required_ctxs.begin(), g_dispatch_required_ctxs.end()),
+        g_dispatch_required_ctxs.end());
   }
 }
 
@@ -160,15 +267,17 @@ OcclDispatchFilter g_occl_filter;
 uint32_t FilterSceneDrawList(uint8_t* base, uint32_t sort_vec, uint32_t first,
                              uint32_t count) {
   OcclDispatchFilter& f = g_occl_filter;
+  const bool occlusion_filter =
+      REXCVAR_GET(skate3_native_render_scene_occlusion_cull_guest);
   if (f.active || count == 0 || count > 100000 ||
-      !REXCVAR_GET(skate3_native_render_scene_occlusion_cull_guest)) {
+      (!occlusion_filter && !g_dispatch_decimate_statics)) {
     return count;
   }
-  if (f.stamp != g_frame_index) {
+  if (occlusion_filter && f.stamp != g_frame_index) {
     f.stamp = g_frame_index;
     skate3::native_scene::CopyOcclusionCulledCtxs(f.ctxs);
   }
-  if (f.ctxs.empty()) {
+  if (f.ctxs.empty() && !g_dispatch_decimate_statics) {
     return count;
   }
   skate3::native_scene::GuestReadRecoveryScope guest_read_recovery(base);
@@ -185,8 +294,14 @@ uint32_t FilterSceneDrawList(uint8_t* base, uint32_t sort_vec, uint32_t first,
     uint32_t ctx_be;
     std::memcpy(&ctx_be, src + 4, 4);
     const uint32_t mesh_context = __builtin_bswap32(ctx_be);
-    if (mesh_context != 0 &&
-        std::binary_search(f.ctxs.begin(), f.ctxs.end(), mesh_context)) {
+    const bool static_decimated =
+        g_dispatch_decimate_statics && mesh_context != 0 &&
+        !std::binary_search(g_dispatch_required_ctxs.begin(),
+                            g_dispatch_required_ctxs.end(), mesh_context);
+    const bool occlusion_decimated =
+        occlusion_filter && mesh_context != 0 &&
+        std::binary_search(f.ctxs.begin(), f.ctxs.end(), mesh_context);
+    if (static_decimated || occlusion_decimated) {
       ++skipped;
       continue;
     }
@@ -299,6 +414,7 @@ void OnFrameEnd(uint8_t* base) {
 
   std::lock_guard<std::mutex> lock(g_mutex);
   ++g_frame_index;
+  g_frame_epoch.store(g_frame_index, std::memory_order_relaxed);
   const size_t mesh_count = g_current_frame.size();
 
   const auto bd_build0 = Clock::now();
@@ -481,7 +597,15 @@ extern "C" REX_FUNC(sub_827A52C8) {
 // alpha/identity, the serving path).
 extern "C" REX_FUNC(sub_827C1188) {
   const uint32_t entity = ctx.r3.u32;
+  if (!skate3::native_render::ShouldUpdateLivingWorld(entity)) {
+    return;
+  }
+  // Multiplayer: overwrite the puppet entity's world matrices with the
+  // remote pose around the game's own update (ungated by native render:
+  // these are guest-memory writes both render paths consume).
+  skate3::mp::OnLwEntityUpdatePre(base, entity);
   __imp__sub_827C1188(ctx, base);
+  skate3::mp::OnLwEntityUpdatePost(base, entity);
   if (skate3::native_render::Enabled()) {
     skate3::native_lw::OnLwEntityTick(base, entity);
   }
@@ -513,10 +637,14 @@ extern "C" REX_FUNC(sub_82783038) {
 // per instance with the tick's final locomotion (the body pose of record).
 // Bracketed as a pack owner so those snapshots carry the entity.
 extern "C" REX_FUNC(sub_82782818) {
+  const uint32_t entity = ctx.r3.u32;
   const uint32_t prev_owner =
-      skate3::native_palette::ExchangePackOwner(ctx.r3.u32);
+      skate3::native_palette::ExchangePackOwner(entity);
   __imp__sub_82782818(ctx, base);
   skate3::native_palette::ExchangePackOwner(prev_owner);
+  // Multiplayer: post-call the entity's +416 holds the tick's final
+  // locomotion — the local-pose read point and network pump heartbeat.
+  skate3::mp::OnSkaterTick(base, entity);
 }
 
 // Skater-family virtual UBT+Pack driver (vtable slot +16): the remaining
@@ -1007,9 +1135,11 @@ extern "C" REX_FUNC(sub_82B79FC0) {
 // entity; post-call m_matrices holds the packed rows.
 extern "C" REX_FUNC(sub_827C1D38) {
   const uint32_t entity = ctx.r3.u32;
+  if (!skate3::native_render::ShouldUpdateLivingWorld(entity)) {
+    return;
+  }
   __imp__sub_827C1D38(ctx, base);
   if (skate3::native_render::Enabled()) {
     skate3::native_palette::OnLwPack(base, entity);
   }
 }
-

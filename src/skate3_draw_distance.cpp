@@ -56,14 +56,20 @@
 #include <windows.h>
 #endif
 
-REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 2.0, "Skate 3",
+#if defined(__ANDROID__)
+constexpr double kDefaultDrawDistanceScale = 0.5;
+#else
+constexpr double kDefaultDrawDistanceScale = 2.0;
+#endif
+
+REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, kDefaultDrawDistanceScale, "Skate 3",
                       "Scale the distance at which small world meshes "
                       "(foliage, props, street furniture) stop being drawn. "
                       "1 = original console behavior. Larger values draw more "
                       "of the world and cost proportionally more GPU/CPU.")
     .range(0.25, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 2.0, "Skate 3",
+REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, kDefaultDrawDistanceScale, "Skate 3",
                       "Scale the distances at which skaters, pedestrians and "
                       "vehicles switch to lower-detail models. 1 = original "
                       "console behavior.")

@@ -61,6 +61,8 @@ elseif(APPLE)
     else()
         message(FATAL_ERROR "Unsupported macOS architecture: ${SKATE3_TARGET_PROCESSOR}. macOS builds are ARM64-only.")
     endif()
+elseif(ANDROID)
+    set(SKATE3_BUILD_PLATFORM "android-arm64")
 elseif(UNIX AND NOT APPLE)
     if(SKATE3_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(SKATE3_BUILD_PLATFORM "linux-amd64")
@@ -246,6 +248,8 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_draw_distance.cpp
     src/skate3_fov.cpp
     src/skate3_iso_installer.cpp
+    src/skate3_mp.cpp
+    src/skate3_penguin_mod.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
@@ -286,6 +290,8 @@ if(WIN32)
         @ONLY
     )
     target_sources(skate3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc)
+elseif(ANDROID)
+    add_library(skate3 SHARED ${SKATE3_SOURCES})
 else()
     add_executable(skate3 ${SKATE3_SOURCES})
 endif()
@@ -356,6 +362,14 @@ endif()
 
 target_link_libraries(skate3 PRIVATE rex::runtime)
 rexglue_configure_target(skate3)
+
+# The recompiled guest is split across many generated translation units.  On the
+# handheld build, ThinLTO lets Clang optimize the extremely hot guest call chains
+# across those file boundaries without the memory cost of full LTO.
+if(ANDROID AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(skate3 PRIVATE -flto=thin)
+    target_link_options(skate3 PRIVATE -flto=thin)
+endif()
 
 if(APPLE)
     target_link_options(skate3 PRIVATE -Wl,-stack_size,0x4000000)

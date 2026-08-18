@@ -5,6 +5,7 @@
 // skate3_native_scene_state.h.
 
 #include "skate3_native_scene.h"
+#include "skate3_penguin_mod.h"
 
 #include "generated/skate3_init.h"
 
@@ -59,6 +60,26 @@
 
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
+#if REX_PLATFORM_ANDROID
+constexpr int32_t kDefaultSceneMsaa = 1;
+constexpr bool kDefaultSsao = false;
+constexpr bool kDefaultBloom = false;
+constexpr bool kDefaultHdr = false;
+constexpr bool kDefaultShafts = false;
+constexpr int32_t kDefaultStaticShadowSize = 1024;
+constexpr bool kDefaultShadowPcss = false;
+constexpr bool kDefaultNativeScene = false;
+#else
+constexpr int32_t kDefaultSceneMsaa = 4;
+constexpr bool kDefaultSsao = true;
+constexpr bool kDefaultBloom = true;
+constexpr bool kDefaultHdr = true;
+constexpr bool kDefaultShafts = true;
+constexpr int32_t kDefaultStaticShadowSize = 4096;
+constexpr bool kDefaultShadowPcss = true;
+constexpr bool kDefaultNativeScene = true;
+#endif
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene, true, "Skate 3",
                     "Render the game scene natively from the hooked MeshContext stream, "
                     "replacing the emulated GPU output (requires skate3_native_render). "
@@ -83,7 +104,7 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_debug, 0, "Skate 3",
                      "3=limit to 20 items, 4=depth test disabled")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 4, "Skate 3",
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, kDefaultSceneMsaa, "Skate 3",
                      "MSAA sample count for the native scene (1 = off, 2/4/8). Distant "
                      "thin geometry (railings, wires) shimmers without it; mipmaps only "
                      "fix texture aliasing. Applies live: the scene pipeline family and "
@@ -110,7 +131,7 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynobj_v2, true, "Skate 3",
                     "to the flat-map constants). Off = the v1 flat response, for A/B "
                     "comparison.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ssao, kDefaultSsao, "Skate 3",
                     "Screen-space ambient occlusion (GTAO) in the native renderer: soft "
                     "contact shading where surfaces meet (under ledges, rails, vehicles, "
                     "the skater). A post pass over the resolved scene depth, an "
@@ -178,14 +199,14 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_ssr_debug, 0, "Skate 3",
                      "too-thick crossings, white = hit x confidence).")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr, kDefaultHdr, "Skate 3",
                     "Render the 3D scene into a float (HDR) intermediate and apply the "
                     "game's shared tone chain once in a host post pass, the basis for "
                     "real bloom (and later HDR effects). With bloom off the output is "
                     "equivalent to the classic in-material tonemap. Off = the classic "
                     "path, for A/B parity checks.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_bloom, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_bloom, kDefaultBloom, "Skate 3",
                     "Real bloom from the HDR scene: a downsample/upsample pyramid driven "
                     "by pre-tonemap brightness (night lamps, neon, the sun and sky "
                     "glow). Requires the HDR intermediate.")
@@ -222,7 +243,7 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_hdr_debug, 0, "Skate 3",
                      "the directional haze term only.")
     .range(0, 5)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shafts, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shafts, kDefaultShafts, "Skate 3",
                     "Volumetric sun shafts: the air along each view ray is marched "
                     "against the dynamic CSM atlas and the static world-shadow map, "
                     "and the SHADOWED portion proportionally dims the light seen "
@@ -545,7 +566,13 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_boot_native, true, "Skate 3",
                     "yielding. With this and the pause/loading modes on, the emulated "
                     "GPU output is never presented.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_native, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_native,
+#if REX_PLATFORM_ANDROID
+                    false,
+#else
+                    true,
+#endif
+                    "Skate 3",
                     "Render FMVs natively: the movie player CPU-decodes VP6 into "
                     "three YUV plane textures (VideoRenderer_RwTexture members, "
                     "published per frame by the Render hook), and the captured "
@@ -712,7 +739,8 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_radius, 180.0,
                       "texel density; the term fades out at the outer edge.")
     .range(40.0, 600.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size,
+                     kDefaultStaticShadowSize,
                      "Skate 3",
                      "Static sun-shadow map resolution per cascade tile "
                      "(the map is three tiles). At the default radius the "
@@ -720,7 +748,8 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
                      "~9 cm. Applies live: the map recreates on change.")
     .range(1024, 8192)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_pcss, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_pcss, kDefaultShadowPcss,
+                    "Skate 3",
                     "Contact-hardening soft shadows (PCSS): a blocker search "
                     "estimates the caster distance per pixel and the filter "
                     "width follows the sun's angular size: crisp at the "
@@ -1158,6 +1187,21 @@ REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_log, false, "Skate 3",
                     "Log periodic native-renderer performance breakdown lines "
                     "(see skate3_native_render_scene_perf_interval)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_handheld_potato,
+#if REX_PLATFORM_ANDROID
+    true,
+#else
+    false,
+#endif
+    "Skate 3",
+    "Aggressive handheld CPU profile: removes vegetation, alpha-tested "
+    "world clutter, ambient pedestrians/traffic and movable props; strips "
+    "secondary world textures; and coalesces nearby draw islands. Intended "
+    "for low-power Android handhelds where frame rate matters more than "
+    "scene fidelity.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_perf_interval, 600, "Skate 3",
@@ -2546,6 +2590,9 @@ struct CachedItemCore {
 };
 std::mutex g_item_cache_mutex;
 std::unordered_map<uint32_t, CachedItemCore> g_item_cache;
+#if REX_PLATFORM_ANDROID
+std::vector<DrawItem> g_android_static_scene_items;
+#endif
 
 void InvalidateCachedItem(uint32_t mesh) {
   std::lock_guard<std::mutex> lock(g_item_cache_mutex);
@@ -2556,6 +2603,9 @@ void InvalidateCachedItem(uint32_t mesh) {
 void ClearItemCache() {
   std::lock_guard<std::mutex> lock(g_item_cache_mutex);
   g_item_cache.clear();
+#if REX_PLATFORM_ANDROID
+  g_android_static_scene_items.clear();
+#endif
 }
 
 namespace {
@@ -2601,7 +2651,11 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
             g_item_cache.erase(it);
             return false;
           }
+#if REX_PLATFORM_ANDROID
+          core.fp_frame = frame + 16;
+#else
           core.fp_frame = frame + 4;
+#endif
         }
         item = core.item;
         g_item_cache_hits.fetch_add(1, std::memory_order_relaxed);
@@ -2627,14 +2681,92 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   }
   CachedItemCore core;
   core.item = item;
-  core.fp_frame = frame + 4;
+  core.fp_frame = frame +
+#if REX_PLATFORM_ANDROID
+                      16;
+#else
+                      4;
+#endif
   // Materials with an unresolved diffuse retry the full walk quickly: CAS
   // composites and streamed channel textures bind shortly after first sight
   // (ocean.default legitimately has no diffuse and just rebuilds often,
   // a handful of items).
-  core.rebuild_frame = frame + (item.diffuse_tex != 0 ? 32 : 2);
+  core.rebuild_frame = frame +
+#if REX_PLATFORM_ANDROID
+                           (item.diffuse_tex != 0 ? 128 : 4);
+#else
+                           (item.diffuse_tex != 0 ? 32 : 2);
+#endif
   g_item_cache[mesh] = std::move(core);
   return true;
+}
+
+bool HandheldPotatoEnabled() {
+  return REXCVAR_GET(skate3_native_render_scene_handheld_potato);
+}
+
+// Content that costs far more CPU than it contributes on a 4-inch screen.
+// This gate runs before palette capture for dynamic submissions and before
+// publication for statics, so dropped content avoids the expensive scene
+// post-processing and render-side texture/draw work as well.
+bool HandheldPotatoDrops(const DrawItem& item) {
+  if (!HandheldPotatoEnabled()) {
+    return false;
+  }
+  // Tree cards and environmentsimple.alphatest (grass, shrubs, leaf/fence
+  // cards) are extremely draw-heavy and shimmer badly at handheld scale.
+  if (item.env_family == 7 || item.env_family == 9 ||
+      item.env_family == 10 || item.transparent || item.env_family == 13) {
+    return true;
+  }
+  // LivingWorld pedestrians/traffic and movable street clutter require
+  // per-frame palette/world capture. Preserve the player families (1/2),
+  // skateboard and gameplay geometry; remove ambient simulation visuals.
+  if (item.char_family == 3 || item.char_family == 6 ||
+      item.char_family == 7 || item.dynobj != 0) {
+    return true;
+  }
+  return false;
+}
+
+// Static-only micro-detail gate for the 288p handheld target. Keep anything
+// long enough to be a rail/ledge and every authored large surface; discard
+// tiny trim/clutter whose full raster footprint is only a few pixels. This is
+// deliberately not used by the dynamic capture path, so the skateboard and
+// player pieces can never be classified as disposable by their bounds.
+bool HandheldPotatoDropsStaticGeometry(const DrawItem& item) {
+  if (!HandheldPotatoEnabled() || item.char_family != 0 || item.water) {
+    return false;
+  }
+  const float sx = std::fabs(item.bbox_max[0] - item.bbox_min[0]);
+  const float sy = std::fabs(item.bbox_max[1] - item.bbox_min[1]);
+  const float sz = std::fabs(item.bbox_max[2] - item.bbox_min[2]);
+  const float longest = std::max({sx, sy, sz});
+  uint64_t indices = 0;
+  for (const DrawEntry& draw : item.draws) {
+    indices += draw.index_count;
+  }
+  return longest < 1.25f || (longest < 2.0f && indices < 60);
+}
+
+void ApplyHandheldPotatoMaterial(DrawItem& item) {
+  if (!HandheldPotatoEnabled() || item.char_family != 0 || item.water) {
+    return;
+  }
+  // Retain the authored base color but replace every secondary material
+  // input with the renderer's shared neutral textures. This eliminates the
+  // guest route checks, decode/store traffic and streaming heals for maps
+  // that are barely visible at 360p: baked light, macro grime, detail/
+  // normal, spec/reflection masks and decal artwork.
+  item.lightmap_tex = 0;
+  item.macro_tex = 0;
+  item.detail_tex = 0;
+  item.spec_tex = 0;
+  item.decal_art = 0;
+  item.decal = false;
+  item.decal_tileable = false;
+  std::memset(item.diffuse_fetch, 0, sizeof(item.diffuse_fetch));
+  std::memset(item.decal_fetch, 0, sizeof(item.decal_fetch));
 }
 
 bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
@@ -2664,6 +2796,7 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
   if (prof) {
     g_pw_bi_fetch.Add(PerfNsSince(fetch_t0));
   }
+  ApplyHandheldPotatoMaterial(item);
   // Identity for per-instance consumers (the occlusion cull's guest-side
   // dispatch filter keys on it; the dynamic capture path overwrites it with
   // its own value).
@@ -2682,6 +2815,24 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
     DrawEntry entry{REX_LOAD_U32(d), REX_LOAD_U32(d + 4), REX_LOAD_U32(d + 8),
                     REX_LOAD_U32(d + 12)};
     if (entry.index_count == 0 || entry.index_count > item.ib_count) continue;
+    // Draw lists are visibility islands inside one material mesh. On the
+    // handheld profile, coalesce adjacent islands and tiny culled gaps into
+    // one command. Drawing at most 32 extra triangles is substantially
+    // cheaper than another Vulkan state/descriptor/draw submission on the
+    // RG406V, and all indices still belong to this material's index buffer.
+    if (HandheldPotatoEnabled() && !item.draws.empty()) {
+      DrawEntry& prev = item.draws.back();
+      const uint64_t prev_end = uint64_t(prev.start_index) + prev.index_count;
+      const uint64_t entry_end = uint64_t(entry.start_index) + entry.index_count;
+      const uint64_t gap = entry.start_index >= prev_end
+                               ? uint64_t(entry.start_index) - prev_end
+                               : UINT64_MAX;
+      if (prev.prim == entry.prim && prev.base_vertex == entry.base_vertex &&
+          gap <= 96 && (gap % 3u) == 0u && entry_end <= item.ib_count) {
+        prev.index_count = uint32_t(entry_end - prev.start_index);
+        continue;
+      }
+    }
     item.draws.push_back(entry);
   }
   if (item.draws.empty()) {
@@ -4193,6 +4344,9 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   }
   DrawItem item;
   if (!BuildItemGeometry(base, ctx, item)) {
+    return 0;
+  }
+  if (HandheldPotatoDrops(item)) {
     return 0;
   }
   item.ctx = ctx;  // identity key for the palette serve / entity store
@@ -8502,6 +8656,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // the ctx owner's instance matrix, and only for ctxs no live dynamic
   // capture already covered this frame.
   std::unordered_map<uint32_t, DrawItem> sortlist_local_by_ctx;
+#if REX_PLATFORM_ANDROID
+  // Static geometry is immutable between streamer fixups. Refresh its full
+  // guest-side scene walk at 7.5 Hz and reuse it between refreshes; dynamic
+  // captures (skater, NPCs, cloth, vehicles) still update every guest tick.
+  const bool refresh_android_statics = (g_guest_frame & 7u) == 0u;
+  std::vector<DrawItem> android_statics;
+  if (!refresh_android_statics) {
+    std::lock_guard<std::mutex> lock(g_item_cache_mutex);
+    android_statics = g_android_static_scene_items;
+  }
+#endif
   const auto total_indices = [](const DrawItem& d) {
     uint64_t n = 0;
     for (const DrawEntry& e : d.draws) n += e.index_count;
@@ -8554,6 +8719,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;
       }
       const DrawItem& cand = dynitems[r.c - 1];
+      if (HandheldPotatoDrops(cand)) {
+        continue;
+      }
       if (cand.pending) {
         // Deferred mesh whose draw never came, or a capture the palette
         // acceptance gates refused. Remember it: if the instance does not
@@ -8647,8 +8815,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     if (!REXCVAR_GET(skate3_native_render_scene_world_items)) {
       continue;
     }
+#if REX_PLATFORM_ANDROID
+    if (!refresh_android_statics) {
+      continue;
+    }
+#endif
     DrawItem item;
     if (BuildItemGeometry(base, r.a, item)) {
+      if (HandheldPotatoDrops(item) ||
+          HandheldPotatoDropsStaticGeometry(item)) {
+        continue;
+      }
       if (item.skinned) {
         // Skinned meshes reached through the world sort lists (flags,
         // banners) have no captured palette, bind-pose garbage; skip.
@@ -8675,7 +8852,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         sortlist_local_by_ctx.try_emplace(r.a, std::move(item));
         continue;
       }
+#if REX_PLATFORM_ANDROID
+      android_statics.push_back(std::move(item));
+#else
       scene.items.push_back(std::move(item));
+#endif
     } else {
       // Silent world-item drop attribution (the F7 rings show world meshes
       // MISSING for 8-11 frame episodes, the mesh
@@ -8696,6 +8877,15 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+#if REX_PLATFORM_ANDROID
+  if (refresh_android_statics) {
+    std::lock_guard<std::mutex> lock(g_item_cache_mutex);
+    g_android_static_scene_items = android_statics;
+  }
+  scene.items.insert(scene.items.end(),
+                     std::make_move_iterator(android_statics.begin()),
+                     std::make_move_iterator(android_statics.end()));
+#endif
   if (wloop_prof) {
     g_pw_bi_wloop.Add(PerfNsSince(wloop_t0));
   }
@@ -10050,6 +10240,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   UpdateFreecam(scene, cam_view,
                 std::chrono::duration<double>(build_t0.time_since_epoch()).count());
 
+  // Host-owned playable-character mods run after every capture/rescue pass,
+  // so none of the original CAC pieces can be reintroduced later this frame.
+  skate3::penguin_mod::ApplyToFrame(scene);
+
   // Hor+ ultrawide: widen the published camera to the wide output aspect.
   // Applied after every camera override (smoothing, synthetic pan, freecam)
   // so it survives their view_proj/proj rewrites.
@@ -10222,13 +10416,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_fog_frame_done = false;
   g_shadow_frame_done = false;
   g_sky_frame_done = false;
-  g_tree_frame_done = false;
+  // The handheld potato profile drops these families or deliberately uses
+  // their cheaper legacy material paths. Re-arming their name-based capture
+  // probes made every guest draw re-read and strstr shader debug paths when a
+  // family wasn't present in the current view (especially ocean/water).
+  const bool potato_capture_skip = HandheldPotatoEnabled();
+  g_tree_frame_done = potato_capture_skip;
   g_proxy_frame_done = false;
-  g_dynobj_frame_done = false;
-  g_water_frame_done = false;
-  g_ocean_frame_done = false;
-  g_oceanrefl_frame_done = false;
-  g_scroll_frame_done = false;
+  g_dynobj_frame_done = potato_capture_skip;
+  g_water_frame_done = potato_capture_skip;
+  g_ocean_frame_done = potato_capture_skip;
+  g_oceanrefl_frame_done = potato_capture_skip;
+  g_scroll_frame_done = potato_capture_skip;
 
 
   // Draw-time STRETCH VETO: the last line of defense, judging what the GPU
@@ -10487,4 +10686,3 @@ extern "C" REX_FUNC(sub_82802A00) {
   }
   __imp__sub_82802A00(ctx, base);
 }
-

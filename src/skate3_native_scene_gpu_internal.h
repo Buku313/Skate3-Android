@@ -492,6 +492,13 @@ struct RendererState {
   nrhi::Texture* depth = nullptr;
   uint32_t depth_width = 0;
   uint32_t depth_height = 0;
+  // Android handheld path: shade the 3D scene at widescreen 360p, upscale it
+  // once into the 720p guest output, then draw the HUD/menus at output res.
+  // The target idles as RENDER_TARGET between frames.
+  nrhi::Texture* handheld_color = nullptr;
+  nrhi::TextureView* handheld_srv = nullptr;
+  uint32_t handheld_width = 0;
+  uint32_t handheld_height = 0;
   // Cached guest-output texture identity (context.guest_output) for change
   // detection: the presenter recreates the output image on resize.
   nrhi::Texture* rtv_resource = nullptr;
@@ -788,6 +795,14 @@ struct RendererState {
   // destruction is deferred inside the RHI (Device::DestroyDeferred) and
   // texture bindings are backend-managed view objects.)
   GuestTexture white;
+  // Host-owned texture for the playable penguin replacement. Its mesh lives
+  // in `meshes` under penguin_mod::kMeshKey so every native pass can bind it
+  // through the ordinary geometry path.
+  GuestTexture penguin;
+  // Shared neutral baked-lighting substitute for the Android potato profile.
+  // This keeps stripped world materials readable without resolving any guest
+  // lightmap pages (one texture/view for the entire scene).
+  GuestTexture neutral_lightmap;
   // Water environment CUBE maps (t6): separate cache; same guest object
   // addresses decode differently (6 faces, TextureCube SRV).
   std::unordered_map<uint32_t, GuestTexture> cube_textures;
@@ -981,6 +996,11 @@ struct RendererState {
   struct TexRoute {
     uint32_t words[6] = {};
     uint64_t key = 0;
+    // The first draw using this guest texture object refreshes its route;
+    // every other draw in the same rendered frame reuses that stable result.
+    // World materials share texture objects heavily, so reading the same six
+    // guest words twice per draw was a large handheld CPU cost.
+    uint64_t refreshed_frame = ~uint64_t{0};
     // Live words carry no mip-0 base (streamer demoted the top level; the
     // old pool range is already reused). The route holds the pre-demote
     // state, its cached decode carries the full chain, strictly better,

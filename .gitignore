@@ -5,6 +5,20 @@
 /generated.backup-*/
 /tools/
 
+# Android generated/build products and staged native libraries
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/libs/
+/android/app/jni/
+/android/local.properties
+*.apk
+*.aab
+
+# Local title-update payloads and platform metadata
+TU_*
+.DS_Store
+
 # Local game dump and retail media. Users must provide their own copy.
 /game/
 *.iso

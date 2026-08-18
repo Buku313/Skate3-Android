@@ -26,7 +26,7 @@
 #include <windows.h>
 
 #include <rex/ui/window_win.h>
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)
 #else
 #include <gtk/gtk.h>
 #endif
@@ -103,6 +103,11 @@ std::filesystem::path PickIsoFile() {
 #elif defined(__APPLE__)
 std::filesystem::path PickIsoFile() {
   return skate3::PickIsoFileMacOS();
+}
+#elif defined(__ANDROID__)
+std::filesystem::path PickIsoFile() {
+  // Android uses the preinstalled game directory on shared storage.
+  return {};
 }
 #else
 std::filesystem::path PickIsoFile() {
@@ -486,7 +491,7 @@ bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context
     if (window) {
       window->RequestPaint();
     }
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__ANDROID__)
     while (gtk_events_pending()) {
       gtk_main_iteration_do(FALSE);
     }

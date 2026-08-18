@@ -4,7 +4,7 @@
   <img alt="Skate 3 Native PC Recompilation" src="banner-light.png">
 </picture>
 
-An unofficial native recompilation of the Xbox 360 version of Skate 3, supporting Windows, Linux, and macOS.
+An unofficial native recompilation of the Xbox 360 version of Skate 3, supporting Windows, Linux, macOS, and experimental ARM64 Android devices.
 
 As of v2.0.0, the game runs on a native renderer built directly on Direct3D 12 and Vulkan instead of emulating the Xbox 360 GPU. Compared to the emulated renderer it delivers more than twice the frame rate at roughly a quarter of the GPU power draw, and on Apple Silicon the frame rate uplift is closer to 10x.
 
@@ -56,6 +56,19 @@ Notes:
 6. Wait for the installer to extract the game files.
 7. Click "Start Game".
 
+### Android (ARM64 / Experimental)
+
+The Android build targets performance-oriented phones and handhelds. It currently
+requires Android 13 or newer, an ARM64 CPU with ARMv8.2 FP16/dot-product support,
+and Vulkan. The RG406V (Unisoc T820 / Mali-G57) is the first verified target;
+support and performance on other devices will vary.
+
+Android currently uses a curated 512x288 native-renderer scene target (upscaled
+under the full-resolution HUD), reduced world and LOD range, simplified materials,
+and a fixed 60 FPS guest cap. It is not an emulator build and does not include any
+retail game data. See [android/README.md](android/README.md) for build, install, and
+device-data instructions.
+
 ## Native Renderer
 
 Since v2.0.0 the game no longer relies on emulating the Xbox 360 GPU. A native renderer draws the game directly through Direct3D 12 or Vulkan, covering the entire game: gameplay, menus, HUD, loading screens, videos, and the photo, replay, skater, and park editors. It runs exact ports of the game's own material shading for the world, characters, vehicles, and water, so the image stays at close visual parity with the original console output while running far faster and more efficiently.
@@ -100,6 +113,7 @@ The builds include an experimental true ultrawide mode: the native renderer draw
 - PlayStation (DualShock/DualSense), Switch and most generic controllers are supported through the SDL controller backend: set Settings > Controls > Controller Backend to SDL and restart the game. Steam Input through XInput also works. On Linux and macOS the SDL backend is always used, so these controllers work out of the box.
 - Keyboard controls can be enabled in the game settings menu.
 - Press Escape on keyboard or (RB + Start) on the controller to open the game settings menu. The chord can be changed in Settings > Controls.
+- Android handheld controls are routed through SDL as an Xbox-style gamepad. On the RG406V, RB + Start opens the recomp settings overlay.
 
 ### Keyboard Keybinds
 
@@ -251,6 +265,27 @@ cmake --build --preset macos-release --parallel
 
 The release artifacts are `out/build/macos-release/skate3` and
 `librexruntime.dylib`, plus the MoltenVK library and ICD manifest beside them.
+
+## Android Build (ARM64 / Experimental)
+
+The Android package uses Android SDK 35, NDK r27c, JDK 17, CMake/Ninja, and a
+host Clang toolchain for code generation. The current preset is intentionally
+tuned for ARMv8.2 (`fp16` and `dotprod`) and has a minimum API level of 33.
+
+On a macOS ARM host, after preparing your own extracted game dump and Title
+Update 3 package as described above:
+
+```sh
+export ANDROID_NDK_ROOT=/path/to/android-sdk/ndk/27.2.12479018
+android/tools/build_android_libs.sh
+cd android
+./gradlew assembleDebug
+```
+
+The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
+Native libraries, APKs, generated recompilation sources, title-update payloads,
+and retail files are deliberately excluded from Git. Full setup and installation
+steps are in [android/README.md](android/README.md).
 
 ## Running a Development Build
 

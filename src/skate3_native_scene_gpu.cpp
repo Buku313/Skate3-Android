@@ -5,6 +5,7 @@
 
 #include "skate3_native_debug_dialog.h"
 #include "skate3_native_scene.h"
+#include "skate3_penguin_mod.h"
 
 #include "generated/skate3_init.h"
 
@@ -35,6 +36,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
+#include <rex/kernel/xam/input_injection.h>
 #include <rex/logging.h>
 
 #include "native/skate3_native_diag.h"
@@ -77,9 +79,14 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_hdr);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_hdr_packed);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_handheld_potato);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lightmaps);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lm_dump);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_loading_native);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_fade);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_gap_fill);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_identity);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_palette);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_macro);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_rtt_passes);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_unsuppress);
@@ -1073,6 +1080,10 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
           item.mesh, item.normal_fmt, item.tb_fmt, item.skinned);
     }
   }
+  // The first few original-player decodes provide the real CAC bind-space
+  // positions and weights used by the host penguin's automatic rig transfer.
+  // Once ready, ApplyToFrame replaces these pieces on subsequent frames.
+  penguin_mod::ObserveSkaterMesh(item, dst, num_verts);
   // Stretch-veto probe (see g_skin_probe): cache ~32 decoded sample verts
   // so the guest thread can cheaply skin what the GPU will actually draw.
   if (item.skinned) {
@@ -1320,6 +1331,62 @@ void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4]) {
   for (int i = 0; i < 16; ++i) {
     std::memcpy(px[i], col[bits & 3u], 4);
     bits >>= 2;
+  }
+}
+
+// Android Mali devices don't expose the BC formats used by Skate 3. Decode
+// them on the texture workers to universally-supported RGBA8. Handheld mode
+// starts from a lower guest mip below, so this never expands a 1024/2048px
+// source at full size.
+void DecodeBcAlphaBlock(const uint8_t* b, uint8_t out[16]) {
+  uint8_t values[8] = {b[0], b[1]};
+  if (values[0] > values[1]) {
+    for (uint32_t i = 1; i <= 6; ++i) {
+      values[i + 1] = uint8_t(((7 - i) * values[0] + i * values[1]) / 7);
+    }
+  } else {
+    for (uint32_t i = 1; i <= 4; ++i) {
+      values[i + 1] = uint8_t(((5 - i) * values[0] + i * values[1]) / 5);
+    }
+    values[6] = 0;
+    values[7] = 255;
+  }
+  uint64_t bits = 0;
+  for (uint32_t i = 0; i < 6; ++i) bits |= uint64_t(b[2 + i]) << (8 * i);
+  for (uint32_t i = 0; i < 16; ++i) out[i] = values[(bits >> (3 * i)) & 7u];
+}
+
+void DecodeBcMobileBlock(xenos::TextureFormat format, const uint8_t* b,
+                         uint8_t px[16][4]) {
+  const auto base_format = rex::graphics::GetBaseFormat(format);
+  if (base_format == xenos::TextureFormat::k_DXT1) {
+    DecodeBc1Block(b, px);
+    return;
+  }
+  if (base_format == xenos::TextureFormat::k_DXT2_3 ||
+      base_format == xenos::TextureFormat::k_DXT4_5) {
+    DecodeBc1Block(b + 8, px);
+    if (base_format == xenos::TextureFormat::k_DXT2_3) {
+      uint64_t alpha = 0;
+      std::memcpy(&alpha, b, sizeof(alpha));
+      for (uint32_t i = 0; i < 16; ++i) {
+        px[i][3] = uint8_t(((alpha >> (4 * i)) & 15u) * 17u);
+      }
+    } else {
+      uint8_t alpha[16];
+      DecodeBcAlphaBlock(b, alpha);
+      for (uint32_t i = 0; i < 16; ++i) px[i][3] = alpha[i];
+    }
+    return;
+  }
+  uint8_t r[16] = {}, g[16] = {};
+  DecodeBcAlphaBlock(b, r);
+  if (base_format == xenos::TextureFormat::k_DXN) DecodeBcAlphaBlock(b + 8, g);
+  for (uint32_t i = 0; i < 16; ++i) {
+    px[i][0] = r[i];
+    px[i][1] = g[i];
+    px[i][2] = 0;
+    px[i][3] = 255;
   }
 }
 
@@ -1646,7 +1713,6 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   const uint32_t block_h = format_info->block_height;
   const uint32_t host_width = ((width + block_w - 1) / block_w) * block_w;
   const uint32_t host_height = ((height + block_h - 1) / block_h) * block_h;
-
   // Upload the guest MIP CHAIN, not just mip 0; sampling mip 0 at distance
   // is the source of the grass "TV static" and flickering floor/window
   // lines. Power-of-two sizes only (everything the game ships) so BC block
@@ -1664,10 +1730,33 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
       ++mip_count;
     }
   }
+#if REX_PLATFORM_ANDROID
+  const auto mobile_base_format = rex::graphics::GetBaseFormat(info.format);
+  const bool mobile_bc = mobile_base_format == xenos::TextureFormat::k_DXT1 ||
+                         mobile_base_format == xenos::TextureFormat::k_DXT2_3 ||
+                         mobile_base_format == xenos::TextureFormat::k_DXT4_5 ||
+                         mobile_base_format == xenos::TextureFormat::k_DXT5A ||
+                         mobile_base_format == xenos::TextureFormat::k_DXN;
+#else
+  const bool mobile_bc = false;
+#endif
+  // Mobile BC->RGBA expansion is intentionally quality-capped. Select an
+  // existing guest mip instead of decoding and then downsampling the large
+  // top levels. This keeps the worker cost and resident memory bounded.
+  uint32_t first_mip = 0;
+  constexpr uint32_t kMobileTextureMax = 128;
+  if (mobile_bc) {
+    while (first_mip + 1 < mip_count &&
+           (std::max(width >> first_mip, 1u) > kMobileTextureMax ||
+            std::max(height >> first_mip, 1u) > kMobileTextureMax)) {
+      ++first_mip;
+    }
+  }
   // No guest chain at all (runtime-composed lightmap pages): generate one,
   // see UploadGeneratedMips. Small DXT1/8888 textures only; falls back to
   // the plain single-mip path on any failure.
-  if (mip_count == 1 && pow2 && REXCVAR_GET(skate3_native_render_scene_tex_mips) &&
+  if (!mobile_bc && mip_count == 1 && pow2 &&
+      REXCVAR_GET(skate3_native_render_scene_tex_mips) &&
       width >= 8 && height >= 8 && width <= 512 && height <= 512) {
     const auto base_fmt = rex::graphics::GetBaseFormat(info.format);
     if (base_fmt == xenos::TextureFormat::k_DXT1 ||
@@ -1693,7 +1782,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   MipSrc srcs[16] = {};
   static thread_local std::vector<uint8_t> tex_scratch;
   uint32_t scratch_total = 0;
-  for (uint32_t m = 0; m < mip_count; ++m) {
+  for (uint32_t m = first_mip; m < mip_count; ++m) {
     uint32_t ox = 0, oy = 0;
     // Mip 0 through GetMipLocation too: textures <= 16 texels on a side
     // store their BASE level packed inside a 32x32 tile at a block offset.
@@ -1741,7 +1830,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   tex_scratch.resize(scratch_total);
   uint32_t mips_copied = 0;
   bool copy_truncated = false;
-  for (uint32_t m = 0; m < mip_count; ++m) {
+  for (uint32_t m = first_mip; m < mip_count; ++m) {
     MipSrc& s = srcs[m];
     if (!GuestTryCopy(tex_scratch.data() + s.scratch_off,
                       base + (0xA0000000u | s.addr), s.size)) {
@@ -1763,7 +1852,8 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   if (mips_copied == 0) {
     return false;
   }
-  mip_count = mips_copied;
+  mip_count = first_mip + mips_copied;
+  const uint32_t output_mip_count = mips_copied;
   out.incomplete = copy_truncated;
   if (copy_truncated) {
     static std::atomic<uint32_t> s_trunc_logs{0};
@@ -1782,26 +1872,30 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   };
   MipPlan plans[16] = {};
   uint32_t upload_size = 0;
-  for (uint32_t m = 0; m < mip_count; ++m) {
-    const uint32_t mw = std::max(width >> m, 1u);
-    const uint32_t mh = std::max(height >> m, 1u);
-    MipPlan& p = plans[m];
+  const uint32_t resource_width = std::max(width >> first_mip, 1u);
+  const uint32_t resource_height = std::max(height >> first_mip, 1u);
+  for (uint32_t om = 0; om < output_mip_count; ++om) {
+    const uint32_t sm = first_mip + om;
+    const uint32_t mw = std::max(width >> sm, 1u);
+    const uint32_t mh = std::max(height >> sm, 1u);
+    MipPlan& p = plans[om];
     p.cols = (mw + block_w - 1) / block_w;
     p.rows = (mh + block_h - 1) / block_h;
-    p.pitch = (p.cols * bytes_per_block + (nrhi::kRowPitchAlignment - 1u)) &
+    const uint32_t row_bytes = mobile_bc ? mw * 4u : p.cols * bytes_per_block;
+    p.pitch = (row_bytes + (nrhi::kRowPitchAlignment - 1u)) &
               ~(nrhi::kRowPitchAlignment - 1u);
     p.offset = (upload_size + (kUploadPlacementAlignment - 1u)) &
                ~(kUploadPlacementAlignment - 1u);
-    upload_size = p.offset + p.pitch * p.rows;
+    upload_size = p.offset + p.pitch * (mobile_bc ? mh : p.rows);
   }
 
   nrhi::Device* device = context.device;
   nrhi::TextureDesc desc;
   desc.kind = nrhi::TextureKind::k2D;
-  desc.width = host_width;
-  desc.height = host_height;
-  desc.mip_levels = mip_count;
-  desc.format = host.resource_format;
+  desc.width = mobile_bc ? resource_width : host_width;
+  desc.height = mobile_bc ? resource_height : host_height;
+  desc.mip_levels = output_mip_count;
+  desc.format = mobile_bc ? nrhi::Format::kR8G8B8A8_UNORM : host.resource_format;
   desc.initial_state = nrhi::ResourceState::kCopyDest;
   const auto create_t0 = PerfClock::now();
   out.texture = device->CreateTexture(desc);
@@ -1818,13 +1912,14 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   uint8_t* mapping = static_cast<uint8_t*>(device->Map(out.upload));
   const bool swap_rb_565 =
       rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_5_6_5;
-  for (uint32_t m = 0; m < mip_count; ++m) {
-    const MipPlan& p = plans[m];
-    const uint32_t ox = srcs[m].ox;
-    const uint32_t oy = srcs[m].oy;
-    const uint32_t src_pitch_blocks = srcs[m].pitch_blocks;
-    const uint32_t src_size = srcs[m].size;
-    const uint8_t* guest = tex_scratch.data() + srcs[m].scratch_off;
+  for (uint32_t om = 0; om < output_mip_count; ++om) {
+    const uint32_t sm = first_mip + om;
+    const MipPlan& p = plans[om];
+    const uint32_t ox = srcs[sm].ox;
+    const uint32_t oy = srcs[sm].oy;
+    const uint32_t src_pitch_blocks = srcs[sm].pitch_blocks;
+    const uint32_t src_size = srcs[sm].size;
+    const uint8_t* guest = tex_scratch.data() + srcs[sm].scratch_off;
     const uint32_t row_bytes = p.cols * bytes_per_block;
     uint32_t guard_zeroed = 0;  // blocks zeroed by the range guard (diag)
     // Run-copy untiling. The per-BLOCK GetTiledOffset2D loop made a single
@@ -1906,13 +2001,29 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
           std::memcpy(out_row + i, &value, sizeof(value));
         }
       }
-      std::memcpy(mapping + p.offset + size_t(by) * p.pitch, out_row, row_bytes);
+      if (mobile_bc) {
+        const uint32_t mw = std::max(width >> sm, 1u);
+        const uint32_t mh = std::max(height >> sm, 1u);
+        for (uint32_t bx = 0; bx < p.cols; ++bx) {
+          uint8_t pixels[16][4];
+          DecodeBcMobileBlock(info.format,
+                              out_row + size_t(bx) * bytes_per_block, pixels);
+          for (uint32_t py = 0; py < 4 && by * 4 + py < mh; ++py) {
+            const uint32_t copy_pixels = std::min(4u, mw - bx * 4);
+            std::memcpy(mapping + p.offset + size_t(by * 4 + py) * p.pitch +
+                            size_t(bx * 4) * 4,
+                        pixels[py * 4], size_t(copy_pixels) * 4);
+          }
+        }
+      } else {
+        std::memcpy(mapping + p.offset + size_t(by) * p.pitch, out_row, row_bytes);
+      }
     }
     // Half-black-mip diagnostic (PCU Library banners): discriminate "the
     // guest pool genuinely holds zeros for this mip" from "our addressing
     // zeroed/misread it". Samples 32 uploaded blocks spread over the mip;
     // guard_zeroed separates range-guard zeroing from zero CONTENT.
-    if (m > 0) {
+    if (!mobile_bc && om > 0) {
       uint32_t zero_samples = 0;
       const uint32_t total_blocks = p.rows * p.cols;
       for (uint32_t s = 0; s < 32; ++s) {
@@ -1933,10 +2044,10 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
               "native-scene: MIP DIAG {}x{} mip {}/{} zero_samples={}/32 "
               "guard_zeroed={}/{} ox={} oy={} pitch_b={} size={} min={} "
               "tiled={} fmt={} w0={:08X} w1={:08X} w2={:08X} mip_addr={:08X}",
-              width, height, m, mip_count, zero_samples, guard_zeroed,
+              width, height, sm, mip_count, zero_samples, guard_zeroed,
               total_blocks, ox, oy, src_pitch_blocks, src_size,
-              srcs[m].min_size, info.is_tiled ? 1 : 0, uint32_t(info.format),
-              words[0], words[1], words[2], srcs[m].addr);
+              srcs[sm].min_size, info.is_tiled ? 1 : 0, uint32_t(info.format),
+              words[0], words[1], words[2], srcs[sm].addr);
         }
       }
     }
@@ -1946,7 +2057,8 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   // generated-mips gate excludes): mip 0 as linear block rows, raw guest
   // block format post-endian-swap, for offline decode + byte-diff against
   // gsnap_tex_decode of the same fetch words.
-  if (mip_count == 1 && REXCVAR_GET(skate3_native_render_scene_lm_dump)) {
+  if (!mobile_bc && output_mip_count == 1 &&
+      REXCVAR_GET(skate3_native_render_scene_lm_dump)) {
     char path[260];
     std::snprintf(path, sizeof(path),
                   "native_texture_dumps/plain_%08X_%ux%u_f%u_t%u.blk",
@@ -1967,21 +2079,23 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     // Decode worker: export the commit recipe; the render thread records
     // the copies + barrier and creates the SRV (CommitStagedGuestTexture).
     StagedTexCommit& sc = *g_tex_stage_out;
-    sc.copy_format = host.resource_format;
-    sc.srv_format = host.srv_format;
+    sc.copy_format = mobile_bc ? nrhi::Format::kR8G8B8A8_UNORM : host.resource_format;
+    sc.srv_format = mobile_bc ? nrhi::Format::kR8G8B8A8_UNORM : host.srv_format;
     ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle, sc.swizzle);
-    sc.mip_count = std::min<uint32_t>(mip_count, 16);
+    sc.mip_count = std::min<uint32_t>(output_mip_count, 16);
     for (uint32_t m = 0; m < sc.mip_count; ++m) {
-      sc.mips[m] = {plans[m].offset, plans[m].pitch, std::max(host_width >> m, 1u),
-                    std::max(host_height >> m, 1u)};
+      sc.mips[m] = {plans[m].offset, plans[m].pitch,
+                    std::max((mobile_bc ? resource_width : host_width) >> m, 1u),
+                    std::max((mobile_bc ? resource_height : host_height) >> m, 1u)};
     }
   } else {
     // Record the upload copies into the deferred command list.
-    for (uint32_t m = 0; m < mip_count; ++m) {
+    for (uint32_t m = 0; m < output_mip_count; ++m) {
       const MipPlan& p = plans[m];
       context.cmd->CopyBufferToTexture(out.texture, m, 0, out.upload, p.offset,
-                                       p.pitch, std::max(host_width >> m, 1u),
-                                       std::max(host_height >> m, 1u), 1);
+                                       p.pitch,
+                                       std::max((mobile_bc ? resource_width : host_width) >> m, 1u),
+                                       std::max((mobile_bc ? resource_height : host_height) >> m, 1u), 1);
     }
     context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
                          nrhi::ResourceState::kPixelShaderResource);
@@ -1993,21 +2107,22 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     // SRV view with the composed swizzle.
     nrhi::TextureViewDesc srv;
     srv.dimension = nrhi::ViewDimension::k2D;
-    srv.format = host.srv_format;
+    srv.format = mobile_bc ? nrhi::Format::kR8G8B8A8_UNORM : host.srv_format;
     ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle, srv.swizzle);
-    srv.mip_levels = mip_count;
+    srv.mip_levels = output_mip_count;
     out.srv_format = srv.format;
-    out.srv_mips = mip_count;
+    out.srv_mips = output_mip_count;
     out.srv = device->CreateTextureView(out.texture, srv);
     if (out.srv == nullptr) {
       return false;
     }
   }
   // Payload sample for content revalidation (see GuestTexture).
-  out.payload_addr = 0xA0000000u | info.memory.base_address;
-  out.payload_size = srcs[0].size;
-  BuildPayloadProbes(info, srcs[0].addr, srcs[0].ox, srcs[0].oy,
-                     srcs[0].pitch_blocks, srcs[0].size, out);
+  out.payload_addr = 0xA0000000u | srcs[first_mip].addr;
+  out.payload_size = srcs[first_mip].size;
+  BuildPayloadProbes(info, srcs[first_mip].addr, srcs[first_mip].ox,
+                     srcs[first_mip].oy, srcs[first_mip].pitch_blocks,
+                     srcs[first_mip].size, out);
   out.payload_fp = SampleProbeFingerprint(base, out);
   out.near_black = SampleProbeNearBlack(base, out);
   out.recheck_frame = 0;
@@ -3905,7 +4020,8 @@ bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
-// 1x1 white diffuse fallback + 1x1x6 mid-gray environment-cube fallback.
+// 1x1 white diffuse fallback + 1x1 neutral baked-lighting substitute +
+// 1x1x6 mid-gray environment-cube fallback.
 bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
   if (!g_r.white.valid) {
@@ -3942,6 +4058,53 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
       return false;
     }
     g_r.white.valid = true;
+  }
+  if (!g_r.neutral_lightmap.valid) {
+    // The handheld potato profile intentionally discards guest lightmaps.
+    // Binding the ordinary white fallback makes exact world shaders run at
+    // full baked brightness and washes out the base diffuse. A single shared
+    // neutral texel preserves useful contrast at effectively zero memory and
+    // upload cost, without reintroducing guest texture resolves or streaming.
+    nrhi::TextureDesc desc;
+    desc.width = 1;
+    desc.height = 1;
+    desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+    desc.initial_state = nrhi::ResourceState::kCopyDest;
+    g_r.neutral_lightmap.texture = device->CreateTexture(desc);
+    if (g_r.neutral_lightmap.texture == nullptr) {
+      g_r.failed = true;
+      return false;
+    }
+    g_r.neutral_lightmap.upload =
+        CreateUploadBuffer(device, 256, nrhi::BufferBindClass::kCopySrc);
+    if (!g_r.neutral_lightmap.upload) {
+      g_r.failed = true;
+      return false;
+    }
+    uint8_t* mapping =
+        static_cast<uint8_t*>(device->Map(g_r.neutral_lightmap.upload));
+    mapping[0] = 0xB0;
+    mapping[1] = 0xB0;
+    mapping[2] = 0xB0;
+    mapping[3] = 0xFF;
+    device->Unmap(g_r.neutral_lightmap.upload);
+    context.cmd->CopyBufferToTexture(g_r.neutral_lightmap.texture, 0, 0,
+                                     g_r.neutral_lightmap.upload, 0, 256, 1,
+                                     1, 1);
+    context.cmd->Barrier(g_r.neutral_lightmap.texture,
+                         nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
+    g_r.device->DestroyDeferred(g_r.neutral_lightmap.upload);
+    g_r.neutral_lightmap.upload = nullptr;
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.neutral_lightmap.srv =
+        device->CreateTextureView(g_r.neutral_lightmap.texture, vd);
+    if (g_r.neutral_lightmap.srv == nullptr) {
+      g_r.failed = true;
+      return false;
+    }
+    g_r.neutral_lightmap.valid = true;
   }
   if (!g_r.white_cube.valid) {
     // 1x1x6 mid-gray fallback cube for the water reflection slot (t6): a
@@ -3989,11 +4152,113 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
+// Uploads the host-owned penguin mesh and atlas through the same RHI buffers
+// used by decoded guest meshes. Geometry is placed in the ordinary mesh map
+// so shadows, outlines, and the main pass all understand it without parallel
+// draw code.
+bool EnsurePenguinResources(const NativeGuestOutputRenderContext& context) {
+  const penguin_mod::Asset* rigged = penguin_mod::GetRiggedAsset();
+  if (rigged == nullptr) return false;
+  const penguin_mod::Asset& asset = *rigged;
+
+  nrhi::Device* device = context.device;
+  if (!g_r.meshes.contains(penguin_mod::kMeshKey)) {
+    MeshBuffers mesh;
+    const size_t vb_bytes = asset.vertices.size() * sizeof(float);
+    const size_t ib_bytes = asset.indices.size() * sizeof(uint16_t);
+    mesh.vb = CreateUploadBuffer(device, vb_bytes,
+                                 nrhi::BufferBindClass::kVertexIndex);
+    mesh.ib = CreateUploadBuffer(device, ib_bytes,
+                                 nrhi::BufferBindClass::kVertexIndex);
+    if (mesh.vb == nullptr || mesh.ib == nullptr) {
+      if (mesh.vb != nullptr) device->DestroyDeferred(mesh.vb);
+      if (mesh.ib != nullptr) device->DestroyDeferred(mesh.ib);
+      REXLOG_ERROR("penguin-mod: GPU mesh allocation failed");
+      return false;
+    }
+    void* vb_map = device->Map(mesh.vb);
+    void* ib_map = device->Map(mesh.ib);
+    if (vb_map == nullptr || ib_map == nullptr) {
+      if (vb_map != nullptr) device->Unmap(mesh.vb);
+      if (ib_map != nullptr) device->Unmap(mesh.ib);
+      device->DestroyDeferred(mesh.vb);
+      device->DestroyDeferred(mesh.ib);
+      REXLOG_ERROR("penguin-mod: GPU mesh mapping failed");
+      return false;
+    }
+    std::memcpy(vb_map, asset.vertices.data(), vb_bytes);
+    std::memcpy(ib_map, asset.indices.data(), ib_bytes);
+    device->Unmap(mesh.vb);
+    device->Unmap(mesh.ib);
+    mesh.vb_view = {mesh.vb, 0, uint32_t(vb_bytes), 56};
+    mesh.ib_view = {mesh.ib, 0, uint32_t(ib_bytes)};
+    mesh.fingerprint = 0x50454E4755494E32ull;
+    g_r.meshes.emplace(penguin_mod::kMeshKey, std::move(mesh));
+  }
+
+  if (!g_r.penguin.valid) {
+    nrhi::TextureDesc desc;
+    desc.width = asset.texture_width;
+    desc.height = asset.texture_height;
+    desc.mip_levels = 1;
+    desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+    desc.initial_state = nrhi::ResourceState::kCopyDest;
+    g_r.penguin.texture = device->CreateTexture(desc);
+    const uint32_t row_bytes = asset.texture_width * 4;
+    const uint32_t row_pitch =
+        (row_bytes + nrhi::kRowPitchAlignment - 1) &
+        ~(nrhi::kRowPitchAlignment - 1);
+    const size_t upload_bytes = size_t(row_pitch) * asset.texture_height;
+    g_r.penguin.upload = CreateUploadBuffer(
+        device, upload_bytes, nrhi::BufferBindClass::kCopySrc);
+    if (g_r.penguin.texture == nullptr || g_r.penguin.upload == nullptr) {
+      REXLOG_ERROR("penguin-mod: GPU texture allocation failed");
+      return false;
+    }
+    uint8_t* mapping = static_cast<uint8_t*>(device->Map(g_r.penguin.upload));
+    if (mapping == nullptr) {
+      REXLOG_ERROR("penguin-mod: GPU texture mapping failed");
+      return false;
+    }
+    for (uint32_t y = 0; y < asset.texture_height; ++y) {
+      std::memcpy(mapping + size_t(y) * row_pitch,
+                  asset.rgba.data() + size_t(y) * row_bytes, row_bytes);
+    }
+    device->Unmap(g_r.penguin.upload);
+    context.cmd->CopyBufferToTexture(
+        g_r.penguin.texture, 0, 0, g_r.penguin.upload, 0, row_pitch,
+        asset.texture_width, asset.texture_height, 1);
+    context.cmd->Barrier(g_r.penguin.texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
+    device->DestroyDeferred(g_r.penguin.upload);
+    g_r.penguin.upload = nullptr;
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.penguin.srv = device->CreateTextureView(g_r.penguin.texture, vd);
+    if (g_r.penguin.srv == nullptr) {
+      REXLOG_ERROR("penguin-mod: texture view creation failed");
+      return false;
+    }
+    g_r.penguin.valid = true;
+    REXLOG_INFO("penguin-mod: native GPU resources ready");
+  }
+  return true;
+}
+
 // Depth buffer + MSAA color target, rebuilt on output-size change.
 bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
+#if REX_PLATFORM_ANDROID
+  // Aggressive 288p internal scene raster. The guest output remains
+  // 1280x720 so emulated menus and the native HUD keep their original
+  // layout/sharpness. This also leaves thermal headroom after the CPU-side
+  // scene cuts expose more throughput.
+  const uint32_t width = std::min(context.guest_output_width, 512u);
+  const uint32_t height = std::min(context.guest_output_height, 288u);
+#else
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
+#endif
   const nrhi::Format want_scene_fmt =
       g_r.hdr_active ? g_r.hdr_scene_format : nrhi::Format::kUnknown;
   if (!g_r.depth || g_r.depth_width != width || g_r.depth_height != height ||
@@ -4044,6 +4309,38 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
     }
     g_r.depth_width = width;
     g_r.depth_height = height;
+
+#if REX_PLATFORM_ANDROID
+    if (g_r.handheld_srv != nullptr) {
+      g_r.device->DestroyDeferred(g_r.handheld_srv);
+      g_r.handheld_srv = nullptr;
+    }
+    if (g_r.handheld_color != nullptr) {
+      g_r.device->DestroyDeferred(g_r.handheld_color);
+      g_r.handheld_color = nullptr;
+    }
+    nrhi::TextureDesc handheld_desc;
+    handheld_desc.width = width;
+    handheld_desc.height = height;
+    handheld_desc.mip_levels = 1;
+    handheld_desc.format = context.guest_output->format();
+    handheld_desc.usage = nrhi::kTextureUsageRenderTarget;
+    handheld_desc.initial_state = nrhi::ResourceState::kRenderTarget;
+    g_r.handheld_color = g_r.device->CreateTexture(handheld_desc);
+    if (g_r.handheld_color != nullptr) {
+      nrhi::TextureViewDesc handheld_view_desc;
+      handheld_view_desc.mip_levels = 1;
+      g_r.handheld_srv =
+          g_r.device->CreateTextureView(g_r.handheld_color, handheld_view_desc);
+    }
+    if (g_r.handheld_color == nullptr || g_r.handheld_srv == nullptr) {
+      REXLOG_ERROR("native-scene: Android 288p scene target creation failed");
+      g_r.failed = true;
+      return false;
+    }
+    g_r.handheld_width = width;
+    g_r.handheld_height = height;
+#endif
 
     if (g_r.msaa > 1) {
       // MSAA color target + its Texture2DMS view for the fullscreen resolve
@@ -4559,6 +4856,34 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
       g_miss_inflight_mesh.erase(e.mesh);
     }
     return;
+  }
+  if (REXCVAR_GET(skate3_native_render_scene_handheld_potato)) {
+    const bool drop = item.env_family == 7 || item.env_family == 9 ||
+                      item.env_family == 10 || item.transparent ||
+                      item.env_family == 13 || item.char_family == 3 ||
+                      item.char_family == 6 || item.char_family == 7 ||
+                      item.dynobj != 0;
+    if (drop) {
+      // Count this registration as completed without allocating any GPU
+      // buffers or staging textures. The live capture/build path applies
+      // the identical classification, so this content can never miss later.
+      PrewarmResult res;
+      res.item = std::move(item);
+      std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
+      g_prewarm_out.push_back(std::move(res));
+      return;
+    }
+    if (item.char_family == 0 && !item.water) {
+      item.lightmap_tex = 0;
+      item.macro_tex = 0;
+      item.detail_tex = 0;
+      item.spec_tex = 0;
+      item.decal_art = 0;
+      item.decal = false;
+      item.decal_tileable = false;
+      std::memset(item.diffuse_fetch, 0, sizeof(item.diffuse_fetch));
+      std::memset(item.decal_fetch, 0, sizeof(item.decal_fetch));
+    }
   }
   // One representative draw entry so DecodeMesh's two-sided-sheet detection
   // keys off the real primitive type (empty draw lists would pass it
@@ -7639,6 +7964,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (!EnsurePipeline(context)) {
     return false;
   }
+  const bool has_penguin =
+      std::any_of(scene.items.begin(), scene.items.end(), [](const DrawItem& item) {
+        return item.mesh == penguin_mod::kMeshKey;
+      });
+  if (has_penguin && !EnsurePenguinResources(context)) {
+    return false;
+  }
   // Flush any barriers pushed by lazy resource creation (white texture).
   context.cmd->FlushBarriers();
 
@@ -7759,6 +8091,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         return false;
       }
       if (!small_or_stale) {
+        // A substantial native world is a stronger gameplay signal than the
+        // title's delayed presence-context update. Stop the boot dialog
+        // auto-tap here so it can never bleed into live skating or be re-armed.
+        const bool automation_was_active =
+            !rex::kernel::xam::IsSyntheticBootAutomationComplete();
+        rex::kernel::xam::CompleteSyntheticBootAutomation();
+        if (automation_was_active) {
+          REXLOG_INFO(
+              "native-scene: gameplay takeover completed boot input automation");
+        }
         g_warmup_armed.store(false, std::memory_order_relaxed);
         g_settle_until_frame = frame_number + 120;
         g_takeover_frame = frame_number;
@@ -7815,12 +8157,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // per-pass spans. The first mark starts here so the frame's store commits
   // and evictions are attributed separately from the render passes.
   cmd->ProfileRegion(nrhi::ProfileStage::kCommit);
-
-  if (!g_r.announced) {
-    g_r.announced = true;
-    REXLOG_INFO("native-scene: rendering natively ({} items, {}x{})", scene.items.size(),
-                context.guest_output_width, context.guest_output_height);
-  }
 
   // Commit finished worker decodes every frame (streamed arenas decode on
   // the workers before their first draw instead of hitching the first frame
@@ -7886,10 +8222,31 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   const bool hdr_on = g_r.hdr_active && g_r.hdr_resolved != nullptr &&
                       g_r.hdr_srv != nullptr && g_r.pso_tonemap != nullptr;
   const bool msaa_on = g_r.msaa > 1 && g_r.msaa_color != nullptr && g_r.resolve_pso != nullptr;
+#if REX_PLATFORM_ANDROID
+  const bool handheld_on = !hdr_on && !msaa_on && g_r.handheld_color != nullptr &&
+                           g_r.handheld_srv != nullptr &&
+                           g_r.pso_blur_blit != nullptr;
+#else
+  constexpr bool handheld_on = false;
+#endif
+  if (!g_r.announced) {
+    g_r.announced = true;
+    if (handheld_on) {
+      REXLOG_INFO(
+          "native-scene: rendering natively ({} items, scene {}x{} -> output {}x{})",
+          scene.items.size(), g_r.handheld_width, g_r.handheld_height,
+          context.guest_output_width, context.guest_output_height);
+    } else {
+      REXLOG_INFO("native-scene: rendering natively ({} items, {}x{})",
+                  scene.items.size(), context.guest_output_width,
+                  context.guest_output_height);
+    }
+  }
   nrhi::Texture* scene_color =
-      msaa_on ? g_r.msaa_color
+      handheld_on ? g_r.handheld_color
+      : msaa_on ? g_r.msaa_color
               : (hdr_on ? g_r.hdr_resolved : context.guest_output);
-  if (!msaa_on && !hdr_on) {
+  if (!handheld_on && !msaa_on && !hdr_on) {
     cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
                  nrhi::ResourceState::kRenderTarget);
     cmd->FlushBarriers();
@@ -7923,15 +8280,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cmd->SetRenderTargets(scene_color, nullptr);
   }
 
-  const nrhi::Viewport viewport{0.0f,
-                                0.0f,
-                                float(context.guest_output_width),
-                                float(context.guest_output_height),
-                                0.0f,
-                                1.0f};
+  nrhi::Viewport viewport{0.0f, 0.0f,
+                          float(handheld_on ? g_r.handheld_width
+                                            : context.guest_output_width),
+                          float(handheld_on ? g_r.handheld_height
+                                            : context.guest_output_height),
+                          0.0f, 1.0f};
   cmd->SetViewport(viewport);
-  const nrhi::Rect scissor{0, 0, int32_t(context.guest_output_width),
-                           int32_t(context.guest_output_height)};
+  nrhi::Rect scissor{0, 0,
+                     int32_t(handheld_on ? g_r.handheld_width
+                                         : context.guest_output_width),
+                     int32_t(handheld_on ? g_r.handheld_height
+                                         : context.guest_output_height)};
   cmd->SetScissor(scissor);
   cmd->SetBindingLayout(g_r.layout);
   cmd->SetPipeline(use_depth ? g_r.pso : g_r.pso_nodepth);
@@ -8457,7 +8817,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       const bool trm = g_trace_mesh_addr != 0 && item.mesh == g_trace_mesh_addr;
       auto rit = g_r.tex_routes.find(tex_ptr);
-      if (!item.retained) {
+      if (!item.retained &&
+          (rit == g_r.tex_routes.end() ||
+           rit->second.refreshed_frame != frame_number)) {
         // Route refresh: seqlock-stable read of the live fetch words (a
         // mid-rewrite mixed snapshot must never become a key; it would
         // decode a coherent image of the WRONG memory, the pool-page
@@ -8473,6 +8835,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             std::memcpy(rit->second.words, live, sizeof(live));
             rit->second.key = FetchWordsKey(live);
             rit->second.demoted = demoted;
+            rit->second.refreshed_frame = frame_number;
           } else if (demoted) {
             // Mip-0 demoted (base address cleared; the old pool range is
             // already reused): hold the pre-demote route; its decode
@@ -8489,6 +8852,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                             frame_number, tex_ptr);
               }
             }
+            rit->second.refreshed_frame = frame_number;
           } else if (std::memcmp(live, rit->second.words, sizeof(live)) != 0) {
             if (trm) {
               REXLOG_INFO(
@@ -8504,12 +8868,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             std::memcpy(rit->second.words, live, sizeof(live));
             rit->second.key = FetchWordsKey(live);
             rit->second.demoted = false;
+            rit->second.refreshed_frame = frame_number;
           } else {
             rit->second.demoted = false;
+            rit->second.refreshed_frame = frame_number;
           }
         } else if (trm) {
           REXLOG_INFO("tex-trace: f{} obj={:08X} words UNSTABLE (mid-rewrite)",
                       frame_number, tex_ptr);
+        } else if (rit != g_r.tex_routes.end()) {
+          // One unstable double-read is enough for this frame. Keep the last
+          // coherent route and retry next frame instead of letting every
+          // material user repeat the same racing guest loads.
+          rit->second.refreshed_frame = frame_number;
         }
       }
       if (rit == g_r.tex_routes.end()) {
@@ -8768,7 +9139,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // the words-keyed cache (shared with the 2D pass; the art has no guest
     // object to key on).
     const GuestTexture* diffuse =
-        item.diffuse_fetch[1] != 0
+        item.mesh == penguin_mod::kMeshKey
+            ? &g_r.penguin
+        : item.diffuse_fetch[1] != 0
             ? resolve_fetch_words(item.diffuse_fetch, uint64_t(item.mesh) << 1,
                                   item.retained)
             : nullptr;
@@ -8795,6 +9168,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             : nullptr;
     if (lightmap == &g_r.white) {
       lightmap = nullptr;
+    }
+    if (lightmap == nullptr &&
+        REXCVAR_GET(skate3_native_render_scene_handheld_potato) &&
+        item.char_family == 0 && !item.unlit && !item.water) {
+      lightmap = &g_r.neutral_lightmap;
     }
 
     // constants = world + mvp (world * view_proj, row-vector) + tint + cam
@@ -9982,6 +10360,35 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
     };
+    // The guest submits for its unsmoothed camera and retention deliberately
+    // keeps an edge guard-band alive. On a handheld CPU, don't pay draw-state
+    // and texture-routing cost for static bounds that are outside the actual
+    // published render camera. A 5% margin preserves fast-pan edges.
+    if (!item.skinned && !item.ropa && !item.cloth_quads &&
+        item.bones.empty() &&
+        ItemOutsideFrustum(item, scene.view_proj, 1.05f)) {
+      stamp_route(4);
+      continue;
+    }
+    // Screen-size-biased clutter LOD for the aggressive handheld profile.
+    // Preserve large surfaces and nearby skate geometry; progressively
+    // discard tiny static props whose complete draw/material setup resolves
+    // to only a handful of pixels at 360p.
+    if (REXCVAR_GET(skate3_native_render_scene_handheld_potato) &&
+        !item.dyn_entity && !item.skinned && !item.ropa &&
+        !item.cloth_quads && item.bones.empty()) {
+      const float sx = item.bbox_max[0] - item.bbox_min[0];
+      const float sy = item.bbox_max[1] - item.bbox_min[1];
+      const float sz = item.bbox_max[2] - item.bbox_min[2];
+      const float span = std::max(sx, std::max(sy, sz));
+      const float d2 = view_dist2(item);
+      if ((span < 0.35f && d2 > 100.0f) ||
+          (span < 1.0f && d2 > 625.0f) ||
+          (span < 3.0f && d2 > 3025.0f)) {
+        stamp_route(5);
+        continue;
+      }
+    }
     // Occlusion cull (statics only; same classifiability gate as the
     // profiler): the 1 m depth margin on top of the conservative bbox test
     // keeps reveal edges safe at speed - deeply hidden mass sits many
@@ -10075,6 +10482,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       const bool hair = item->char_family >= 4 && item->char_family <= 5 &&
                         item->char_rows[14 * 4 + 1] > 0.0f;
       if (hair && use_depth && g_r.pso_hair_a != nullptr && g_r.pso_hair_b != nullptr) {
+        if (REXCVAR_GET(skate3_native_render_scene_handheld_potato)) {
+          // The desktop path layers opposing cull passes for far/near hair
+          // strands. One coverage pass is sufficient at 360p and halves the
+          // CPU draw cost of every hair item.
+          cmd->SetPipeline(g_r.pso_hair_a);
+          timed_draw(*item);
+          cmd->SetPipeline(blend_bound);
+          continue;
+        }
         // The game's two hair passes: cull BACK then cull FRONT with the
         // same shader: keeps far-side strands from compositing over
         // near-side ones (one uncull(ed) pass reads as crunchy noise).
@@ -10479,6 +10895,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
     cmd->Draw(3, 0);
     cmd->Barrier(g_r.msaa_color, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+  }
+
+  if (handheld_on) {
+    // One bilinear upscale of the finished 3D scene. Everything after this
+    // point (outline/post, popup blur, HUD/APT and the recomp settings UI)
+    // uses the full 1280x720 guest output, so lowering 3D cost cannot blur
+    // text or disturb menu coordinates.
+    cmd->Barrier(g_r.handheld_color, nrhi::ResourceState::kRenderTarget,
+                 nrhi::ResourceState::kPixelShaderResource);
+    cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->FlushBarriers();
+    viewport = nrhi::Viewport{0.0f, 0.0f, float(context.guest_output_width),
+                              float(context.guest_output_height), 0.0f, 1.0f};
+    scissor = nrhi::Rect{0, 0, int32_t(context.guest_output_width),
+                         int32_t(context.guest_output_height)};
+    cmd->SetRenderTargets(context.guest_output, nullptr);
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    cmd->SetBindingLayout(g_r.layout);
+    cmd->SetPipeline(g_r.pso_blur_blit);
+    cmd->SetTexture(1, g_r.handheld_srv);
+    cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.handheld_color, nrhi::ResourceState::kPixelShaderResource,
                  nrhi::ResourceState::kRenderTarget);
   }
 
@@ -11574,6 +12016,35 @@ void ResetSceneFailure() {
 }
 
 void Install() {
+#if REX_PLATFORM_ANDROID
+  // Handheld performance profile. These are enforced after persisted CVar
+  // state is loaded so an old desktop-quality session can't silently turn
+  // expensive effects back on for a Mali-class phone GPU.
+  REXCVAR_SET(skate3_native_render_scene, true);
+  REXCVAR_SET(skate3_native_render_scene_handheld_potato, true);
+  REXCVAR_SET(skate3_native_render_scene_msaa, 1);
+  REXCVAR_SET(skate3_native_render_scene_shadows, false);
+  REXCVAR_SET(skate3_native_render_scene_shadow_static_casters, false);
+  REXCVAR_SET(skate3_native_render_scene_shadow_pcss, false);
+  REXCVAR_SET(skate3_native_render_scene_ssao, false);
+  REXCVAR_SET(skate3_native_render_scene_ssr, false);
+  REXCVAR_SET(skate3_native_render_scene_hdr, false);
+  REXCVAR_SET(skate3_native_render_scene_bloom, false);
+  REXCVAR_SET(skate3_native_render_scene_shafts, false);
+  REXCVAR_SET(skate3_native_render_scene_selection_outline, false);
+  REXCVAR_SET(skate3_native_render_scene_lightmaps, false);
+  REXCVAR_SET(skate3_native_render_scene_macro, false);
+  REXCVAR_SET(skate3_native_render_scene_decals, false);
+  REXCVAR_SET(skate3_native_render_scene_sort_opaque, false);
+  REXCVAR_SET(skate3_native_render_scene_splines, false);
+  REXCVAR_SET(skate3_native_render_scene_ropa_blend, false);
+  REXCVAR_SET(skate3_native_render_scene_entity_fade, false);
+  REXCVAR_SET(skate3_native_render_scene_lw_fade, false);
+  REXCVAR_SET(skate3_native_render_scene_lw_gap_fill, false);
+  REXCVAR_SET(skate3_native_render_scene_lw_identity, false);
+  REXCVAR_SET(skate3_native_render_scene_lw_palette, false);
+  REXCVAR_SET(skate3_native_render_scene_prewarm_budget_ms, 8);
+#endif
   // Registered even when the scene cvar starts off: RenderScene yields to the
   // emulated output while disabled, and the runtime toggle (F5) can flip the
   // cvar live at any point after boot.
@@ -11597,4 +12068,3 @@ void ResetSceneFailure() {}
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12 || REX_HAS_VULKAN
-
