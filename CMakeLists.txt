@@ -23,6 +23,17 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Android 15 and newer may run on devices with 16 KB memory pages. NDK r27
+# still defaults shared-library LOAD segments to 4 KB, so apply Android's
+# recommended flexible-page-size linker alignment to every target below,
+# including the bundled ReXGlue runtime.
+if(ANDROID)
+    add_link_options(
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384"
+    )
+endif()
+
 include(cmake/Skate3Version.cmake)
 
 skate3_resolve_version(SKATE3_FULL_VERSION

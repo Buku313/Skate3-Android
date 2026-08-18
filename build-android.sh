@@ -204,6 +204,26 @@ fi
 mkdir -p "${project_root}/out"
 cp -f "$apk" "$friendly_apk"
 
+# Android 15+ devices may use 16 KB pages. Refuse to ship another APK whose
+# native LOAD segments or uncompressed JNI entries are aligned to only 4 KB.
+llvm_readelf="$(find "${android_ndk}/toolchains/llvm/prebuilt" \
+  -path '*/bin/llvm-readelf' -print -quit)"
+[[ -x "$llvm_readelf" ]] || die "llvm-readelf was not found in the Android NDK"
+for native_lib in "${project_root}/android/app/libs/arm64-v8a/"*.so; do
+  saw_load=false
+  while IFS= read -r alignment; do
+    saw_load=true
+    (( alignment >= 0x4000 )) ||
+      die "$(basename "$native_lib") has a LOAD segment below 16 KB alignment"
+  done < <("$llvm_readelf" -lW "$native_lib" | awk '$1 == "LOAD" { print $NF }')
+  $saw_load || die "$(basename "$native_lib") has no readable ELF LOAD segments"
+done
+
+zipalign="${android_sdk}/build-tools/35.0.0/zipalign"
+[[ -x "$zipalign" ]] || die "Android build-tools 35.0.0 zipalign is missing"
+"$zipalign" -c -P 16 4 "$friendly_apk" ||
+  die "APK native libraries are not ZIP-aligned for 16 KB Android devices"
+
 if $release_build; then
   apksigner="${android_sdk}/build-tools/35.0.0/apksigner"
   [[ -x "$apksigner" ]] || die "Android build-tools 35.0.0 apksigner is missing"

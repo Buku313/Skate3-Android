@@ -90,6 +90,7 @@ the person building the project. This is experimental research software, and a
 - Menus and controller input work
 - Gameplay and tricks work
 - Native Vulkan rendering works
+- 4 KB and 16 KB Android memory pages are supported
 - Saves and game data load from Android storage
 - RG406V performance profile included
 - High-end Android quality profile included
