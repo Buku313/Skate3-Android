@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Skate 3 Mobile | Native Android Port</title>
+  <meta name="description" content="Play Skate 3 natively on supported Android phones and handhelds. Download one APK, select your own Xbox 360 ISO, and skate.">
+  <meta name="theme-color" content="#ff6518">
+  <meta property="og:title" content="Skate 3 Mobile">
+  <meta property="og:description" content="Native ARM64 Skate 3 on Android. Download the APK, select your own ISO, and play.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://buku313.github.io/Skate3-Mobile/">
+  <meta property="og:image" content="https://buku313.github.io/Skate3-Mobile/skate3-android-social-preview.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" href="https://buku313.github.io/Skate3-Mobile/">
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f8f8fb;
+      --muted: #a7a8b2;
+      --panel: #17171c;
+      --line: #2a2a32;
+      --orange: #ff6518;
+      --orange-hot: #ff8a2f;
+      --cyan: #41d7ff;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 80% 0%, rgba(65, 215, 255, .12), transparent 30rem),
+        radial-gradient(circle at 5% 30%, rgba(255, 101, 24, .12), transparent 26rem),
+        #09090b;
+      line-height: 1.55;
+    }
+    a { color: inherit; }
+    .wrap { width: min(1120px, calc(100% - 36px)); margin: 0 auto; }
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 72px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+    }
+    .brand { font-weight: 950; letter-spacing: -.04em; font-size: 1.15rem; text-decoration: none; }
+    .brand span { color: var(--orange); }
+    .github { color: var(--muted); font-weight: 750; text-decoration: none; }
+    .github:hover { color: white; }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.04fr .96fr;
+      gap: clamp(34px, 6vw, 86px);
+      align-items: center;
+      min-height: calc(100vh - 72px);
+      padding: 68px 0 86px;
+    }
+    .eyebrow { color: var(--orange); font-weight: 900; letter-spacing: .16em; font-size: .78rem; }
+    h1 {
+      max-width: 760px;
+      margin: 14px 0 20px;
+      font-size: clamp(3.4rem, 9vw, 7.8rem);
+      line-height: .83;
+      letter-spacing: -.075em;
+      font-weight: 1000;
+    }
+    h1 span { display: block; color: var(--orange); }
+    .lede { max-width: 620px; color: #d7d7dd; font-size: clamp(1.05rem, 2vw, 1.28rem); }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 30px 0 14px; }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 58px;
+      padding: 0 25px;
+      border-radius: 12px;
+      background: var(--orange);
+      color: #080808;
+      font-weight: 950;
+      text-decoration: none;
+      box-shadow: 0 12px 42px rgba(255,101,24,.28);
+      transition: transform .18s ease, background .18s ease;
+    }
+    .button:hover { transform: translateY(-2px); background: var(--orange-hot); }
+    .button.secondary { background: #24242b; color: white; box-shadow: none; }
+    .fine { color: var(--muted); font-size: .86rem; }
+    .cover {
+      position: relative;
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,.1);
+      border-radius: 28px;
+      background: linear-gradient(145deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
+      box-shadow: 0 32px 90px rgba(0,0,0,.45);
+      transform: rotate(1.5deg);
+    }
+    .cover img { width: 100%; display: block; border-radius: 18px; }
+    .status {
+      position: absolute;
+      right: -14px;
+      bottom: 26px;
+      border: 1px solid rgba(65,215,255,.35);
+      border-radius: 999px;
+      padding: 9px 14px;
+      background: #0c1518;
+      color: var(--cyan);
+      font-size: .78rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+    }
+    section { padding: 84px 0; border-top: 1px solid rgba(255,255,255,.08); }
+    h2 { margin: 0 0 14px; font-size: clamp(2rem, 5vw, 3.5rem); letter-spacing: -.045em; }
+    .section-intro { margin: 0 0 34px; color: var(--muted); max-width: 700px; }
+    .steps, .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .step, .card {
+      min-height: 190px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(23,23,28,.82);
+    }
+    .number { color: var(--orange); font-weight: 1000; font-size: 2rem; }
+    h3 { margin: 12px 0 8px; font-size: 1.18rem; }
+    .step p, .card p { color: var(--muted); margin: 0; }
+    .requirements { margin-top: 22px; padding: 20px 22px; border-left: 4px solid var(--cyan); background: #10161a; color: #d8e9ef; }
+    .download-panel {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 30px;
+      padding: clamp(28px, 6vw, 58px);
+      border-radius: 24px;
+      background: linear-gradient(120deg, #ff6518, #ff9a32);
+      color: #090909;
+    }
+    .download-panel h2 { margin: 0; }
+    .download-panel p { max-width: 580px; margin: 8px 0 0; font-weight: 650; }
+    .download-panel .button { background: #090909; color: white; box-shadow: none; white-space: nowrap; }
+    footer { padding: 42px 0 56px; color: #7d7e87; font-size: .86rem; }
+    footer a { color: #c5c6ce; }
+    @media (max-width: 780px) {
+      .hero { grid-template-columns: 1fr; min-height: auto; padding-top: 50px; }
+      .cover { transform: none; }
+      .steps, .cards { grid-template-columns: 1fr; }
+      .download-panel { align-items: flex-start; flex-direction: column; }
+      .download-panel .button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header class="wrap">
+    <nav>
+      <a class="brand" href="#top">SKATE 3 <span>MOBILE</span></a>
+      <a class="github" href="https://github.com/Buku313/Skate3-Mobile">Source on GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <div class="wrap hero">
+      <div>
+        <div class="eyebrow">NATIVE ARM64 ANDROID PORT</div>
+        <h1>SKATE<span>ANYWHERE.</span></h1>
+        <p class="lede">Skate 3 running natively on supported Android phones and handhelds. Download one APK, select an ISO dumped from your own copy, and start skating.</p>
+        <div class="actions">
+          <a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD APK</a>
+          <a class="button secondary" href="#install">HOW TO INSTALL</a>
+        </div>
+        <div class="fine">Android 13+ · ARM64 · Vulkan · Physical controller required</div>
+      </div>
+      <div class="cover">
+        <img src="skate3-android-cover.png" alt="Android mascot skateboarding in front of the Skate 3 logo">
+        <div class="status">PLAYABLE · EXPERIMENTAL</div>
+      </div>
+    </div>
+
+    <section id="install">
+      <div class="wrap">
+        <h2>Three steps. No computer.</h2>
+        <p class="section-intro">The app handles extraction and the verified Title Update locally. Your ISO stays on your device and is never uploaded.</p>
+        <div class="steps">
+          <article class="step"><div class="number">01</div><h3>Install the APK</h3><p>Download Skate 3 Mobile and allow your browser to install this one app when Android asks.</p></article>
+          <article class="step"><div class="number">02</div><h3>Select your ISO</h3><p>Open the app and choose an Xbox 360 Skate 3 ISO dumped from your own supported copy.</p></article>
+          <article class="step"><div class="number">03</div><h3>Wait, then skate</h3><p>The app extracts and verifies the files, installs Title Update 3, and gives you a Play button.</p></article>
+        </div>
+        <div class="requirements"><strong>Before downloading:</strong> allow roughly 8 GiB free after the ISO is already available. The current build supports Android 13 or newer, 64-bit ARM, Vulkan, and controller input. It does not support iPhone or 32-bit Android devices.</div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <h2>Built for players.</h2>
+        <p class="section-intro">Performance mode targets handheld hardware such as the RG406V. Quality mode is included for stronger phones.</p>
+        <div class="cards">
+          <article class="card"><h3>Native Vulkan rendering</h3><p>Static ARM64 recompilation with a native scene renderer. This is not conventional Xbox 360 emulation.</p></article>
+          <article class="card"><h3>Original or Seiyu</h3><p>The original skater is the default. Import the optional Seiyu files, then switch characters live from the RB + Start Mods menu.</p></article>
+          <article class="card"><h3>Your game stays yours</h3><p>No retail game assets are included. The installer reads your own ISO locally, never uploads it, and does not request All files access.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap download-panel">
+        <div><h2>Ready to skate?</h2><p>Grab the latest signed Android build. Release notes, checksums, source code, and issue reporting remain available on GitHub.</p></div>
+        <a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">GET SKATE 3 MOBILE</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    This is an experimental, unofficial fan project. It is not affiliated with Electronic Arts, Black Box, Microsoft, Google, or Android. Skate 3 and related properties belong to their respective owners. <a href="https://github.com/Buku313/Skate3-Mobile">Read the source and credits.</a>
+  </footer>
+</body>
+</html>

@@ -3,21 +3,42 @@ plugins {
 }
 
 def buildWithCMake = project.hasProperty('BUILD_WITH_CMAKE');
+def releaseKeystore = System.getenv('SKATE3_RELEASE_KEYSTORE')
+def releaseStorePassword = System.getenv('SKATE3_RELEASE_STORE_PASSWORD')
+def releaseKeyAlias = System.getenv('SKATE3_RELEASE_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('SKATE3_RELEASE_KEY_PASSWORD')
 
 android {
     namespace = "chat.buku.skate3"
     compileSdkVersion 35
     ndkVersion = "27.2.12479018"
+    signingConfigs {
+        if (releaseKeystore && releaseStorePassword && releaseKeyAlias && releaseKeyPassword) {
+            release {
+                storeFile file(releaseKeystore)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
     defaultConfig {
-        applicationId "chat.buku.skate3.dev"
+        applicationId "chat.buku.skate3"
         minSdkVersion 33
         targetSdkVersion 35
-        versionCode 20005
-        versionName "2.0.5-phone-setup"
+        versionCode 20006
+        versionName "2.0.6"
     }
     buildTypes {
+        debug {
+            applicationIdSuffix ".dev"
+            versionNameSuffix "-debug"
+        }
         release {
             minifyEnabled false
+            if (signingConfigs.findByName('release') != null) {
+                signingConfig signingConfigs.release
+            }
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }

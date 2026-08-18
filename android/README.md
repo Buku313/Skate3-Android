@@ -46,7 +46,7 @@ if the download cannot be completed.
 The extracted game uses app-specific external storage. Its usual location is:
 
 ```text
-/storage/emulated/0/Android/data/chat.buku.skate3.dev/files/game/
+/storage/emulated/0/Android/data/chat.buku.skate3/files/game/
 ```
 
 Android protects this folder from ordinary file-manager access. That is normal.
@@ -162,13 +162,16 @@ below full speed, return to the Performance profile.
 
 ## Optional SEIYU PARADISE PENGUIN MOD
 
-Place the two user-supplied mod assets here:
+Use the mod-files button in the Skate 3 Mobile launcher to select these two
+user-supplied mod assets:
 
 ```text
-/sdcard/skate3/mods/penguin/base.obj
-/sdcard/skate3/mods/penguin/texture_diffuse.png
+base.obj
+texture_diffuse.png
 ```
 
-The renderer automatically rigs Seiyu to the live skater skeleton while
-preserving the skateboard. The assets themselves are intentionally not part of
-the repository.
+The launcher copies them into the active installation. Press **RB + Start** in
+game and open **Mods > Playable Character** to switch live between Seiyu and the
+original skater. The renderer
+automatically rigs Seiyu to the live skater skeleton while preserving the
+skateboard. The assets themselves are intentionally not part of the repository.

@@ -46,7 +46,11 @@ import java.util.concurrent.Executors;
 public class LauncherActivity extends Activity {
     private static final int REQUEST_ISO = 1001;
     private static final int REQUEST_TITLE_UPDATE = 1002;
+    private static final int REQUEST_SEIYU_MODEL = 1003;
+    private static final int REQUEST_SEIYU_TEXTURE = 1004;
     private static final long INSTALL_HEADROOM = 512L * 1024 * 1024;
+    private static final long MAX_SEIYU_MODEL_SIZE = 32L * 1024 * 1024;
+    private static final long MAX_SEIYU_TEXTURE_SIZE = 64L * 1024 * 1024;
     private static final String COMPLETE_MARKER = ".iso-extraction-complete";
     private static final String EXPECTED_DEFAULT_XEX =
         "1db39496585c521d17a2137804f42cf73ebed2b32cac166ec42dbf772f4dcf7f";
@@ -62,6 +66,7 @@ public class LauncherActivity extends Activity {
     private TextView detailText;
     private ProgressBar progressBar;
     private Button primaryButton;
+    private Button characterButton;
     private Button secondaryButton;
     private Button tertiaryButton;
     private boolean busy;
@@ -132,9 +137,11 @@ public class LauncherActivity extends Activity {
         content.addView(progressBar, matchFixed(dp(10), dp(18)));
 
         primaryButton = actionButton(true);
+        characterButton = actionButton(false);
         secondaryButton = actionButton(false);
         tertiaryButton = actionButton(false);
         content.addView(primaryButton, matchFixed(dp(58), dp(10)));
+        content.addView(characterButton, matchFixed(dp(54), dp(10)));
         content.addView(secondaryButton, matchFixed(dp(54), dp(10)));
         content.addView(tertiaryButton, matchFixed(dp(54), dp(10)));
 
@@ -159,6 +166,7 @@ public class LauncherActivity extends Activity {
             statusText.setText("DEVICE NOT SUPPORTED");
             detailText.setText(unsupported);
             setButton(primaryButton, "CLOSE", view -> finish(), true);
+            hide(characterButton);
             hide(secondaryButton);
             hide(tertiaryButton);
             return;
@@ -171,6 +179,7 @@ public class LauncherActivity extends Activity {
             File activeGame = scopedReady ? gameDirectory : new File("/storage/emulated/0/skate3");
             detailText.setText(Build.MODEL + "\nGame files: " + activeGame.getAbsolutePath());
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
+            configureSeiyuInstallButton(activeGame);
             if (scopedReady) {
                 setButton(secondaryButton, "REPAIR OR REINSTALL", view -> confirmReinstall(), false);
             } else {
@@ -184,6 +193,7 @@ public class LauncherActivity extends Activity {
             statusText.setText("GAME EXTRACTED");
             detailText.setText("Finish by downloading the verified 1.7 MB Title Update 3, or select the package yourself.");
             setButton(primaryButton, "FINISH SETUP AUTOMATICALLY", view -> finishSetupOnline(), true);
+            hide(characterButton);
             setButton(secondaryButton, "SELECT TITLE UPDATE FILE", view -> pickTitleUpdate(), false);
             setButton(tertiaryButton, "START OVER", view -> confirmStartOver(), false);
             return;
@@ -193,6 +203,7 @@ public class LauncherActivity extends Activity {
         detailText.setText("Select your Skate 3 Xbox 360 ISO. It can be in Downloads, on an SD card, or on a connected USB drive.\n\nFree space: " +
                            humanBytes(new StatFs(storageRoot.getAbsolutePath()).getAvailableBytes()));
         setButton(primaryButton, "SELECT MY SKATE 3 ISO", view -> pickIso(), true);
+        hide(characterButton);
         hide(secondaryButton);
         if (setupLog.isFile()) {
             setButton(tertiaryButton, "VIEW LAST SETUP LOG", view -> showLog(), false);
@@ -230,6 +241,11 @@ public class LauncherActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            if (requestCode == REQUEST_SEIYU_TEXTURE) {
+                busy = false;
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                refreshInterface();
+            }
             return;
         }
         Uri uri = data.getData();
@@ -242,6 +258,10 @@ public class LauncherActivity extends Activity {
             beginIsoInstallation(uri);
         } else if (requestCode == REQUEST_TITLE_UPDATE) {
             installSelectedTitleUpdate(uri);
+        } else if (requestCode == REQUEST_SEIYU_MODEL) {
+            importSeiyuModel(uri);
+        } else if (requestCode == REQUEST_SEIYU_TEXTURE) {
+            importSeiyuTexture(uri);
         }
     }
 
@@ -355,6 +375,7 @@ public class LauncherActivity extends Activity {
             statusText.setText("INSTALLATION COMPLETE");
             detailText.setText("Your files were verified and stayed on this device.");
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
+            configureSeiyuInstallButton(gameDirectory);
             hide(secondaryButton);
             hide(tertiaryButton);
         });
@@ -391,6 +412,147 @@ public class LauncherActivity extends Activity {
         }
         startActivity(new Intent(this, Skate3Activity.class));
         finish();
+    }
+
+    private void configureSeiyuInstallButton(File activeGame) {
+        boolean assetsInstalled = seiyuAssetsInstalled(activeGame);
+        String label = assetsInstalled
+            ? "SEIYU MOD FILES: INSTALLED"
+            : "OPTIONAL: ADD SEIYU MOD FILES";
+        setButton(characterButton, label, view -> explainSeiyuInstall(), false);
+    }
+
+    private static boolean seiyuAssetsInstalled(File activeGame) {
+        File mod = new File(activeGame, "mods/penguin");
+        return new File(mod, "base.obj").isFile() &&
+               new File(mod, "texture_diffuse.png").isFile();
+    }
+
+    private File activeGameDirectory() {
+        if (isGameReady(gameDirectory.toPath())) {
+            return gameDirectory;
+        }
+        return new File("/storage/emulated/0/skate3");
+    }
+
+    private void explainSeiyuInstall() {
+        new AlertDialog.Builder(this)
+            .setTitle("Add Seiyu Paradise Penguin")
+            .setMessage("Seiyu is optional and is not bundled with the app. If you have the Seiyu model files, choose base.obj and then texture_diffuse.png. In game, press RB + Start and open Mods to switch between the original skater and Seiyu.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Choose files", (dialog, which) -> pickSeiyuModel())
+            .show();
+    }
+
+    private void pickSeiyuModel() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.putExtra(Intent.EXTRA_TITLE, "Choose Seiyu base.obj");
+        startActivityForResult(intent, REQUEST_SEIYU_MODEL);
+    }
+
+    private void pickSeiyuTexture() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/png");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.putExtra(Intent.EXTRA_TITLE, "Choose Seiyu texture_diffuse.png");
+        startActivityForResult(intent, REQUEST_SEIYU_TEXTURE);
+    }
+
+    private void importSeiyuModel(Uri uri) {
+        setBusy("ADDING SEIYU", "Copying the character model...", false);
+        worker.execute(() -> {
+            try {
+                Path mod = activeGameDirectory().toPath().resolve("mods/penguin");
+                Files.createDirectories(mod);
+                copyUriLimited(uri, mod.resolve("base.obj.installing"), MAX_SEIYU_MODEL_SIZE, false);
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    pickSeiyuTexture();
+                });
+            } catch (Exception exception) {
+                showFailure("Could not add the Seiyu model: " + cleanMessage(exception), exception);
+            }
+        });
+    }
+
+    private void importSeiyuTexture(Uri uri) {
+        setBusy("ADDING SEIYU", "Copying and checking the texture...", false);
+        worker.execute(() -> {
+            Path mod = activeGameDirectory().toPath().resolve("mods/penguin");
+            Path pendingModel = mod.resolve("base.obj.installing");
+            Path pendingTexture = mod.resolve("texture_diffuse.png.installing");
+            try {
+                if (!Files.isRegularFile(pendingModel)) {
+                    throw new IOException("Choose the Seiyu model again first.");
+                }
+                copyUriLimited(uri, pendingTexture, MAX_SEIYU_TEXTURE_SIZE, true);
+                Files.move(pendingModel, mod.resolve("base.obj"),
+                           StandardCopyOption.REPLACE_EXISTING);
+                Files.move(pendingTexture, mod.resolve("texture_diffuse.png"),
+                           StandardCopyOption.REPLACE_EXISTING);
+                appendLog("Seiyu Paradise Penguin files installed.");
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    Toast.makeText(this, "Seiyu installed. Choose it in RB + Start > Mods.",
+                                   Toast.LENGTH_LONG).show();
+                    refreshInterface();
+                });
+            } catch (Exception exception) {
+                try {
+                    Files.deleteIfExists(pendingTexture);
+                } catch (IOException ignored) {
+                }
+                showFailure("Could not add the Seiyu texture: " + cleanMessage(exception), exception);
+            }
+        });
+    }
+
+    private void copyUriLimited(Uri uri, Path destination, long maximumBytes,
+                                boolean requirePng) throws IOException {
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) {
+                throw new IOException("Android could not open the selected file.");
+            }
+            Files.deleteIfExists(destination);
+            byte[] buffer = new byte[256 * 1024];
+            long copied = 0;
+            try (java.io.OutputStream output = Files.newOutputStream(destination)) {
+                for (;;) {
+                    int read = input.read(buffer);
+                    if (read < 0) break;
+                    copied += read;
+                    if (copied > maximumBytes) {
+                        throw new IOException("The selected Seiyu file is unexpectedly large.");
+                    }
+                    output.write(buffer, 0, read);
+                }
+            } catch (IOException exception) {
+                Files.deleteIfExists(destination);
+                throw exception;
+            }
+            if (copied == 0) {
+                Files.deleteIfExists(destination);
+                throw new IOException("The selected Seiyu file is empty.");
+            }
+        }
+        if (requirePng) {
+            byte[] header = new byte[8];
+            try (InputStream input = Files.newInputStream(destination)) {
+                if (input.read(header) != header.length ||
+                    header[0] != (byte) 0x89 || header[1] != 'P' || header[2] != 'N' ||
+                    header[3] != 'G' || header[4] != '\r' || header[5] != '\n' ||
+                    header[6] != 0x1A || header[7] != '\n') {
+                    Files.deleteIfExists(destination);
+                    throw new IOException("The selected texture is not a PNG file.");
+                }
+            }
+        }
     }
 
     private boolean legacyGameReady() {
@@ -560,6 +722,7 @@ public class LauncherActivity extends Activity {
 
     private void setButtonsEnabled(boolean enabled) {
         primaryButton.setEnabled(enabled);
+        characterButton.setEnabled(enabled);
         secondaryButton.setEnabled(enabled);
         tertiaryButton.setEnabled(enabled);
     }

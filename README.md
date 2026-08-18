@@ -1,4 +1,10 @@
-# SKATE 3 ANDROID
+# SKATE 3 MOBILE
+
+<p align="center">
+  <a href="https://buku313.github.io/Skate3-Mobile/"><strong>OPEN THE SKATE 3 MOBILE WEBSITE</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk"><strong>DOWNLOAD THE ANDROID APK</strong></a>
+</p>
 
 <p align="center">
   <img src="docs/skate3-android-cover.png" alt="Android mascot skateboarding in front of the Skate 3 logo" width="100%">
@@ -12,7 +18,28 @@ It uses the native Vulkan renderer from Skate3Recomp with Android input, audio,
 storage, performance profiles, and handheld tuning added in this fork.
 
 No retail game files are included. You must provide your own legally obtained
-copy of Skate 3 and Title Update 3.
+copy of Skate 3. The phone installer obtains and verifies the supported Title
+Update 3, with a manual file-selection fallback if its download is unavailable.
+
+## Players: start here
+
+You do not need a computer, developer tools, or an ISO extraction app.
+
+1. [Download the latest signed Android APK](https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk).
+2. Install it and open **Skate 3 Mobile**.
+3. Tap **Select My Skate 3 ISO** and choose an ISO dumped from your own copy.
+4. Keep the app open while it extracts and verifies the game.
+5. Tap **Play Skate 3**.
+
+Requirements: Android 13 or newer, ARM64, Vulkan, a physical controller, and
+about 8 GiB free after the ISO is already available. The first verified device
+is the Anbernic RG406V. This is experimental software, so other phones may need
+testing and tuning.
+
+The original skater is selected by default. If you have the optional Seiyu
+Paradise Penguin files, use the launcher to import `base.obj` and
+`texture_diffuse.png`. In game, press **RB + Start**, open **Mods**, and switch
+between **Original Skater** and **Seiyu Paradise Penguin** instantly.
 
 ## How it works and how it was developed
 
@@ -167,8 +194,8 @@ Put the extracted game in `game/` and the Title Update 3 package at the
 repository root, then run one command:
 
 ```sh
-git clone --recursive https://github.com/Buku313/Skate3-Android.git
-cd Skate3-Android
+git clone --recursive https://github.com/Buku313/Skate3-Mobile.git
+cd Skate3-Mobile
 ./build-android.sh
 ```
 
@@ -189,14 +216,16 @@ setup are documented in [android/README.md](android/README.md).
 
 ## SEIYU PARADISE PENGUIN MOD
 
-Place the user-supplied Seiyu model and texture here:
+On Android, use the mod-files button in the launcher to import the user-supplied
+Seiyu model and texture. The files are stored under the active game install:
 
 ```text
-/sdcard/skate3/mods/penguin/base.obj
-/sdcard/skate3/mods/penguin/texture_diffuse.png
+mods/penguin/base.obj
+mods/penguin/texture_diffuse.png
 ```
 
-The mod rigs Seiyu to the live skater skeleton and keeps the skateboard visible.
+Choose Seiyu from **RB + Start > Mods > Playable Character**. The mod rigs Seiyu
+to the live skater skeleton and keeps the skateboard visible.
 The model and texture are not included in this repository.
 
 ## Credits

@@ -31,7 +31,7 @@ constexpr const char* kDefaultPenguinDir =
 constexpr const char* kDefaultPenguinDir = "mods/penguin";
 #endif
 
-REXCVAR_DEFINE_BOOL(skate3_penguin_mod, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_penguin_mod, false, "Skate 3",
                     "Replace the playable create-a-skater model with the "
                     "Seiyu Paradise Penguin Mod when its assets are installed")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

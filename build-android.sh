@@ -7,6 +7,7 @@ title_update="${SKATE3_TITLE_UPDATE_PACKAGE:-}"
 android_ndk="${ANDROID_NDK_ROOT:-}"
 install_apk=false
 stage_game=false
+release_build=false
 ndk_version="27.2.12479018"
 
 usage() {
@@ -22,6 +23,7 @@ Options:
   --ndk PATH            Android NDK 27.2.12479018 directory
   --install             Install the finished APK with adb
   --stage-game          Install the APK and copy your game data to the device
+  --release             Build a signed public release APK
   -h, --help            Show this help
 
 Environment alternatives:
@@ -30,6 +32,8 @@ Environment alternatives:
   ANDROID_NDK_ROOT
   ANDROID_SDK_ROOT or ANDROID_HOME
   JAVA_HOME
+  SKATE3_RELEASE_KEYSTORE, SKATE3_RELEASE_STORE_PASSWORD,
+  SKATE3_RELEASE_KEY_ALIAS, SKATE3_RELEASE_KEY_PASSWORD (with --release)
 EOF
 }
 
@@ -83,6 +87,10 @@ while [[ $# -gt 0 ]]; do
     --stage-game)
       install_apk=true
       stage_game=true
+      shift
+      ;;
+    --release)
+      release_build=true
       shift
       ;;
     -h|--help)
@@ -173,14 +181,35 @@ step "Building native ARM64 libraries"
 android/tools/build_android_libs.sh
 
 step "Building Android APK"
-(cd android && ./gradlew --no-daemon assembleDebug)
+if $release_build; then
+  [[ -n "${SKATE3_RELEASE_KEYSTORE:-}" && -f "${SKATE3_RELEASE_KEYSTORE}" ]] ||
+    die "SKATE3_RELEASE_KEYSTORE must point to the release keystore"
+  [[ -n "${SKATE3_RELEASE_STORE_PASSWORD:-}" ]] ||
+    die "SKATE3_RELEASE_STORE_PASSWORD is required for a release build"
+  [[ -n "${SKATE3_RELEASE_KEY_ALIAS:-}" ]] ||
+    die "SKATE3_RELEASE_KEY_ALIAS is required for a release build"
+  [[ -n "${SKATE3_RELEASE_KEY_PASSWORD:-}" ]] ||
+    die "SKATE3_RELEASE_KEY_PASSWORD is required for a release build"
+  (cd android && ./gradlew --no-daemon assembleRelease)
+  apk="${project_root}/android/app/build/outputs/apk/release/app-release.apk"
+  friendly_apk="${project_root}/out/Skate3-Mobile-Android.apk"
+else
+  (cd android && ./gradlew --no-daemon assembleDebug)
+  apk="${project_root}/android/app/build/outputs/apk/debug/app-debug.apk"
+  friendly_apk="${project_root}/out/Skate3-Mobile-Android-debug.apk"
+fi
 
-apk="${project_root}/android/app/build/outputs/apk/debug/app-debug.apk"
 [[ -f "$apk" ]] || die "Gradle completed but the APK was not found at ${apk}"
 
 mkdir -p "${project_root}/out"
-friendly_apk="${project_root}/out/Skate3-Mobile-Android-debug.apk"
 cp -f "$apk" "$friendly_apk"
+
+if $release_build; then
+  apksigner="${android_sdk}/build-tools/35.0.0/apksigner"
+  [[ -x "$apksigner" ]] || die "Android build-tools 35.0.0 apksigner is missing"
+  "$apksigner" verify --verbose "$friendly_apk" >/dev/null ||
+    die "release APK signature verification failed"
+fi
 
 if $install_apk; then
   if command -v adb >/dev/null 2>&1; then

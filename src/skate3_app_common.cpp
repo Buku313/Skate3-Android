@@ -88,6 +88,7 @@ extern "C" REX_FUNC(__restgprlr_19);
 // Defined in skate3_native_scene.cpp; toggled by the showcase hotkey below.
 REXCVAR_DECLARE(bool, skate3_native_render_capture_hotkeys);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_showcase);
+REXCVAR_DECLARE(std::string, skate3_penguin_mod_dir);
 // Defined in skate3_native_scene.cpp; the freecam hotkey below toggles it,
 // and while it captures input the guest input system is gated off.
 REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam);
@@ -557,6 +558,12 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   config_path_ = paths.config_path;
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
 #if defined(__ANDROID__)
+  // Resolve optional mod assets from the active game root so both scoped
+  // phone installs and older /sdcard/skate3 installs work. The Mods page in
+  // the RB + Start menu owns the live Original / Seiyu character choice.
+  REXCVAR_SET(skate3_penguin_mod_dir,
+              (paths.game_data_root / "mods/penguin").string());
+
   // The Android native renderer owns a profile-sized scene target and places
   // the full-resolution HUD over its result. Keep the guest frontbuffer at the
   // game's expected 720p mode; Skate 3 creates that frontbuffer directly and
