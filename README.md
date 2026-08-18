@@ -79,23 +79,31 @@ instructions are in [android/README.md](android/README.md).
 
 ## Build
 
-You need Android SDK 35, Android NDK r27c, JDK 17, CMake, Ninja, Clang, your
-extracted game dump, and Title Update 3.
+You need Android SDK 35, Android NDK r27c, JDK 17 or newer, CMake, Ninja,
+Clang, your extracted game dump, and Title Update 3.
+
+Put the extracted game in `game/` and the Title Update 3 package at the
+repository root, then run one command:
 
 ```sh
 git clone --recursive https://github.com/Buku313/Skate3-Android.git
 cd Skate3-Android
-export ANDROID_NDK_ROOT=/path/to/android-sdk/ndk/27.2.12479018
-android/tools/build_android_libs.sh
-cd android
-./gradlew assembleDebug
+./build-android.sh
 ```
 
-The APK is written to:
+The script detects Android Studio's SDK, NDK, and Java installation, generates
+the recompiled code, builds the native libraries, and builds the APK. Custom
+game and title-update locations are also supported:
 
-```text
-android/app/build/outputs/apk/debug/app-debug.apk
+```sh
+./build-android.sh \
+  --game-dir /path/to/extracted-skate3 \
+  --title-update /path/to/title-update-package
 ```
+
+The finished APK is written to `out/Skate3-Mobile-Android-debug.apk`. Add
+`--install` to install it on a connected Android device. The complete manual
+build and device setup are documented in [android/README.md](android/README.md).
 
 ## SEIYU PARADISE PENGUIN MOD
 

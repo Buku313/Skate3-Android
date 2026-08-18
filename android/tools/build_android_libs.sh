@@ -4,6 +4,7 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 game_root="${SKATE3_GAME_DATA_ROOT:-${project_root}/game}"
 android_ndk="${ANDROID_NDK_ROOT:-}"
+title_update="${SKATE3_TITLE_UPDATE_PACKAGE:-}"
 jni_dir="${project_root}/android/app/libs/arm64-v8a"
 
 if [[ -z "${android_ndk}" ]]; then
@@ -19,13 +20,18 @@ fi
 
 cd "${project_root}"
 
+cmake_args=(-DSKATE3_GAME_DATA_ROOT="${game_root}")
+if [[ -n "${title_update}" ]]; then
+  cmake_args+=(-DSKATE3_TITLE_UPDATE_PACKAGE="${title_update}")
+fi
+
 if [[ ! -f generated/sources.cmake ||
       ! -f generated/eawebkit/sources.cmake ]]; then
-  cmake --preset macos-relwithdebinfo -DSKATE3_GAME_DATA_ROOT="${game_root}"
+  cmake --preset macos-relwithdebinfo "${cmake_args[@]}"
   cmake --build --preset macos-relwithdebinfo --target generate-all --parallel
 fi
 
-cmake --preset android-release -DSKATE3_GAME_DATA_ROOT="${game_root}"
+cmake --preset android-release "${cmake_args[@]}"
 cmake --build --preset android-release --parallel
 
 cxx_shared="$(find "${android_ndk}/toolchains/llvm/prebuilt" \
@@ -42,4 +48,3 @@ install -m 0755 out/build/android-release/librexruntime.so "${jni_dir}/"
 install -m 0755 "${cxx_shared}" "${jni_dir}/"
 
 echo "Android libraries staged in ${jni_dir}"
-echo "Run: cd android && ./gradlew assembleDebug"

@@ -27,33 +27,54 @@ multiplayer.
 
 - A macOS ARM build host
 - CMake 3.25+, Ninja, and Homebrew LLVM/Clang
-- Android SDK 35, Android NDK `27.2.12479018`, and JDK 17
+- Android SDK 35, Android NDK `27.2.12479018`, and JDK 17 or newer
 - A legally obtained, extracted Skate 3 game dump in `game/`
 - The Skate 3 Title Update 3 package at the repository root, or provided with
   `-DSKATE3_TITLE_UPDATE_PACKAGE=/path/to/package`
 
-Initialize all submodules first:
+## Easy build
+
+Put the extracted game in `game/` and the Title Update 3 package at the
+repository root, then run this from the repository root:
+
+```sh
+./build-android.sh
+```
+
+The script detects Android Studio's SDK, NDK, and Java installation, initializes
+submodules, generates the recompiled code, builds the native libraries, and
+builds the APK. To use files stored elsewhere:
+
+```sh
+./build-android.sh \
+  --game-dir /path/to/extracted-skate3 \
+  --title-update /path/to/title-update-package
+```
+
+The finished APK is produced at `out/Skate3-Mobile-Android-debug.apk`. Use
+`./build-android.sh --install` to build and install it on a connected device.
+
+## Manual build
+
+The wrapper above performs these steps automatically. To run them manually,
+initialize the submodules first:
 
 ```sh
 git submodule sync --recursive
 git submodule update --init --recursive --jobs 8
 ```
 
-Build the generated game code and Android native libraries:
+Build the generated game code and Android native libraries, then build the APK:
 
 ```sh
 export ANDROID_NDK_ROOT=/path/to/android-sdk/ndk/27.2.12479018
+export SKATE3_TITLE_UPDATE_PACKAGE=/path/to/title-update-package
 android/tools/build_android_libs.sh
+(cd android && ./gradlew assembleDebug)
 ```
 
-Then build the APK with JDK 17 active:
-
-```sh
-cd android
-./gradlew assembleDebug
-```
-
-The APK is produced at `android/app/build/outputs/apk/debug/app-debug.apk`.
+The manual build produces
+`android/app/build/outputs/apk/debug/app-debug.apk`.
 
 ## Install and stage your game data
 
