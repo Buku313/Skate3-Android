@@ -82,6 +82,20 @@ instructions are in [android/README.md](android/README.md).
 You need Android SDK 35, Android NDK r27c, JDK 17 or newer, CMake, Ninja,
 Clang, your extracted game dump, and Title Update 3.
 
+### No terminal required
+
+On an Apple Silicon Mac:
+
+1. Install and open [Android Studio](https://developer.android.com/studio) once.
+2. Double-click `Setup Build Tools.command`.
+3. Double-click `Build Skate 3 Mobile.command` and choose your game files.
+
+The builder can create the APK by itself or build, install, and copy the game
+to a connected Android device. See the complete
+[non-coder build guide](docs/NONCODER_BUILD.md).
+
+### One-command build
+
 Put the extracted game in `game/` and the Title Update 3 package at the
 repository root, then run one command:
 
@@ -102,8 +116,9 @@ game and title-update locations are also supported:
 ```
 
 The finished APK is written to `out/Skate3-Mobile-Android-debug.apk`. Add
-`--install` to install it on a connected Android device. The complete manual
-build and device setup are documented in [android/README.md](android/README.md).
+`--install` to install it on a connected Android device, or `--stage-game` to
+install the APK and copy your game data. The complete manual build and device
+setup are documented in [android/README.md](android/README.md).
 
 ## SEIYU PARADISE PENGUIN MOD
 

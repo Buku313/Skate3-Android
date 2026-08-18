@@ -6,6 +6,7 @@ game_root="${SKATE3_GAME_DATA_ROOT:-${project_root}/game}"
 title_update="${SKATE3_TITLE_UPDATE_PACKAGE:-}"
 android_ndk="${ANDROID_NDK_ROOT:-}"
 install_apk=false
+stage_game=false
 ndk_version="27.2.12479018"
 
 usage() {
@@ -20,6 +21,7 @@ Options:
   --title-update PATH   Skate 3 Title Update 3 package
   --ndk PATH            Android NDK 27.2.12479018 directory
   --install             Install the finished APK with adb
+  --stage-game          Install the APK and copy your game data to the device
   -h, --help            Show this help
 
 Environment alternatives:
@@ -76,6 +78,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --install)
       install_apk=true
+      shift
+      ;;
+    --stage-game)
+      install_apk=true
+      stage_game=true
       shift
       ;;
     -h|--help)
@@ -176,12 +183,34 @@ friendly_apk="${project_root}/out/Skate3-Mobile-Android-debug.apk"
 cp -f "$apk" "$friendly_apk"
 
 if $install_apk; then
-  need_command adb "adb is required for --install (install Android SDK Platform-Tools)"
-  [[ -n "$(adb devices | awk 'NR > 1 && $2 == "device" { print $1; exit }')" ]] ||
+  if command -v adb >/dev/null 2>&1; then
+    adb_bin="$(command -v adb)"
+  elif [[ -x "${android_sdk}/platform-tools/adb" ]]; then
+    adb_bin="${android_sdk}/platform-tools/adb"
+  else
+    die "adb is required for installation. Install Android SDK Platform-Tools"
+  fi
+  [[ -n "$("$adb_bin" devices | awk 'NR > 1 && $2 == "device" { print $1; exit }')" ]] ||
     die "no authorized Android device is connected"
   step "Installing APK"
-  adb install -r "$friendly_apk"
+  "$adb_bin" install -r "$friendly_apk"
+fi
+
+if $stage_game; then
+  default_patch="${project_root}/out/build/android-release/game/default.xexp"
+  webkit_patch="${project_root}/out/build/android-release/game/data/webkit/EAWebkit.xexp"
+  [[ -f "$default_patch" && -f "$webkit_patch" ]] ||
+    die "the generated Title Update patch files are missing"
+
+  step "Copying your game data to /sdcard/skate3"
+  "$adb_bin" shell mkdir -p /sdcard/skate3/data/webkit
+  "$adb_bin" push "${game_root}/." /sdcard/skate3/
+  "$adb_bin" push "$default_patch" /sdcard/skate3/default.xexp
+  "$adb_bin" push "$webkit_patch" /sdcard/skate3/data/webkit/EAWebkit.xexp
 fi
 
 printf '\nBuild complete:\n  %s\n' "$friendly_apk"
 printf '\nThe APK does not contain retail game data. See android/README.md for device setup.\n'
+if $stage_game; then
+  printf 'Game data copied. Launch the app and grant All files access when Android asks.\n'
+fi

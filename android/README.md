@@ -34,6 +34,9 @@ multiplayer.
 
 ## Easy build
 
+Non-coders can use the double-click
+[macOS build guide](../docs/NONCODER_BUILD.md).
+
 Put the extracted game in `game/` and the Title Update 3 package at the
 repository root, then run this from the repository root:
 
@@ -52,7 +55,8 @@ builds the APK. To use files stored elsewhere:
 ```
 
 The finished APK is produced at `out/Skate3-Mobile-Android-debug.apk`. Use
-`./build-android.sh --install` to build and install it on a connected device.
+`./build-android.sh --install` to build and install it on a connected device,
+or `./build-android.sh --stage-game` to install it and copy your game data.
 
 ## Manual build
 
