@@ -50,6 +50,7 @@
 
     <!-- Required by the optional direct-IP UDP multiplayer prototype. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Create a Java class extending SDLActivity and place it in a
          directory under app/src/main/java matching the package, e.g. app/src/main/java/com/gamemaker/game/MyGame.java
@@ -66,6 +67,12 @@
         android:theme="@style/AppTheme"
         android:enableOnBackInvokedCallback="false"
         android:hardwareAccelerated="true" >
+
+        <provider
+            android:name="chat.buku.skate3.UpdateFileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
         <!-- SDL otherwise overrides the Activity's landscape declaration with
              FULL_USER because its host window is resizable. Keep the render

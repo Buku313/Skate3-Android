@@ -5,11 +5,13 @@ import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.ViewGroup;
 import org.libsdl.app.SDLActivity;
 import org.libsdl.app.SDLControllerManager;
 
 public class Skate3Activity extends SDLActivity {
     private static final String INPUT_TAG = "Skate3Input";
+    private TouchControllerView touchController;
 
     @Override
     protected String[] getLibraries() {
@@ -22,6 +24,21 @@ public class Skate3Activity extends SDLActivity {
         String files = getFilesDir().getAbsolutePath();
         nativeSetenv("XDG_DATA_HOME", files);
         nativeSetenv("HOME", files);
+        touchController = new TouchControllerView(this);
+        mLayout.addView(touchController, new ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    @Override
+    protected void onPause() {
+        if (touchController != null) touchController.clearInput();
+        super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (touchController != null) touchController.disconnect();
+        super.onDestroy();
     }
 
     private static int getAllSources(int deviceId, int eventSource) {

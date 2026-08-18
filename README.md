@@ -31,10 +31,16 @@ You do not need a computer, developer tools, or an ISO extraction app.
 4. Keep the app open while it extracts and verifies the game.
 5. Tap **Play Skate 3**.
 
-Requirements: Android 13 or newer, ARM64, Vulkan, a physical controller, and
-about 8 GiB free after the ISO is already available. The first verified device
-is the Anbernic RG406V. This is experimental software, so other phones may need
+Requirements: Android 13 or newer, ARM64, Vulkan, and about 8 GiB free after
+the ISO is already available. A multitouch controller is built in for phones.
+Physical and built-in gamepads remain supported. The first verified device is
+the Anbernic RG406V. This is experimental software, so other phones may need
 testing and tuning.
+
+Starting with v2.0.8, the launcher checks for signed updates automatically. It
+downloads and verifies the new APK inside the app. Android still asks you to
+approve the installation, but you do not need to return to GitHub or reinstall
+your game files.
 
 The original skater is selected by default. If you have the optional Seiyu
 Paradise Penguin files, use the launcher to import `base.obj` and
@@ -61,12 +67,18 @@ The build uses these methods:
    constants, and frame data. The custom native scene renderer reconstructs
    that work with Vulkan shaders instead of directly running the original Xbox
    360 graphics pipeline.
-4. SDL3 supplies the Android window, controller, and audio integration. The
-   phone installer reads the user's ISO through Android's system file picker,
-   extracts it locally, verifies the supported executables, installs the exact
-   Title Update 3 payload, and stores the result in private app storage. Older
-   `/sdcard/skate3` installations remain supported.
-5. The handheld profile lowers scene resolution and draw distance, simplifies
+4. SDL3 supplies the Android window, physical controller, and audio integration.
+   A native XInput bridge merges the optional multitouch overlay into player
+   one, including in the recomp menu. The phone installer reads the user's ISO
+   through Android's system file picker, extracts it locally, verifies the
+   supported executables, installs the exact Title Update 3 payload, and stores
+   the result in private app storage. Older `/sdcard/skate3` installations
+   remain supported.
+5. The launcher checks a small manifest hosted by this repository, compares the
+   version code, verifies the downloaded APK with SHA-256, and hands it to
+   Android's package installer. Android also enforces the existing app-signing
+   certificate. Updates never replace the extracted game directory.
+6. The handheld profile lowers scene resolution and draw distance, simplifies
    materials, removes grass and costly post effects, reduces selected static
    rendering work, and uses native occlusion and frame pacing. Physics, player
    input, the board, menus, and HUD remain full-rate. The quality profile keeps
@@ -88,6 +100,8 @@ the person building the project. This is experimental research software, and a
 
 - Boots into the game
 - Menus and controller input work
+- Optional multitouch controller for phones
+- Verified in-app APK update checks
 - Gameplay and tricks work
 - Native Vulkan rendering works
 - 4 KB and 16 KB Android memory pages are supported
@@ -106,7 +120,7 @@ problems, and performance differences between phones.
 - ARM64
 - ARMv8.2 with FP16 and dot-product support
 - Vulkan support
-- A physical controller or built-in gamepad
+- Touchscreen, physical controller, or built-in gamepad
 
 The RG406V with the Unisoc T820 and Mali-G57 is the first verified device.
 Newer Snapdragon and Adreno devices are good candidates, but they have not all

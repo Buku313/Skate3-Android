@@ -69,7 +69,13 @@ public class LauncherActivity extends Activity {
     private Button characterButton;
     private Button secondaryButton;
     private Button tertiaryButton;
+    private Button updateButton;
     private boolean busy;
+    private boolean checkingUpdate;
+    private boolean updatePromptShown;
+    private boolean awaitingInstallPermission;
+    private AppUpdater.UpdateInfo availableUpdate;
+    private File pendingUpdateApk;
     private long lastProgressUpdate;
 
     @Override
@@ -82,6 +88,17 @@ public class LauncherActivity extends Activity {
         setupLog = new File(getFilesDir(), "phone-setup.log");
         buildInterface();
         refreshInterface();
+        checkForAppUpdate(false);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (awaitingInstallPermission && pendingUpdateApk != null &&
+            getPackageManager().canRequestPackageInstalls()) {
+            awaitingInstallPermission = false;
+            if (AppUpdater.install(this, pendingUpdateApk)) pendingUpdateApk = null;
+        }
     }
 
     @Override
@@ -140,13 +157,16 @@ public class LauncherActivity extends Activity {
         characterButton = actionButton(false);
         secondaryButton = actionButton(false);
         tertiaryButton = actionButton(false);
+        updateButton = actionButton(false);
         content.addView(primaryButton, matchFixed(dp(58), dp(10)));
         content.addView(characterButton, matchFixed(dp(54), dp(10)));
         content.addView(secondaryButton, matchFixed(dp(54), dp(10)));
         content.addView(tertiaryButton, matchFixed(dp(54), dp(10)));
+        content.addView(updateButton, matchFixed(dp(50), dp(18)));
+        setButton(updateButton, "CHECK FOR APP UPDATES", view -> checkForAppUpdate(true), false);
 
         TextView requirements = text(
-            "Requires Android 13+, ARM64, Vulkan, a controller, and about 8 GB free after the ISO is already on your device or USB drive.",
+            "Requires Android 13+, ARM64, Vulkan, and about 8 GB free after the ISO is already on your device or USB drive. Touch controls are included.",
             12, Color.rgb(125, 125, 132));
         requirements.setGravity(Gravity.CENTER);
         requirements.setLineSpacing(0, 1.1f);
@@ -412,6 +432,98 @@ public class LauncherActivity extends Activity {
         }
         startActivity(new Intent(this, Skate3Activity.class));
         finish();
+    }
+
+    private void checkForAppUpdate(boolean manual) {
+        if (checkingUpdate || busy) return;
+        checkingUpdate = true;
+        updateButton.setEnabled(false);
+        updateButton.setText("CHECKING FOR UPDATES...");
+        worker.execute(() -> {
+            try {
+                AppUpdater.UpdateInfo result = AppUpdater.check(this);
+                runOnUiThread(() -> {
+                    checkingUpdate = false;
+                    availableUpdate = result;
+                    refreshUpdateButton();
+                    if (result != null && (!updatePromptShown || manual)) {
+                        updatePromptShown = true;
+                        showUpdatePrompt(result);
+                    } else if (result == null && manual) {
+                        Toast.makeText(this, "You already have the newest build.",
+                                       Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } catch (Exception exception) {
+                appendLog("Update check failed: " + stackTrace(exception));
+                runOnUiThread(() -> {
+                    checkingUpdate = false;
+                    updateButton.setEnabled(true);
+                    updateButton.setText("CHECK FOR APP UPDATES");
+                    if (manual) {
+                        Toast.makeText(this, "Could not check for updates: " +
+                                       cleanMessage(exception), Toast.LENGTH_LONG).show();
+                    }
+                });
+            }
+        });
+    }
+
+    private void refreshUpdateButton() {
+        if (availableUpdate == null) {
+            setButton(updateButton, "APP UP TO DATE", view -> checkForAppUpdate(true), false);
+        } else {
+            setButton(updateButton, "UPDATE TO " + availableUpdate.versionName,
+                      view -> showUpdatePrompt(availableUpdate), false);
+        }
+    }
+
+    private void showUpdatePrompt(AppUpdater.UpdateInfo info) {
+        new AlertDialog.Builder(this)
+            .setTitle("Skate 3 Mobile " + info.versionName)
+            .setMessage(info.notes + "\n\nThe app will verify the download, then Android will ask you to tap Install. Your game files and settings stay in place.")
+            .setNegativeButton("Later", null)
+            .setPositiveButton("Download update", (dialog, which) -> downloadAppUpdate(info))
+            .show();
+    }
+
+    private void downloadAppUpdate(AppUpdater.UpdateInfo info) {
+        if (busy) return;
+        setBusy("DOWNLOADING APP UPDATE", "Starting " + info.versionName + "...", true);
+        worker.execute(() -> {
+            try {
+                File apk = AppUpdater.downloadApk(this, info, (copied, total) ->
+                    showDownloadProgress(copied, total, "Downloading Skate 3 Mobile " +
+                                         info.versionName));
+                pendingUpdateApk = apk;
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setProgress(1000);
+                    statusText.setText("UPDATE VERIFIED");
+                    detailText.setText("Android will now open the installer. Your game files stay in place.");
+                    setButtonsEnabled(true);
+                    boolean opened = AppUpdater.install(this, apk);
+                    awaitingInstallPermission = !opened;
+                    if (opened) pendingUpdateApk = null;
+                    else Toast.makeText(this,
+                        "Allow installs from Skate 3 Mobile, then return here.",
+                        Toast.LENGTH_LONG).show();
+                });
+            } catch (Exception exception) {
+                appendLog("App update failed: " + stackTrace(exception));
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setVisibility(View.GONE);
+                    new AlertDialog.Builder(this)
+                        .setTitle("Update needs attention")
+                        .setMessage("The app update was not installed: " + cleanMessage(exception))
+                        .setPositiveButton("OK", (dialog, which) -> refreshInterface())
+                        .show();
+                });
+            }
+        });
     }
 
     private void configureSeiyuInstallButton(File activeGame) {
@@ -725,6 +837,7 @@ public class LauncherActivity extends Activity {
         characterButton.setEnabled(enabled);
         secondaryButton.setEnabled(enabled);
         tertiaryButton.setEnabled(enabled);
+        updateButton.setEnabled(enabled && !checkingUpdate);
     }
 
     private void setButton(Button button, String label, View.OnClickListener listener,
