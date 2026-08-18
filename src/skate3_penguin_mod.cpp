@@ -327,8 +327,7 @@ void ObserveSkaterMesh(const native_scene::DrawItem& item, const float* vertices
 }
 
 void ObserveSkaterPalette(const native_scene::DrawItem& item) {
-  if (!REXCVAR_GET(skate3_penguin_mod) || !item.skinned ||
-      (item.char_family != 2 && item.char_family != 4) ||
+  if (!item.skinned || (item.char_family != 2 && item.char_family != 4) ||
       IsSkateboardDeck(item) || item.bones.empty()) {
     return;
   }
@@ -711,12 +710,15 @@ const Asset* GetRiggedAsset() {
 }
 
 void ApplyToFrame(native_scene::FrameScene& scene) {
-  if (!REXCVAR_GET(skate3_penguin_mod)) return;
+  // Prepare the optional rig from the first coherent local-skater frame even
+  // while Original Skater is displayed. If preparation waits for the menu
+  // toggle, the capture map can contain several unrelated skaters and their
+  // incompatible local bone palettes make the flippers stretch.
   for (const native_scene::DrawItem& item : scene.items) {
     ObserveSkaterPalette(item);
   }
   const Asset* rigged = GetRiggedAsset();
-  if (rigged == nullptr) return;
+  if (!REXCVAR_GET(skate3_penguin_mod) || rigged == nullptr) return;
   const Asset& asset = *rigged;
 
   // The CAC family is the local player's skin/face/clothes. Select the item
