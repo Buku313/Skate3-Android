@@ -14,6 +14,46 @@ storage, performance profiles, and handheld tuning added in this fork.
 No retail game files are included. You must provide your own legally obtained
 copy of Skate 3 and Title Update 3.
 
+## How it works and how it was developed
+
+This project is a fork of Alex McHugh's
+[Skate3Recomp](https://github.com/mchughalex/skate3recomp), not a new port made
+from scratch. The upstream Git history and authorship are preserved.
+
+The build uses these methods:
+
+1. The user supplies an extracted retail `default.xex`, the EAWebKit XEX, and
+   Title Update 3. A local build step prepares the updated executables and patch
+   files.
+2. The rexglue code generator statically translates the configured Xbox 360
+   PowerPC guest functions into native code. Android Clang then compiles and
+   links that generated code as ARM64 libraries with the rexglue compatibility
+   runtime. The finished game logic runs as native AArch64 rather than through
+   a conventional CPU emulator.
+3. Runtime hooks observe the game's mesh submissions, textures, shader state,
+   constants, and frame data. The custom native scene renderer reconstructs
+   that work with Vulkan shaders instead of directly running the original Xbox
+   360 graphics pipeline.
+4. SDL3 supplies the Android window, controller, and audio integration. Android
+   storage glue lets the runtime read the user's files from `/sdcard/skate3`.
+5. The handheld profile lowers scene resolution and draw distance, simplifies
+   materials, removes grass and costly post effects, reduces selected static
+   rendering work, and uses native occlusion and frame pacing. Physics, player
+   input, the board, menus, and HUD remain full-rate. The quality profile keeps
+   substantially more of the native renderer enabled for faster devices.
+
+Reverse engineering in this project uses executable analysis, function and
+shader disassembly, runtime logging, graphics captures, targeted hooks, and
+repeated testing on real hardware. Development and documentation in this fork
+have also been assisted by OpenAI Codex. Buku313 reviewed the changes and
+performed the Android and RG406V build, launch, control, graphics, and gameplay
+testing.
+
+The repository does not distribute retail executables, assets, Title Update
+data, or generated game code. Those inputs and generated outputs stay local to
+the person building the project. This is experimental research software, and a
+60 FPS setting is a target and guest cap, not a performance guarantee.
+
 ## Current status
 
 - Boots into the game
