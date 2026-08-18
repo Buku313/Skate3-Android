@@ -106,6 +106,15 @@ REXCVAR_DEFINE_BOOL(skate3_ultrawide_widen_game_frustum, true, "Skate 3",
 REXCVAR_DEFINE_DOUBLE(skate3_ultrawide_target_aspect, 0.0, "Skate 3",
                       "Ultrawide display aspect (0 = derive from the host display at boot)")
     .range(0.0, 8.0);
+#if defined(__ANDROID__)
+REXCVAR_DEFINE_INT32(
+    skate3_android_quality_profile, 0, "Skate 3",
+    "Android device profile: 0 = RG406V / Performance (288p and aggressive "
+    "scene cuts), 1 = High-End / Quality (720p and the full native material "
+    "pipeline). Applied after restart.")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 namespace {
 
@@ -531,24 +540,19 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   config_path_ = paths.config_path;
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
 #if defined(__ANDROID__)
-  // The Android native renderer owns its 512x288 handheld scene target and
-  // upscales it before the full-resolution HUD. Keep the guest frontbuffer at
-  // the game's expected 720p mode; Skate 3 creates that frontbuffer directly
-  // and ignores lower advertised video modes anyway.
+  // The Android native renderer owns a profile-sized scene target and places
+  // the full-resolution HUD over its result. Keep the guest frontbuffer at the
+  // game's expected 720p mode; Skate 3 creates that frontbuffer directly and
+  // ignores lower advertised video modes anyway.
   rex::cvar::SetFlagByName("resolution_scale", "1");
   rex::cvar::SetFlagByName("draw_resolution_scale_x", "1");
   rex::cvar::SetFlagByName("draw_resolution_scale_y", "1");
 
-  // Saved settings can originate from a desktop install or from an older
-  // Android build whose curated defaults were still desktop-oriented.  In
-  // particular, a persisted 2x draw distance makes the guest vectorized
-  // culling and render-job pipeline process vastly more world pieces even
-  // though the native renderer discards the Xbox draw packets.  Apply one
-  // coherent handheld preset after loading settings so old config cannot
-  // silently defeat the CPU-oriented native renderer.  Large authored map
-  // surfaces remain; the shorter contribution range primarily removes
-  // distant small props and detail that is not legible at 360p.
-  constexpr std::pair<std::string_view, std::string_view> kHandheldPreset[] = {
+  // Apply a coherent profile after loading settings. The performance profile
+  // keeps the known-good RG406V budget. The quality profile restores the full
+  // material/entity pipeline and original world range for stronger phones;
+  // its 720p scene target is selected by the renderer from the same profile.
+  constexpr std::pair<std::string_view, std::string_view> kPerformancePreset[] = {
       {"skate3_native_render_scene_handheld_potato", "true"},
       {"native_render_suppress_mode", "1"},
       {"skate3_native_render_guest_static_refresh", "8"},
@@ -566,6 +570,19 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
       {"skate3_native_render_scene_shafts", "false"},
       {"skate3_native_render_scene_haze", "false"},
       {"skate3_native_render_scene_smooth_camera", "false"},
+      {"skate3_native_render_scene_selection_outline", "false"},
+      {"skate3_native_render_scene_lightmaps", "false"},
+      {"skate3_native_render_scene_macro", "false"},
+      {"skate3_native_render_scene_decals", "false"},
+      {"skate3_native_render_scene_sort_opaque", "false"},
+      {"skate3_native_render_scene_splines", "false"},
+      {"skate3_native_render_scene_ropa_blend", "false"},
+      {"skate3_native_render_scene_entity_fade", "false"},
+      {"skate3_native_render_scene_lw_fade", "false"},
+      {"skate3_native_render_scene_lw_gap_fill", "false"},
+      {"skate3_native_render_scene_lw_identity", "false"},
+      {"skate3_native_render_scene_lw_palette", "false"},
+      {"skate3_native_render_scene_prewarm_budget_ms", "8"},
       {"skate3_native_render_scene_occlusion_cull", "true"},
       {"skate3_native_render_scene_occlusion_cull_build", "true"},
       {"skate3_native_render_scene_occlusion_cull_guest", "true"},
@@ -573,12 +590,63 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
       {"skate3_native_render_scene_perf_interval", "300"},
       {"show_fps_counter", "true"},
   };
-  for (const auto& [name, value] : kHandheldPreset) {
-    rex::cvar::SetFlagByName(std::string(name), std::string(value));
+  constexpr std::pair<std::string_view, std::string_view> kHighEndPreset[] = {
+      {"skate3_native_render_scene_handheld_potato", "false"},
+      {"native_render_suppress_mode", "1"},
+      {"skate3_native_render_guest_static_refresh", "1"},
+      {"skate3_native_render_lw_update_refresh", "1"},
+      {"skate3_draw_distance_scale", "1.0"},
+      {"skate3_lod_distance_scale", "1.0"},
+      {"skate3_draw_distance_stream_probe", "100"},
+      {"skate3_native_render_scene_msaa", "2"},
+      {"skate3_native_render_scene_shadows", "true"},
+      {"skate3_native_render_scene_shadow_static_casters", "true"},
+      {"skate3_native_render_scene_shadow_pcss", "false"},
+      {"skate3_native_render_scene_ssao", "true"},
+      {"skate3_native_render_scene_ssr", "false"},
+      {"skate3_native_render_scene_hdr", "true"},
+      {"skate3_native_render_scene_bloom", "true"},
+      {"skate3_native_render_scene_shafts", "true"},
+      {"skate3_native_render_scene_haze", "true"},
+      {"skate3_native_render_scene_smooth_camera", "true"},
+      {"skate3_native_render_scene_selection_outline", "true"},
+      {"skate3_native_render_scene_lightmaps", "true"},
+      {"skate3_native_render_scene_macro", "true"},
+      {"skate3_native_render_scene_decals", "true"},
+      {"skate3_native_render_scene_sort_opaque", "true"},
+      {"skate3_native_render_scene_splines", "true"},
+      {"skate3_native_render_scene_ropa_blend", "true"},
+      {"skate3_native_render_scene_entity_fade", "true"},
+      {"skate3_native_render_scene_lw_fade", "true"},
+      {"skate3_native_render_scene_lw_gap_fill", "true"},
+      {"skate3_native_render_scene_lw_identity", "true"},
+      {"skate3_native_render_scene_lw_palette", "true"},
+      {"skate3_native_render_scene_prewarm_budget_ms", "32"},
+      {"skate3_native_render_scene_occlusion_cull", "true"},
+      {"skate3_native_render_scene_occlusion_cull_build", "true"},
+      {"skate3_native_render_scene_occlusion_cull_guest", "true"},
+      {"skate3_native_render_scene_perf_log", "false"},
+      {"skate3_native_render_scene_perf_interval", "300"},
+      {"show_fps_counter", "false"},
+  };
+  const int32_t android_profile =
+      std::clamp(rex::cvar::Query<int32_t>("skate3_android_quality_profile"), 0, 1);
+  const auto apply_profile = [](const auto& profile) {
+    for (const auto& [name, value] : profile) {
+      rex::cvar::SetFlagByName(std::string(name), std::string(value));
+    }
+  };
+  if (android_profile == 0) {
+    apply_profile(kPerformancePreset);
+    REXLOG_INFO(
+        "Android device profile: RG406V / Performance (512x288, 0.5x "
+        "world/LOD, simplified materials)");
+  } else {
+    apply_profile(kHighEndPreset);
+    REXLOG_INFO(
+        "Android device profile: High-End / Quality (1280x720, original "
+        "world/LOD, full materials and effects)");
   }
-  REXLOG_INFO(
-      "Android handheld performance preset: 288p, 0.5x world/LOD range, "
-      "potato materials, shadows and volumetrics disabled");
 #endif
   Skate3InitializeFieldOfViewOverride();
   ApplyUltrawideVideoDefaults();

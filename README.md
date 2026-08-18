@@ -63,11 +63,12 @@ requires Android 13 or newer, an ARM64 CPU with ARMv8.2 FP16/dot-product support
 and Vulkan. The RG406V (Unisoc T820 / Mali-G57) is the first verified target;
 support and performance on other devices will vary.
 
-Android currently uses a curated 512x288 native-renderer scene target (upscaled
-under the full-resolution HUD), reduced world and LOD range, simplified materials,
-and a fixed 60 FPS guest cap. It is not an emulator build and does not include any
-retail game data. See [android/README.md](android/README.md) for build, install, and
-device-data instructions.
+Android defaults to a curated RG406V profile with a 512x288 native-renderer scene
+target, reduced world and LOD range, simplified materials, and a fixed 60 FPS guest
+cap. Stronger devices can select **Settings > Video > Android Device Profile >
+High-End / Quality** for native 720p, original world detail, vegetation, materials,
+and effects. It is not an emulator build and does not include any retail game data.
+See [android/README.md](android/README.md) for full instructions.
 
 ## Native Renderer
 

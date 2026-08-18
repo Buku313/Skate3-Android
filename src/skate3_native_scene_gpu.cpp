@@ -128,6 +128,9 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao_debug);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssao_full_res);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssr);
+#if REX_PLATFORM_ANDROID
+REXCVAR_DECLARE(int32_t, skate3_android_quality_profile);
+#endif
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_transparents);
@@ -4249,12 +4252,15 @@ bool EnsurePenguinResources(const NativeGuestOutputRenderContext& context) {
 bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
 #if REX_PLATFORM_ANDROID
-  // Aggressive 288p internal scene raster. The guest output remains
-  // 1280x720 so emulated menus and the native HUD keep their original
-  // layout/sharpness. This also leaves thermal headroom after the CPU-side
-  // scene cuts expose more throughput.
-  const uint32_t width = std::min(context.guest_output_width, 512u);
-  const uint32_t height = std::min(context.guest_output_height, 288u);
+  // The guest output remains 1280x720 so emulated menus and the native HUD
+  // keep their original layout/sharpness. The RG406V profile shades the 3D
+  // scene at 512x288; the high-end profile restores native 720p.
+  const bool high_end_profile =
+      std::clamp(REXCVAR_GET(skate3_android_quality_profile), 0, 1) == 1;
+  const uint32_t width = std::min(context.guest_output_width,
+                                  high_end_profile ? 1280u : 512u);
+  const uint32_t height = std::min(context.guest_output_height,
+                                   high_end_profile ? 720u : 288u);
 #else
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
@@ -4334,7 +4340,7 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
           g_r.device->CreateTextureView(g_r.handheld_color, handheld_view_desc);
     }
     if (g_r.handheld_color == nullptr || g_r.handheld_srv == nullptr) {
-      REXLOG_ERROR("native-scene: Android 288p scene target creation failed");
+      REXLOG_ERROR("native-scene: Android profile scene target creation failed");
       g_r.failed = true;
       return false;
     }
@@ -12017,33 +12023,35 @@ void ResetSceneFailure() {
 
 void Install() {
 #if REX_PLATFORM_ANDROID
-  // Handheld performance profile. These are enforced after persisted CVar
-  // state is loaded so an old desktop-quality session can't silently turn
-  // expensive effects back on for a Mali-class phone GPU.
+  // The app layer applies the selected Android profile after loading saved
+  // settings. Keep the native renderer mandatory on both profiles, and retain
+  // the conservative duplicate guard only for the RG406V profile.
   REXCVAR_SET(skate3_native_render_scene, true);
-  REXCVAR_SET(skate3_native_render_scene_handheld_potato, true);
-  REXCVAR_SET(skate3_native_render_scene_msaa, 1);
-  REXCVAR_SET(skate3_native_render_scene_shadows, false);
-  REXCVAR_SET(skate3_native_render_scene_shadow_static_casters, false);
-  REXCVAR_SET(skate3_native_render_scene_shadow_pcss, false);
-  REXCVAR_SET(skate3_native_render_scene_ssao, false);
-  REXCVAR_SET(skate3_native_render_scene_ssr, false);
-  REXCVAR_SET(skate3_native_render_scene_hdr, false);
-  REXCVAR_SET(skate3_native_render_scene_bloom, false);
-  REXCVAR_SET(skate3_native_render_scene_shafts, false);
-  REXCVAR_SET(skate3_native_render_scene_selection_outline, false);
-  REXCVAR_SET(skate3_native_render_scene_lightmaps, false);
-  REXCVAR_SET(skate3_native_render_scene_macro, false);
-  REXCVAR_SET(skate3_native_render_scene_decals, false);
-  REXCVAR_SET(skate3_native_render_scene_sort_opaque, false);
-  REXCVAR_SET(skate3_native_render_scene_splines, false);
-  REXCVAR_SET(skate3_native_render_scene_ropa_blend, false);
-  REXCVAR_SET(skate3_native_render_scene_entity_fade, false);
-  REXCVAR_SET(skate3_native_render_scene_lw_fade, false);
-  REXCVAR_SET(skate3_native_render_scene_lw_gap_fill, false);
-  REXCVAR_SET(skate3_native_render_scene_lw_identity, false);
-  REXCVAR_SET(skate3_native_render_scene_lw_palette, false);
-  REXCVAR_SET(skate3_native_render_scene_prewarm_budget_ms, 8);
+  if (std::clamp(REXCVAR_GET(skate3_android_quality_profile), 0, 1) == 0) {
+    REXCVAR_SET(skate3_native_render_scene_handheld_potato, true);
+    REXCVAR_SET(skate3_native_render_scene_msaa, 1);
+    REXCVAR_SET(skate3_native_render_scene_shadows, false);
+    REXCVAR_SET(skate3_native_render_scene_shadow_static_casters, false);
+    REXCVAR_SET(skate3_native_render_scene_shadow_pcss, false);
+    REXCVAR_SET(skate3_native_render_scene_ssao, false);
+    REXCVAR_SET(skate3_native_render_scene_ssr, false);
+    REXCVAR_SET(skate3_native_render_scene_hdr, false);
+    REXCVAR_SET(skate3_native_render_scene_bloom, false);
+    REXCVAR_SET(skate3_native_render_scene_shafts, false);
+    REXCVAR_SET(skate3_native_render_scene_selection_outline, false);
+    REXCVAR_SET(skate3_native_render_scene_lightmaps, false);
+    REXCVAR_SET(skate3_native_render_scene_macro, false);
+    REXCVAR_SET(skate3_native_render_scene_decals, false);
+    REXCVAR_SET(skate3_native_render_scene_sort_opaque, false);
+    REXCVAR_SET(skate3_native_render_scene_splines, false);
+    REXCVAR_SET(skate3_native_render_scene_ropa_blend, false);
+    REXCVAR_SET(skate3_native_render_scene_entity_fade, false);
+    REXCVAR_SET(skate3_native_render_scene_lw_fade, false);
+    REXCVAR_SET(skate3_native_render_scene_lw_gap_fill, false);
+    REXCVAR_SET(skate3_native_render_scene_lw_identity, false);
+    REXCVAR_SET(skate3_native_render_scene_lw_palette, false);
+    REXCVAR_SET(skate3_native_render_scene_prewarm_budget_ms, 8);
+  }
 #endif
   // Registered even when the scene cvar starts off: RenderScene yields to the
   // emulated output while disabled, and the runtime toggle (F5) can flip the

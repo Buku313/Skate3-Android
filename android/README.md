@@ -78,11 +78,22 @@ On first launch, Android asks for All files access so the game can read
 
 ## Handheld profile and controls
 
-Android defaults to a 512x288 scene target upscaled beneath the native-resolution
-HUD, 0.5x world/LOD range, simplified materials, no grass, shadows, SSAO, bloom,
-or volumetrics, and a fixed 60 FPS guest cap. The map, player physics, and board
-remain active at full rate. The controller is presented to the game as an Xbox
-pad through SDL. Press RB + Start to open the recomp settings overlay.
+The same APK includes two device profiles:
+
+| Profile | Scene | Intended hardware | Rendering |
+| --- | --- | --- | --- |
+| RG406V / Performance | 512x288 | T820/Mali-G57-class handhelds | 0.5x world/LOD range, simplified materials, no grass or expensive post effects |
+| High-End / Quality | 1280x720 | Fast modern phones and gaming handhelds | Original world/LOD range, vegetation and full materials, 2x MSAA, shadows, SSAO, bloom and volumetrics |
+
+Open the recomp overlay with **RB + Start**, then choose **Video > Android Device
+Profile** and use **Apply & Restart**. Performance remains the default so an APK
+can boot safely on the RG406V. Both profiles keep the 60 FPS guest cap; the map,
+player physics, and board remain full-rate. The controller is presented to the
+game as an Xbox pad through SDL.
+
+High-End is deliberately demanding and is not guaranteed to sustain 60 FPS on
+every nominally compatible phone. If it overheats, crashes a GPU driver, or falls
+below full speed, return to the Performance profile.
 
 ## Optional PalmWii penguin mod
 
