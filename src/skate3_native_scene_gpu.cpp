@@ -66,6 +66,7 @@ REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_2d);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_2d_safe_area);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_backface_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_boot_native);
@@ -11778,6 +11779,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
         float constants[40];
         std::memcpy(constants, d.consts, sizeof(d.consts));
+        // 2D ortho draws have no translation row in the projection (c3 ==
+        // (0,0,0,1)); perspective view-proj rows do.
+        const bool ortho = d.consts[12] == 0.0f && d.consts[13] == 0.0f &&
+                           d.consts[14] == 0.0f && d.consts[15] == 1.0f;
         // Match the staged 16:9 projection to the selected output shape.
         if (output_2d_scale != 1.0f) {
           constants[0] *= output_2d_scale;
@@ -11785,11 +11790,49 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           constants[2] *= output_2d_scale;
           constants[3] *= output_2d_scale;
         }
-        // 2D ortho draws have no translation row in the projection (c3 ==
-        // (0,0,0,1)); perspective view-proj rows do. Half-pixel applies to
-        // the former only.
-        const bool ortho = d.consts[12] == 0.0f && d.consts[13] == 0.0f &&
-                           d.consts[14] == 0.0f && d.consts[15] == 1.0f;
+        // 4:3 crops 160 pixels from each side of Skate 3's 1280-wide APT
+        // canvas. Keep gameplay-HUD groups anchored to the new safe edges
+        // without shrinking or stretching them. Bit 3 is the HUD
+        // render-to-texture bracket; menus and full-screen art use other
+        // brackets and retain the intentional centered crop. Grouping by
+        // transformed draw bounds gives every batch on the left or right
+        // the same whole-crop translation, so composite meters and minimap
+        // layers stay registered with each other.
+        if (output_2d_scale > 1.01f && ortho && yuv == nullptr &&
+            (d.flags & 0x08u) != 0 &&
+            REXCVAR_GET(skate3_native_render_scene_2d_safe_area)) {
+          const float proj_x = std::fabs(d.consts[0]);
+          const float guest_width = proj_x > 1e-6f ? 2.0f / proj_x : 0.0f;
+          if (guest_width >= 640.0f && guest_width <= 4096.0f) {
+            float min_x = std::numeric_limits<float>::max();
+            float max_x = std::numeric_limits<float>::lowest();
+            for (uint32_t v = 0; v < d.count; ++v) {
+              float p[4];
+              std::memcpy(p, d.verts.data() + size_t(v) * d.stride, sizeof(p));
+              // Same world transform as overlay2d.hlsl: wp.x = dot(p, m[4]).
+              const float x = p[0] * d.consts[16] + p[1] * d.consts[17] +
+                              p[2] * d.consts[18] + p[3] * d.consts[19];
+              min_x = std::min(min_x, x);
+              max_x = std::max(max_x, x);
+            }
+            if (std::isfinite(min_x) && std::isfinite(max_x) && max_x >= min_x) {
+              const float center_x = (min_x + max_x) * 0.5f;
+              const float visible_fraction = 1.0f / output_2d_scale;
+              const float crop_x = guest_width * (1.0f - visible_fraction) * 0.5f;
+              float safe_shift_x = 0.0f;
+              if (center_x < guest_width * 0.40f) {
+                safe_shift_x = crop_x;
+              } else if (center_x > guest_width * 0.60f) {
+                safe_shift_x = -crop_x;
+              }
+              // m[0].w is the ortho clip-X translation. It is already
+              // multiplied by output_2d_scale above, so add the shifted
+              // guest-pixel distance in the same scaled clip space.
+              constants[3] += output_2d_scale * 2.0f * safe_shift_x / guest_width;
+            }
+          }
+        }
+        // Half-pixel applies to 2D ortho draws only.
         constants[36] = ortho ? 1.0f : 0.0f;
         // m[9].y: sharp-magnification amount for APT cached-bitmap tiles
         // (see the cvar; the shader gates on actual fetch magnification).

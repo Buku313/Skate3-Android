@@ -1,7 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Base application theme. -->
-    <style name="AppTheme" parent="android:Theme.NoTitleBar.Fullscreen">
-        <!-- Customize your theme here. -->
+    <style name="AppTheme" parent="android:Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowBackground">#080C0F</item>
+        <item name="android:colorAccent">#FF6B16</item>
+        <item name="android:alertDialogTheme">@style/AppAlertDialogTheme</item>
+    </style>
+
+    <!-- Explicitly dark instead of inheriting the vendor's day/night dialog.
+         One UI otherwise mixes the app's white text with a white alert panel,
+         making the installed Turnip choices look like a blank screen. -->
+    <style name="AppAlertDialogTheme" parent="android:Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#FF6B16</item>
+        <item name="android:windowBackground">#10171C</item>
+        <item name="android:textColorPrimary">#FFFFFFFF</item>
+        <item name="android:textColorSecondary">#FFCBD3D8</item>
     </style>
 </resources>

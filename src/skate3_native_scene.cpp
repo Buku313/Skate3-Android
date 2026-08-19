@@ -394,6 +394,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_2d, true, "Skate 3",
                     "Replay the game's 2D/APT (Flash HUD) draws as a native overlay pass "
                     "on top of the 3D scene")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_2d_safe_area, true, "Skate 3",
+    "Keep edge-anchored gameplay HUD groups inside narrower native outputs "
+    "such as 4:3 while full-screen 2D art continues to center-crop")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_splines, true, "Skate 3",
                     "Replay the game's in-world neon spline draws (waypoint arrows, "
                     "marker beams; spline_darken/spline_default shaders) inside the "
