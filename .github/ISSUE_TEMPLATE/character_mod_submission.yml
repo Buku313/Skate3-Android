@@ -1,0 +1,73 @@
+name: Character mod submission
+description: Submit an original character for review in the Skate 3 Mobile Mod Store
+title: "[CHARACTER SUBMISSION] "
+labels:
+  - mod submission
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for making a character for Skate 3 Mobile. Attach only work you created or have permission to redistribute. Do not attach Skate 3 retail assets, game executables, ISOs, or Title Update files.
+  - type: input
+    id: character_name
+    attributes:
+      label: Character name
+      placeholder: Seiyu Paradise Penguin
+    validations:
+      required: true
+  - type: input
+    id: creator
+    attributes:
+      label: Creator credit
+      description: The name and link that should appear in the Mod Store.
+      placeholder: Creator name and https://github.com/username
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Character description
+      description: Write the short description players should see in the store.
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Character ZIP and preview
+      description: Drag the ZIP and a PNG or JPG preview here. The ZIP should contain base.obj and texture_diffuse.png only.
+    validations:
+      required: true
+  - type: textarea
+    id: permission
+    attributes:
+      label: Ownership and permission
+      description: Explain who created the model and texture and the permission or license allowing this project to redistribute them.
+    validations:
+      required: true
+  - type: input
+    id: tested_version
+    attributes:
+      label: Tested Skate 3 Mobile version
+      placeholder: v2.0.14
+    validations:
+      required: true
+  - type: textarea
+    id: testing
+    attributes:
+      label: Testing notes
+      description: List tested devices and describe feet, board contact, flippers or hands, emotes, tricks, and any visible problems.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission permission
+      options:
+        - label: I created these files or have explicit permission to redistribute them.
+          required: true
+        - label: This submission contains no Skate 3 retail assets, executables, ISO data, or Title Update files.
+          required: true
+        - label: I allow Buku313/Skate3-Mobile to test, package, redistribute, and credit this character through the public Mod Store.
+          required: true
+        - label: I understand that review, technical changes, or rejection may be necessary before publication.
+          required: true

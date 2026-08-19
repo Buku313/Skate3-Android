@@ -47,10 +47,10 @@ downloads and verifies the new APK inside the app. Android still asks you to
 approve the installation, but you do not need to return to GitHub or reinstall
 your game files.
 
-The original skater is selected by default. Open **Mod Store** in the launcher
-to download and install Seiyu Paradise Penguin with one tap. In game, press
-**RB + Start**, open **Mods**, and switch between **Original Skater** and
-**Seiyu Paradise Penguin** instantly.
+The original skater is selected by default. Seiyu Paradise Penguin is included
+in the APK and remains optional. In game, press **RB + Start**, open **Mods**,
+and switch between **Original Skater** and **Seiyu Paradise Penguin** instantly.
+The verified Mod Store remains available for community characters.
 
 ## How it works and how it was developed
 
@@ -110,12 +110,12 @@ the person building the project. This is experimental research software, and a
 - In-app GitHub bug reports with privacy-safe device and crash diagnostics
 - Gameplay and tricks work
 - Native Vulkan rendering works
-- Optional rootless custom Turnip drivers on Snapdragon / Adreno devices
+- Experimental rootless custom Turnip drivers hidden under Advanced Options
 - 4 KB and 16 KB Android memory pages are supported
 - Saves and game data load from Android storage
 - RG406V performance profile included
 - High-end Android quality profile included
-- Optional Seiyu Paradise Penguin Mod included
+- Seiyu Paradise Penguin included, with the original skater selected by default
 - Experimental direct-IP free-skate ghost included and disabled by default
 
 This is still early. Expect visual bugs, missing effects, device-specific
@@ -160,15 +160,17 @@ Device Profile**, then use **Apply & Restart**.
 
 ## Optional Turnip drivers
 
-Snapdragon / Adreno users can open **GPU Driver** in the Android launcher and
-import an AdrenoTools-compatible driver ZIP. The package is checked before it
-is copied into private app storage. Skate 3 Mobile validates the ADPKG metadata,
-Android API requirement, archive paths, size limits, and ARM64 shared libraries.
+Snapdragon / Adreno users can open **Advanced Options > GPU driver experiments**
+in the Android launcher and import an AdrenoTools-compatible driver ZIP. The
+package is checked before it is copied into private app storage. Importing a
+driver does not enable it. Skate 3 Mobile validates the ADPKG metadata, Android
+API requirement, archive paths, size limits, and ARM64 shared libraries.
 
 The driver applies only to Skate 3 Mobile and does not require root. No custom
 driver is bundled or downloaded by this project. **System Driver** remains the
-default and is always available as the recovery option. If Turnip makes the
-game crash, reopen the launcher and select **System Driver** before playing.
+default and is always available as the recovery option. If the game works on
+the System Driver, do not change this setting. If Turnip makes the game crash,
+reopen Advanced Options and select **System Driver** before playing.
 
 Turnip is for Adreno GPUs. Mali devices such as the RG406V remain locked to the
 System Driver. Driver packages are device-specific and experimental, so a
@@ -254,8 +256,9 @@ setup are documented in [android/README.md](android/README.md).
 
 ## SEIYU PARADISE PENGUIN MOD
 
-On Android, open **Mod Store** in the launcher and install Seiyu. The catalog,
-manual download, and verified source assets are published on the
+Seiyu ships inside the Android APK and is restored automatically if its files
+are missing. The original skater remains the default. The catalog, manual
+download, and verified source assets are published on the
 [Mod Store website](https://buku313.github.io/Skate3-Mobile/mods/). The files
 are stored under the active game install:
 
@@ -266,6 +269,10 @@ mods/penguin/texture_diffuse.png
 
 Choose Seiyu from **RB + Start > Mods > Playable Character**. The mod rigs Seiyu
 to the live skater skeleton and keeps the skateboard visible.
+
+Creators can [submit an original custom character](https://buku313.github.io/Skate3-Mobile/mods/submit.html)
+for testing and possible inclusion in the verified Mod Store. Submissions must
+include redistribution permission and may not contain retail Skate 3 assets.
 
 ## Credits
 

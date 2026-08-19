@@ -160,13 +160,14 @@ High-End is deliberately demanding and is not guaranteed to sustain 60 FPS on
 every nominally compatible phone. If it overheats, crashes a GPU driver, or falls
 below full speed, return to the Performance profile.
 
-## Optional custom Turnip driver
+## Experimental custom Turnip driver
 
-On Snapdragon / Adreno devices, open **GPU Driver** in the launcher to import
-an AdrenoTools-compatible driver ZIP. The launcher accepts the standard ADPKG
-layout with `meta.json`, the named Vulkan library, and any dependency libraries.
-It validates the metadata, Android API requirement, archive paths, extraction
-limits, and ARM64 ELF files before activating the package.
+On Snapdragon / Adreno devices, open **Advanced Options > GPU driver
+experiments** in the launcher to import an AdrenoTools-compatible driver ZIP.
+The launcher accepts the standard ADPKG layout with `meta.json`, the named
+Vulkan library, and any dependency libraries. It validates the metadata,
+Android API requirement, archive paths, extraction limits, and ARM64 ELF files.
+Importing a package does not enable it.
 
 The imported driver is stored under the app's private internal files directory
 because Android will not load executable libraries from shared storage. It is
@@ -183,15 +184,17 @@ but neither that project nor any individual driver package is part of Skate 3
 Mobile. A package that works on one Snapdragon model may crash or render
 incorrectly on another.
 
-**System Driver** is the default and permanent fallback. If a custom driver
-causes a crash, reopen Skate 3 Mobile, choose **GPU Driver**, and select **Use
+**System Driver** is the default and permanent fallback. Leave it selected if
+the game already works. If a custom driver causes a crash, reopen Skate 3
+Mobile, choose **Advanced Options > GPU driver experiments**, and select **Use
 System Driver**. Mali devices such as the RG406V do not offer custom driver
 activation.
 
-## Optional SEIYU PARADISE PENGUIN MOD
+## Included SEIYU PARADISE PENGUIN MOD
 
-Open **Mod Store** in the Skate 3 Mobile launcher and install Seiyu with one
-tap. The store downloads and verifies these two assets:
+Seiyu is bundled in the APK and restored automatically when the launcher finds
+a valid game installation. The original skater remains selected by default.
+The included package contains these two verified assets:
 
 ```text
 base.obj
@@ -201,5 +204,6 @@ texture_diffuse.png
 The launcher copies them into the active installation. Press **RB + Start** in
 game and open **Mods > Playable Character** to switch live between Seiyu and the
 original skater. The renderer automatically rigs Seiyu to the live skater
-skeleton while preserving the skateboard. A manual ZIP is also available on
-the [Mod Store website](https://buku313.github.io/Skate3-Mobile/mods/).
+skeleton while preserving the skateboard. The Mod Store remains available for
+community characters. Creators can review the package requirements and
+[submit a character](https://buku313.github.io/Skate3-Mobile/mods/submit.html).

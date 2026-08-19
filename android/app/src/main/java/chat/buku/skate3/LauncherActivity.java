@@ -81,6 +81,7 @@ public class LauncherActivity extends Activity {
     private boolean checkingUpdate;
     private boolean updatePromptShown;
     private boolean awaitingInstallPermission;
+    private boolean bundledSeiyuAttempted;
     private AppUpdater.UpdateInfo availableUpdate;
     private File pendingUpdateApk;
     private long lastProgressUpdate;
@@ -188,7 +189,6 @@ public class LauncherActivity extends Activity {
         reportButton = actionButton(false);
         content.addView(primaryButton, matchFixed(dp(58), dp(10)));
         content.addView(characterButton, matchFixed(dp(54), dp(10)));
-        content.addView(gpuDriverButton, matchFixed(dp(54), dp(10)));
         content.addView(secondaryButton, matchFixed(dp(54), dp(10)));
         content.addView(tertiaryButton, matchFixed(dp(54), dp(10)));
         content.addView(updateButton, matchFixed(dp(50), dp(18)));
@@ -196,6 +196,7 @@ public class LauncherActivity extends Activity {
         content.addView(reportButton, matchFixed(dp(50), dp(18)));
         setButton(reportButton, "BUG REPORT / DEVICE DIAGNOSTICS",
                   view -> BugReporter.show(this), false);
+        content.addView(gpuDriverButton, matchFixed(dp(46), dp(18)));
 
         TextView requirements = text(
             "Requires Android 13+, ARM64, Vulkan, and about 8 GB free after the ISO is already on your device or USB drive. Touch controls are included.",
@@ -228,12 +229,13 @@ public class LauncherActivity extends Activity {
         boolean scopedReady = isGameReady(gameDirectory.toPath());
         boolean legacyReady = legacyGameReady();
         if (scopedReady || legacyReady) {
-            statusText.setText("READY TO SKATE");
             File activeGame = scopedReady ? gameDirectory : new File("/storage/emulated/0/skate3");
+            if (ensureBundledSeiyu(activeGame)) return;
+            statusText.setText("READY TO SKATE");
             detailText.setText(Build.MODEL + "\nGame files: " + activeGame.getAbsolutePath());
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
             configureSeiyuInstallButton(activeGame);
-            configureGpuDriverButton();
+            configureAdvancedButton();
             if (scopedReady) {
                 setButton(secondaryButton, "REPAIR OR REINSTALL", view -> confirmReinstall(), false);
             } else {
@@ -426,6 +428,13 @@ public class LauncherActivity extends Activity {
             Files.move(partialDirectory.toPath(), gameDirectory.toPath());
         }
         appendLog("Phone-only installation completed at " + gameDirectory.getAbsolutePath());
+        try {
+            BundledMods.installSeiyu(this, gameDirectory.toPath());
+            appendLog("Bundled Seiyu Paradise Penguin files installed.");
+        } catch (IOException exception) {
+            appendLog("Bundled Seiyu installation will retry from the launcher: " +
+                      cleanMessage(exception));
+        }
         runOnUiThread(() -> {
             busy = false;
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -434,7 +443,7 @@ public class LauncherActivity extends Activity {
             detailText.setText("Your files were verified and stayed on this device.");
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
             configureSeiyuInstallButton(gameDirectory);
-            configureGpuDriverButton();
+            configureAdvancedButton();
             hide(secondaryButton);
             hide(tertiaryButton);
         });
@@ -566,36 +575,116 @@ public class LauncherActivity extends Activity {
     }
 
     private void configureSeiyuInstallButton(File activeGame) {
-        boolean assetsInstalled = seiyuAssetsInstalled(activeGame);
-        String label = assetsInstalled
-            ? "MOD STORE  •  SEIYU INSTALLED"
-            : "MOD STORE  •  1 MOD AVAILABLE";
-        setButton(characterButton, label, view -> openModStore(), false);
+        boolean ready = BundledMods.isSeiyuReady(activeGame.toPath());
+        String label = ready
+            ? "CHARACTERS  •  SEIYU INCLUDED"
+            : "CHARACTERS  •  RESTORE SEIYU";
+        setButton(characterButton, label, view -> showSeiyuIncluded(activeGame), false);
     }
 
-    private static boolean seiyuAssetsInstalled(File activeGame) {
-        File mod = new File(activeGame, "mods/penguin");
-        return new File(mod, "base.obj").isFile() &&
-               new File(mod, "texture_diffuse.png").isFile();
-    }
-
-    private void configureGpuDriverButton() {
-        CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
-        String label;
-        if (!CustomGpuDriver.isLikelyAdrenoDevice()) {
-            label = "GPU DRIVER  •  SYSTEM";
-        } else if (driver != null && driver.enabled) {
-            label = "GPU DRIVER  •  CUSTOM: " + driver.version;
-        } else {
-            label = "GPU DRIVER  •  SYSTEM";
+    private boolean ensureBundledSeiyu(File activeGame) {
+        if (BundledMods.isSeiyuReady(activeGame.toPath()) || bundledSeiyuAttempted) {
+            return false;
         }
-        setButton(gpuDriverButton, label, view -> showGpuDriverMenu(), false);
+        bundledSeiyuAttempted = true;
+        setBusy("PREPARING SEIYU", "Installing the included playable penguin...", true);
+        worker.execute(() -> {
+            try {
+                BundledMods.installSeiyu(this, activeGame.toPath());
+                appendLog("Bundled Seiyu Paradise Penguin files installed.");
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setProgress(1000);
+                    Toast.makeText(this,
+                        "Seiyu is included and ready in RB + Start > Mods.",
+                        Toast.LENGTH_LONG).show();
+                    refreshInterface();
+                });
+            } catch (Exception exception) {
+                appendLog("Could not install bundled Seiyu: " + stackTrace(exception));
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setVisibility(View.GONE);
+                    new AlertDialog.Builder(this)
+                        .setTitle("Seiyu needs attention")
+                        .setMessage("The included Seiyu files could not be installed: " +
+                                    cleanMessage(exception) +
+                                    "\n\nSkate 3 can still use the original skater. You can retry from Characters.")
+                        .setPositiveButton("OK", (dialog, which) -> refreshInterface())
+                        .show();
+                });
+            }
+        });
+        return true;
+    }
+
+    private void showSeiyuIncluded(File activeGame) {
+        boolean ready = BundledMods.isSeiyuReady(activeGame.toPath());
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+            .setTitle("Seiyu Paradise Penguin")
+            .setMessage(ready
+                ? "Seiyu comes with Skate 3 Mobile and is ready to skate. In game, press RB + Start and open Mods > Playable Character to switch between Seiyu and the original skater."
+                : "Seiyu comes with Skate 3 Mobile, but his local files need to be restored. The original skater is still available.")
+            .setNegativeButton("Close", null)
+            .setPositiveButton("Open Mod Store", (ignored, which) -> openModStore())
+            .setNeutralButton("Restore Seiyu", (ignored, which) -> restoreBundledSeiyu());
+        dialog.show();
+    }
+
+    private void restoreBundledSeiyu() {
+        if (busy) return;
+        setBusy("RESTORING SEIYU", "Verifying the character files included in the APK...", true);
+        worker.execute(() -> {
+            try {
+                BundledMods.installSeiyu(this, activeGameDirectory().toPath());
+                appendLog("Bundled Seiyu Paradise Penguin files restored.");
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setProgress(1000);
+                    Toast.makeText(this, "Seiyu restored and ready.", Toast.LENGTH_LONG).show();
+                    refreshInterface();
+                });
+            } catch (Exception exception) {
+                showModStoreFailure("Could not restore Seiyu: " +
+                                    cleanMessage(exception), exception);
+            }
+        });
+    }
+
+    private void configureAdvancedButton() {
+        CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
+        String label = driver != null && driver.enabled
+            ? "ADVANCED OPTIONS  •  CUSTOM GPU DRIVER ACTIVE"
+            : "ADVANCED OPTIONS";
+        setButton(gpuDriverButton, label, view -> showAdvancedOptions(), false);
+    }
+
+    private void showAdvancedOptions() {
+        CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
+        boolean customActive = driver != null && driver.enabled;
+        String message = customActive
+            ? "A custom GPU driver is active. System Driver is the normal and recommended setting. Change this only while troubleshooting a device-specific graphics problem."
+            : "Skate 3 is using the device System Driver. This is the recommended setting. If the game already works, leave these options unchanged.";
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+            .setTitle("Advanced options")
+            .setMessage(message)
+            .setNegativeButton("Close", null);
+        if (CustomGpuDriver.isLikelyAdrenoDevice()) {
+            dialog.setPositiveButton("GPU driver experiments",
+                                     (ignored, which) -> showGpuDriverMenu());
+        } else {
+            dialog.setPositiveButton("OK", null);
+        }
+        dialog.show();
     }
 
     private void showGpuDriverMenu() {
         if (!CustomGpuDriver.isLikelyAdrenoDevice()) {
             new AlertDialog.Builder(this)
-                .setTitle("GPU driver")
+                .setTitle("Experimental GPU driver")
                 .setMessage("This device does not appear to use a Snapdragon / Adreno GPU. Turnip is not compatible here, so Skate 3 will stay on the System Driver.")
                 .setPositiveButton("OK", null)
                 .show();
@@ -605,8 +694,8 @@ public class LauncherActivity extends Activity {
         CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
         if (driver == null) {
             new AlertDialog.Builder(this)
-                .setTitle("GPU driver")
-                .setMessage("System Driver is selected. Advanced Snapdragon users can import an AdrenoTools-compatible Turnip driver ZIP. Drivers are device-specific and an incompatible build may crash at launch.")
+                .setTitle("Experimental GPU driver")
+                .setMessage("System Driver is selected and recommended. Do not change this if Skate 3 already works. Turnip is only a troubleshooting option for affected Snapdragon devices and an incompatible package may crash at launch.")
                 .setNegativeButton("Close", null)
                 .setPositiveButton("Import Turnip ZIP", (dialog, which) -> pickGpuDriver())
                 .show();
@@ -621,10 +710,10 @@ public class LauncherActivity extends Activity {
             "Remove imported driver"
         };
         new AlertDialog.Builder(this)
-            .setTitle("GPU driver")
+            .setTitle("Experimental GPU driver")
             .setMessage("Selected: " + selected + "\n\nCustom driver: " + driver.label() +
                         "\nVendor: " + driver.vendor + "\nAuthor: " + driver.author +
-                        "\n\nIf a custom driver crashes, reopen the launcher and select System Driver.")
+                        "\n\nSystem Driver is recommended. If a custom driver crashes, reopen the launcher and select System Driver.")
             .setItems(choices, (dialog, which) -> {
                 if (which == 0) {
                     CustomGpuDriver.useSystem(this);
@@ -644,10 +733,11 @@ public class LauncherActivity extends Activity {
 
     private void confirmCustomGpuDriver(CustomGpuDriver.Driver driver) {
         new AlertDialog.Builder(this)
-            .setTitle("Use custom Turnip driver?")
-            .setMessage(driver.label() + " will be used only by Skate 3. This is experimental. If the game crashes, reopen the launcher and switch back to System Driver.")
+            .setTitle("Enable experimental driver?")
+            .setMessage("Do not enable this if Skate 3 already works. " + driver.label() +
+                        " will replace the working System Driver only inside Skate 3. It may crash, black-screen, or render incorrectly. You can return here and restore System Driver.")
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Use custom driver", (dialog, which) -> {
+            .setPositiveButton("Enable anyway", (dialog, which) -> {
                 try {
                     CustomGpuDriver.useCustom(this);
                     Toast.makeText(this, "Custom driver selected for the next launch.",
@@ -690,7 +780,7 @@ public class LauncherActivity extends Activity {
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     progressBar.setVisibility(View.GONE);
                     Toast.makeText(this, driver.label() +
-                        " imported and selected. It will be used on the next game launch.",
+                        " imported but not enabled. System Driver remains selected.",
                         Toast.LENGTH_LONG).show();
                     refreshInterface();
                 });
@@ -756,9 +846,8 @@ public class LauncherActivity extends Activity {
                         .setTitle("Mod Store unavailable")
                         .setMessage("The online catalog could not be loaded: " +
                                     cleanMessage(exception) +
-                                    "\n\nYou can still import Seiyu's files manually.")
-                        .setNegativeButton("Close", null)
-                        .setPositiveButton("Import files", (dialog, which) -> pickSeiyuModel())
+                                    "\n\nSeiyu is included with the app and remains available offline.")
+                        .setPositiveButton("Close", null)
                         .show();
                 });
             }
@@ -775,7 +864,7 @@ public class LauncherActivity extends Activity {
             ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
 
         TextView intro = text(
-            "One-tap character mods. Every download is size-limited and SHA-256 verified before installation.",
+            "Seiyu is included with the app. Community character mods use size-limited, SHA-256 verified downloads before installation.",
             14, Color.rgb(190, 190, 198));
         intro.setLineSpacing(0, 1.12f);
         list.addView(intro, matchWrap(dp(16)));
@@ -833,6 +922,7 @@ public class LauncherActivity extends Activity {
     }
 
     private void showModStoreDetails(ModStore.Mod mod, boolean installed) {
+        boolean bundledSeiyu = mod.id.equals("seiyu-paradise-penguin");
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(22), dp(18), dp(22), dp(12));
@@ -844,7 +934,8 @@ public class LauncherActivity extends Activity {
 
         TextView details = text(
             "Version " + mod.version + "\nDownload: " + humanBytes(mod.downloadSize()) +
-            "\nStatus: " + (installed ? "Installed" : "Not installed") +
+            "\nStatus: " + (bundledSeiyu ? "Included with Skate 3 Mobile" :
+                              (installed ? "Installed" : "Not installed")) +
             "\n\nAfter installation, choose the character in RB + Start > Mods.",
             13, Color.rgb(150, 150, 160));
         details.setLineSpacing(0, 1.16f);
@@ -853,13 +944,16 @@ public class LauncherActivity extends Activity {
         AlertDialog.Builder dialog = new AlertDialog.Builder(this)
             .setTitle(mod.name)
             .setView(panel)
-            .setNegativeButton("Close", null)
-            .setPositiveButton(installed ? "Reinstall" : "Install",
-                (ignored, which) -> installStoreMod(mod));
-        if (installed) {
+            .setNegativeButton("Close", null);
+        if (bundledSeiyu) {
+            dialog.setPositiveButton("Restore bundled copy",
+                                     (ignored, which) -> restoreBundledSeiyu());
+        } else {
+            dialog.setPositiveButton(installed ? "Reinstall" : "Install",
+                                     (ignored, which) -> installStoreMod(mod));
+        }
+        if (installed && !bundledSeiyu) {
             dialog.setNeutralButton("Remove", (ignored, which) -> confirmRemoveStoreMod(mod));
-        } else if (mod.id.equals("seiyu-paradise-penguin")) {
-            dialog.setNeutralButton("Import files", (ignored, which) -> pickSeiyuModel());
         }
         dialog.show();
     }
@@ -934,8 +1028,8 @@ public class LauncherActivity extends Activity {
 
     private void explainSeiyuInstall() {
         new AlertDialog.Builder(this)
-            .setTitle("Add Seiyu Paradise Penguin")
-            .setMessage("Seiyu is optional and is not bundled with the app. If you have the Seiyu model files, choose base.obj and then texture_diffuse.png. In game, press RB + Start and open Mods to switch between the original skater and Seiyu.")
+            .setTitle("Restore Seiyu Paradise Penguin")
+            .setMessage("Seiyu is bundled with the app and the original skater remains the default. Manual import is available only for development or restoring custom files. In game, press RB + Start and open Mods to switch characters.")
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Choose files", (dialog, which) -> pickSeiyuModel())
             .show();

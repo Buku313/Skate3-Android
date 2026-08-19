@@ -144,9 +144,9 @@ final class CustomGpuDriver {
                 throw exception;
             }
             context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit()
-                .putBoolean(ENABLED_PREFERENCE, true).apply();
+                .putBoolean(ENABLED_PREFERENCE, false).apply();
             Driver driver = installed(context);
-            if (driver == null) throw new IOException("The imported driver could not be activated.");
+            if (driver == null) throw new IOException("The imported driver could not be installed.");
             return driver;
         } catch (Exception exception) {
             deleteRecursively(staging);

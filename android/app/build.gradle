@@ -26,8 +26,8 @@ android {
         applicationId "chat.buku.skate3"
         minSdkVersion 33
         targetSdkVersion 35
-        versionCode 20013
-        versionName "2.0.13"
+        versionCode 20014
+        versionName "2.0.14"
     }
     buildTypes {
         debug {

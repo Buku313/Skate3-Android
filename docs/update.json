@@ -1,7 +1,7 @@
 {
-  "versionCode": 20012,
-  "versionName": "2.0.12",
+  "versionCode": 20014,
+  "versionName": "2.0.14",
   "apkUrl": "https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk",
-  "sha256": "1bc8e62b65a776533e3f176945810e9928f4151747dd35aa0987dfcf7e0d0c66",
-  "notes": "Adds the one-tap Mod Store with Seiyu Paradise Penguin, verified downloads, install and removal controls, plus the v2.0.11 Android guest-memory and Qualcomm compatibility work."
+  "sha256": "fb05182e7ea7ac8d029d785ff58e19cc87384f1746c7983e603499939137803f",
+  "notes": "Includes Seiyu Paradise Penguin while keeping the original skater selected by default, preserves the verified Mod Store, adds community character submissions, and moves custom GPU drivers into optional Advanced Options."
 }
