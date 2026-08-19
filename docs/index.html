@@ -136,6 +136,32 @@
       font-weight: 900;
       letter-spacing: .08em;
     }
+    .performance-showcase {
+      display: grid;
+      grid-template-columns: 1.35fr .65fr;
+      gap: clamp(24px, 5vw, 58px);
+      align-items: center;
+    }
+    .performance-video {
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,.13);
+      border-radius: 22px;
+      background: #000;
+      box-shadow: 0 24px 70px rgba(0,0,0,.42);
+    }
+    .performance-video video { display: block; width: 100%; height: auto; }
+    .performance-copy .eyebrow { margin-bottom: 12px; }
+    .performance-copy h2 { margin-bottom: 18px; }
+    .performance-copy p { color: var(--muted); }
+    .performance-number {
+      display: block;
+      margin: 20px 0 4px;
+      color: var(--cyan);
+      font-size: clamp(3.2rem, 7vw, 5.8rem);
+      font-weight: 1000;
+      letter-spacing: -.07em;
+      line-height: .9;
+    }
     section { padding: 84px 0; border-top: 1px solid rgba(255,255,255,.08); }
     h2 { margin: 0 0 14px; font-size: clamp(2rem, 5vw, 3.5rem); letter-spacing: -.045em; }
     .section-intro { margin: 0 0 34px; color: var(--muted); max-width: 700px; }
@@ -191,6 +217,7 @@
     @media (max-width: 780px) {
       .hero { grid-template-columns: 1fr; min-height: auto; padding-top: 50px; }
       .cover { transform: none; }
+      .performance-showcase { grid-template-columns: 1fr; }
       .steps, .cards { grid-template-columns: 1fr; }
       .download-panel { align-items: flex-start; flex-direction: column; }
       .download-panel .button { width: 100%; }
@@ -233,6 +260,24 @@
         <div class="status">PLAYABLE · DEV BUILD</div>
       </div>
     </div>
+
+    <section id="ayn-thor">
+      <div class="wrap performance-showcase">
+        <div class="performance-video">
+          <video controls playsinline preload="metadata" poster="media/ayn-thor-90fps.jpg">
+            <source src="media/ayn-thor-90fps.mp4" type="video/mp4">
+            Your browser does not support embedded MP4 video.
+          </video>
+        </div>
+        <div class="performance-copy">
+          <div class="eyebrow">REAL DEVICE CAPTURE</div>
+          <h2>Beautiful on AYN Thor.</h2>
+          <span class="performance-number">90 FPS</span>
+          <p>Native Skate 3 gameplay is now verified around 90 FPS on an AYN Thor, with captured peaks above 100 FPS. Watch the complete uncut handheld recording.</p>
+          <p class="fine">Experimental developer build. Frame rate changes with scene, settings, temperature, and device power mode.</p>
+        </div>
+      </div>
+    </section>
 
     <section id="install">
       <div class="wrap">
@@ -279,7 +324,7 @@
     <section>
       <div class="wrap">
         <h2>Built for players.</h2>
-        <p class="section-intro">Performance mode targets handheld hardware such as the RG406V. Quality mode is included for stronger phones.</p>
+        <p class="section-intro">Performance mode targets handheld hardware such as the RG406V. The AYN Thor has now demonstrated around 90 FPS, and Quality mode is included for stronger devices.</p>
         <div class="cards">
           <article class="card"><h3>Native Vulkan rendering</h3><p>Static ARM64 recompilation with a native scene renderer. This is not conventional Xbox 360 emulation.</p></article>
           <article class="card"><h3>Touch or controller</h3><p>Use the built-in multitouch overlay on a phone, or keep using a physical or built-in gamepad. Toggle touch controls from the top of the game.</p></article>
