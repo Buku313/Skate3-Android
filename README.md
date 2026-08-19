@@ -110,6 +110,7 @@ the person building the project. This is experimental research software, and a
 - In-app GitHub bug reports with privacy-safe device and crash diagnostics
 - Gameplay and tricks work
 - Native Vulkan rendering works
+- Optional rootless custom Turnip drivers on Snapdragon / Adreno devices
 - 4 KB and 16 KB Android memory pages are supported
 - Saves and game data load from Android storage
 - RG406V performance profile included
@@ -156,6 +157,22 @@ The same APK includes both profiles.
 
 Open the recomp menu with **RB + Start**. Go to **Video**, select **Android
 Device Profile**, then use **Apply & Restart**.
+
+## Optional Turnip drivers
+
+Snapdragon / Adreno users can open **GPU Driver** in the Android launcher and
+import an AdrenoTools-compatible driver ZIP. The package is checked before it
+is copied into private app storage. Skate 3 Mobile validates the ADPKG metadata,
+Android API requirement, archive paths, size limits, and ARM64 shared libraries.
+
+The driver applies only to Skate 3 Mobile and does not require root. No custom
+driver is bundled or downloaded by this project. **System Driver** remains the
+default and is always available as the recovery option. If Turnip makes the
+game crash, reopen the launcher and select **System Driver** before playing.
+
+Turnip is for Adreno GPUs. Mali devices such as the RG406V remain locked to the
+System Driver. Driver packages are device-specific and experimental, so a
+newer package is not automatically a better package for every phone.
 
 ## Game data
 
@@ -273,8 +290,12 @@ Penguin Mod, and the experimental free-skate networking work.
 - [rexglue SDK](https://github.com/rexglue/rexglue-sdk)
 - [Xenia](https://github.com/xenia-project/xenia)
 - [SDL](https://github.com/libsdl-org/SDL)
+- [libadrenotools](https://github.com/bylaws/libadrenotools)
 - [Vulkan](https://www.vulkan.org/)
 - [FFmpeg](https://ffmpeg.org/)
+
+See [third-party notices](docs/THIRD_PARTY_NOTICES.md) for applicable license
+texts.
 
 Thank you to everyone whose Xbox 360 research, testing, bug reports, and open
 source work made this possible.

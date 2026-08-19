@@ -160,6 +160,34 @@ High-End is deliberately demanding and is not guaranteed to sustain 60 FPS on
 every nominally compatible phone. If it overheats, crashes a GPU driver, or falls
 below full speed, return to the Performance profile.
 
+## Optional custom Turnip driver
+
+On Snapdragon / Adreno devices, open **GPU Driver** in the launcher to import
+an AdrenoTools-compatible driver ZIP. The launcher accepts the standard ADPKG
+layout with `meta.json`, the named Vulkan library, and any dependency libraries.
+It validates the metadata, Android API requirement, archive paths, extraction
+limits, and ARM64 ELF files before activating the package.
+
+The imported driver is stored under the app's private internal files directory
+because Android will not load executable libraries from shared storage. It is
+loaded without root through
+[libadrenotools](https://github.com/bylaws/libadrenotools) before the first
+Vulkan instance is created. The app does not bundle or automatically download
+a Turnip package.
+
+Driver packages are hardware-specific. Confirm the exact Adreno generation
+before importing one, and only use a ZIP from a source you trust. Community
+ADPKG builds are published by the
+[AdrenoTools Drivers project](https://github.com/K11MCH1/AdrenoToolsDrivers/releases),
+but neither that project nor any individual driver package is part of Skate 3
+Mobile. A package that works on one Snapdragon model may crash or render
+incorrectly on another.
+
+**System Driver** is the default and permanent fallback. If a custom driver
+causes a crash, reopen Skate 3 Mobile, choose **GPU Driver**, and select **Use
+System Driver**. Mali devices such as the RG406V do not offer custom driver
+activation.
+
 ## Optional SEIYU PARADISE PENGUIN MOD
 
 Open **Mod Store** in the Skate 3 Mobile launcher and install Seiyu with one

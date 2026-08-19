@@ -25,10 +25,10 @@
 #include "../third_party/rexglue-sdk/thirdparty/tracy/profiler/src/stb_image.h"
 
 #if defined(__ANDROID__) || defined(ANDROID)
-constexpr const char* kDefaultPenguinDir =
+constexpr const char *kDefaultPenguinDir =
     "/storage/emulated/0/skate3/mods/penguin";
 #else
-constexpr const char* kDefaultPenguinDir = "mods/penguin";
+constexpr const char *kDefaultPenguinDir = "mods/penguin";
 #endif
 
 REXCVAR_DEFINE_BOOL(skate3_penguin_mod, false, "Skate 3",
@@ -58,11 +58,11 @@ struct ObjIndex {
   int vt = 0;
   int vn = 0;
 
-  bool operator==(const ObjIndex&) const = default;
+  bool operator==(const ObjIndex &) const = default;
 };
 
 struct ObjIndexHash {
-  size_t operator()(const ObjIndex& i) const {
+  size_t operator()(const ObjIndex &i) const {
     uint64_t h = uint32_t(i.v);
     h = (h * 0x9E3779B185EBCA87ull) ^ uint32_t(i.vt);
     h = (h * 0x9E3779B185EBCA87ull) ^ uint32_t(i.vn);
@@ -79,14 +79,17 @@ struct ObservedVertex {
 struct ObservedMesh {
   std::vector<ObservedVertex> vertices;
   std::vector<float> bones;
+  uint64_t palette_epoch = 0;
 };
 
 std::mutex g_rig_mutex;
 std::unordered_map<uint32_t, ObservedMesh> g_skater_meshes;
 std::chrono::steady_clock::time_point g_last_new_skater_mesh{};
 std::unique_ptr<Asset> g_rigged_asset;
+uint64_t g_palette_epoch = 0;
+uint64_t g_next_rig_attempt_epoch = 0;
 
-bool IsSkateboardDeck(const native_scene::DrawItem& item) {
+bool IsSkateboardDeck(const native_scene::DrawItem &item) {
   // The deck is submitted through the same character shaders as the CAC.
   // Its bind box is uniquely long, wide and almost planar at sole height;
   // material family alone therefore must never decide whether it is erased.
@@ -99,7 +102,7 @@ bool IsSkateboardDeck(const native_scene::DrawItem& item) {
          item.bbox_max[1] <= 0.45f;
 }
 
-bool IsOriginalFaceFragment(const native_scene::DrawItem& item) {
+bool IsOriginalFaceFragment(const native_scene::DrawItem &item) {
   // Eyes/teeth use character.default rather than the normal CAC material,
   // which is why the family-2 replacement left two eyeballs overhead. They
   // are compact skinned pieces authored in the upper half of the player's
@@ -115,16 +118,15 @@ bool IsOriginalFaceFragment(const native_scene::DrawItem& item) {
   return item.bbox_min[1] >= 0.65f && std::max({sx, sy, sz}) <= 0.65f;
 }
 
-bool ParseObjIndex(std::string_view token, ObjIndex& out) {
+bool ParseObjIndex(std::string_view token, ObjIndex &out) {
   const size_t a = token.find('/');
-  const size_t b = a == std::string_view::npos
-                       ? std::string_view::npos
-                       : token.find('/', a + 1);
+  const size_t b = a == std::string_view::npos ? std::string_view::npos
+                                               : token.find('/', a + 1);
   try {
     out.v = std::stoi(std::string(token.substr(0, a)));
     if (a != std::string_view::npos && b != a + 1) {
-      out.vt = std::stoi(std::string(token.substr(
-          a + 1, b == std::string_view::npos ? b : b - a - 1)));
+      out.vt = std::stoi(std::string(
+          token.substr(a + 1, b == std::string_view::npos ? b : b - a - 1)));
     }
     if (b != std::string_view::npos && b + 1 < token.size()) {
       out.vn = std::stoi(std::string(token.substr(b + 1)));
@@ -136,12 +138,14 @@ bool ParseObjIndex(std::string_view token, ObjIndex& out) {
 }
 
 int ResolveIndex(int raw, size_t count) {
-  if (raw > 0) return raw - 1;
-  if (raw < 0) return int(count) + raw;
+  if (raw > 0)
+    return raw - 1;
+  if (raw < 0)
+    return int(count) + raw;
   return -1;
 }
 
-bool LoadObj(const std::filesystem::path& path, Asset& out) {
+bool LoadObj(const std::filesystem::path &path, Asset &out) {
   std::ifstream file(path);
   if (!file) {
     out.error = "could not open " + path.string();
@@ -159,7 +163,7 @@ bool LoadObj(const std::filesystem::path& path, Asset& out) {
   std::fill(std::begin(out.bbox_max), std::end(out.bbox_max),
             std::numeric_limits<float>::lowest());
 
-  auto emit_vertex = [&](ObjIndex key, uint16_t& result) -> bool {
+  auto emit_vertex = [&](ObjIndex key, uint16_t &result) -> bool {
     if (auto it = remap.find(key); it != remap.end()) {
       result = it->second;
       return true;
@@ -167,20 +171,19 @@ bool LoadObj(const std::filesystem::path& path, Asset& out) {
     const int pi = ResolveIndex(key.v, positions.size());
     const int ti = ResolveIndex(key.vt, texcoords.size());
     const int ni = ResolveIndex(key.vn, normals.size());
-    if (pi < 0 || pi >= int(positions.size())) return false;
+    if (pi < 0 || pi >= int(positions.size()))
+      return false;
     if (out.vertices.size() / 14 >= 65535) {
       out.error = "OBJ expands beyond the native renderer's 16-bit index limit";
       return false;
     }
-    const auto& p = positions[size_t(pi)];
-    const std::array<float, 2> uv =
-        ti >= 0 && ti < int(texcoords.size())
-            ? texcoords[size_t(ti)]
-            : std::array<float, 2>{0.0f, 0.0f};
-    const std::array<float, 3> n =
-        ni >= 0 && ni < int(normals.size())
-            ? normals[size_t(ni)]
-            : std::array<float, 3>{0.0f, 1.0f, 0.0f};
+    const auto &p = positions[size_t(pi)];
+    const std::array<float, 2> uv = ti >= 0 && ti < int(texcoords.size())
+                                        ? texcoords[size_t(ti)]
+                                        : std::array<float, 2>{0.0f, 0.0f};
+    const std::array<float, 3> n = ni >= 0 && ni < int(normals.size())
+                                       ? normals[size_t(ni)]
+                                       : std::array<float, 3>{0.0f, 1.0f, 0.0f};
     for (int axis = 0; axis < 3; ++axis) {
       out.bbox_min[axis] = std::min(out.bbox_min[axis], p[axis]);
       out.bbox_max[axis] = std::max(out.bbox_max[axis], p[axis]);
@@ -193,10 +196,11 @@ bool LoadObj(const std::filesystem::path& path, Asset& out) {
     const float v = 1.0f - uv[1];
     const float weight = std::bit_cast<float>(uint32_t{0x000000FFu});
     const float bone = std::bit_cast<float>(uint32_t{0});
-    const float packed[14] = {p[0], p[1], p[2], uv[0], v, uv[0], v,
-                              weight, bone, n[0], n[1], n[2], uv[0], v};
+    const float packed[14] = {p[0],   p[1], p[2], uv[0], v,    uv[0], v,
+                              weight, bone, n[0], n[1],  n[2], uv[0], v};
     result = uint16_t(out.vertices.size() / 14);
-    out.vertices.insert(out.vertices.end(), std::begin(packed), std::end(packed));
+    out.vertices.insert(out.vertices.end(), std::begin(packed),
+                        std::end(packed));
     remap.emplace(key, result);
     return true;
   };
@@ -210,20 +214,24 @@ bool LoadObj(const std::filesystem::path& path, Asset& out) {
     stream >> tag;
     if (tag == "v") {
       std::array<float, 3> value{};
-      if (stream >> value[0] >> value[1] >> value[2]) positions.push_back(value);
+      if (stream >> value[0] >> value[1] >> value[2])
+        positions.push_back(value);
     } else if (tag == "vt") {
       std::array<float, 2> value{};
-      if (stream >> value[0] >> value[1]) texcoords.push_back(value);
+      if (stream >> value[0] >> value[1])
+        texcoords.push_back(value);
     } else if (tag == "vn") {
       std::array<float, 3> value{};
-      if (stream >> value[0] >> value[1] >> value[2]) normals.push_back(value);
+      if (stream >> value[0] >> value[1] >> value[2])
+        normals.push_back(value);
     } else if (tag == "f") {
       std::vector<ObjIndex> face;
       std::string token;
       while (stream >> token) {
         ObjIndex index;
         if (!ParseObjIndex(token, index)) {
-          out.error = "bad face index at OBJ line " + std::to_string(line_number);
+          out.error =
+              "bad face index at OBJ line " + std::to_string(line_number);
           return false;
         }
         face.push_back(index);
@@ -250,12 +258,14 @@ bool LoadObj(const std::filesystem::path& path, Asset& out) {
   return true;
 }
 
-bool LoadTexture(const std::filesystem::path& path, Asset& out) {
+bool LoadTexture(const std::filesystem::path &path, Asset &out) {
   int width = 0, height = 0, components = 0;
-  stbi_uc* pixels = stbi_load(path.string().c_str(), &width, &height, &components, 4);
+  stbi_uc *pixels =
+      stbi_load(path.string().c_str(), &width, &height, &components, 4);
   if (pixels == nullptr || width <= 0 || height <= 0) {
     out.error = "could not decode " + path.string();
-    if (pixels != nullptr) stbi_image_free(pixels);
+    if (pixels != nullptr)
+      stbi_image_free(pixels);
     return false;
   }
   out.texture_width = uint32_t(width);
@@ -268,7 +278,7 @@ bool LoadTexture(const std::filesystem::path& path, Asset& out) {
 Asset LoadAsset() {
   Asset result;
   std::string dir(REXCVAR_GET(skate3_penguin_mod_dir));
-  if (const char* env = std::getenv("SKATE3_PENGUIN_MOD_DIR");
+  if (const char *env = std::getenv("SKATE3_PENGUIN_MOD_DIR");
       env != nullptr && *env != '\0') {
     dir = env;
   }
@@ -287,15 +297,15 @@ Asset LoadAsset() {
   return result;
 }
 
-}  // namespace
+} // namespace
 
-const Asset& GetAsset() {
+const Asset &GetAsset() {
   static const Asset asset = LoadAsset();
   return asset;
 }
 
-void ObserveSkaterMesh(const native_scene::DrawItem& item, const float* vertices,
-                       uint32_t vertex_count) {
+void ObserveSkaterMesh(const native_scene::DrawItem &item,
+                       const float *vertices, uint32_t vertex_count) {
   // Capture the original CAC bind data even while Original Skater is selected.
   // Decoded guest meshes are cached, so waiting until Seiyu is enabled means
   // there may be no later decode from which to build the live rig. This is a
@@ -305,14 +315,17 @@ void ObserveSkaterMesh(const native_scene::DrawItem& item, const float* vertices
     return;
   }
   std::lock_guard<std::mutex> lock(g_rig_mutex);
-  if (g_rigged_asset != nullptr) return;
-  ObservedMesh& slot = g_skater_meshes[item.mesh];
-  if (!slot.vertices.empty()) return;
+  if (g_rigged_asset != nullptr)
+    return;
+  ObservedMesh &slot = g_skater_meshes[item.mesh];
+  if (!slot.vertices.empty())
+    return;
 
   slot.vertices.reserve(vertex_count);
-  if (!item.bones.empty()) slot.bones = item.bones;
+  if (!item.bones.empty())
+    slot.bones = item.bones;
   for (uint32_t i = 0; i < vertex_count; ++i) {
-    const float* v = vertices + size_t(i) * 14;
+    const float *v = vertices + size_t(i) * 14;
     ObservedVertex sample{{v[0], v[1], v[2]}, 0, 0};
     std::memcpy(&sample.weights, v + 7, sizeof(sample.weights));
     std::memcpy(&sample.indices, v + 8, sizeof(sample.indices));
@@ -326,34 +339,52 @@ void ObserveSkaterMesh(const native_scene::DrawItem& item, const float* vertices
   }
 }
 
-void ObserveSkaterPalette(const native_scene::DrawItem& item) {
+void ObserveSkaterPalette(const native_scene::DrawItem &item) {
   if (!item.skinned || (item.char_family != 2 && item.char_family != 4) ||
       IsSkateboardDeck(item) || item.bones.empty()) {
     return;
   }
   std::lock_guard<std::mutex> lock(g_rig_mutex);
-  if (g_rigged_asset != nullptr) return;
-  ObservedMesh& slot = g_skater_meshes[item.mesh];
-  if (slot.bones.empty()) {
-    slot.bones = item.bones;
-    g_last_new_skater_mesh = std::chrono::steady_clock::now();
-  }
+  if (g_rigged_asset != nullptr)
+    return;
+  ObservedMesh &slot = g_skater_meshes[item.mesh];
+  // Refresh every visible piece from the same built frame. The old hot-switch
+  // path kept the first palette seen for each asynchronously decoded mesh, so
+  // the matrices came from different animation poses. Nearest-matrix matching
+  // then nondeterministically collapsed Seiyu's feet and flippers onto the
+  // torso root.
+  slot.bones = item.bones;
+  slot.palette_epoch = g_palette_epoch;
 }
 
-const Asset* GetRiggedAsset() {
-  const Asset& source = GetAsset();
-  if (!source.loaded) return nullptr;
+void BeginSkaterPaletteFrame() {
+  std::lock_guard<std::mutex> lock(g_rig_mutex);
+  if (g_rigged_asset != nullptr)
+    return;
+  ++g_palette_epoch;
+  if (g_palette_epoch == 0)
+    ++g_palette_epoch;
+}
+
+const Asset *GetRiggedAsset() {
+  const Asset &source = GetAsset();
+  if (!source.loaded)
+    return nullptr;
 
   std::lock_guard<std::mutex> lock(g_rig_mutex);
-  if (g_rigged_asset != nullptr) return g_rigged_asset.get();
+  if (g_rigged_asset != nullptr)
+    return g_rigged_asset.get();
+  if (g_palette_epoch < g_next_rig_attempt_epoch)
+    return nullptr;
 
   // Let the worker decoders see the full outfit (head, torso, trousers,
   // shoes and hair) before freezing the transfer cloud. This usually lasts
   // 10-15 gameplay frames and is hidden by the normal takeover prewarm.
   size_t total_vertices = 0;
   size_t complete_meshes = 0;
-  for (const auto& [mesh, observed] : g_skater_meshes) {
-    if (!observed.vertices.empty() && !observed.bones.empty()) {
+  for (const auto &[mesh, observed] : g_skater_meshes) {
+    if (observed.palette_epoch == g_palette_epoch &&
+        !observed.vertices.empty() && !observed.bones.empty()) {
       total_vertices += observed.vertices.size();
       ++complete_meshes;
     }
@@ -365,36 +396,62 @@ const Asset* GetRiggedAsset() {
     return nullptr;
   }
 
-  // Every character piece has a compact local palette. Choose the largest
-  // captured palette as canonical, then match each local bone matrix to its
-  // nearest canonical matrix before combining vertices from shoes, trousers,
-  // torso, face and hair. Treating the raw local byte as a global index was
-  // the mangled-v1 bug (one shoe's local bone 0 became the torso root).
-  const auto canonical_it = std::max_element(
-      g_skater_meshes.begin(), g_skater_meshes.end(),
-      [](const auto& a, const auto& b) {
-        return a.second.bones.size() < b.second.bones.size();
-      });
+  // Every character piece has a compact local palette. Use the piece with the
+  // greatest bind-space height as canonical. That is the lower-body garment
+  // spanning shoes through hips, which was the stable anchor used by Seiyu's
+  // original good rig. Picking the mesh with the most vertices instead chose
+  // an upper-body palette and made both feet follow unrelated joints.
+  auto canonical_it = g_skater_meshes.end();
+  float canonical_height = -1.0f;
+  for (auto it = g_skater_meshes.begin(); it != g_skater_meshes.end(); ++it) {
+    const ObservedMesh &candidate = it->second;
+    if (candidate.palette_epoch != g_palette_epoch ||
+        candidate.vertices.empty() || candidate.bones.empty()) {
+      continue;
+    }
+    float min_y = std::numeric_limits<float>::max();
+    float max_y = std::numeric_limits<float>::lowest();
+    for (const ObservedVertex &vertex : candidate.vertices) {
+      min_y = std::min(min_y, vertex.p[1]);
+      max_y = std::max(max_y, vertex.p[1]);
+    }
+    const float height = max_y - min_y;
+    if (canonical_it == g_skater_meshes.end() ||
+        height > canonical_height + 0.0001f ||
+        (std::fabs(height - canonical_height) <= 0.0001f &&
+         (candidate.bones.size() > canonical_it->second.bones.size() ||
+          (candidate.bones.size() == canonical_it->second.bones.size() &&
+           it->first < canonical_it->first)))) {
+      canonical_it = it;
+      canonical_height = height;
+    }
+  }
   if (canonical_it == g_skater_meshes.end() ||
       canonical_it->second.bones.size() < 12) {
     return nullptr;
   }
-  const std::vector<float>& canonical_bones = canonical_it->second.bones;
+  const std::vector<float> &canonical_bones = canonical_it->second.bones;
   const size_t canonical_count = canonical_bones.size() / 12;
 
   std::vector<ObservedVertex> cloud;
   cloud.reserve(total_vertices);
   float worst_bone_match = 0.0f;
-  for (const auto& [mesh, observed] : g_skater_meshes) {
-    if (observed.vertices.empty() || observed.bones.empty()) continue;
+  for (const auto &[mesh, observed] : g_skater_meshes) {
+    if (observed.palette_epoch != g_palette_epoch ||
+        observed.vertices.empty() || observed.bones.empty()) {
+      continue;
+    }
     const size_t local_count = observed.bones.size() / 12;
     std::vector<uint8_t> remap(local_count, 0);
     for (size_t local = 0; local < local_count; ++local) {
+      // Palette slots are local even when two expanded palettes happen to
+      // contain the same number of bones. Match matrices from this one frame
+      // so a shoe's local ankle slot reaches the lower-body anchor's ankle.
       float best_error = std::numeric_limits<float>::max();
       size_t best_bone = 0;
-      const float* local_rows = observed.bones.data() + local * 12;
+      const float *local_rows = observed.bones.data() + local * 12;
       for (size_t candidate = 0; candidate < canonical_count; ++candidate) {
-        const float* canonical_rows = canonical_bones.data() + candidate * 12;
+        const float *canonical_rows = canonical_bones.data() + candidate * 12;
         float error = 0.0f;
         for (int r = 0; r < 12; ++r) {
           const float delta = local_rows[r] - canonical_rows[r];
@@ -425,14 +482,13 @@ const Asset* GetRiggedAsset() {
   float src_max[3] = {std::numeric_limits<float>::lowest(),
                       std::numeric_limits<float>::lowest(),
                       std::numeric_limits<float>::lowest()};
-  for (const ObservedVertex& v : cloud) {
+  for (const ObservedVertex &v : cloud) {
     for (int axis = 0; axis < 3; ++axis) {
       src_min[axis] = std::min(src_min[axis], v.p[axis]);
       src_max[axis] = std::max(src_max[axis], v.p[axis]);
     }
   }
-  const float src_span[3] = {src_max[0] - src_min[0],
-                             src_max[1] - src_min[1],
+  const float src_span[3] = {src_max[0] - src_min[0], src_max[1] - src_min[1],
                              src_max[2] - src_min[2]};
   if (src_span[1] < 0.8f || src_span[0] < 0.25f || src_span[2] < 0.1f) {
     // An outfit piece arrived but the full body has not yet been decoded.
@@ -454,27 +510,23 @@ const Asset* GetRiggedAsset() {
 
   auto rigged = std::make_unique<Asset>(source);
   rigged->anchor_mesh = canonical_it->first;
-  const float penguin_span[3] = {
-      source.bbox_max[0] - source.bbox_min[0],
-      source.bbox_max[1] - source.bbox_min[1],
-      source.bbox_max[2] - source.bbox_min[2]};
-  const float lateral_scale =
-      src_span[0] / std::max(penguin_span[0], 0.001f);
+  const float penguin_span[3] = {source.bbox_max[0] - source.bbox_min[0],
+                                 source.bbox_max[1] - source.bbox_min[1],
+                                 source.bbox_max[2] - source.bbox_min[2]};
+  const float lateral_scale = src_span[0] / std::max(penguin_span[0], 0.001f);
   const float map_scale[3] = {
-      lateral_scale,
-      src_span[1] / std::max(penguin_span[1], 0.001f),
+      lateral_scale, src_span[1] / std::max(penguin_span[1], 0.001f),
       // Preserve the mascot's authored round cross-section. The human body
       // cloud is naturally much thinner front-to-back than it is wide; using
       // that depth directly made the penguin look paper-flat once the long
       // skateboard deck was correctly excluded from calibration.
       lateral_scale};
   const float src_center_z = 0.5f * (src_min[2] + src_max[2]);
-  const float fit_min[3] = {
-      src_min[0], src_min[1],
-      src_center_z - 0.5f * penguin_span[2] * map_scale[2]};
-  float fit_max[3] = {
-      src_max[0], src_max[1],
-      src_center_z + 0.5f * penguin_span[2] * map_scale[2]};
+  const float fit_min[3] = {src_min[0], src_min[1],
+                            src_center_z -
+                                0.5f * penguin_span[2] * map_scale[2]};
+  float fit_max[3] = {src_max[0], src_max[1],
+                      src_center_z + 0.5f * penguin_span[2] * map_scale[2]};
 
   // Resolve a compact mascot skeleton from the original outfit. The first
   // nearest-surface version copied human weights onto every penguin vertex;
@@ -484,22 +536,23 @@ const Asset* GetRiggedAsset() {
   std::array<float, 256> body_influence{};
   std::array<float, 256> foot_influence[2]{};
   std::array<float, 256> arm_influence[2]{};
-  std::array<std::vector<const ObservedVertex*>, 2> arm_samples;
+  std::array<std::vector<const ObservedVertex *>, 2> arm_samples;
   const float src_center_x = 0.5f * (src_min[0] + src_max[0]);
   const float src_half_x = 0.5f * src_span[0];
-  const auto add_influence = [](std::array<float, 256>& dst,
-                                const ObservedVertex& v, float scale) {
+  const auto add_influence = [](std::array<float, 256> &dst,
+                                const ObservedVertex &v, float scale) {
     for (int k = 0; k < 4; ++k) {
       const uint8_t weight = uint8_t(v.weights >> (8 * k));
       const uint8_t bone = uint8_t(v.indices >> (8 * k));
       dst[bone] += float(weight) * scale;
     }
   };
-  for (const ObservedVertex& v : cloud) {
+  for (const ObservedVertex &v : cloud) {
     const float yn = (v.p[1] - src_min[1]) / src_span[1];
     const float xn = (v.p[0] - src_center_x) / src_half_x;
     const int side = xn < 0.0f ? 0 : 1;
-    if (yn < 0.16f) add_influence(foot_influence[side], v, 1.0f);
+    if (yn < 0.16f)
+      add_influence(foot_influence[side], v, 1.0f);
     // Human arms/hands occupy the upper outer half of the bind pose. The
     // old 0.22 lower bound admitted the wide skating stance, so the mascot
     // flippers accidentally selected leg bones (they moved for tricks but
@@ -507,10 +560,8 @@ const Asset* GetRiggedAsset() {
     // the selected end-effector is the hand/wrist rather than the sleeve.
     const float lateral = std::fabs(xn);
     if (lateral > 0.62f && yn > 0.48f && yn < 0.90f) {
-      const float distal =
-          std::clamp((lateral - 0.62f) / 0.38f, 0.0f, 1.0f);
-      add_influence(arm_influence[side], v,
-                    1.0f + 8.0f * distal * distal);
+      const float distal = std::clamp((lateral - 0.62f) / 0.38f, 0.0f, 1.0f);
+      add_influence(arm_influence[side], v, 1.0f + 8.0f * distal * distal);
     }
     if (lateral > 0.40f && yn > 0.45f && yn < 0.90f) {
       arm_samples[side].push_back(&v);
@@ -519,9 +570,10 @@ const Asset* GetRiggedAsset() {
       add_influence(body_influence, v, 1.0f);
     }
   }
-  const auto strongest_bone = [](const std::array<float, 256>& influence) {
-    return uint8_t(std::distance(
-        influence.begin(), std::max_element(influence.begin(), influence.end())));
+  const auto strongest_bone = [](const std::array<float, 256> &influence) {
+    return uint8_t(
+        std::distance(influence.begin(),
+                      std::max_element(influence.begin(), influence.end())));
   };
   const uint8_t body_bone = strongest_bone(body_influence);
   const uint8_t foot_bone[2] = {strongest_bone(foot_influence[0]),
@@ -529,16 +581,45 @@ const Asset* GetRiggedAsset() {
   const uint8_t arm_bone[2] = {strongest_bone(arm_influence[0]),
                                strongest_bone(arm_influence[1])};
 
+  const auto influence_total = [](const std::array<float, 256> &influence) {
+    float total = 0.0f;
+    for (float value : influence)
+      total += value;
+    return total;
+  };
+  const bool collapsed =
+      influence_total(body_influence) <= 0.0f ||
+      influence_total(foot_influence[0]) <= 0.0f ||
+      influence_total(foot_influence[1]) <= 0.0f ||
+      influence_total(arm_influence[0]) <= 0.0f ||
+      influence_total(arm_influence[1]) <= 0.0f || foot_bone[0] == body_bone ||
+      foot_bone[1] == body_bone || foot_bone[0] == foot_bone[1] ||
+      arm_bone[0] == body_bone || arm_bone[1] == body_bone ||
+      arm_bone[0] == arm_bone[1];
+  if (collapsed) {
+    static uint32_t rejected = 0;
+    if (rejected < 8 || (rejected & 255u) == 0) {
+      REXLOG_WARN(
+          "penguin-mod: rejected collapsed rig body={} feet={}/{} arms={}/{} "
+          "from {} coherent meshes (n={})",
+          body_bone, foot_bone[0], foot_bone[1], arm_bone[0], arm_bone[1],
+          complete_meshes, rejected);
+    }
+    ++rejected;
+    g_next_rig_attempt_epoch = g_palette_epoch + 15;
+    return nullptr;
+  }
+
   // Fit the penguin to the skater's bind box for correct joint pivots. The
   // final 0.62 mascot scale is applied to the live bone output later.
   const size_t output_vertices = rigged->vertices.size() / 14;
   for (size_t i = 0; i < output_vertices; ++i) {
-    float* v = rigged->vertices.data() + i * 14;
+    float *v = rigged->vertices.data() + i * 14;
     const float model[3] = {v[0], v[1], v[2]};
     float mapped[3];
     for (int axis = 0; axis < 3; ++axis) {
-      mapped[axis] = fit_min[axis] +
-                     (v[axis] - source.bbox_min[axis]) * map_scale[axis];
+      mapped[axis] =
+          fit_min[axis] + (v[axis] - source.bbox_min[axis]) * map_scale[axis];
       v[axis] = mapped[axis];
     }
     // Correct normals for the non-uniform bind-space fit.
@@ -559,13 +640,13 @@ const Asset* GetRiggedAsset() {
 
     // Feet are identified by their actual yellow atlas texels plus the low,
     // forward sole pixels. This deliberately excludes the yellow beak.
-    const uint32_t tx = std::min(
-        uint32_t(std::clamp(v[3], 0.0f, 1.0f) * source.texture_width),
-        source.texture_width - 1);
-    const uint32_t ty = std::min(
-        uint32_t(std::clamp(v[4], 0.0f, 1.0f) * source.texture_height),
-        source.texture_height - 1);
-    const uint8_t* texel =
+    const uint32_t tx =
+        std::min(uint32_t(std::clamp(v[3], 0.0f, 1.0f) * source.texture_width),
+                 source.texture_width - 1);
+    const uint32_t ty =
+        std::min(uint32_t(std::clamp(v[4], 0.0f, 1.0f) * source.texture_height),
+                 source.texture_height - 1);
+    const uint8_t *texel =
         source.rgba.data() + (size_t(ty) * source.texture_width + tx) * 4;
     const bool yellow = texel[0] > 145 && texel[1] > 95 && texel[2] < 115;
     const bool white = texel[0] > 150 && texel[1] > 150 && texel[2] > 150 &&
@@ -580,8 +661,8 @@ const Asset* GetRiggedAsset() {
     // two eye ovals and the beak, excluding the white belly/flippers and the
     // yellow feet. Displace in the model's forward (+Z) direction after the
     // round-body fit, leaving the torso proportions untouched.
-    const bool eye = white && py > 0.66f && pz > 0.62f &&
-                     std::fabs(px - 0.5f) < 0.20f;
+    const bool eye =
+        white && py > 0.66f && pz > 0.62f && std::fabs(px - 0.5f) < 0.20f;
     const bool beak = yellow && py > 0.60f && py < 0.76f && pz > 0.70f &&
                       std::fabs(px - 0.5f) < 0.20f;
     if (beak) {
@@ -612,9 +693,9 @@ const Asset* GetRiggedAsset() {
         const float target_yn =
             0.56f + 0.16f * std::clamp((py - 0.20f) / 0.48f, 0.0f, 1.0f);
         const float target_zn = pz;
-        const ObservedVertex* nearest = nullptr;
+        const ObservedVertex *nearest = nullptr;
         float nearest_d2 = std::numeric_limits<float>::max();
-        for (const ObservedVertex* sample : arm_samples[side]) {
+        for (const ObservedVertex *sample : arm_samples[side]) {
           const float sxn = (sample->p[0] - src_center_x) / src_half_x;
           const float syn = (sample->p[1] - src_min[1]) / src_span[1];
           const float szn = (sample->p[2] - src_min[2]) / src_span[2];
@@ -631,11 +712,9 @@ const Asset* GetRiggedAsset() {
           std::array<float, 256> blended{};
           blended[body_bone] = float(255 - aw);
           for (int k = 0; k < 4; ++k) {
-            const uint8_t human_weight =
-                uint8_t(nearest->weights >> (8 * k));
+            const uint8_t human_weight = uint8_t(nearest->weights >> (8 * k));
             const uint8_t human_bone = uint8_t(nearest->indices >> (8 * k));
-            blended[human_bone] +=
-                float(aw) * float(human_weight) / 255.0f;
+            blended[human_bone] += float(aw) * float(human_weight) / 255.0f;
           }
           std::array<uint8_t, 4> out_bones{};
           std::array<float, 4> out_values{};
@@ -652,11 +731,10 @@ const Asset* GetRiggedAsset() {
             packed_weights = packed_bones = 0;
             for (int k = 0; k < 4; ++k) {
               const uint32_t q =
-                  k == 3
-                      ? 255u - used
-                      : std::min(255u - used,
-                                 uint32_t(std::lround(out_values[k] * 255.0f /
-                                                      total)));
+                  k == 3 ? 255u - used
+                         : std::min(255u - used,
+                                    uint32_t(std::lround(out_values[k] *
+                                                         255.0f / total)));
               used += q;
               packed_weights |= q << (8 * k);
               packed_bones |= uint32_t(out_bones[k]) << (8 * k);
@@ -664,8 +742,7 @@ const Asset* GetRiggedAsset() {
           }
         } else {
           packed_weights = uint32_t(255 - aw) | (uint32_t(aw) << 8);
-          packed_bones = uint32_t(body_bone) |
-                         (uint32_t(arm_bone[side]) << 8);
+          packed_bones = uint32_t(body_bone) | (uint32_t(arm_bone[side]) << 8);
         }
       }
     }
@@ -684,7 +761,7 @@ const Asset* GetRiggedAsset() {
   const float center_x = 0.5f * (src_min[0] + src_max[0]);
   float best_score[2] = {std::numeric_limits<float>::max(),
                          std::numeric_limits<float>::max()};
-  for (const ObservedVertex& v : cloud) {
+  for (const ObservedVertex &v : cloud) {
     const int side = v.p[0] < center_x ? 0 : 1;
     const float score = v.p[1] + 0.02f * std::fabs(v.p[0] - center_x);
     if (score < best_score[side]) {
@@ -701,30 +778,32 @@ const Asset* GetRiggedAsset() {
       "canonical={:08X}/{} bones match_err={:.5f}; bones body={} "
       "feet={}/{} arms={}/{}; bind box "
       "({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})",
-      g_skater_meshes.size(), total_vertices, rigged->anchor_mesh,
-      canonical_count, worst_bone_match, body_bone, foot_bone[0],
-      foot_bone[1], arm_bone[0], arm_bone[1],
-      fit_min[0], fit_min[1], fit_min[2], fit_max[0], fit_max[1], fit_max[2]);
+      complete_meshes, total_vertices, rigged->anchor_mesh, canonical_count,
+      worst_bone_match, body_bone, foot_bone[0], foot_bone[1], arm_bone[0],
+      arm_bone[1], fit_min[0], fit_min[1], fit_min[2], fit_max[0], fit_max[1],
+      fit_max[2]);
   g_rigged_asset = std::move(rigged);
   return g_rigged_asset.get();
 }
 
-void ApplyToFrame(native_scene::FrameScene& scene) {
+void ApplyToFrame(native_scene::FrameScene &scene) {
   // Prepare the optional rig from the first coherent local-skater frame even
   // while Original Skater is displayed. If preparation waits for the menu
   // toggle, the capture map can contain several unrelated skaters and their
   // incompatible local bone palettes make the flippers stretch.
-  for (const native_scene::DrawItem& item : scene.items) {
+  BeginSkaterPaletteFrame();
+  for (const native_scene::DrawItem &item : scene.items) {
     ObserveSkaterPalette(item);
   }
-  const Asset* rigged = GetRiggedAsset();
-  if (!REXCVAR_GET(skate3_penguin_mod) || rigged == nullptr) return;
-  const Asset& asset = *rigged;
+  const Asset *rigged = GetRiggedAsset();
+  if (!REXCVAR_GET(skate3_penguin_mod) || rigged == nullptr)
+    return;
+  const Asset &asset = *rigged;
 
   // The CAC family is the local player's skin/face/clothes. Select the item
   // carrying the fullest palette as the pose/lighting anchor.
-  const native_scene::DrawItem* anchor = nullptr;
-  for (const native_scene::DrawItem& item : scene.items) {
+  const native_scene::DrawItem *anchor = nullptr;
+  for (const native_scene::DrawItem &item : scene.items) {
     if (item.char_family == 2 && item.skinned && !item.bones.empty() &&
         (anchor == nullptr || item.bones.size() > anchor->bones.size())) {
       anchor = &item;
@@ -734,7 +813,8 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
       break;
     }
   }
-  if (anchor == nullptr) return;
+  if (anchor == nullptr)
+    return;
 
   // One-shot replacement audit. Skateboard surfaces and tiny facial
   // accessories both use character materials, so family alone is not a
@@ -743,13 +823,14 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
   static bool audited_character_items = false;
   if (!audited_character_items) {
     audited_character_items = true;
-    for (const native_scene::DrawItem& item : scene.items) {
-      if (item.char_family == 0) continue;
+    for (const native_scene::DrawItem &item : scene.items) {
+      if (item.char_family == 0)
+        continue;
       uint32_t drawn_indices = 0;
-      for (const native_scene::DrawEntry& draw : item.draws) {
+      for (const native_scene::DrawEntry &draw : item.draws) {
         drawn_indices += draw.index_count;
       }
-      const float* pose = item.skinned && item.bones.size() >= 12
+      const float *pose = item.skinned && item.bones.size() >= 12
                               ? item.bones.data()
                               : item.world;
       REXLOG_INFO(
@@ -769,7 +850,7 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
   // limb rotates around the correct authored joint. Shrink the final skinned
   // result around the live midpoint of both soles instead: feet stay flush on
   // the board while the body, arm reach and trick motion scale together.
-  const auto skin_anchor = [&](const Asset::Anchor& a, float out[3]) {
+  const auto skin_anchor = [&](const Asset::Anchor &a, float out[3]) {
     out[0] = out[1] = out[2] = 0.0f;
     float total = 0.0f;
     for (int k = 0; k < 4; ++k) {
@@ -778,12 +859,11 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
       if (weight <= 0.0f || size_t(bone) * 12 + 11 >= penguin.bones.size()) {
         continue;
       }
-      const float* rows = penguin.bones.data() + size_t(bone) * 12;
+      const float *rows = penguin.bones.data() + size_t(bone) * 12;
       for (int axis = 0; axis < 3; ++axis) {
-        const float* row = rows + axis * 4;
-        out[axis] += weight *
-                     (a.p[0] * row[0] + a.p[1] * row[1] +
-                      a.p[2] * row[2] + row[3]);
+        const float *row = rows + axis * 4;
+        out[axis] += weight * (a.p[0] * row[0] + a.p[1] * row[1] +
+                               a.p[2] * row[2] + row[3]);
       }
       total += weight;
     }
@@ -812,13 +892,14 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
   const float board_offset = float(REXCVAR_GET(skate3_penguin_board_offset));
   for (size_t bone = 0; bone + 11 < penguin.bones.size(); bone += 12) {
     for (int axis = 0; axis < 3; ++axis) {
-      float* row = penguin.bones.data() + bone + axis * 4;
+      float *row = penguin.bones.data() + bone + axis * 4;
       row[0] *= mascot_scale;
       row[1] *= mascot_scale;
       row[2] *= mascot_scale;
-      row[3] = scale_origin[axis] +
-               mascot_scale * (row[3] - scale_origin[axis]);
-      if (axis == 1) row[3] += board_offset;
+      row[3] =
+          scale_origin[axis] + mascot_scale * (row[3] - scale_origin[axis]);
+      if (axis == 1)
+        row[3] += board_offset;
     }
   }
   penguin.mesh = kMeshKey;
@@ -830,7 +911,8 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
   penguin.macro_tex = penguin.hair_alpha_tex = 0;
   penguin.decal_art = penguin.water_normal = penguin.water_normal2 = 0;
   penguin.water_env = penguin.spec_tex = penguin.detail_tex = 0;
-  std::fill(std::begin(penguin.diffuse_fetch), std::end(penguin.diffuse_fetch), 0);
+  std::fill(std::begin(penguin.diffuse_fetch), std::end(penguin.diffuse_fetch),
+            0);
   std::fill(std::begin(penguin.decal_fetch), std::end(penguin.decal_fetch), 0);
   penguin.hair = penguin.decal = penguin.decal_tileable = false;
   penguin.transparent = penguin.water = penguin.water_flowing = false;
@@ -839,7 +921,7 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
   penguin.env_family = penguin.dynobj = 0;
   penguin.pending = penguin.retained = penguin.selected = false;
   penguin.shadow_caster = true;
-  penguin.fingerprint = 0x50454E4755494E32ull;  // "PENGUIN2"
+  penguin.fingerprint = 0x50454E4755494E32ull; // "PENGUIN2"
   std::copy(std::begin(asset.bbox_min), std::end(asset.bbox_min),
             std::begin(penguin.bbox_min));
   std::copy(std::begin(asset.bbox_max), std::end(asset.bbox_max),
@@ -848,7 +930,7 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
 
   scene.items.erase(
       std::remove_if(scene.items.begin(), scene.items.end(),
-                     [](const native_scene::DrawItem& item) {
+                     [](const native_scene::DrawItem &item) {
                        // Family 2 is CAC skin/face/clothes; family 4 is the
                        // CAC-only hair pass. Keeping family 4 leaves the
                        // original skater's hair floating behind the penguin.
@@ -872,4 +954,4 @@ void ApplyToFrame(native_scene::FrameScene& scene) {
   }
 }
 
-}  // namespace skate3::penguin_mod
+} // namespace skate3::penguin_mod

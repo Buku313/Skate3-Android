@@ -40,21 +40,22 @@ struct Asset {
 
 // Loads the OBJ and diffuse atlas on first use. The returned storage lives for
 // the process lifetime and is safe for the game and render threads to share.
-const Asset& GetAsset();
+const Asset &GetAsset();
 
 // Called by the ordinary guest-mesh decoder while the original CAC is still
 // visible. Once enough pieces have arrived, their bind-pose vertices and real
 // bone weights are used to auto-rig a stable copy of the penguin asset.
-void ObserveSkaterMesh(const native_scene::DrawItem& item, const float* vertices,
-                       uint32_t vertex_count);
-void ObserveSkaterPalette(const native_scene::DrawItem& item);
+void ObserveSkaterMesh(const native_scene::DrawItem &item,
+                       const float *vertices, uint32_t vertex_count);
+void BeginSkaterPaletteFrame();
+void ObserveSkaterPalette(const native_scene::DrawItem &item);
 
 // Null during the brief calibration window; stable for the process lifetime
 // after the player rig has been transferred.
-const Asset* GetRiggedAsset();
+const Asset *GetRiggedAsset();
 
 // Replaces the CAC player pieces with one host-owned penguin draw item while
 // preserving the live player bone palette, world state, and lighting.
-void ApplyToFrame(native_scene::FrameScene& scene);
+void ApplyToFrame(native_scene::FrameScene &scene);
 
-}  // namespace skate3::penguin_mod
+} // namespace skate3::penguin_mod

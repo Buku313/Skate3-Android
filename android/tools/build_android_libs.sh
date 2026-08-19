@@ -45,6 +45,12 @@ fi
 mkdir -p "${jni_dir}"
 install -m 0755 out/build/android-release/libskate3.so "${jni_dir}/"
 install -m 0755 out/build/android-release/librexruntime.so "${jni_dir}/"
+install -m 0755 \
+  out/build/android-release/third_party/libadrenotools/src/hook/libhook_impl.so \
+  "${jni_dir}/"
+install -m 0755 \
+  out/build/android-release/third_party/libadrenotools/src/hook/libmain_hook.so \
+  "${jni_dir}/"
 install -m 0755 "${cxx_shared}" "${jni_dir}/"
 
 echo "Android libraries staged in ${jni_dir}"

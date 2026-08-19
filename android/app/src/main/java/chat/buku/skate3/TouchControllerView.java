@@ -77,7 +77,7 @@ public final class TouchControllerView extends View {
     public void disconnect() {
         for (Control control : controls) control.release();
         pointers.clear();
-        TouchControllerBridge.setState(-1, 0, 0, 0, 0, 0, 0);
+        TouchControllerBridge.trySetState(-1, 0, 0, 0, 0, 0, 0);
     }
 
     @Override
@@ -237,12 +237,12 @@ public final class TouchControllerView extends View {
 
     private void sendState() {
         if (!controlsVisible) {
-            TouchControllerBridge.setState(-1, 0, 0, 0, 0, 0, 0);
+            TouchControllerBridge.trySetState(-1, 0, 0, 0, 0, 0, 0);
             return;
         }
         int buttons = 0;
         for (Control control : controls) buttons |= control.buttons();
-        TouchControllerBridge.setState(
+        TouchControllerBridge.trySetState(
             buttons,
             leftStick == null ? 0 : leftStick.xValue,
             leftStick == null ? 0 : leftStick.yValue,

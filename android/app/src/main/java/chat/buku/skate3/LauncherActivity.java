@@ -49,9 +49,12 @@ public class LauncherActivity extends Activity {
     private static final int REQUEST_TITLE_UPDATE = 1002;
     private static final int REQUEST_SEIYU_MODEL = 1003;
     private static final int REQUEST_SEIYU_TEXTURE = 1004;
+    private static final int REQUEST_GPU_DRIVER = 1005;
     private static final long INSTALL_HEADROOM = 512L * 1024 * 1024;
     private static final long MAX_SEIYU_MODEL_SIZE = 32L * 1024 * 1024;
     private static final long MAX_SEIYU_TEXTURE_SIZE = 64L * 1024 * 1024;
+    private static final String BUKU_GITHUB =
+        "https://github.com/Buku313/Skate3-Mobile";
     private static final String COMPLETE_MARKER = ".iso-extraction-complete";
     private static final String EXPECTED_DEFAULT_XEX =
         "1db39496585c521d17a2137804f42cf73ebed2b32cac166ec42dbf772f4dcf7f";
@@ -68,6 +71,7 @@ public class LauncherActivity extends Activity {
     private ProgressBar progressBar;
     private Button primaryButton;
     private Button characterButton;
+    private Button gpuDriverButton;
     private Button secondaryButton;
     private Button tertiaryButton;
     private Button updateButton;
@@ -84,6 +88,13 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        // Opening the launcher icon over a live SDL session used to leave its
+        // SurfaceView abandoned. Remove this duplicate launcher immediately and
+        // reveal the game that is already underneath it.
+        if (Skate3Activity.isSessionActive()) {
+            finish();
+            return;
+        }
         File external = getExternalFilesDir(null);
         storageRoot = external != null ? external : getFilesDir();
         gameDirectory = new File(storageRoot, "game");
@@ -124,11 +135,23 @@ public class LauncherActivity extends Activity {
         scroll.addView(content, new ScrollView.LayoutParams(
             ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
 
+        LinearLayout brandRow = new LinearLayout(this);
+        brandRow.setOrientation(LinearLayout.HORIZONTAL);
+        brandRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView bukuBrand = githubBrand("BUKU", Gravity.START);
+        TextView numberBrand = githubBrand("313", Gravity.END);
+        brandRow.addView(bukuBrand, new LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        brandRow.addView(numberBrand, new LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        content.addView(brandRow, matchWrap(dp(8)));
+
         TextView eyebrow = text("PHONE-ONLY INSTALLER", 13, Color.rgb(255, 112, 28));
         eyebrow.setGravity(Gravity.CENTER);
         content.addView(eyebrow, matchWrap(dp(4)));
 
-        TextView title = text("SKATE 3 MOBILE", 30, Color.WHITE);
+        TextView title = text("SKATE 3", 30, Color.WHITE);
         title.setGravity(Gravity.CENTER);
         title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         content.addView(title, matchWrap(dp(8)));
@@ -158,12 +181,14 @@ public class LauncherActivity extends Activity {
 
         primaryButton = actionButton(true);
         characterButton = actionButton(false);
+        gpuDriverButton = actionButton(false);
         secondaryButton = actionButton(false);
         tertiaryButton = actionButton(false);
         updateButton = actionButton(false);
         reportButton = actionButton(false);
         content.addView(primaryButton, matchFixed(dp(58), dp(10)));
         content.addView(characterButton, matchFixed(dp(54), dp(10)));
+        content.addView(gpuDriverButton, matchFixed(dp(54), dp(10)));
         content.addView(secondaryButton, matchFixed(dp(54), dp(10)));
         content.addView(tertiaryButton, matchFixed(dp(54), dp(10)));
         content.addView(updateButton, matchFixed(dp(50), dp(18)));
@@ -194,6 +219,7 @@ public class LauncherActivity extends Activity {
             detailText.setText(unsupported);
             setButton(primaryButton, "CLOSE", view -> finish(), true);
             hide(characterButton);
+            hide(gpuDriverButton);
             hide(secondaryButton);
             hide(tertiaryButton);
             return;
@@ -207,6 +233,7 @@ public class LauncherActivity extends Activity {
             detailText.setText(Build.MODEL + "\nGame files: " + activeGame.getAbsolutePath());
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
             configureSeiyuInstallButton(activeGame);
+            configureGpuDriverButton();
             if (scopedReady) {
                 setButton(secondaryButton, "REPAIR OR REINSTALL", view -> confirmReinstall(), false);
             } else {
@@ -221,6 +248,7 @@ public class LauncherActivity extends Activity {
             detailText.setText("Finish by downloading the verified 1.7 MB Title Update 3, or select the package yourself.");
             setButton(primaryButton, "FINISH SETUP AUTOMATICALLY", view -> finishSetupOnline(), true);
             hide(characterButton);
+            hide(gpuDriverButton);
             setButton(secondaryButton, "SELECT TITLE UPDATE FILE", view -> pickTitleUpdate(), false);
             setButton(tertiaryButton, "START OVER", view -> confirmStartOver(), false);
             return;
@@ -231,6 +259,7 @@ public class LauncherActivity extends Activity {
                            humanBytes(new StatFs(storageRoot.getAbsolutePath()).getAvailableBytes()));
         setButton(primaryButton, "SELECT MY SKATE 3 ISO", view -> pickIso(), true);
         hide(characterButton);
+        hide(gpuDriverButton);
         hide(secondaryButton);
         if (setupLog.isFile()) {
             setButton(tertiaryButton, "VIEW LAST SETUP LOG", view -> showLog(), false);
@@ -289,6 +318,8 @@ public class LauncherActivity extends Activity {
             importSeiyuModel(uri);
         } else if (requestCode == REQUEST_SEIYU_TEXTURE) {
             importSeiyuTexture(uri);
+        } else if (requestCode == REQUEST_GPU_DRIVER) {
+            importGpuDriver(uri);
         }
     }
 
@@ -403,6 +434,7 @@ public class LauncherActivity extends Activity {
             detailText.setText("Your files were verified and stayed on this device.");
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
             configureSeiyuInstallButton(gameDirectory);
+            configureGpuDriverButton();
             hide(secondaryButton);
             hide(tertiaryButton);
         });
@@ -487,7 +519,7 @@ public class LauncherActivity extends Activity {
 
     private void showUpdatePrompt(AppUpdater.UpdateInfo info) {
         new AlertDialog.Builder(this)
-            .setTitle("Skate 3 Mobile " + info.versionName)
+            .setTitle("Skate 3 " + info.versionName)
             .setMessage(info.notes + "\n\nThe app will verify the download, then Android will ask you to tap Install. Your game files and settings stay in place.")
             .setNegativeButton("Later", null)
             .setPositiveButton("Download update", (dialog, which) -> downloadAppUpdate(info))
@@ -500,7 +532,7 @@ public class LauncherActivity extends Activity {
         worker.execute(() -> {
             try {
                 File apk = AppUpdater.downloadApk(this, info, (copied, total) ->
-                    showDownloadProgress(copied, total, "Downloading Skate 3 Mobile " +
+                    showDownloadProgress(copied, total, "Downloading Skate 3 " +
                                          info.versionName));
                 pendingUpdateApk = apk;
                 runOnUiThread(() -> {
@@ -514,7 +546,7 @@ public class LauncherActivity extends Activity {
                     awaitingInstallPermission = !opened;
                     if (opened) pendingUpdateApk = null;
                     else Toast.makeText(this,
-                        "Allow installs from Skate 3 Mobile, then return here.",
+                        "Allow installs from Skate 3, then return here.",
                         Toast.LENGTH_LONG).show();
                 });
             } catch (Exception exception) {
@@ -545,6 +577,147 @@ public class LauncherActivity extends Activity {
         File mod = new File(activeGame, "mods/penguin");
         return new File(mod, "base.obj").isFile() &&
                new File(mod, "texture_diffuse.png").isFile();
+    }
+
+    private void configureGpuDriverButton() {
+        CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
+        String label;
+        if (!CustomGpuDriver.isLikelyAdrenoDevice()) {
+            label = "GPU DRIVER  •  SYSTEM";
+        } else if (driver != null && driver.enabled) {
+            label = "GPU DRIVER  •  CUSTOM: " + driver.version;
+        } else {
+            label = "GPU DRIVER  •  SYSTEM";
+        }
+        setButton(gpuDriverButton, label, view -> showGpuDriverMenu(), false);
+    }
+
+    private void showGpuDriverMenu() {
+        if (!CustomGpuDriver.isLikelyAdrenoDevice()) {
+            new AlertDialog.Builder(this)
+                .setTitle("GPU driver")
+                .setMessage("This device does not appear to use a Snapdragon / Adreno GPU. Turnip is not compatible here, so Skate 3 will stay on the System Driver.")
+                .setPositiveButton("OK", null)
+                .show();
+            return;
+        }
+
+        CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
+        if (driver == null) {
+            new AlertDialog.Builder(this)
+                .setTitle("GPU driver")
+                .setMessage("System Driver is selected. Advanced Snapdragon users can import an AdrenoTools-compatible Turnip driver ZIP. Drivers are device-specific and an incompatible build may crash at launch.")
+                .setNegativeButton("Close", null)
+                .setPositiveButton("Import Turnip ZIP", (dialog, which) -> pickGpuDriver())
+                .show();
+            return;
+        }
+
+        String selected = driver.enabled ? "Custom driver" : "System Driver";
+        String[] choices = {
+            "Use System Driver" + (driver.enabled ? "" : "  •  SELECTED"),
+            "Use " + driver.label() + (driver.enabled ? "  •  SELECTED" : ""),
+            "Import another driver ZIP",
+            "Remove imported driver"
+        };
+        new AlertDialog.Builder(this)
+            .setTitle("GPU driver")
+            .setMessage("Selected: " + selected + "\n\nCustom driver: " + driver.label() +
+                        "\nVendor: " + driver.vendor + "\nAuthor: " + driver.author +
+                        "\n\nIf a custom driver crashes, reopen the launcher and select System Driver.")
+            .setItems(choices, (dialog, which) -> {
+                if (which == 0) {
+                    CustomGpuDriver.useSystem(this);
+                    Toast.makeText(this, "System Driver selected.", Toast.LENGTH_SHORT).show();
+                    refreshInterface();
+                } else if (which == 1) {
+                    confirmCustomGpuDriver(driver);
+                } else if (which == 2) {
+                    pickGpuDriver();
+                } else {
+                    confirmRemoveGpuDriver(driver);
+                }
+            })
+            .setNegativeButton("Close", null)
+            .show();
+    }
+
+    private void confirmCustomGpuDriver(CustomGpuDriver.Driver driver) {
+        new AlertDialog.Builder(this)
+            .setTitle("Use custom Turnip driver?")
+            .setMessage(driver.label() + " will be used only by Skate 3. This is experimental. If the game crashes, reopen the launcher and switch back to System Driver.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Use custom driver", (dialog, which) -> {
+                try {
+                    CustomGpuDriver.useCustom(this);
+                    Toast.makeText(this, "Custom driver selected for the next launch.",
+                                   Toast.LENGTH_LONG).show();
+                    refreshInterface();
+                } catch (IOException exception) {
+                    showFailure("Could not select the custom GPU driver: " +
+                                cleanMessage(exception), exception);
+                }
+            })
+            .show();
+    }
+
+    private void pickGpuDriver() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/zip");
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivityForResult(intent, REQUEST_GPU_DRIVER);
+        } catch (ActivityNotFoundException exception) {
+            intent.setType("*/*");
+            try {
+                startActivityForResult(intent, REQUEST_GPU_DRIVER);
+            } catch (ActivityNotFoundException second) {
+                showFailure("Android could not open its file picker.", second);
+            }
+        }
+    }
+
+    private void importGpuDriver(Uri uri) {
+        setBusy("IMPORTING GPU DRIVER", "Checking " + displayName(uri) + "...", true);
+        worker.execute(() -> {
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                if (input == null) throw new IOException("Android could not open the selected ZIP.");
+                CustomGpuDriver.Driver driver = CustomGpuDriver.importPackage(this, input);
+                appendLog("Imported custom GPU driver " + driver.label() + ".");
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setVisibility(View.GONE);
+                    Toast.makeText(this, driver.label() +
+                        " imported and selected. It will be used on the next game launch.",
+                        Toast.LENGTH_LONG).show();
+                    refreshInterface();
+                });
+            } catch (Exception exception) {
+                showFailure("Could not import the GPU driver: " + cleanMessage(exception),
+                            exception);
+            }
+        });
+    }
+
+    private void confirmRemoveGpuDriver(CustomGpuDriver.Driver driver) {
+        new AlertDialog.Builder(this)
+            .setTitle("Remove custom driver?")
+            .setMessage("This removes " + driver.label() +
+                        " from Skate 3 and selects the System Driver.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Remove", (dialog, which) -> {
+                try {
+                    CustomGpuDriver.remove(this);
+                    Toast.makeText(this, "Custom driver removed.", Toast.LENGTH_SHORT).show();
+                    refreshInterface();
+                } catch (IOException exception) {
+                    showFailure("Could not remove the custom GPU driver: " +
+                                cleanMessage(exception), exception);
+                }
+            })
+            .show();
     }
 
     private File activeGameDirectory() {
@@ -1047,6 +1220,7 @@ public class LauncherActivity extends Activity {
     private void setButtonsEnabled(boolean enabled) {
         primaryButton.setEnabled(enabled);
         characterButton.setEnabled(enabled);
+        gpuDriverButton.setEnabled(enabled);
         secondaryButton.setEnabled(enabled);
         tertiaryButton.setEnabled(enabled);
         updateButton.setEnabled(enabled && !checkingUpdate);
@@ -1085,6 +1259,28 @@ public class LauncherActivity extends Activity {
         text.setTextSize(size);
         text.setTextColor(color);
         return text;
+    }
+
+    private TextView githubBrand(String label, int gravity) {
+        TextView brand = text(label, 16, Color.rgb(255, 104, 24));
+        brand.setGravity(gravity);
+        brand.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        brand.setPadding(0, dp(8), 0, dp(8));
+        brand.setClickable(true);
+        brand.setFocusable(true);
+        brand.setContentDescription(label + ", open Buku313 on GitHub");
+        brand.setOnClickListener(view -> openBukuGitHub());
+        return brand;
+    }
+
+    private void openBukuGitHub() {
+        try {
+            Intent browser = new Intent(Intent.ACTION_VIEW, Uri.parse(BUKU_GITHUB));
+            browser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(Intent.createChooser(browser, "Open Buku313 on GitHub"));
+        } catch (ActivityNotFoundException exception) {
+            Toast.makeText(this, BUKU_GITHUB, Toast.LENGTH_LONG).show();
+        }
     }
 
     private LinearLayout.LayoutParams matchWrap(int bottomMargin) {

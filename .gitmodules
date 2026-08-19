@@ -3,3 +3,6 @@
 	url = https://github.com/Buku313/rexglue-skate3-android.git
 	branch = android-arm64
 
+[submodule "third_party/libadrenotools"]
+	path = third_party/libadrenotools
+	url = https://github.com/bylaws/libadrenotools.git

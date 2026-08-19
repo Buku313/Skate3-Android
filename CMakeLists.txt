@@ -249,7 +249,18 @@ if(WIN32)
     set(REXGLUE_RUNTIME_RC_COPYRIGHT "(c) Skate3Recomp contributors")
 endif()
 
+if(ANDROID)
+    # libadrenotools provides rootless, per-app custom Vulkan driver loading.
+    # The driver itself is supplied by the user and is never bundled here.
+    set(GEN_INSTALL_TARGET OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/libadrenotools)
+endif()
+
 include(cmake/RexGlue.cmake)
+if(ANDROID)
+    target_link_libraries(rexui PUBLIC adrenotools)
+    target_compile_definitions(rexui PRIVATE REX_HAS_ADRENOTOOLS=1)
+endif()
 include(cmake/CodegenTargets.cmake)
 
 set(SKATE3_COMMON_SOURCES

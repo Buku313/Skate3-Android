@@ -9,9 +9,16 @@ import android.view.ViewGroup;
 import org.libsdl.app.SDLActivity;
 import org.libsdl.app.SDLControllerManager;
 
+import java.io.File;
+
 public class Skate3Activity extends SDLActivity {
     private static final String INPUT_TAG = "Skate3Input";
+    private static volatile boolean sessionActive;
     private TouchControllerView touchController;
+
+    static boolean isSessionActive() {
+        return sessionActive;
+    }
 
     @Override
     protected String[] getLibraries() {
@@ -21,9 +28,23 @@ public class Skate3Activity extends SDLActivity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        sessionActive = true;
         String files = getFilesDir().getAbsolutePath();
         nativeSetenv("XDG_DATA_HOME", files);
         nativeSetenv("HOME", files);
+        nativeSetenv("SKATE3_INTERNAL_FILES_DIR", files);
+        nativeSetenv("SKATE3_NATIVE_LIBRARY_DIR", getApplicationInfo().nativeLibraryDir);
+        CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
+        if (driver != null && driver.enabled) {
+            nativeSetenv("SKATE3_VULKAN_DRIVER_DIR",
+                         driver.directory.toAbsolutePath().toString() + File.separator);
+            nativeSetenv("SKATE3_VULKAN_DRIVER_NAME", driver.libraryName);
+            Log.i("Skate3GpuDriver", "Selected custom driver: " + driver.label());
+        } else {
+            nativeSetenv("SKATE3_VULKAN_DRIVER_DIR", "");
+            nativeSetenv("SKATE3_VULKAN_DRIVER_NAME", "");
+            Log.i("Skate3GpuDriver", "Selected system driver");
+        }
         touchController = new TouchControllerView(this);
         mLayout.addView(touchController, new ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -37,6 +58,7 @@ public class Skate3Activity extends SDLActivity {
 
     @Override
     protected void onDestroy() {
+        sessionActive = false;
         if (touchController != null) touchController.disconnect();
         super.onDestroy();
     }

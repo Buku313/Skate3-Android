@@ -69,6 +69,7 @@ final class BugReporter {
         String soc = clean(Build.SOC_MANUFACTURER + " " + Build.SOC_MODEL);
         if (soc.isEmpty()) soc = clean(Build.HARDWARE);
         String profile = graphicsProfile(context);
+        String gpuDriver = CustomGpuDriver.diagnostic(context);
         String input = inputMethod();
         String exits = recentExits(context);
         String runtime = runtimeEvidence(context);
@@ -77,7 +78,7 @@ final class BugReporter {
         long availableMb = Runtime.getRuntime().maxMemory() / (1024 * 1024);
 
         String report =
-            "Skate 3 Mobile diagnostics\n" +
+            "Skate 3 diagnostics\n" +
             "App: " + version + "\n" +
             "Package: " + context.getPackageName() + "\n" +
             "Device: " + device + "\n" +
@@ -89,6 +90,7 @@ final class BugReporter {
             "Vulkan feature: " + vulkan + "\n" +
             "Java heap limit: " + availableMb + " MiB\n" +
             "Graphics profile: " + profile + "\n" +
+            "GPU driver: " + gpuDriver + "\n" +
             "Input: " + input + "\n" +
             "Recent process exits:\n" + exits + "\n\n" +
             "Native renderer evidence:\n" + runtime;
@@ -468,7 +470,7 @@ final class BugReporter {
 
     private static void copy(Context context, String report) {
         ClipboardManager clipboard = context.getSystemService(ClipboardManager.class);
-        clipboard.setPrimaryClip(ClipData.newPlainText("Skate 3 Mobile diagnostics", report));
+        clipboard.setPrimaryClip(ClipData.newPlainText("Skate 3 diagnostics", report));
         Toast.makeText(context, "Device diagnostics copied.", Toast.LENGTH_SHORT).show();
     }
 
