@@ -62,11 +62,11 @@
 
   <main>
     <div class="wrap current">
-      <span class="version">CURRENT · <span data-current-version>v2.0.14 DEV</span></span>
-      <h2>Seiyu included and community submissions</h2>
-      <p>Keeps the original skater selected by default, bundles Seiyu in the APK, preserves the Mod Store, and makes custom GPU drivers clearly experimental.</p>
+      <span class="version">CURRENT · <span data-current-version>v2.0.15 DEV</span></span>
+      <h2>AYN Thor content crash hotfix</h2>
+      <p>Recovers the exact stale optional callback reported during the first FMV transition on an AYN Thor with Adreno 740. All other invalid indirect calls still stop with diagnostics.</p>
       <div class="actions">
-        <a class="button" data-version-download href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD v2.0.14 DEV</a>
+        <a class="button" data-version-download href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD v2.0.15 DEV</a>
         <a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">REPORT A BUG</a>
       </div>
     </div>
@@ -86,7 +86,8 @@
     <section>
       <div class="wrap">
         <h2>Release history</h2>
-        <article class="release"><time>v2.0.14 · CURRENT DEV BUILD</time><h3>Seiyu included, original skater by default</h3><ul><li>Bundled the verified Seiyu model and texture inside the APK.</li><li>Kept Original Skater as the default and preserved the live RB + Start character switch.</li><li>Kept the Mod Store for verified community characters.</li><li>Added a structured character-submission page and GitHub review form.</li><li>Moved custom Turnip controls under Advanced Options and stopped imported drivers from enabling automatically.</li><li>Verified System Driver launch to the Skate 3 title screen at 60 FPS on RG406V.</li></ul></article>
+        <article class="release"><time>v2.0.15 · CURRENT DEV BUILD</time><h3>AYN Thor content crash hotfix</h3><ul><li>Matched the supplied native stack to guest return address 0x82B3CE2C.</li><li>Confirmed the stale 0xFFFDFFFF target came from an optional content-validation callback.</li><li>Returns false only at that exact call site so the retail code follows its normal cleanup path.</li><li>Keeps every unknown indirect call elsewhere fatal and visible in diagnostics.</li><li>Verified a clean System Driver launch to the Skate 3 title screen at 60 FPS on RG406V.</li><li>AYN Thor confirmation is still requested because the device-specific sentinel does not reproduce on the RG406V.</li></ul></article>
+        <article class="release"><time>v2.0.14 · PREVIOUS DEV BUILD</time><h3>Seiyu included, original skater by default</h3><ul><li>Bundled the verified Seiyu model and texture inside the APK.</li><li>Kept Original Skater as the default and preserved the live RB + Start character switch.</li><li>Kept the Mod Store for verified community characters.</li><li>Added a structured character-submission page and GitHub review form.</li><li>Moved custom Turnip controls under Advanced Options and stopped imported drivers from enabling automatically.</li><li>Verified System Driver launch to the Skate 3 title screen at 60 FPS on RG406V.</li></ul></article>
         <article class="release"><time>v2.0.13 · COMPATIBILITY PREVIEW</time><h3>Custom Turnip drivers and Seiyu rig fix</h3><ul><li>Added optional AdrenoTools driver ZIP imports for Snapdragon and Adreno devices.</li><li>Kept System Driver as the safe default and launcher recovery path.</li><li>Added strict package, metadata, size, API, and ARM64 library validation.</li><li>Restored stable Seiyu feet, body, and flipper mapping from a coherent skeleton palette.</li><li>Added the selected GPU driver to device diagnostics.</li></ul></article>
         <article class="release"><time>v2.0.12 · PREVIOUS DEV BUILD</time><h3>One-tap Mod Store and Seiyu Paradise Penguin</h3><ul><li>Added a data-driven Mod Store to the launcher.</li><li>Published Seiyu as a verified 2.93 MiB character download.</li><li>Added Install, Reinstall, Remove, status, and manual import controls.</li><li>Restricted downloads to HTTPS project hosts, safe mod paths, exact sizes, and SHA-256 hashes.</li><li>Preserved the original character switch in the RB + Start Mods menu.</li></ul></article>
         <article class="release"><time>v2.0.11 · COMPATIBILITY TEST</time><h3>Android guest memory and Qualcomm bring-up</h3><ul><li>Reserved the complete guest address range before alias mappings.</li><li>Added a sparse memfd guest backing object and safe arbitrary-base fallback.</li><li>Kept Qualcomm devices on the fully bound shared-memory buffer while Adreno testing continues.</li><li>Added guest-address-space and sparse-residency evidence to bug reports.</li></ul></article>

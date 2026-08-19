@@ -48,7 +48,7 @@ body:
     id: tested_version
     attributes:
       label: Tested Skate 3 Mobile version
-      placeholder: v2.0.14
+      placeholder: v2.0.15
     validations:
       required: true
   - type: textarea

@@ -1,7 +1,7 @@
 {
-  "versionCode": 20014,
-  "versionName": "2.0.14",
+  "versionCode": 20015,
+  "versionName": "2.0.15",
   "apkUrl": "https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk",
-  "sha256": "fb05182e7ea7ac8d029d785ff58e19cc87384f1746c7983e603499939137803f",
-  "notes": "Includes Seiyu Paradise Penguin while keeping the original skater selected by default, preserves the verified Mod Store, adds community character submissions, and moves custom GPU drivers into optional Advanced Options."
+  "sha256": "a5fb2d91966dffb0656df4b76b523c0d3dd5a16a94101f6f37dfb9f786569f4a",
+  "notes": "Fixes an AYN Thor native abort at guest return address 0x82B3CE2C during the first FMV transition. Seiyu remains included, the original skater remains the default, and System Driver remains recommended."
 }
