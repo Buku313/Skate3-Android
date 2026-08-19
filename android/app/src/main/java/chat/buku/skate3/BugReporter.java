@@ -389,7 +389,10 @@ final class BugReporter {
                       lower.contains("nrhi-vulkan:") || lower.contains("fatal") ||
                       lower.contains("abort") || lower.contains("failed") ||
                       lower.contains("error") || lower.contains("adreno") ||
-                      lower.contains("gpu"))) continue;
+                      lower.contains("gpu") || lower.contains("guest address space") ||
+                      lower.contains("shared memory") || lower.contains("sparse residency"))) {
+                    continue;
+                }
                 String safe = sanitizePath(context, line);
                 if (head.size() < 24) head.add(safe);
                 else {
