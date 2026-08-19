@@ -1,7 +1,7 @@
 {
-  "versionCode": 20010,
-  "versionName": "2.0.10",
+  "versionCode": 20012,
+  "versionName": "2.0.12",
   "apkUrl": "https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk",
-  "sha256": "876af769d74752a8395827274aef73a764e163166caff7b50b4fee6c766b98a1",
-  "notes": "Adds an Android performance-mode Vulkan compatibility path plus native tombstone, stack, graphics-profile, and renderer-log diagnostics for Snapdragon device crashes."
+  "sha256": "1bc8e62b65a776533e3f176945810e9928f4151747dd35aa0987dfcf7e0d0c66",
+  "notes": "Adds the one-tap Mod Store with Seiyu Paradise Penguin, verified downloads, install and removal controls, plus the v2.0.11 Android guest-memory and Qualcomm compatibility work."
 }
