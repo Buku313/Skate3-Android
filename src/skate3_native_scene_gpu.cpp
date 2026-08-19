@@ -2829,6 +2829,82 @@ nrhi::ShaderDesc MakeShaderDesc(nrhi::ShaderStage stage, const char* file,
       break;
     }
   }
+  // The original frozen Vulkan plan used one descriptor set for every
+  // texture-table root parameter. The main scene layout consequently needed
+  // seven sets total, beyond Vulkan's four-set portability floor, and old
+  // Qualcomm drivers have been observed crashing inside
+  // vkCreatePipelineLayout instead of rejecting it. The compact root layout
+  // below merges adjacent tables into three groups. Rewrite only the SPIR-V
+  // DescriptorSet/Binding decorations to the equivalent compact locations;
+  // shader code and resource registers are otherwise unchanged.
+  if (sd.spirv != nullptr && sd.spirv_size_bytes >= 5 * sizeof(uint32_t)) {
+    struct Decorations {
+      size_t set_word = 0;
+      size_t binding_word = 0;
+    };
+    static std::mutex remap_mutex;
+    static std::unordered_map<const uint32_t*,
+                              std::unique_ptr<std::vector<uint32_t>>>
+        remapped_blobs;
+    std::lock_guard<std::mutex> lock(remap_mutex);
+    auto found = remapped_blobs.find(sd.spirv);
+    if (found == remapped_blobs.end()) {
+      const size_t word_count = sd.spirv_size_bytes / sizeof(uint32_t);
+      auto words = std::make_unique<std::vector<uint32_t>>(
+          sd.spirv, sd.spirv + word_count);
+      std::unordered_map<uint32_t, Decorations> decorations;
+      for (size_t i = 5; i < word_count;) {
+        const uint32_t instruction = (*words)[i];
+        const uint32_t count = instruction >> 16;
+        const uint32_t opcode = instruction & 0xFFFFu;
+        if (count == 0 || i + count > word_count) {
+          break;
+        }
+        // OpDecorate %target Decoration literal
+        if (opcode == 71 && count >= 4) {
+          Decorations& d = decorations[(*words)[i + 1]];
+          if ((*words)[i + 2] == 34) {       // DescriptorSet
+            d.set_word = i + 3;
+          } else if ((*words)[i + 2] == 33) {  // Binding
+            d.binding_word = i + 3;
+          }
+        }
+        i += count;
+      }
+      for (const auto& [id, d] : decorations) {
+        (void)id;
+        if (d.set_word == 0 || d.binding_word == 0) {
+          continue;
+        }
+        uint32_t& set = (*words)[d.set_word];
+        uint32_t& binding = (*words)[d.binding_word];
+        switch (set) {
+          case 2:  // t1 table joins t0.
+            set = 1;
+            binding += 1;
+            break;
+          case 3:  // t3 table starts compact set 2.
+            set = 2;
+            break;
+          case 4:  // t4/t5 follow t3 in compact set 2.
+            set = 2;
+            binding += 1;
+            break;
+          case 5:  // t6/t7 start compact set 3.
+            set = 3;
+            break;
+          case 6:  // t8/t9/t10 follow t6/t7 in compact set 3.
+            set = 3;
+            binding += 2;
+            break;
+          default:
+            break;
+        }
+      }
+      found = remapped_blobs.emplace(sd.spirv, std::move(words)).first;
+    }
+    sd.spirv = found->second->data();
+  }
   return sd;
 }
 
@@ -2838,50 +2914,32 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
   }
   {
     nrhi::BindingLayoutDesc ld;
-    // NOTE the 64-DWORD root-signature budget (a D3D12-backend constraint:
-    // the layout maps 1:1 onto a D3D12 root signature there): 52 constants +
-    // 6 descriptor tables (1 each) + 1 root SRV (2) + 2 root CBVs (2 each)
-    // = 64, FULL. Going past 64 makes the D3D12 layout creation fail
-    // (renderer falls back to emulated). Any further addition must pack into
-    // existing rows/tables.
-    ld.param_count = 10;
+    // Keep Vulkan at four descriptor sets or fewer. Vulkan only guarantees
+    // maxBoundDescriptorSets >= 4, and Adreno 619/650 system drivers have
+    // crashed while creating the former seven-set layout. Adjacent texture
+    // registers are grouped into three tables: t0..t1, t3..t5, t6..t10.
+    // This also leaves the D3D12 root signature at 61 DWORDs instead of the
+    // previous full 64-DWORD budget.
+    ld.param_count = 7;
     ld.params[0] = {nrhi::BindingParamKind::kConstants, /*b*/ 0, 52,
                     nrhi::Visibility::kAll};
-    ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 1,
+    ld.params[1] = {nrhi::BindingParamKind::kTextureTable, /*t*/ 0, 2,
                     nrhi::Visibility::kPixel};
-    ld.params[2] = {nrhi::BindingParamKind::kTextureTable, 1, 1,
-                    nrhi::Visibility::kPixel};
-    ld.params[3] = {nrhi::BindingParamKind::kBufferSrv, /*t*/ 2, 1,
+    ld.params[2] = {nrhi::BindingParamKind::kBufferSrv, /*t*/ 2, 1,
                     nrhi::Visibility::kVertex};
-    // Macro overlay (t3).
-    ld.params[4] = {nrhi::BindingParamKind::kTextureTable, 3, 1,
-                    nrhi::Visibility::kPixel};
-    // Decal art / spec masks (t4). Second entry of the table = the fam 5/6
-    // normal map (t5), bound via cmd->SetTexturePair. Draws without a pair
-    // leave t5 at the backend fallback; the shader only samples t5 when
-    // overlay.w == 4 (pair bound).
-    ld.params[5] = {nrhi::BindingParamKind::kTextureTable, 4, 2,
+    // Macro overlay (t3), decal/spec art (t4), and normal map (t5).
+    ld.params[3] = {nrhi::BindingParamKind::kTextureTable, 3, 3,
                     nrhi::Visibility::kPixel};
     // Dynamic-shadow additions: per-frame receiver constants (b1).
-    ld.params[6] = {nrhi::BindingParamKind::kConstantBuffer, /*b*/ 1, 1,
+    ld.params[4] = {nrhi::BindingParamKind::kConstantBuffer, /*b*/ 1, 1,
                     nrhi::Visibility::kPixel};
-    // Environment cube (t6) + blurred shadow atlas (t7) as ONE two-entry
-    // table (bound together via SetTexturePair); merging them freed the
-    // root-signature DWORD the v2 material table below needs.
-    ld.params[7] = {nrhi::BindingParamKind::kTextureTable, 6, 2,
-                    nrhi::Visibility::kPixel};
-    // World-shading v2 material maps: the detail normal map (t8) + the
-    // decal families' spec/ecc masks (t9), plus the native static
-    // sun-shadow map (t10) as the table's third entry; extending an
-    // existing table costs no root-signature DWORDs. Bound together via
-    // SetTextures (a pair-only bind would drop t10 to the backend
-    // fallback).
-    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 3,
+    // Environment cube, dynamic atlas, v2 material pair, static sun map.
+    ld.params[5] = {nrhi::BindingParamKind::kTextureTable, 6, 5,
                     nrhi::Visibility::kPixel};
     // Character lighting block (b2): the canonical per-draw rows captured
     // from the guest PS bank (CaptureCharLighting), sliced out of the bone
     // upload ring per character draw.
-    ld.params[9] = {nrhi::BindingParamKind::kConstantBuffer, 2, 1,
+    ld.params[6] = {nrhi::BindingParamKind::kConstantBuffer, 2, 1,
                     nrhi::Visibility::kPixel};
     ld.static_sampler_count = 2;
     ld.static_samplers[0] = {/*s*/ 0, nrhi::Filter::kAnisotropic,
@@ -6706,7 +6764,7 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
   cmd->ClearRenderTarget(g_r.static_sun, clear);
   cmd->SetRenderTargets(g_r.static_sun, nullptr);
   cmd->SetBindingLayout(g_r.layout);
-  cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+  cmd->SetConstantBuffer(6, g_r.bone_ring, bone_region);
   const float size = float(g_r.static_sun_size);
   // Per tile (0 = inner r/6, 1 = mid r/2, 2 = far), two phases each:
   // opaque statics, then the alpha-tested families (trees, alphatest
@@ -6779,7 +6837,7 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
           }
         }
         cmd->SetRootConstants(0, 52, constants, 0);
-        cmd->SetBufferSrv(3, g_r.bone_ring, bone_region);
+        cmd->SetBufferSrv(2, g_r.bone_ring, bone_region);
         if (phase == 1) {
           nrhi::TextureView* srv = LookupResolvedTexture(rec.diffuse_tex);
           cmd->SetTexture(1, srv != nullptr ? srv : g_r.white.srv);
@@ -6952,7 +7010,7 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       cmd->SetBindingLayout(g_r.layout);
       cmd->SetPipeline(g_r.pso_shadow_caster);
       // Unused by the caster shaders, but never leave root CBVs unset.
-      cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+      cmd->SetConstantBuffer(6, g_r.bone_ring, bone_region);
       for (int ci = 0; ci < 3; ++ci) {
         // Cascade scale/offset (cascade 0 = identity; PS c1/c2 for 1/2).
         float sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
@@ -7008,7 +7066,7 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
             }
             constants[33] = c.bones ? 1.0f : 0.0f;  // tint.g = skinned branch
             cmd->SetRootConstants(0, 52, constants, 0);
-            cmd->SetBufferSrv(3, g_r.bone_ring,
+            cmd->SetBufferSrv(2, g_r.bone_ring,
                               bone_region + (c.bones ? c.bone_offset : 0));
             if (phase == 1) {
               cmd->SetTexture(1, c.clip_srv != nullptr ? c.clip_srv
@@ -7199,7 +7257,7 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       cmd->SetRenderTargets(g_r.world_shadow, nullptr);
       cmd->SetBindingLayout(g_r.layout);
       cmd->SetPipeline(g_r.pso_shadow_caster);
-      cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+      cmd->SetConstantBuffer(6, g_r.bone_ring, bone_region);
       const float ws_size = float(RendererState::kWorldShadowSize);
       cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f, ws_size, ws_size, 0.0f, 1.0f});
       cmd->SetScissor(nrhi::Rect{0, 0, int32_t(RendererState::kWorldShadowSize),
@@ -7246,7 +7304,7 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
           }
         }
         cmd->SetRootConstants(0, 52, constants, 0);
-        cmd->SetBufferSrv(3, g_r.bone_ring, bone_region);
+        cmd->SetBufferSrv(2, g_r.bone_ring, bone_region);
         cmd->SetVertexBuffer(mit->second.vb_view.buffer,
                              mit->second.vb_view.offset,
                              mit->second.vb_view.size_bytes,
@@ -8509,21 +8567,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       std::memcpy(cb + 132, scene.oceanrefl_rows,
                   sizeof(scene.oceanrefl_rows));
     }
-    cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
+    cmd->SetConstantBuffer(4, g_r.shadow_cb, cb_offset);
     // b2 (character lighting) default: point at the ring base so the root
     // CBV is never left unset; character draws re-point it per item.
-    cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
-    // t6/t7 ride one table: default = white cube + this frame's atlas
-    // (draw_item re-pairs with the item's real cube when one resolves).
-    cmd->SetTexturePair(7, g_r.white_cube.srv,
-                        shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
-    // v2 material table default (t8/t9 white) + the static sun-shadow map
-    // at its third entry (t10); every lit branch samples it, so the table
-    // must be bound for all draws, not only the v2/ocean re-binds.
-    nrhi::TextureView* t8_default[3] = {
+    cmd->SetConstantBuffer(6, g_r.bone_ring, bone_region);
+    // Compact t6..t10 table: environment cube, dynamic atlas, v2 material
+    // pair, and static sun map. Draws replace this full tuple together.
+    nrhi::TextureView* t6_default[5] = {
+        g_r.white_cube.srv,
+        shadow_ready ? g_r.shadow_srv_final : g_r.white.srv,
         g_r.white.srv, g_r.white.srv,
         g_r.static_sun_valid ? g_r.static_sun_srv : g_r.white.srv};
-    cmd->SetTextures(8, t8_default, 3);
+    cmd->SetTextures(5, t6_default, 5);
   }
   nrhi::TextureView* const nsm_view =
       g_r.static_sun_valid ? g_r.static_sun_srv : g_r.white.srv;
@@ -9255,7 +9310,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (offset + bytes <= RendererState::kBoneRegionSize) {
         std::memcpy(g_r.bone_ring_cpu + bone_region + offset, item.bones.data(), bytes);
         g_r.bone_ring_offset = offset + bytes;
-        cmd->SetBufferSrv(3, g_r.bone_ring, bone_region + offset);
+        cmd->SetBufferSrv(2, g_r.bone_ring, bone_region + offset);
         bones_bound = true;
       }
     }
@@ -9265,7 +9320,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // effectively invisible. Must never happen silently.
         g_rr_no_bones.fetch_add(1, std::memory_order_relaxed);
       }
-      cmd->SetBufferSrv(3, g_r.bone_ring, 0);
+      cmd->SetBufferSrv(2, g_r.bone_ring, 0);
     }
 
     if (debug_mode >= 2) {
@@ -9310,7 +9365,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         std::memcpy(g_r.bone_ring_cpu + bone_region + offset, item.char_rows,
                     sizeof(item.char_rows));
         g_r.bone_ring_offset = offset + 512u;
-        cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region + offset);
+        cmd->SetConstantBuffer(6, g_r.bone_ring, bone_region + offset);
         constants[39] = item.char_rows[14 * 4 + 1];
         g_char_drawn.fetch_add(1, std::memory_order_relaxed);
       }
@@ -9888,33 +9943,29 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     cmd->SetRootConstants(0, 52, constants, 0);
 
-    cmd->SetTexture(1, diffuse->srv);
-    cmd->SetTexture(2, (lightmap != nullptr ? lightmap : &g_r.white)->srv);
-    cmd->SetTexture(4, macro_tex->srv);
+    cmd->SetTexturePair(1, diffuse->srv,
+                        (lightmap != nullptr ? lightmap : &g_r.white)->srv);
     // t4 override: the dynobj world-shadow map rides the free first entry
     // of the t4/t5 pair table (flag 8: dynobj draws never bind decal art
     // or spec masks there).
     nrhi::TextureView* t4_view =
         (v2_flags & 8u) != 0 ? g_r.world_shadow_srv : decal_tex->srv;
-    if (normal_paired || t4_view != decal_tex->srv) {
-      cmd->SetTexturePair(5, t4_view,
-                          normal_paired ? pair_normal->srv : g_r.white.srv);
-    } else {
-      cmd->SetTexture(5, decal_tex->srv);
-    }
-    // t6 (cube) shares its table with t7 (shadow atlas); re-pair both.
-    cmd->SetTexturePair(7, cube_tex->srv,
-                        shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
-    // World-shading v2 material pair (t8 detail + t9 decal spec); the exact
-    // ocean rides the same pair (t8 = second PCA component, t9 = overlay).
-    if (v2_flags != 0 || ocean_n2 || ocean_ov) {
-      // Three-entry bind: re-pairing only t8/t9 would reset the t10 static
-      // sun-shadow map to the backend fallback.
-      nrhi::TextureView* t8_views[3] = {
-          (v2_detail != nullptr ? v2_detail : &g_r.white)->srv,
-          (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv, nsm_view};
-      cmd->SetTextures(8, t8_views, 3);
-    }
+    nrhi::TextureView* t3_views[3] = {
+        macro_tex->srv, t4_view,
+        normal_paired ? pair_normal->srv : g_r.white.srv};
+    cmd->SetTextures(3, t3_views, 3);
+    // Compact t6..t10 table. Bind the full tuple so a draw that does not use
+    // v2 materials cannot inherit detail/spec views from the previous draw.
+    const bool use_v2_maps = v2_flags != 0 || ocean_n2 || ocean_ov;
+    nrhi::TextureView* t6_views[5] = {
+        cube_tex->srv,
+        shadow_ready ? g_r.shadow_srv_final : g_r.white.srv,
+        use_v2_maps ? (v2_detail != nullptr ? v2_detail : &g_r.white)->srv
+                    : g_r.white.srv,
+        use_v2_maps ? (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv
+                    : g_r.white.srv,
+        nsm_view};
+    cmd->SetTextures(5, t6_views, 5);
     // ROPA shape blend (see RendererState::ropa_shapes): combine the shape
     // generations with the kernel weights InterpolateDynamicItems computed
     // (the SAME 8-tap boxcar / pair-lerp the body bones and garment world
@@ -10882,8 +10933,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         continue;  // decode swapped since the main-pass draw; next frame
       }
       cmd->SetRootConstants(0, 52, si.constants, 0);
-      cmd->SetTexture(4, si.t3);
-      cmd->SetTexturePair(5, si.t4, si.t5);
+      nrhi::TextureView* refl_views[3] = {si.t3, si.t4, si.t5};
+      cmd->SetTextures(3, refl_views, 3);
       cmd->SetVertexBuffer(mit->second.vb_view.buffer,
                            mit->second.vb_view.offset,
                            mit->second.vb_view.size_bytes,
@@ -11035,8 +11086,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       const uint32_t cb_offset =
           uint32_t(frame_number % RendererState::kShadowCbRegions) *
         RendererState::kShadowCbSlice;
-      cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
-      cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+      cmd->SetConstantBuffer(4, g_r.shadow_cb, cb_offset);
+      cmd->SetConstantBuffer(6, g_r.bone_ring, bone_region);
     }
   }
 
@@ -11437,8 +11488,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         const uint32_t cb_offset =
             uint32_t(frame_number % RendererState::kShadowCbRegions) *
         RendererState::kShadowCbSlice;
-        cmd->SetConstantBuffer(6, g_r.shadow_cb, cb_offset);
-        cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+        cmd->SetConstantBuffer(4, g_r.shadow_cb, cb_offset);
+        cmd->SetConstantBuffer(6, g_r.bone_ring, bone_region);
       }
       static bool s_pfx_first = true;
       if (s_pfx_first) {
@@ -11848,11 +11899,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         constants[38] = output_2d_scale != 1.0f ? output_2d_scale : 0.0f;
         constants[39] = 0.0f;
         cmd->SetRootConstants(0, 40, constants, 0);
-        cmd->SetTexture(1, srv_view);
         if (yuv != nullptr) {
           cmd->SetPipeline(g_r.pso_yuv2d);
-          cmd->SetTexture(2, yuv[1]);
-          cmd->SetTexture(5, yuv[2]);
+          nrhi::TextureView* yuv_yu[2] = {srv_view, yuv[1]};
+          cmd->SetTextures(1, yuv_yu, 2);
+          nrhi::TextureView* yuv_v[3] = {
+              g_r.white.srv, yuv[2], g_r.white.srv};
+          cmd->SetTextures(3, yuv_v, 3);
+        } else {
+          cmd->SetTexture(1, srv_view);
         }
         cmd->SetVertexBuffer(g_r.ui_ring, ui_region + ui_offset, bytes,
                              d.stride);
