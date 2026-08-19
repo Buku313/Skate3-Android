@@ -23,7 +23,7 @@ import java.util.Locale;
 
 final class ModStore {
     static final String CATALOG_URL =
-        "https://buku313.github.io/Skate3-Mobile/mods/catalog.json";
+        "https://raw.githubusercontent.com/Buku313/Skate3-Mobile/main/docs/mods/catalog.json";
     private static final int MAX_CATALOG_SIZE = 256 * 1024;
     private static final long MAX_ASSET_SIZE = 64L * 1024 * 1024;
 
@@ -176,8 +176,7 @@ final class ModStore {
             throw new IOException("The Mod Store contains an invalid asset.");
         }
         URL url = new URL(asset.url);
-        if (!"https".equals(url.getProtocol()) ||
-                !"buku313.github.io".equalsIgnoreCase(url.getHost())) {
+        if (!"https".equals(url.getProtocol()) || !trustedHost(url.getHost())) {
             throw new IOException("The Mod Store asset host is not trusted.");
         }
     }
@@ -254,8 +253,7 @@ final class ModStore {
 
     private static HttpURLConnection open(String address, String accept) throws IOException {
         URL url = new URL(address);
-        if (!"https".equals(url.getProtocol()) ||
-                !"buku313.github.io".equalsIgnoreCase(url.getHost())) {
+        if (!"https".equals(url.getProtocol()) || !trustedHost(url.getHost())) {
             throw new IOException("The Mod Store refused an untrusted download address.");
         }
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -272,6 +270,11 @@ final class ModStore {
             throw new IOException("Mod Store server returned HTTP " + status + ".");
         }
         return connection;
+    }
+
+    private static boolean trustedHost(String host) {
+        return "buku313.github.io".equalsIgnoreCase(host) ||
+               "raw.githubusercontent.com".equalsIgnoreCase(host);
     }
 
     private static void moveReplacing(Path source, Path destination) throws IOException {
