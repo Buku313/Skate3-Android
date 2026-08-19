@@ -4252,15 +4252,26 @@ bool EnsurePenguinResources(const NativeGuestOutputRenderContext& context) {
 bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
 #if REX_PLATFORM_ANDROID
-  // The guest output remains 1280x720 so emulated menus and the native HUD
-  // keep their original layout/sharpness. The RG406V profile shades the 3D
-  // scene at 512x288; the high-end profile restores native 720p.
+  // Keep the 3D target proportional to the selected native output shape.
+  // The RG406V profile retains its 288-line low-power budget (384x288 at
+  // 4:3); the high-end profile renders at the full 720-line output
+  // (960x720 at 4:3).
   const bool high_end_profile =
       std::clamp(REXCVAR_GET(skate3_android_quality_profile), 0, 1) == 1;
-  const uint32_t width = std::min(context.guest_output_width,
-                                  high_end_profile ? 1280u : 512u);
-  const uint32_t height = std::min(context.guest_output_height,
-                                   high_end_profile ? 720u : 288u);
+  const uint32_t width_cap = high_end_profile ? 1280u : 512u;
+  const uint32_t height_cap = high_end_profile ? 720u : 288u;
+  uint32_t height = std::min(context.guest_output_height, height_cap);
+  uint32_t width = uint32_t((uint64_t(height) * context.guest_output_width +
+                             context.guest_output_height / 2) /
+                            std::max(context.guest_output_height, 1u));
+  if (width > width_cap) {
+    width = width_cap;
+    height = uint32_t((uint64_t(width) * context.guest_output_height +
+                       context.guest_output_width / 2) /
+                      std::max(context.guest_output_width, 1u));
+  }
+  width = std::max(width & ~1u, 2u);
+  height = std::max(height & ~1u, 2u);
 #else
   const uint32_t width = context.guest_output_width;
   const uint32_t height = context.guest_output_height;
@@ -4271,6 +4282,11 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
       g_r.targets_hdr != g_r.hdr_active ||
       g_r.targets_scene_fmt != want_scene_fmt ||
       g_r.targets_msaa != g_r.msaa) {
+    if (g_r.depth_width != width || g_r.depth_height != height) {
+      REXLOG_INFO("native-scene: output {}x{} -> scene target {}x{}",
+                  context.guest_output_width, context.guest_output_height,
+                  width, height);
+    }
     if (g_r.depth) {
       // The AO/SSR/volumetric scene-depth SRVs alias this texture and
       // re-point on pointer identity; heap reuse can hand the NEW depth
@@ -8034,6 +8050,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   const bool movie_sub = movie_fresh &&
                          REXCVAR_GET(skate3_native_render_scene_fmv_native) &&
                          g_r.pso_yuv2d != nullptr;
+  // A configured 4:3 or ultrawide native shape must never leak into the
+  // emulated FMV fallback. The aspect decision happens before this renderer
+  // callback on the next swap, so disable it while an unsubstituted movie is
+  // fresh and restore it once native rendering owns the frame again.
+  rex::graphics::SetNativeGuestOutputAspectEnabled(!movie_fresh || movie_sub);
   if (!movie_sub && YieldForMovie()) {
     return false;
   }
@@ -11430,16 +11451,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
-  // Hor+ ultrawide: the 2D stream and the guest screenshot raster are
-  // authored for the 16:9 frontbuffer. On a wide output the 2D replay
-  // scales clip-space X by this factor (centering ortho HUD/menu/FMV draws
-  // in a pillarboxed 16:9 band and narrowing perspective SimpleDraw markers
-  // to match the widened scene projection - one operation covers both), and
-  // the photo grab center-crops the same band.
+  // The 2D stream and guest screenshot raster are authored for a 16:9
+  // frontbuffer. Scale clip-space X by the ratio between 16:9 and the native
+  // output shape. Ultrawide gets a centered 16:9 band; 4:3 uses a centered
+  // crop, preserving HUD/menu geometry instead of horizontally squashing it.
   const float out_aspect2d =
       float(context.guest_output_width) / float(context.guest_output_height);
-  const float wide_2d_scale =
-      out_aspect2d > (16.0f / 9.0f) * 1.01f ? (16.0f / 9.0f) / out_aspect2d : 1.0f;
+  const float output_2d_scale =
+      std::fabs(out_aspect2d - (16.0f / 9.0f)) > 0.01f
+          ? (16.0f / 9.0f) / out_aspect2d
+          : 1.0f;
 
   cmd->ProfileRegion(nrhi::ProfileStage::k2d);
 
@@ -11554,14 +11575,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
         cmd->SetPipeline(g_r.pso_blur_down);
         // Source UV rect (second register): the centered 16:9 band on a
-        // wide output; the guest screenshot raster is 16:9.
+        // wide output; the guest screenshot raster is 16:9. A 4:3 output is
+        // already a horizontal crop, so read its full visible frame.
+        const float grab_uv_scale = std::min(output_2d_scale, 1.0f);
         const float grab_consts[8] = {1.0f / float(context.guest_output_width),
                                       1.0f / float(context.guest_output_height),
                                       0.0f,
                                       0.0f,
-                                      wide_2d_scale,
+                                      grab_uv_scale,
                                       1.0f,
-                                      (1.0f - wide_2d_scale) * 0.5f,
+                                      (1.0f - grab_uv_scale) * 0.5f,
                                       0.0f};
         cmd->SetRootConstants(0, 8, grab_consts, 0);
         cmd->SetTexture(1, g_r.output_srv_slot);
@@ -11755,14 +11778,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
         float constants[40];
         std::memcpy(constants, d.consts, sizeof(d.consts));
-        // Wide output: scale the staged projection's clip.x row (the VS
-        // computes clip.x = dot(wp, c0)) so the 16:9-authored stream lands
-        // centered (see wide_2d_scale).
-        if (wide_2d_scale != 1.0f) {
-          constants[0] *= wide_2d_scale;
-          constants[1] *= wide_2d_scale;
-          constants[2] *= wide_2d_scale;
-          constants[3] *= wide_2d_scale;
+        // Match the staged 16:9 projection to the selected output shape.
+        if (output_2d_scale != 1.0f) {
+          constants[0] *= output_2d_scale;
+          constants[1] *= output_2d_scale;
+          constants[2] *= output_2d_scale;
+          constants[3] *= output_2d_scale;
         }
         // 2D ortho draws have no translation row in the projection (c3 ==
         // (0,0,0,1)); perspective view-proj rows do. Half-pixel applies to
@@ -11781,7 +11802,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // half_pixel_offset reversal); the old up-left OUTPUT-pixel nudge
         // staged here left a see-through sliver along the bottom/right of
         // edge-to-edge loading quads.
-        constants[38] = wide_2d_scale != 1.0f ? wide_2d_scale : 0.0f;
+        constants[38] = output_2d_scale != 1.0f ? output_2d_scale : 0.0f;
         constants[39] = 0.0f;
         cmd->SetRootConstants(0, 40, constants, 0);
         cmd->SetTexture(1, srv_view);

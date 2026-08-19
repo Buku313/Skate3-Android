@@ -8409,14 +8409,14 @@ static void ApplySunOverride(FrameScene& scene) {
   }
 }
 
-// Hor+ ultrawide: clip-space X scale that widens the game's screen-shaped
-// projection to the wide guest-output aspect (see the SDK's
-// ApplyNativeGuestOutputWideAspect). 1.0 while the output is not wide. The
-// projection aspect is read off the matrix itself (|m11/m00|) so the FOV
-// override and freecam zoom compose naturally.
-float WideOutputHorScale(const float proj[16]) {
-  const double wide_aspect = rex::graphics::GetNativeGuestOutputWideAspect();
-  if (wide_aspect <= 0.0 || !rex::graphics::IsNativeGuestOutputActive()) {
+// Clip-space X scale that makes the game's screen-shaped projection match
+// the native guest-output aspect. Values below 1 widen the horizontal view;
+// values above 1 narrow it for 4:3 while preserving vertical FOV. The base
+// aspect is read from the matrix itself (|m11/m00|), so the FOV override and
+// freecam zoom compose naturally.
+float NativeOutputHorScale(const float proj[16]) {
+  const double output_aspect = rex::graphics::GetNativeGuestOutputAspect();
+  if (output_aspect <= 0.0 || !rex::graphics::IsNativeGuestOutputActive()) {
     return 1.0f;
   }
   const float m00 = std::fabs(proj[0]);
@@ -8425,18 +8425,18 @@ float WideOutputHorScale(const float proj[16]) {
     return 1.0f;
   }
   const double base_aspect = double(m11) / double(m00);
-  if (wide_aspect <= base_aspect + 0.01) {
+  if (std::fabs(output_aspect - base_aspect) <= 0.01) {
     return 1.0f;
   }
-  return float(base_aspect / wide_aspect);
+  return float(base_aspect / output_aspect);
 }
 
-// Applies the Hor+ scale to the published camera: column 0 of the row-vector
+// Applies the aspect scale to the published camera: column 0 of the row-vector
 // projection and view*proj (clip.x = dot(v, column 0)). Every consumer (draw
 // MVPs, post-pass unprojection, splines, frustum tests) reads these published
 // matrices, so the frame stays self-consistent, exactly as if the game camera
 // itself had the wide aspect.
-void WidenPublishedCamera(FrameScene& scene, float scale) {
+void ApplyPublishedCameraAspect(FrameScene& scene, float scale) {
   if (scale == 1.0f) {
     return;
   }
@@ -9968,11 +9968,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
 
-  // Hor+ ultrawide scale for this frame's camera (1.0 when the output is not
-  // wide). The matrices are widened after the camera overrides below; the
-  // retention frustum guards divide by it here so their tests already match
-  // the frame's real (wider) view.
-  const float wide_hor_scale = WideOutputHorScale(scene.proj);
+  // Native output aspect scale for this frame's camera. The matrices are
+  // adjusted after the camera overrides below. Only a wider-than-16:9 view
+  // needs the retention guards expanded; the guest's normal 16:9 culling
+  // already contains everything visible to a narrower 4:3 camera.
+  const float output_hor_scale = NativeOutputHorScale(scene.proj);
+  const float retention_hor_scale = std::min(output_hor_scale, 1.0f);
 
   // Off-screen retention (see g_retained_items): re-append statics the game
   // view-culled this frame while the trailing rendered pose can still see
@@ -10033,14 +10034,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       // it. The 0.97 margin shrinks the tested frustum so bounds poking
       // just inside an edge still count as view-culled.
       if (now - r.last_seen > kRetainTtlFrames ||
-          !ItemOutsideFrustum(r.item, guest_vp, 0.97f / wide_hor_scale)) {
+          !ItemOutsideFrustum(r.item, guest_vp, 0.97f / retention_hor_scale)) {
         rit = g_retained_items.erase(rit);
         continue;
       }
       // Draw it only if the RENDERED pose can actually see it (widened
       // frustum: only clearly-outside skips); after a fast 180 the trail
       // behind the camera stays retained but costs nothing.
-      if (!ItemOutsideFrustum(r.item, scene.view_proj, 1.05f / wide_hor_scale)) {
+      if (!ItemOutsideFrustum(r.item, scene.view_proj, 1.05f / retention_hor_scale)) {
         scene.items.push_back(r.item);
         ++retain_appended;
       }
@@ -10244,10 +10245,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // so none of the original CAC pieces can be reintroduced later this frame.
   skate3::penguin_mod::ApplyToFrame(scene);
 
-  // Hor+ ultrawide: widen the published camera to the wide output aspect.
-  // Applied after every camera override (smoothing, synthetic pan, freecam)
-  // so it survives their view_proj/proj rewrites.
-  WidenPublishedCamera(scene, wide_hor_scale);
+  // Apply the native output aspect after every camera override (smoothing,
+  // synthetic pan, freecam), so it survives their view_proj/proj rewrites.
+  ApplyPublishedCameraAspect(scene, output_hor_scale);
 
   // Publish the frame's captured fog rows and re-arm the OnDrawDone capture
   // (keyed to this frame's camera) for the next frame.

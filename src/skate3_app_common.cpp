@@ -103,6 +103,11 @@ REXCVAR_DEFINE_BOOL(skate3_ultrawide, false, "Skate 3",
                     "frames at the host display aspect (requires the native renderer; the "
                     "emulated fallback presents 16:9 pillarboxed)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(skate3_display_aspect_mode, 0, "Skate 3",
+                     "Native renderer display shape: 0 = 16:9, 1 = native 4:3, "
+                     "2 = host ultrawide.")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_field_of_view, 60.0, "Skate 3",
                       "Gameplay camera field of view in degrees")
     .range(40.0, 120.0);
@@ -277,8 +282,27 @@ std::optional<DisplaySize> ResolveUltrawideTargetDisplaySize() {
   return std::nullopt;
 }
 
-void ApplyUltrawideVideoDefaults() {
-  if (!REXCVAR_GET(skate3_ultrawide)) {
+void ApplyNativeDisplayAspectDefaults() {
+  int32_t aspect_mode = std::clamp(REXCVAR_GET(skate3_display_aspect_mode), 0, 2);
+  REXLOG_INFO("Native display shape: mode {} (0 = 16:9, 1 = 4:3, 2 = ultrawide)",
+              aspect_mode);
+  // Preserve existing configs from before the three-way display-shape
+  // setting was introduced.
+  if (aspect_mode == 0 && REXCVAR_GET(skate3_ultrawide)) {
+    aspect_mode = 2;
+  }
+  if (aspect_mode == 0) {
+    rex::graphics::SetNativeGuestOutputAspect(0.0);
+    return;
+  }
+
+  if (aspect_mode == 1) {
+    // Skate 3's native scene and 2D replay both understand this exact shape.
+    // A 720-line guest output therefore becomes 960x720 on 4:3 handhelds.
+    rex::graphics::SetNativeGuestOutputAspect(4.0 / 3.0);
+    if (!rex::cvar::HasNonDefaultValue("present_letterbox")) {
+      rex::cvar::SetFlagByName("present_letterbox", "true");
+    }
     return;
   }
 
@@ -304,7 +328,7 @@ void ApplyUltrawideVideoDefaults() {
   // output + Hor+ projection + centered 2D band). Emulated fallback frames
   // keep the 16:9 guest output and present pillarboxed via the letterbox
   // default below.
-  rex::graphics::SetNativeGuestOutputWideAspect(
+  rex::graphics::SetNativeGuestOutputAspect(
       std::clamp(target_aspect, kSixteenNineAspect, 8.0));
 
   if (!rex::cvar::HasNonDefaultValue("present_letterbox")) {
@@ -673,7 +697,7 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   }
 #endif
   Skate3InitializeFieldOfViewOverride();
-  ApplyUltrawideVideoDefaults();
+  ApplyNativeDisplayAspectDefaults();
   DisableActiveDebugDiagnostics();
 }
 
@@ -898,6 +922,12 @@ void Skate3BaseApp::OnPostSetup() {
   skate3::shader_disasm::RunIfRequested();
   skate3::mp::Start();
   ApplySelectedProfileToRuntime();
+  // Reapply the saved display shape after the graphics runtime is fully set
+  // up. On Android this is the first point where the native guest-output
+  // state is guaranteed to survive startup, so a saved 4:3 selection is in
+  // effect before the first native frame rather than only after opening the
+  // settings overlay.
+  ApplyNativeDisplayAspectDefaults();
   ApplyGameplayCursorMode();
 
   if (auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system())) {
