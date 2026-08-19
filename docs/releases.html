@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Releases | Skate 3 Mobile</title>
+  <meta name="description" content="Download current and previous Skate 3 Mobile Android developer builds.">
+  <meta name="theme-color" content="#ff6518">
+  <link rel="canonical" href="https://buku313.github.io/Skate3-Mobile/releases.html">
+  <style>
+    :root { color-scheme:dark; --ink:#f8f8fb; --muted:#a7a8b2; --panel:#17171c; --line:#2a2a32; --orange:#ff6518; --orange-hot:#ff8a2f; --cyan:#41d7ff; }
+    * { box-sizing:border-box; }
+    html,body { width:100%; max-width:100%; overflow-x:hidden; }
+    body { margin:0; color:var(--ink); background:radial-gradient(circle at 85% 0%,rgba(65,215,255,.12),transparent 30rem),radial-gradient(circle at 0% 45%,rgba(255,101,24,.1),transparent 28rem),#09090b; font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; line-height:1.55; }
+    a { color:inherit; }
+    .wrap { width:100%; min-width:0; max-width:1056px; margin:0 auto; padding-right:18px; padding-left:18px; }
+    nav { min-width:0; min-height:72px; display:flex; gap:12px; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,.08); }
+    .brand { font-weight:950; letter-spacing:-.04em; font-size:1.15rem; text-decoration:none; }
+    .brand span,.kicker { color:var(--orange); }
+    .nav-links { min-width:0; display:flex; gap:18px; }
+    .nav-links a { color:var(--muted); font-weight:750; text-decoration:none; }
+    .nav-links a:hover { color:white; }
+    header.page { padding:72px 0 44px; }
+    .kicker { font-size:.8rem; font-weight:900; letter-spacing:.15em; }
+    h1 { margin:10px 0 18px; font-size:clamp(3rem,9vw,6rem); line-height:.9; letter-spacing:-.065em; }
+    .lede { max-width:720px; margin:0; color:#d3d3da; font-size:1.15rem; }
+    .notice { width:100%; max-width:100%; margin:30px 0 46px; padding:20px 22px; border:1px solid rgba(255,101,24,.4); border-left:5px solid var(--orange); border-radius:13px; background:rgba(255,101,24,.09); color:#ffd7c3; overflow-wrap:anywhere; }
+    .notice strong { display:block; margin-bottom:4px; color:white; }
+    .release-list { min-width:0; display:grid; gap:18px; padding-bottom:72px; }
+    .release { width:100%; min-width:0; max-width:100%; display:grid; grid-template-columns:170px minmax(0,1fr) auto; gap:24px; align-items:center; padding:26px; border:1px solid var(--line); border-radius:18px; background:rgba(23,23,28,.88); overflow:hidden; }
+    .release.latest { border-color:rgba(65,215,255,.42); background:linear-gradient(145deg,rgba(65,215,255,.09),rgba(23,23,28,.94)); box-shadow:0 20px 70px rgba(0,0,0,.25); }
+    .version { margin:0; font-size:2rem; line-height:1; letter-spacing:-.045em; }
+    .date { display:block; margin-top:8px; color:var(--muted); font-size:.8rem; font-weight:750; }
+    .tag { display:inline-flex; margin-bottom:10px; padding:5px 9px; border-radius:999px; background:#292930; color:#d2d2da; font-size:.7rem; font-weight:950; letter-spacing:.08em; }
+    .latest .tag { background:var(--orange); color:#090909; }
+    h2 { margin:0 0 6px; font-size:1.18rem; }
+    .summary { margin:0; color:var(--muted); overflow-wrap:anywhere; }
+    .meta { margin-top:9px; color:#72737c; font-size:.8rem; }
+    .actions { display:flex; flex-direction:column; gap:9px; min-width:156px; }
+    .button { display:inline-flex; min-height:46px; align-items:center; justify-content:center; padding:0 17px; border-radius:10px; background:var(--orange); color:#090909; font-weight:950; text-decoration:none; white-space:nowrap; transition:transform .18s ease,background .18s ease; }
+    .button:hover { transform:translateY(-2px); background:var(--orange-hot); }
+    .button.secondary { background:#292930; color:white; }
+    footer { padding:42px 0 56px; border-top:1px solid rgba(255,255,255,.08); color:#7d7e87; font-size:.86rem; }
+    footer a { color:#c5c6ce; }
+    @media(max-width:760px) {
+      header.page { padding-top:54px; }
+      .release { grid-template-columns:minmax(0,1fr); gap:16px; padding:21px; }
+      .release > * { min-width:0; }
+      .actions { min-width:0; }
+      .button { width:100%; }
+      .nav-links { gap:11px; font-size:.84rem; }
+      .nav-links a:last-child { display:none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="index.html">SKATE 3 <span>MOBILE</span></a>
+      <div class="nav-links"><a href="index.html">Home</a><a href="updates.html">Updates</a><a href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">Bug report</a></div>
+    </nav>
+  </div>
+
+  <header class="page wrap">
+    <div class="kicker">ANDROID APK ARCHIVE</div>
+    <h1>RELEASES.</h1>
+    <p class="lede">Download the newest developer build or compare previous versions. Every APK below uses the same Skate 3 Mobile package and release signing identity.</p>
+  </header>
+
+  <main class="wrap">
+    <div class="notice"><strong>Use the latest version unless you are troubleshooting.</strong>Older builds contain known bugs and do not receive fixes. Updating the APK does not delete your locally extracted game files.</div>
+
+    <div class="release-list">
+      <article class="release latest">
+        <div><span class="tag">LATEST DEV BUILD</span><h2 class="version">v2.0.10</h2><span class="date">August 19, 2026</span></div>
+        <div><h2>Snapdragon compatibility test</h2><p class="summary">Reduces unused Vulkan pipeline compilation and adds detailed native crash traces, renderer logs, and graphics-profile evidence to bug reports.</p><div class="meta">Android 13+ · ARM64 · About 90 MB</div></div>
+        <div class="actions"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/download/v2.0.10/Skate3-Mobile-Android.apk">DOWNLOAD APK</a><a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/releases/tag/v2.0.10">RELEASE NOTES</a></div>
+      </article>
+
+      <article class="release">
+        <div><span class="tag">PREVIOUS</span><h2 class="version">v2.0.9</h2><span class="date">August 19, 2026</span></div>
+        <div><h2>In-app crash reporting</h2><p class="summary">Introduced the Bug Report and Device Diagnostics flow with device, Vulkan, process-exit, and system information.</p><div class="meta">Android 13+ · ARM64 · About 90 MB</div></div>
+        <div class="actions"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/download/v2.0.9/Skate3-Mobile-Android.apk">DOWNLOAD APK</a><a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/releases/tag/v2.0.9">RELEASE NOTES</a></div>
+      </article>
+
+      <article class="release">
+        <div><span class="tag">PREVIOUS</span><h2 class="version">v2.0.8</h2><span class="date">August 18, 2026</span></div>
+        <div><h2>Touch controls and easy updates</h2><p class="summary">Added the multitouch Xbox-style controller overlay, signed in-app APK updates, and 4 KB plus 16 KB Android memory-page support.</p><div class="meta">Android 13+ · ARM64 · About 90 MB</div></div>
+        <div class="actions"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/download/v2.0.8/Skate3-Mobile-Android.apk">DOWNLOAD APK</a><a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/releases/tag/v2.0.8">RELEASE NOTES</a></div>
+      </article>
+
+      <article class="release">
+        <div><span class="tag">HOTFIX</span><h2 class="version">v2.0.7</h2><span class="date">August 18, 2026</span></div>
+        <div><h2>Modern Android memory pages</h2><p class="summary">Rebuilt the native libraries for 16 KB page alignment while retaining compatibility with 4 KB devices such as the RG406V.</p><div class="meta">Android 13+ · ARM64 · About 90 MB</div></div>
+        <div class="actions"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/download/v2.0.7/Skate3-Mobile-Android.apk">DOWNLOAD APK</a><a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/releases/tag/v2.0.7">RELEASE NOTES</a></div>
+      </article>
+
+      <article class="release">
+        <div><span class="tag">FIRST PLAYER BUILD</span><h2 class="version">v2.0.6</h2><span class="date">August 18, 2026</span></div>
+        <div><h2>Phone-only setup</h2><p class="summary">Added local ISO extraction, Title Update 3 setup, performance and quality profiles, and the optional Seiyu character switch.</p><div class="meta">Android 13+ · ARM64 · About 90 MB</div></div>
+        <div class="actions"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/download/v2.0.6/Skate3-Mobile-Android.apk">DOWNLOAD APK</a><a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/releases/tag/v2.0.6">RELEASE NOTES</a></div>
+      </article>
+    </div>
+  </main>
+
+  <footer class="wrap">Unofficial experimental fan project. APK files do not contain retail game data. Read the <a href="updates.html">development updates</a> or view the <a href="https://github.com/Buku313/Skate3-Mobile/releases">GitHub release archive</a>.</footer>
+</body>
+</html>
