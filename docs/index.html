@@ -151,6 +151,26 @@
     h3 { margin: 12px 0 8px; font-size: 1.18rem; }
     .step p, .card p { color: var(--muted); margin: 0; }
     .requirements { margin-top: 22px; padding: 20px 22px; border-left: 4px solid var(--cyan); background: #10161a; color: #d8e9ef; }
+    .updates-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 34px;
+    }
+    .updates-head .section-intro { margin-bottom: 0; }
+    .updates-head .button { min-height: 48px; white-space: nowrap; }
+    .update-tag {
+      display: inline-flex;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: rgba(65,215,255,.12);
+      color: var(--cyan);
+      font-size: .72rem;
+      font-weight: 950;
+      letter-spacing: .08em;
+    }
+    .update-tag.testing { background: rgba(255,101,24,.13); color: #ffad84; }
     .download-panel {
       display: flex;
       align-items: center;
@@ -173,6 +193,7 @@
       .steps, .cards { grid-template-columns: 1fr; }
       .download-panel { align-items: flex-start; flex-direction: column; }
       .download-panel .button { width: 100%; }
+      .updates-head { align-items: flex-start; flex-direction: column; }
       .nav-links { gap: 12px; font-size: .84rem; }
       .nav-links .source-link { display: none; }
     }
@@ -220,6 +241,35 @@
           <article class="step"><div class="number">03</div><h3>Wait, then skate</h3><p>The app extracts and verifies the files, installs Title Update 3, and gives you a Play button.</p></article>
         </div>
         <div class="requirements"><strong>Before downloading:</strong> allow roughly 8 GiB free after the ISO is already available. The current build supports Android 13 or newer, 64-bit ARM, Vulkan, touch controls, and physical controllers. It does not support iPhone or 32-bit Android devices.</div>
+      </div>
+    </section>
+
+    <section id="updates">
+      <div class="wrap">
+        <div class="updates-head">
+          <div>
+            <h2>Latest updates.</h2>
+            <p class="section-intro">Follow new builds, compatibility work, fixes, and known limitations as development moves fast.</p>
+          </div>
+          <a class="button secondary" href="updates.html">VIEW ALL UPDATES</a>
+        </div>
+        <div class="cards">
+          <article class="card">
+            <span class="update-tag" data-current-version>v2.0.9 DEV</span>
+            <h3>Bug reports inside the app</h3>
+            <p>The launcher can prepare privacy-safe device diagnostics and open a GitHub report with the useful technical details already filled in.</p>
+          </article>
+          <article class="card">
+            <span class="update-tag testing">IN TESTING</span>
+            <h3>Snapdragon and Adreno compatibility</h3>
+            <p>Gameplay-start crashes reported on newer phones are under active investigation. Compatibility changes are tested on the RG406V before release.</p>
+          </article>
+          <article class="card">
+            <span class="update-tag">RECENT</span>
+            <h3>Touch controls and app updates</h3>
+            <p>Play with the multitouch Xbox-style overlay, then download verified signed APK updates without replacing your extracted game files.</p>
+          </article>
+        </div>
       </div>
     </section>
 
