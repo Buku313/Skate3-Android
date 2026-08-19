@@ -1,7 +1,7 @@
 {
-  "versionCode": 20009,
-  "versionName": "2.0.9",
+  "versionCode": 20010,
+  "versionName": "2.0.10",
   "apkUrl": "https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk",
-  "sha256": "cedf3260e2e33c7d86c3d3c58366fc5bb93a552472dac9955c615e547c2c9e5d",
-  "notes": "Adds an in-app GitHub bug report button with privacy-safe device details and Android process-exit diagnostics for Snapdragon and other device crashes."
+  "sha256": "876af769d74752a8395827274aef73a764e163166caff7b50b4fee6c766b98a1",
+  "notes": "Adds an Android performance-mode Vulkan compatibility path plus native tombstone, stack, graphics-profile, and renderer-log diagnostics for Snapdragon device crashes."
 }

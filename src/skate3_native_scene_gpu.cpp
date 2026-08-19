@@ -4497,10 +4497,22 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     g_r.hdr_scene_format = hdr_fmt_want;
     g_r.msaa = msaa_want;
     g_r.showcase_shaders = g_r.showcase_shaders_want;
+    // The Android performance profile never executes these optional passes.
+    // Avoid sending their shader families through the Adreno compiler during
+    // the sensitive transition from menus into gameplay. Quality mode still
+    // creates the complete renderer pipeline set.
+#if REX_PLATFORM_ANDROID
+    const bool lean_android_pipelines =
+        std::clamp(REXCVAR_GET(skate3_android_quality_profile), 0, 1) == 0;
+#else
+    constexpr bool lean_android_pipelines = false;
+#endif
     if (!EnsureScenePsoFamily(context) || !EnsureResolvePso(context) ||
-        !EnsureBlurPsos(context) || !EnsureOutlineEdgePso(context) ||
-        !Ensure2dPso(context) || !EnsureSplinePsos(context) ||
-        !EnsureShadowPsos(context)) {
+        !EnsureBlurPsos(context) ||
+        (!lean_android_pipelines && !EnsureOutlineEdgePso(context)) ||
+        !Ensure2dPso(context) ||
+        (!lean_android_pipelines && !EnsureSplinePsos(context)) ||
+        (!lean_android_pipelines && !EnsureShadowPsos(context))) {
       if (g_r.showcase_shaders) {
         // A showcase-variant build failure must not pin the sticky failure
         // latch: drop the swap request so the F5 retry rebuilds the
@@ -4511,9 +4523,10 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       }
       return false;
     }
-    REXLOG_INFO("native-scene: pipelines created (MSAA x{}, {}{})", g_r.msaa,
+    REXLOG_INFO("native-scene: pipelines created (MSAA x{}, {}{}{})", g_r.msaa,
                 g_r.hdr_active ? "HDR" : "classic",
-                g_r.showcase_shaders ? ", showcase variants" : "");
+                g_r.showcase_shaders ? ", showcase variants" : "",
+                lean_android_pipelines ? ", lean Android set" : "");
     g_r.rtv_format = context.guest_output->format();
   }
 

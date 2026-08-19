@@ -62,11 +62,11 @@
 
   <main>
     <div class="wrap current">
-      <span class="version">CURRENT · <span data-current-version>v2.0.9 DEV</span></span>
-      <h2>Crash reports directly from the app</h2>
-      <p>Signed Android developer build for ARM64 devices. Adds privacy-safe device and historical process-exit diagnostics to the launcher Bug Report button.</p>
+      <span class="version">CURRENT · <span data-current-version>v2.0.10 DEV</span></span>
+      <h2>Snapdragon compatibility test build</h2>
+      <p>Reduces unused Vulkan pipeline compilation in Performance mode and adds actionable native crash traces for Snapdragon and other Android devices.</p>
       <div class="actions">
-        <a class="button" data-version-download href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD v2.0.9 DEV</a>
+        <a class="button" data-version-download href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD v2.0.10 DEV</a>
         <a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">REPORT A BUG</a>
       </div>
     </div>
@@ -86,7 +86,8 @@
     <section>
       <div class="wrap">
         <h2>Release history</h2>
-        <article class="release"><time>v2.0.9 · CURRENT DEV BUILD</time><h3>In-app crash reporting</h3><ul><li>Added a Bug Report / Device Diagnostics button to the Android launcher.</li><li>Prefills the GitHub form with version, device, Android, SoC, profile, input, page size, Vulkan feature level, and recent process exits.</li><li>Identifies native crashes, Java crashes, ANRs, signals, initialization failures, and memory kills without collecting retail game files or private paths.</li></ul></article>
+        <article class="release"><time>v2.0.10 · CURRENT DEV BUILD</time><h3>Snapdragon compatibility and native crash traces</h3><ul><li>Performance mode no longer compiles disabled shadow, outline-edge, or spline Vulkan pipelines during the gameplay loading transition.</li><li>Keeps the proven eager topology pipeline path required by the RG406V.</li><li>Bug reports now include the actual saved graphics profile, native signal, abort message, crashing thread stack offsets, and filtered renderer log lines.</li><li>Verified from a clean launch through first-time setup into live native gameplay at 60 FPS on the RG406V.</li></ul></article>
+        <article class="release"><time>v2.0.9 · PREVIOUS DEV BUILD</time><h3>In-app crash reporting</h3><ul><li>Added a Bug Report / Device Diagnostics button to the Android launcher.</li><li>Prefills the GitHub form with version, device, Android, SoC, profile, input, page size, Vulkan feature level, and recent process exits.</li><li>Identifies native crashes, Java crashes, ANRs, signals, initialization failures, and memory kills without collecting retail game files or private paths.</li></ul></article>
         <article class="release"><time>v2.0.8 · PREVIOUS DEV BUILD</time><h3>Touch controls and easy updates</h3><ul><li>Full multitouch Xbox-style controller with analog sticks, D-pad, face buttons, shoulders, triggers, Start, Back, L3, and R3.</li><li>Touch input merges with physical player-one input.</li><li>Automatic update checks and SHA-256 verified APK downloads.</li><li>Android 4 KB and 16 KB memory-page support retained.</li></ul></article>
         <article class="release"><time>v2.0.7 · HOTFIX</time><h3>Modern Android memory pages</h3><ul><li>Added 16 KB ELF alignment for current flagship phones.</li><li>Made native guest-memory protection follow the device page size.</li><li>Preserved RG406V and other 4 KB device compatibility.</li></ul></article>
         <article class="release"><time>v2.0.6 · FIRST PLAYER BUILD</time><h3>Phone-only setup</h3><ul><li>Added local ISO extraction and supported-file verification.</li><li>Added verified Title Update 3 installation.</li><li>Included performance and quality profiles plus the optional Seiyu character switch.</li></ul></article>

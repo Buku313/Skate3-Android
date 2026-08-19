@@ -18,14 +18,21 @@ import android.system.OsConstants;
 import android.view.InputDevice;
 import android.widget.Toast;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
+import java.util.zip.GZIPInputStream;
 
 final class BugReporter {
     private static final String ISSUE_URL =
@@ -64,6 +71,7 @@ final class BugReporter {
         String profile = graphicsProfile(context);
         String input = inputMethod();
         String exits = recentExits(context);
+        String runtime = runtimeEvidence(context);
         long pageSize = Os.sysconf(OsConstants._SC_PAGESIZE);
         String vulkan = vulkanVersion(context);
         long availableMb = Runtime.getRuntime().maxMemory() / (1024 * 1024);
@@ -82,13 +90,22 @@ final class BugReporter {
             "Java heap limit: " + availableMb + " MiB\n" +
             "Graphics profile: " + profile + "\n" +
             "Input: " + input + "\n" +
-            "Recent process exits:\n" + exits;
-        return new Diagnostic(version, device, android, soc, profile, input, report);
+            "Recent process exits:\n" + exits + "\n\n" +
+            "Native renderer evidence:\n" + runtime;
+        String webReport = report.length() <= 5000 ? report :
+            report.substring(0, 5000) +
+            "\n[Report shortened for the browser. Paste the copied full report in a comment.]";
+        return new Diagnostic(version, device, android, soc, profile, input,
+                              report, webReport);
     }
 
     private static String graphicsProfile(Context context) {
-        File settings = new File(context.getFilesDir(), "settings.toml");
-        try {
+        File[] candidates = {
+            new File(new File(context.getFilesDir(), "skate3"), "settings.toml"),
+            new File(context.getFilesDir(), "settings.toml")
+        };
+        for (File settings : candidates) {
+          try {
             if (settings.isFile() && settings.length() <= 1024 * 1024) {
                 String text = new String(Files.readAllBytes(settings.toPath()),
                                          StandardCharsets.UTF_8);
@@ -102,9 +119,10 @@ final class BugReporter {
                     }
                 }
             }
-        } catch (Exception ignored) {
+          } catch (Exception ignored) {
+          }
         }
-        return "I do not know";
+        return "Not explicitly saved (app default: Performance)";
     }
 
     private static String inputMethod() {
@@ -143,6 +161,7 @@ final class BugReporter {
             SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss 'UTC'", Locale.US);
             format.setTimeZone(TimeZone.getTimeZone("UTC"));
             StringBuilder text = new StringBuilder();
+            boolean traceIncluded = false;
             for (ApplicationExitInfo exit : exits) {
                 text.append("- ").append(format.format(new Date(exit.getTimestamp())))
                     .append(": ").append(reasonName(exit.getReason()))
@@ -150,11 +169,276 @@ final class BugReporter {
                     .append(", pss=").append(exit.getPss()).append(" KiB")
                     .append(", rss=").append(exit.getRss()).append(" KiB");
                 text.append('\n');
+                if (!traceIncluded &&
+                    exit.getReason() == ApplicationExitInfo.REASON_CRASH_NATIVE) {
+                    String trace = nativeTrace(exit);
+                    if (!trace.isEmpty()) {
+                        text.append("  Native tombstone:\n");
+                        for (String line : trace.split("\\R")) {
+                            text.append("  ").append(line).append('\n');
+                        }
+                        traceIncluded = true;
+                    }
+                }
             }
             return text.toString().trim();
         } catch (Exception exception) {
             return "- unavailable: " + clean(exception.getClass().getSimpleName());
         }
+    }
+
+    private static String nativeTrace(ApplicationExitInfo exit) {
+        try (InputStream raw = exit.getTraceInputStream()) {
+            if (raw == null) return "";
+            byte[] encoded = readLimited(raw, 4 * 1024 * 1024);
+            if (encoded.length >= 2 && (encoded[0] & 0xff) == 0x1f &&
+                (encoded[1] & 0xff) == 0x8b) {
+                try (GZIPInputStream gzip = new GZIPInputStream(
+                         new ByteArrayInputStream(encoded))) {
+                    encoded = readLimited(gzip, 4 * 1024 * 1024);
+                }
+            }
+            return parseTombstone(encoded);
+        } catch (Exception exception) {
+            return "trace unavailable: " + clean(exception.getClass().getSimpleName());
+        }
+    }
+
+    // Android stores native exit traces as debuggerd Tombstone protobufs.
+    // This small wire reader extracts only the crash fields we need, avoiding
+    // a large protobuf runtime dependency in the public APK.
+    private static String parseTombstone(byte[] data) {
+        ProtoReader root = new ProtoReader(data);
+        long crashingTid = -1;
+        String signal = "";
+        String abort = "";
+        List<String> causes = new ArrayList<>();
+        List<ThreadTrace> threads = new ArrayList<>();
+        while (root.hasRemaining()) {
+            int tag = root.readTag();
+            if (tag == 0) break;
+            int field = tag >>> 3;
+            int wire = tag & 7;
+            if (field == 6 && wire == 0) {
+                crashingTid = root.readVarint();
+            } else if (field == 10 && wire == 2) {
+                signal = parseSignal(root.readBytes());
+            } else if (field == 14 && wire == 2) {
+                abort = clean(root.readString());
+            } else if (field == 15 && wire == 2) {
+                String cause = parseCause(root.readBytes());
+                if (!cause.isEmpty()) causes.add(cause);
+            } else if (field == 16 && wire == 2) {
+                ThreadTrace thread = parseThreadEntry(root.readBytes());
+                if (thread != null) threads.add(thread);
+            } else {
+                root.skip(wire);
+            }
+        }
+        StringBuilder out = new StringBuilder();
+        if (!signal.isEmpty()) out.append("Signal: ").append(signal).append('\n');
+        if (!abort.isEmpty()) out.append("Abort: ").append(abort).append('\n');
+        for (String cause : causes) out.append("Cause: ").append(cause).append('\n');
+        ThreadTrace crashing = null;
+        for (ThreadTrace thread : threads) {
+            if (thread.tid == crashingTid) {
+                crashing = thread;
+                break;
+            }
+        }
+        if (crashing == null && !threads.isEmpty()) crashing = threads.get(0);
+        if (crashing != null) {
+            out.append("Thread: ").append(crashing.tid);
+            if (!crashing.name.isEmpty()) out.append(" (").append(crashing.name).append(')');
+            out.append('\n');
+            for (String frame : crashing.frames) out.append(frame).append('\n');
+            for (String note : crashing.notes) out.append("Note: ").append(note).append('\n');
+        }
+        return out.toString().trim();
+    }
+
+    private static String parseSignal(byte[] data) {
+        ProtoReader reader = new ProtoReader(data);
+        long number = -1;
+        String name = "";
+        String code = "";
+        long address = -1;
+        while (reader.hasRemaining()) {
+            int tag = reader.readTag();
+            if (tag == 0) break;
+            int field = tag >>> 3;
+            int wire = tag & 7;
+            if (field == 1 && wire == 0) number = reader.readVarint();
+            else if (field == 2 && wire == 2) name = clean(reader.readString());
+            else if (field == 4 && wire == 2) code = clean(reader.readString());
+            else if (field == 9 && wire == 0) address = reader.readVarint();
+            else reader.skip(wire);
+        }
+        StringBuilder out = new StringBuilder();
+        if (!name.isEmpty()) out.append(name);
+        else if (number >= 0) out.append(number);
+        if (!code.isEmpty()) out.append(" / ").append(code);
+        if (address >= 0) out.append(" at 0x").append(Long.toHexString(address));
+        return out.toString();
+    }
+
+    private static String parseCause(byte[] data) {
+        ProtoReader reader = new ProtoReader(data);
+        while (reader.hasRemaining()) {
+            int tag = reader.readTag();
+            if (tag == 0) break;
+            int field = tag >>> 3;
+            int wire = tag & 7;
+            if (field == 1 && wire == 2) return clean(reader.readString());
+            reader.skip(wire);
+        }
+        return "";
+    }
+
+    private static ThreadTrace parseThreadEntry(byte[] data) {
+        ProtoReader entry = new ProtoReader(data);
+        long key = -1;
+        byte[] value = null;
+        while (entry.hasRemaining()) {
+            int tag = entry.readTag();
+            if (tag == 0) break;
+            int field = tag >>> 3;
+            int wire = tag & 7;
+            if (field == 1 && wire == 0) key = entry.readVarint();
+            else if (field == 2 && wire == 2) value = entry.readBytes();
+            else entry.skip(wire);
+        }
+        if (value == null) return null;
+        ThreadTrace thread = parseThread(value);
+        if (thread.tid < 0) thread.tid = key;
+        return thread;
+    }
+
+    private static ThreadTrace parseThread(byte[] data) {
+        ThreadTrace thread = new ThreadTrace();
+        ProtoReader reader = new ProtoReader(data);
+        while (reader.hasRemaining()) {
+            int tag = reader.readTag();
+            if (tag == 0) break;
+            int field = tag >>> 3;
+            int wire = tag & 7;
+            if (field == 1 && wire == 0) thread.tid = reader.readVarint();
+            else if (field == 2 && wire == 2) thread.name = clean(reader.readString());
+            else if (field == 4 && wire == 2 && thread.frames.size() < 16) {
+                String frame = parseFrame(reader.readBytes(), thread.frames.size());
+                if (!frame.isEmpty()) thread.frames.add(frame);
+            } else if (field == 7 && wire == 2 && thread.notes.size() < 4) {
+                thread.notes.add(clean(reader.readString()));
+            } else reader.skip(wire);
+        }
+        return thread;
+    }
+
+    private static String parseFrame(byte[] data, int index) {
+        ProtoReader reader = new ProtoReader(data);
+        long relativePc = -1;
+        long functionOffset = -1;
+        String function = "";
+        String file = "";
+        while (reader.hasRemaining()) {
+            int tag = reader.readTag();
+            if (tag == 0) break;
+            int field = tag >>> 3;
+            int wire = tag & 7;
+            if (field == 1 && wire == 0) relativePc = reader.readVarint();
+            else if (field == 4 && wire == 2) function = clean(reader.readString());
+            else if (field == 5 && wire == 0) functionOffset = reader.readVarint();
+            else if (field == 6 && wire == 2) file = new File(reader.readString()).getName();
+            else reader.skip(wire);
+        }
+        if (file.isEmpty() && function.isEmpty() && relativePc < 0) return "";
+        StringBuilder out = new StringBuilder(String.format(Locale.US, "#%02d ", index));
+        out.append(file.isEmpty() ? "<unknown>" : file);
+        if (relativePc >= 0) out.append("+0x").append(Long.toHexString(relativePc));
+        if (!function.isEmpty()) out.append(" ").append(function);
+        if (functionOffset > 0) out.append("+0x").append(Long.toHexString(functionOffset));
+        return out.toString();
+    }
+
+    private static byte[] readLimited(InputStream input, int limit) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[16 * 1024];
+        while (output.size() < limit) {
+            int read = input.read(buffer, 0, Math.min(buffer.length, limit - output.size()));
+            if (read < 0) break;
+            output.write(buffer, 0, read);
+        }
+        return output.toByteArray();
+    }
+
+    private static String runtimeEvidence(Context context) {
+        File directory = new File(context.getFilesDir(), "logs");
+        File[] logs = directory.listFiles((dir, name) ->
+            name.startsWith("skate3_") && name.endsWith(".log"));
+        if (logs == null || logs.length == 0) return "- no runtime log found";
+        File latest = logs[0];
+        for (File log : logs) if (log.lastModified() > latest.lastModified()) latest = log;
+        try {
+            byte[] data = readLogWindow(latest);
+            String[] lines = new String(data, StandardCharsets.UTF_8).split("\\R");
+            List<String> head = new ArrayList<>();
+            List<String> tail = new ArrayList<>();
+            for (String line : lines) {
+                String lower = line.toLowerCase(Locale.US);
+                if (!(lower.contains("vulkan") || lower.contains("native-scene:") ||
+                      lower.contains("nrhi-vulkan:") || lower.contains("fatal") ||
+                      lower.contains("abort") || lower.contains("failed") ||
+                      lower.contains("error") || lower.contains("adreno") ||
+                      lower.contains("gpu"))) continue;
+                String safe = sanitizePath(context, line);
+                if (head.size() < 24) head.add(safe);
+                else {
+                    tail.add(safe);
+                    if (tail.size() > 72) tail.remove(0);
+                }
+            }
+            if (head.isEmpty() && tail.isEmpty()) return "- no relevant Vulkan lines found";
+            StringBuilder out = new StringBuilder();
+            for (String line : head) out.append(line).append('\n');
+            if (!tail.isEmpty()) {
+                out.append("[latest relevant lines]\n");
+                for (String line : tail) out.append(line).append('\n');
+            }
+            return out.toString().trim();
+        } catch (Exception exception) {
+            return "- runtime log unavailable: " + clean(exception.getClass().getSimpleName());
+        }
+    }
+
+    private static byte[] readLogWindow(File file) throws Exception {
+        final int headLimit = 128 * 1024;
+        final int tailLimit = 512 * 1024;
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (FileInputStream input = new FileInputStream(file)) {
+            byte[] head = new byte[(int)Math.min(file.length(), headLimit)];
+            int read = input.read(head);
+            if (read > 0) output.write(head, 0, read);
+        }
+        if (file.length() > headLimit) {
+            output.write("\n[tail of runtime log]\n".getBytes(StandardCharsets.UTF_8));
+            try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+                int length = (int)Math.min(file.length(), tailLimit);
+                input.seek(file.length() - length);
+                byte[] tail = new byte[length];
+                input.readFully(tail);
+                output.write(tail);
+            }
+        }
+        return output.toByteArray();
+    }
+
+    private static String sanitizePath(Context context, String value) {
+        String safe = value.replace(context.getFilesDir().getAbsolutePath(), "<app-files>");
+        File external = context.getExternalFilesDir(null);
+        if (external != null) {
+            safe = safe.replace(external.getAbsolutePath(), "<app-external-files>");
+        }
+        return clean(safe);
     }
 
     private static String reasonName(int reason) {
@@ -195,7 +479,7 @@ final class BugReporter {
             .appendQueryParameter("chipset", diagnostic.soc)
             .appendQueryParameter("profile", diagnostic.profile)
             .appendQueryParameter("input", diagnostic.input)
-            .appendQueryParameter("evidence", diagnostic.report)
+            .appendQueryParameter("evidence", diagnostic.webReport)
             .build();
         try {
             activity.startActivity(new Intent(Intent.ACTION_VIEW, uri));
@@ -218,9 +502,10 @@ final class BugReporter {
         final String profile;
         final String input;
         final String report;
+        final String webReport;
 
         Diagnostic(String version, String device, String android, String soc,
-                   String profile, String input, String report) {
+                   String profile, String input, String report, String webReport) {
             this.version = version;
             this.device = device;
             this.android = android;
@@ -228,6 +513,80 @@ final class BugReporter {
             this.profile = profile;
             this.input = input;
             this.report = report;
+            this.webReport = webReport;
+        }
+    }
+
+    private static final class ThreadTrace {
+        long tid = -1;
+        String name = "";
+        final List<String> frames = new ArrayList<>();
+        final List<String> notes = new ArrayList<>();
+    }
+
+    private static final class ProtoReader {
+        final byte[] data;
+        int position;
+
+        ProtoReader(byte[] data) {
+            this.data = data != null ? data : new byte[0];
+        }
+
+        boolean hasRemaining() { return position < data.length; }
+
+        int readTag() {
+            long value = readVarint();
+            return value > 0 && value <= Integer.MAX_VALUE ? (int)value : 0;
+        }
+
+        long readVarint() {
+            long value = 0;
+            for (int shift = 0; shift < 64 && position < data.length; shift += 7) {
+                int next = data[position++] & 0xff;
+                value |= (long)(next & 0x7f) << shift;
+                if ((next & 0x80) == 0) return value;
+            }
+            throw new IllegalArgumentException("invalid protobuf varint");
+        }
+
+        byte[] readBytes() {
+            long encodedLength = readVarint();
+            if (encodedLength < 0 || encodedLength > Integer.MAX_VALUE ||
+                position + encodedLength > data.length) {
+                throw new IllegalArgumentException("invalid protobuf length");
+            }
+            int length = (int)encodedLength;
+            byte[] result = new byte[length];
+            System.arraycopy(data, position, result, 0, length);
+            position += length;
+            return result;
+        }
+
+        String readString() {
+            return new String(readBytes(), StandardCharsets.UTF_8);
+        }
+
+        void skip(int wire) {
+            if (wire == 0) {
+                readVarint();
+            } else if (wire == 1) {
+                advance(8);
+            } else if (wire == 2) {
+                long length = readVarint();
+                if (length > Integer.MAX_VALUE) throw new IllegalArgumentException("field too big");
+                advance((int)length);
+            } else if (wire == 5) {
+                advance(4);
+            } else {
+                throw new IllegalArgumentException("unsupported protobuf wire type");
+            }
+        }
+
+        void advance(int count) {
+            if (count < 0 || position + count > data.length) {
+                throw new IllegalArgumentException("truncated protobuf");
+            }
+            position += count;
         }
     }
 }
