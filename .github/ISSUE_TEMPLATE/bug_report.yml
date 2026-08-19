@@ -13,7 +13,7 @@ body:
     attributes:
       label: Skate 3 Mobile version
       description: Find this beside the website download button or on the Updates page.
-      placeholder: v2.0.8 DEV
+      placeholder: v2.0.9 DEV
     validations:
       required: true
   - type: input

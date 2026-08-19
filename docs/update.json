@@ -1,7 +1,7 @@
 {
-  "versionCode": 20008,
-  "versionName": "2.0.8",
+  "versionCode": 20009,
+  "versionName": "2.0.9",
   "apkUrl": "https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk",
-  "sha256": "334667120abfc4b13c0c9dbdd35a63c29a2a17b5c483f5bc20ff3ce3aa21f9f1",
-  "notes": "Adds optional multitouch controls and verified in-app updates. Touch input works alongside physical controllers, and your installed game files stay in place."
+  "sha256": "cedf3260e2e33c7d86c3d3c58366fc5bb93a552472dac9955c615e547c2c9e5d",
+  "notes": "Adds an in-app GitHub bug report button with privacy-safe device details and Android process-exit diagnostics for Snapdragon and other device crashes."
 }
