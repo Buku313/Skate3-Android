@@ -1,7 +1,7 @@
 {
-  "versionCode": 20016,
-  "versionName": "2.0.16",
+  "versionCode": 20017,
+  "versionName": "2.0.17",
   "apkUrl": "https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk",
-  "sha256": "6618f6dbaf3a4699676c76023ef0995c1343216cd8f767adebd7b271da7f5fad",
-  "notes": "Uses Vulkan's portable four-set layout for Adreno 619 and 650 compatibility, keeps Turnip optional with System Driver recovery, adds native 4:3 HUD-safe output, and fixes the AYN cleanup callback at 0x82B3C95C."
+  "sha256": "ba68e51746f3358b3bf800b2180e22ca464378a03b47b71170d55521b83ede68",
+  "notes": "Fixes repeated FMV renderer handoffs and first-run movie-skip callbacks, targets confirmed Samsung and AYN callback crashes, and replaces the optional GPU driver chooser with visible buttons for Samsung, Retroid, and AYN themes. System Driver remains the default."
 }

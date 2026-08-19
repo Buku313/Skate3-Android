@@ -598,8 +598,9 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_yield, true, "Skate 3",
                     "sampling the video), so the native path has nothing to replay; "
                     "the emulated frame is complete and correct there, same class as "
                     "the photo editor. Detected via the MovieDecoder::Decode "
-                    "heartbeat; native rendering resumes within 0.5 s of the last "
-                    "decoded frame.")
+                    "heartbeat; fallback presentation is latched for the active "
+                    "decoder session so slow Android devices cannot alternate "
+                    "between native and emulated output mid-video.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cas_yield, false, "Skate 3",
                     "Yield to the emulated output while the create-a-skater editor "

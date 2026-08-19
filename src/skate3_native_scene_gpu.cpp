@@ -5792,7 +5792,12 @@ bool YieldForMovie() {
   const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              PerfClock::now().time_since_epoch())
                              .count();
-  const bool active = now_ns - last_ns < 500'000'000;
+  // Decode callbacks may be roughly half a second apart on Android when the
+  // device is compiling pipelines or under thermal load. The old 500 ms
+  // freshness window repeatedly declared the same movie ended between two
+  // valid callbacks on Retroid, AYN and Samsung devices.
+  constexpr int64_t kDecoderHoldNs = 1'500'000'000;
+  const bool active = now_ns - last_ns < kDecoderHoldNs;
   // LAST-RESORT gating: yielding INSTANTLY at video start presented the
   // emulated framebuffer, which under draw suppression still holds a stale
   // frame: the flash of the PREVIOUS video at every video boundary
@@ -5804,10 +5809,25 @@ bool YieldForMovie() {
   // plane decode failure) still reaches the emulated yield after the
   // grace window.
   static int64_t s_fresh_since = -1;
+  static bool s_yielding = false;
   if (!active) {
     s_fresh_since = -1;
+    if (s_yielding) {
+      s_yielding = false;
+      REXLOG_INFO("native-scene: FMV ended - native output resumes");
+    }
+    return false;
   } else if (s_fresh_since < 0) {
     s_fresh_since = now_ns;
+  }
+  // Once fallback presentation begins, RenderScene intentionally returns
+  // before replaying its 2D list. That means g_movie_quad_last_ns cannot be
+  // refreshed while yielded. Re-evaluating quad freshness every frame made
+  // the yield cancel itself after 500 ms, render one native frame, see the
+  // quad again, and yield again forever. Latch the fallback for the decoder
+  // session and release it only after a genuine heartbeat timeout.
+  if (s_yielding) {
+    return true;
   }
   const int64_t native_ns = g_movie_native_last_ns.load(std::memory_order_relaxed);
   // Yield only for a video that is ON SCREEN and NOT being served:
@@ -5822,20 +5842,15 @@ bool YieldForMovie() {
   //     starting; a skip tail (<= ~600 ms) never can.
   const int64_t quad_ns = g_movie_quad_last_ns.load(std::memory_order_relaxed);
   const bool quad_recent = quad_ns >= 0 && now_ns - quad_ns < 500'000'000;
-  const bool yield = active && now_ns - s_fresh_since >= 400'000'000 && quad_recent &&
+  const bool yield = now_ns - s_fresh_since >= 400'000'000 && quad_recent &&
                      (native_ns < 0 || last_ns - native_ns > 1'000'000'000);
-  static bool s_active = false;
-  if (yield != s_active) {
-    s_active = yield;
-    if (yield) {
-      REXLOG_INFO(
-          "native-scene: FMV playing - yielding to emulated output "
-          "(MovieDecoder heartbeat; substitution did not engage)");
-    } else {
-      REXLOG_INFO("native-scene: FMV ended - native output resumes");
-    }
+  if (yield) {
+    s_yielding = true;
+    REXLOG_INFO(
+        "native-scene: FMV playing - yielding to emulated output "
+        "(latched until MovieDecoder heartbeat ends)");
   }
-  return yield;
+  return s_yielding;
 }
 
 }  // namespace

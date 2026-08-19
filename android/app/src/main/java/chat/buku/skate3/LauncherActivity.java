@@ -703,43 +703,74 @@ public class LauncherActivity extends Activity {
         }
 
         CustomGpuDriver.Driver driver = CustomGpuDriver.installed(this);
-        if (driver == null) {
-            new AlertDialog.Builder(this)
-                .setTitle("Experimental GPU driver")
-                .setMessage("System Driver is selected and recommended. Do not change this if Skate 3 already works. Turnip is only a troubleshooting option for affected Snapdragon devices and an incompatible package may crash at launch.")
-                .setNegativeButton("Close", null)
-                .setPositiveButton("Import ZIP / ADPKG", (dialog, which) -> pickGpuDriver())
-                .show();
-            return;
+        String selected = driver != null && driver.enabled
+            ? driver.label() : "System Driver";
+
+        // Do not combine AlertDialog.setMessage and setItems here. Samsung,
+        // Retroid and AYN vendor themes have all shipped dialog layouts that
+        // measure the message at full height and leave the item list invisible.
+        // A real custom panel gives every action its own visible, focusable
+        // button and also works with controller/keyboard navigation.
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(22), dp(8), dp(22), dp(6));
+
+        String details = "Selected: " + selected +
+            "\n\nSystem Driver is recommended. Custom drivers are optional and only intended for troubleshooting Snapdragon / Adreno devices.";
+        if (driver != null) {
+            details += "\n\nImported: " + driver.label() +
+                "\nVendor: " + driver.vendor + "\nAuthor: " + driver.author;
+        }
+        TextView description = text(details, 14, Color.rgb(205, 205, 210));
+        description.setLineSpacing(0, 1.12f);
+        panel.addView(description, matchWrap(dp(16)));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle("Experimental GPU driver")
+            .setView(panel)
+            .setNegativeButton("Close", null)
+            .create();
+
+        Button system = actionButton(false);
+        setButton(system, "USE SYSTEM DRIVER" +
+                  (driver == null || !driver.enabled ? "  •  SELECTED" : ""), view -> {
+            CustomGpuDriver.useSystem(this);
+            Toast.makeText(this, "System Driver selected for the next launch.",
+                           Toast.LENGTH_LONG).show();
+            dialog.dismiss();
+            refreshInterface();
+        }, false);
+        panel.addView(system, matchFixed(dp(52), dp(8)));
+
+        if (driver != null) {
+            Button custom = actionButton(false);
+            setButton(custom, "USE IMPORTED DRIVER" +
+                      (driver.enabled ? "  •  SELECTED" : ""), view -> {
+                dialog.dismiss();
+                confirmCustomGpuDriver(driver);
+            }, false);
+            panel.addView(custom, matchFixed(dp(52), dp(8)));
         }
 
-        String selected = driver.enabled ? "Custom driver" : "System Driver";
-        String[] choices = {
-            "Use System Driver" + (driver.enabled ? "" : "  •  SELECTED"),
-            "Use " + driver.label() + (driver.enabled ? "  •  SELECTED" : ""),
-            "Import another ZIP / ADPKG",
-            "Remove imported driver"
-        };
-        new AlertDialog.Builder(this)
-            .setTitle("Experimental GPU driver")
-            .setMessage("Selected: " + selected + "\n\nCustom driver: " + driver.label() +
-                        "\nVendor: " + driver.vendor + "\nAuthor: " + driver.author +
-                        "\n\nSystem Driver is recommended. If a custom driver crashes, reopen the launcher and select System Driver.")
-            .setItems(choices, (dialog, which) -> {
-                if (which == 0) {
-                    CustomGpuDriver.useSystem(this);
-                    Toast.makeText(this, "System Driver selected.", Toast.LENGTH_SHORT).show();
-                    refreshInterface();
-                } else if (which == 1) {
-                    confirmCustomGpuDriver(driver);
-                } else if (which == 2) {
-                    pickGpuDriver();
-                } else {
-                    confirmRemoveGpuDriver(driver);
-                }
-            })
-            .setNegativeButton("Close", null)
-            .show();
+        Button importDriver = actionButton(false);
+        setButton(importDriver,
+                  driver == null ? "IMPORT ZIP / ADPKG" : "IMPORT ANOTHER ZIP / ADPKG",
+                  view -> {
+                      dialog.dismiss();
+                      pickGpuDriver();
+                  }, false);
+        panel.addView(importDriver, matchFixed(dp(52), dp(8)));
+
+        if (driver != null) {
+            Button remove = actionButton(false);
+            setButton(remove, "REMOVE IMPORTED DRIVER", view -> {
+                dialog.dismiss();
+                confirmRemoveGpuDriver(driver);
+            }, false);
+            panel.addView(remove, matchFixed(dp(52), 0));
+        }
+
+        dialog.show();
     }
 
     private void confirmCustomGpuDriver(CustomGpuDriver.Driver driver) {
