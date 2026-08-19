@@ -675,6 +675,17 @@ public class LauncherActivity extends Activity {
         if (CustomGpuDriver.isLikelyAdrenoDevice()) {
             dialog.setPositiveButton("GPU driver experiments",
                                      (ignored, which) -> showGpuDriverMenu());
+            if (customActive) {
+                // Keep recovery available from the first dialog even if a
+                // vendor theme or a broken custom driver makes the detailed
+                // choices difficult to use.
+                dialog.setNeutralButton("Use System Driver", (ignored, which) -> {
+                    CustomGpuDriver.useSystem(this);
+                    Toast.makeText(this, "System Driver selected for the next launch.",
+                                   Toast.LENGTH_LONG).show();
+                    refreshInterface();
+                });
+            }
         } else {
             dialog.setPositiveButton("OK", null);
         }
@@ -697,7 +708,7 @@ public class LauncherActivity extends Activity {
                 .setTitle("Experimental GPU driver")
                 .setMessage("System Driver is selected and recommended. Do not change this if Skate 3 already works. Turnip is only a troubleshooting option for affected Snapdragon devices and an incompatible package may crash at launch.")
                 .setNegativeButton("Close", null)
-                .setPositiveButton("Import Turnip ZIP", (dialog, which) -> pickGpuDriver())
+                .setPositiveButton("Import ZIP / ADPKG", (dialog, which) -> pickGpuDriver())
                 .show();
             return;
         }
@@ -706,7 +717,7 @@ public class LauncherActivity extends Activity {
         String[] choices = {
             "Use System Driver" + (driver.enabled ? "" : "  •  SELECTED"),
             "Use " + driver.label() + (driver.enabled ? "  •  SELECTED" : ""),
-            "Import another driver ZIP",
+            "Import another ZIP / ADPKG",
             "Remove imported driver"
         };
         new AlertDialog.Builder(this)
@@ -754,12 +765,18 @@ public class LauncherActivity extends Activity {
     private void pickGpuDriver() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("application/zip");
+        // Turnip packages use both .zip and .adpkg. Several Android file
+        // pickers report ADPKG as application/octet-stream (or no useful MIME
+        // type at all), so a zip-only filter hides perfectly valid packages.
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+            "application/zip", "application/x-zip-compressed",
+            "application/octet-stream"
+        });
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         try {
             startActivityForResult(intent, REQUEST_GPU_DRIVER);
         } catch (ActivityNotFoundException exception) {
-            intent.setType("*/*");
             try {
                 startActivityForResult(intent, REQUEST_GPU_DRIVER);
             } catch (ActivityNotFoundException second) {
