@@ -4,6 +4,10 @@
   <a href="https://buku313.github.io/Skate3-Mobile/"><strong>OPEN THE SKATE 3 MOBILE WEBSITE</strong></a>
   &nbsp;·&nbsp;
   <a href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk"><strong>DOWNLOAD THE ANDROID APK</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://buku313.github.io/Skate3-Mobile/updates.html"><strong>UPDATES</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml"><strong>REPORT A BUG</strong></a>
 </p>
 
 <p align="center">
@@ -13,7 +17,8 @@
 Skate 3 running as native ARM64 code on Android through static recompilation.
 This is not an Xbox 360 emulator.
 
-The Android port is experimental, but it is playable on the Anbernic RG406V.
+The current release is a developer build. The Android port is experimental,
+but it is playable on the Anbernic RG406V.
 It uses the native Vulkan renderer from Skate3Recomp with Android input, audio,
 storage, performance profiles, and handheld tuning added in this fork.
 

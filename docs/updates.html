@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Updates | Skate 3 Mobile</title>
+  <meta name="description" content="Skate 3 Mobile developer build updates, release notes, downloads, and known limitations.">
+  <meta name="theme-color" content="#ff6518">
+  <link rel="canonical" href="https://buku313.github.io/Skate3-Mobile/updates.html">
+  <style>
+    :root { color-scheme: dark; --ink:#f8f8fb; --muted:#a7a8b2; --panel:#17171c; --line:#2a2a32; --orange:#ff6518; --cyan:#41d7ff; }
+    * { box-sizing: border-box; }
+    body { margin:0; color:var(--ink); background:radial-gradient(circle at 85% 0%,rgba(65,215,255,.12),transparent 30rem),#09090b; font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; line-height:1.55; }
+    a { color:inherit; }
+    .wrap { width:min(920px,calc(100% - 36px)); margin:0 auto; }
+    nav { min-height:72px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid rgba(255,255,255,.08); }
+    .brand { font-weight:950; letter-spacing:-.04em; font-size:1.15rem; text-decoration:none; }
+    .brand span,.kicker { color:var(--orange); }
+    .nav-links { display:flex; gap:18px; }
+    .nav-links a { color:var(--muted); font-weight:750; text-decoration:none; }
+    .nav-links a:hover { color:white; }
+    header.page { padding:72px 0 50px; }
+    .kicker { font-size:.8rem; font-weight:900; letter-spacing:.15em; }
+    h1 { margin:10px 0 18px; font-size:clamp(3rem,9vw,6rem); line-height:.9; letter-spacing:-.065em; }
+    .lede { max-width:690px; margin:0; color:#d3d3da; font-size:1.15rem; }
+    .warning { margin-top:28px; padding:18px 20px; border:1px solid rgba(255,101,24,.4); border-left:5px solid var(--orange); border-radius:12px; background:rgba(255,101,24,.09); color:#ffd7c3; font-weight:750; }
+    .current { margin:10px 0 56px; padding:30px; border:1px solid rgba(65,215,255,.35); border-radius:22px; background:linear-gradient(145deg,rgba(65,215,255,.09),rgba(23,23,28,.92)); }
+    .version { display:inline-block; padding:6px 11px; border-radius:999px; background:var(--orange); color:#090909; font-size:.78rem; font-weight:950; letter-spacing:.06em; }
+    h2 { margin:12px 0 8px; font-size:clamp(2rem,5vw,3.2rem); letter-spacing:-.045em; }
+    h3 { margin:0 0 8px; font-size:1.28rem; }
+    p { color:var(--muted); }
+    .actions { display:flex; flex-wrap:wrap; gap:12px; margin-top:24px; }
+    .button { display:inline-flex; min-height:52px; align-items:center; justify-content:center; padding:0 21px; border-radius:11px; background:var(--orange); color:#090909; font-weight:950; text-decoration:none; }
+    .button.secondary { background:#282830; color:white; }
+    section { padding:52px 0; border-top:1px solid rgba(255,255,255,.08); }
+    .release { position:relative; margin:18px 0; padding:24px 26px 24px 34px; border:1px solid var(--line); border-radius:16px; background:rgba(23,23,28,.82); }
+    .release::before { content:""; position:absolute; top:27px; left:0; width:5px; height:36px; background:var(--orange); }
+    .release ul { margin-bottom:0; color:#c7c7cf; }
+    .release time { color:var(--cyan); font-size:.82rem; font-weight:850; letter-spacing:.06em; }
+    .facts { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+    .fact { padding:20px; border:1px solid var(--line); border-radius:14px; background:var(--panel); }
+    .fact strong { display:block; margin-bottom:7px; color:white; }
+    .fact span { color:var(--muted); }
+    footer { padding:42px 0 56px; color:#7d7e87; font-size:.86rem; }
+    @media(max-width:680px){ .facts{grid-template-columns:1fr}.nav-links{gap:11px;font-size:.84rem}.current{padding:22px} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="index.html">SKATE 3 <span>MOBILE</span></a>
+      <div class="nav-links"><a href="index.html">Home</a><a href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">Bug report</a><a href="https://github.com/Buku313/Skate3-Mobile/releases">All releases</a></div>
+    </nav>
+  </div>
+
+  <header class="page wrap">
+    <div class="kicker">DEVELOPER BUILD CHANGELOG</div>
+    <h1>UPDATES.</h1>
+    <p class="lede">What changed, what is still experimental, and exactly which APK you are testing.</p>
+    <div class="warning">This is active development software. Performance, graphics, controls, setup, and compatibility can break between devices. Keep your original ISO and report reproducible problems.</div>
+  </header>
+
+  <main>
+    <div class="wrap current">
+      <span class="version">CURRENT · <span data-current-version>v2.0.8 DEV</span></span>
+      <h2>Touch controls and in-app updates</h2>
+      <p>Signed Android developer build for ARM64 devices. Adds a complete multitouch controller and a verified updater that preserves locally installed game files.</p>
+      <div class="actions">
+        <a class="button" data-version-download href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD v2.0.8 DEV</a>
+        <a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">REPORT A BUG</a>
+      </div>
+    </div>
+
+    <section>
+      <div class="wrap">
+        <h2>How app updates work</h2>
+        <div class="facts">
+          <div class="fact"><strong>Automatic check</strong><span>The launcher checks this site's signed release manifest when it opens.</span></div>
+          <div class="fact"><strong>Verified download</strong><span>The APK must match the published SHA-256 checksum and existing signing certificate.</span></div>
+          <div class="fact"><strong>Your game stays</strong><span>APK upgrades do not replace extracted Skate 3 files or launcher settings.</span></div>
+        </div>
+        <p>Android always requires you to approve the final installation. Users on v2.0.7 or older must install v2.0.8 manually once to receive the in-app updater.</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <h2>Release history</h2>
+        <article class="release"><time>v2.0.8 · CURRENT DEV BUILD</time><h3>Touch controls and easy updates</h3><ul><li>Full multitouch Xbox-style controller with analog sticks, D-pad, face buttons, shoulders, triggers, Start, Back, L3, and R3.</li><li>Touch input merges with physical player-one input.</li><li>Automatic update checks and SHA-256 verified APK downloads.</li><li>Android 4 KB and 16 KB memory-page support retained.</li></ul></article>
+        <article class="release"><time>v2.0.7 · HOTFIX</time><h3>Modern Android memory pages</h3><ul><li>Added 16 KB ELF alignment for current flagship phones.</li><li>Made native guest-memory protection follow the device page size.</li><li>Preserved RG406V and other 4 KB device compatibility.</li></ul></article>
+        <article class="release"><time>v2.0.6 · FIRST PLAYER BUILD</time><h3>Phone-only setup</h3><ul><li>Added local ISO extraction and supported-file verification.</li><li>Added verified Title Update 3 installation.</li><li>Included performance and quality profiles plus the optional Seiyu character switch.</li></ul></article>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <h2>Known limitations</h2>
+        <div class="facts">
+          <div class="fact"><strong>Device coverage</strong><span>The RG406V is the first verified target. Other ARM64 Vulkan devices still need testing.</span></div>
+          <div class="fact"><strong>Graphics</strong><span>Missing effects, incorrect materials, texture bugs, and device-specific rendering failures are still possible.</span></div>
+          <div class="fact"><strong>Performance</strong><span>A 60 FPS setting is a target and guest cap, not a guarantee on every map or device.</span></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap">Unofficial experimental fan project. No retail game files are distributed. <a href="https://github.com/Buku313/Skate3-Mobile">Source and credits on GitHub.</a></footer>
+  <script>
+    fetch("update.json", { cache: "no-store" })
+      .then(response => response.ok ? response.json() : Promise.reject())
+      .then(update => {
+        const version = "v" + update.versionName + " DEV";
+        document.querySelectorAll("[data-current-version]").forEach(
+          element => { element.textContent = version; });
+        document.querySelectorAll("[data-version-download]").forEach(
+          element => { element.textContent = "DOWNLOAD " + version; });
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>

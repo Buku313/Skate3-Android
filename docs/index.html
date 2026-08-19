@@ -47,8 +47,19 @@
     }
     .brand { font-weight: 950; letter-spacing: -.04em; font-size: 1.15rem; text-decoration: none; }
     .brand span { color: var(--orange); }
+    .nav-links { display: flex; align-items: center; gap: 18px; }
     .github { color: var(--muted); font-weight: 750; text-decoration: none; }
     .github:hover { color: white; }
+    .dev-banner {
+      padding: 10px 16px;
+      border: 1px solid rgba(255,101,24,.4);
+      border-radius: 10px;
+      background: rgba(255,101,24,.1);
+      color: #ffd1ba;
+      font-size: .85rem;
+      font-weight: 800;
+      text-align: center;
+    }
     .hero {
       display: grid;
       grid-template-columns: 1.04fr .96fr;
@@ -69,6 +80,21 @@
     h1 span { display: block; color: var(--orange); }
     .lede { max-width: 620px; color: #d7d7dd; font-size: clamp(1.05rem, 2vw, 1.28rem); }
     .actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 30px 0 14px; }
+    .download-action { display: inline-flex; align-items: center; gap: 10px; }
+    .version-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 0 11px;
+      border: 1px solid rgba(255,255,255,.18);
+      border-radius: 999px;
+      background: #202027;
+      color: white;
+      font-size: .76rem;
+      font-weight: 900;
+      letter-spacing: .06em;
+      white-space: nowrap;
+    }
     .button {
       display: inline-flex;
       align-items: center;
@@ -85,6 +111,7 @@
     }
     .button:hover { transform: translateY(-2px); background: var(--orange-hot); }
     .button.secondary { background: #24242b; color: white; box-shadow: none; }
+    .button.report { background: transparent; color: #fff; border: 1px solid #454550; box-shadow: none; }
     .fine { color: var(--muted); font-size: .86rem; }
     .cover {
       position: relative;
@@ -137,6 +164,7 @@
     .download-panel h2 { margin: 0; }
     .download-panel p { max-width: 580px; margin: 8px 0 0; font-weight: 650; }
     .download-panel .button { background: #090909; color: white; box-shadow: none; white-space: nowrap; }
+    .download-panel .version-badge { background: rgba(9,9,9,.86); }
     footer { padding: 42px 0 56px; color: #7d7e87; font-size: .86rem; }
     footer a { color: #c5c6ce; }
     @media (max-width: 780px) {
@@ -145,6 +173,8 @@
       .steps, .cards { grid-template-columns: 1fr; }
       .download-panel { align-items: flex-start; flex-direction: column; }
       .download-panel .button { width: 100%; }
+      .nav-links { gap: 12px; font-size: .84rem; }
+      .nav-links .source-link { display: none; }
     }
   </style>
 </head>
@@ -152,25 +182,31 @@
   <header class="wrap">
     <nav>
       <a class="brand" href="#top">SKATE 3 <span>MOBILE</span></a>
-      <a class="github" href="https://github.com/Buku313/Skate3-Mobile">Source on GitHub</a>
+      <div class="nav-links">
+        <a class="github" href="updates.html">Updates</a>
+        <a class="github" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">Report a bug</a>
+        <a class="github source-link" href="https://github.com/Buku313/Skate3-Mobile">Source on GitHub</a>
+      </div>
     </nav>
+    <div class="dev-banner">DEVELOPER BUILD · EXPERIMENTAL SOFTWARE · EXPECT BUGS AND DEVICE-SPECIFIC PROBLEMS</div>
   </header>
 
   <main id="top">
     <div class="wrap hero">
       <div>
-        <div class="eyebrow">NATIVE ARM64 ANDROID PORT</div>
+        <div class="eyebrow">v2.0.8 DEVELOPER BUILD · NATIVE ARM64 ANDROID PORT</div>
         <h1>SKATE<span>ANYWHERE.</span></h1>
         <p class="lede">Skate 3 running natively on supported Android phones and handhelds. Download one APK, select an ISO dumped from your own copy, and start skating.</p>
         <div class="actions">
-          <a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD APK</a>
+          <span class="download-action"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">DOWNLOAD APK</a><span class="version-badge" data-current-version>v2.0.8 DEV</span></span>
           <a class="button secondary" href="#install">HOW TO INSTALL</a>
+          <a class="button report" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">BUG REPORT</a>
         </div>
         <div class="fine">Android 13+ · ARM64 · Vulkan · Touch controls included</div>
       </div>
       <div class="cover">
         <img src="skate3-android-cover.png" alt="Android mascot skateboarding in front of the Skate 3 logo">
-        <div class="status">PLAYABLE · EXPERIMENTAL</div>
+        <div class="status">PLAYABLE · DEV BUILD</div>
       </div>
     </div>
 
@@ -203,14 +239,21 @@
 
     <section>
       <div class="wrap download-panel">
-        <div><h2>Ready to skate?</h2><p>Grab the latest signed Android build. Release notes, checksums, source code, and issue reporting remain available on GitHub.</p></div>
-        <a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">GET SKATE 3 MOBILE</a>
+        <div><h2>Ready to test?</h2><p>Grab the latest signed developer build. Expect bugs, report what you find, and check the Updates page before installing.</p></div>
+        <span class="download-action"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">GET SKATE 3 MOBILE</a><span class="version-badge" data-current-version>v2.0.8 DEV</span></span>
       </div>
     </section>
   </main>
 
   <footer class="wrap">
-    This is an experimental, unofficial fan project. It is not affiliated with Electronic Arts, Black Box, Microsoft, Google, or Android. Skate 3 and related properties belong to their respective owners. <a href="https://github.com/Buku313/Skate3-Mobile">Read the source and credits.</a>
+    This is an experimental developer build and unofficial fan project. It is not affiliated with Electronic Arts, Black Box, Microsoft, Google, or Android. Skate 3 and related properties belong to their respective owners. <a href="updates.html">Read updates</a> or <a href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">report a bug</a>.
   </footer>
+  <script>
+    fetch("update.json", { cache: "no-store" })
+      .then(response => response.ok ? response.json() : Promise.reject())
+      .then(update => document.querySelectorAll("[data-current-version]").forEach(
+        element => { element.textContent = "v" + update.versionName + " DEV"; }))
+      .catch(() => {});
+  </script>
 </body>
 </html>

@@ -1,0 +1,93 @@
+name: Bug report
+description: Report a reproducible problem in the Skate 3 Mobile Android developer build
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing the developer build. Do not attach retail game files, game executables, ISOs, or Title Update packages.
+  - type: input
+    id: version
+    attributes:
+      label: Skate 3 Mobile version
+      description: Find this beside the website download button or on the Updates page.
+      placeholder: v2.0.8 DEV
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: Samsung Galaxy S25+, Anbernic RG406V, etc.
+    validations:
+      required: true
+  - type: input
+    id: android
+    attributes:
+      label: Android version
+      placeholder: Android 15
+    validations:
+      required: true
+  - type: input
+    id: chipset
+    attributes:
+      label: Chipset and GPU
+      placeholder: Snapdragon 8 Elite / Adreno 830
+    validations:
+      required: true
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Graphics profile
+      options:
+        - RG406V / Performance
+        - High-End / Quality
+        - I do not know
+    validations:
+      required: true
+  - type: dropdown
+    id: input
+    attributes:
+      label: Input method
+      options:
+        - Touch controls
+        - Built-in handheld controls
+        - Bluetooth controller
+        - USB controller
+        - Multiple input methods
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the visible problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the app
+        2. Select...
+        3. Enter...
+        4. The game...
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, screenshots, or video
+      description: Drag files here. Remove private information first. Do not upload copyrighted retail game files.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final checks
+      options:
+        - label: I reproduced this on the current developer build.
+          required: true
+        - label: I did not attach an ISO, XEX, Title Update package, or other retail game files.
+          required: true
