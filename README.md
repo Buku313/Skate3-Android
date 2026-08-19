@@ -107,6 +107,7 @@ the person building the project. This is experimental research software, and a
 - Menus and controller input work
 - Optional multitouch controller for phones
 - Verified in-app APK update checks
+- In-app GitHub bug reports with privacy-safe device and crash diagnostics
 - Gameplay and tricks work
 - Native Vulkan rendering works
 - 4 KB and 16 KB Android memory pages are supported

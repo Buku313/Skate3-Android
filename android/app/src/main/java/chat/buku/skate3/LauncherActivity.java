@@ -70,6 +70,7 @@ public class LauncherActivity extends Activity {
     private Button secondaryButton;
     private Button tertiaryButton;
     private Button updateButton;
+    private Button reportButton;
     private boolean busy;
     private boolean checkingUpdate;
     private boolean updatePromptShown;
@@ -158,12 +159,16 @@ public class LauncherActivity extends Activity {
         secondaryButton = actionButton(false);
         tertiaryButton = actionButton(false);
         updateButton = actionButton(false);
+        reportButton = actionButton(false);
         content.addView(primaryButton, matchFixed(dp(58), dp(10)));
         content.addView(characterButton, matchFixed(dp(54), dp(10)));
         content.addView(secondaryButton, matchFixed(dp(54), dp(10)));
         content.addView(tertiaryButton, matchFixed(dp(54), dp(10)));
         content.addView(updateButton, matchFixed(dp(50), dp(18)));
         setButton(updateButton, "CHECK FOR APP UPDATES", view -> checkForAppUpdate(true), false);
+        content.addView(reportButton, matchFixed(dp(50), dp(18)));
+        setButton(reportButton, "BUG REPORT / DEVICE DIAGNOSTICS",
+                  view -> BugReporter.show(this), false);
 
         TextView requirements = text(
             "Requires Android 13+, ARM64, Vulkan, and about 8 GB free after the ISO is already on your device or USB drive. Touch controls are included.",
@@ -838,6 +843,7 @@ public class LauncherActivity extends Activity {
         secondaryButton.setEnabled(enabled);
         tertiaryButton.setEnabled(enabled);
         updateButton.setEnabled(enabled && !checkingUpdate);
+        reportButton.setEnabled(enabled);
     }
 
     private void setButton(Button button, String label, View.OnClickListener listener,
