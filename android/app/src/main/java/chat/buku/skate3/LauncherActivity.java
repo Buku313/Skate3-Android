@@ -72,6 +72,7 @@ public class LauncherActivity extends Activity {
     private Button tertiaryButton;
     private Button updateButton;
     private Button reportButton;
+    private AlertDialog modStoreListDialog;
     private boolean busy;
     private boolean checkingUpdate;
     private boolean updatePromptShown;
@@ -592,29 +593,93 @@ public class LauncherActivity extends Activity {
     }
 
     private void showModStoreList(List<ModStore.Mod> mods, boolean[] installed) {
-        String[] labels = new String[mods.size()];
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.rgb(15, 15, 18));
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(18), dp(18), dp(18), dp(6));
+        scroll.addView(list, new ScrollView.LayoutParams(
+            ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+
+        TextView intro = text(
+            "One-tap character mods. Every download is size-limited and SHA-256 verified before installation.",
+            14, Color.rgb(190, 190, 198));
+        intro.setLineSpacing(0, 1.12f);
+        list.addView(intro, matchWrap(dp(16)));
+
         for (int index = 0; index < mods.size(); ++index) {
             ModStore.Mod mod = mods.get(index);
-            labels[index] = mod.name + "\n" +
-                (installed[index] ? "INSTALLED" : "AVAILABLE") + "  •  " +
-                humanBytes(mod.downloadSize());
+            boolean modInstalled = installed[index];
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(dp(18), dp(15), dp(18), dp(14));
+            card.setBackgroundColor(Color.rgb(31, 31, 37));
+
+            TextView name = text(mod.name, 20, Color.WHITE);
+            name.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            card.addView(name, matchWrap(dp(5)));
+
+            TextView meta = text(
+                (modInstalled ? "INSTALLED" : "AVAILABLE") + "  •  v" + mod.version +
+                "  •  " + humanBytes(mod.downloadSize()),
+                12, modInstalled ? Color.rgb(65, 215, 255) : Color.rgb(255, 112, 28));
+            meta.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            card.addView(meta, matchWrap(dp(8)));
+
+            TextView description = text(mod.description, 14, Color.rgb(180, 180, 188));
+            description.setLineSpacing(0, 1.12f);
+            card.addView(description, matchWrap(dp(12)));
+
+            Button open = actionButton(!modInstalled);
+            setButton(open, modInstalled ? "MANAGE MOD" : "VIEW AND INSTALL",
+                      view -> {
+                          dismissModStoreList();
+                          showModStoreDetails(mod, modInstalled);
+                      }, !modInstalled);
+            card.addView(open, matchFixed(dp(48), 0));
+            list.addView(card, matchWrap(dp(12)));
         }
-        new AlertDialog.Builder(this)
+        AlertDialog dialog = new AlertDialog.Builder(this)
             .setTitle("MOD STORE")
-            .setMessage("One-tap character mods for Skate 3 Mobile. Downloads are verified before installation.")
-            .setItems(labels, (dialog, which) -> showModStoreDetails(mods.get(which),
-                                                                    installed[which]))
+            .setView(scroll)
             .setNegativeButton("Close", null)
-            .show();
+            .create();
+        modStoreListDialog = dialog;
+        dialog.setOnDismissListener(ignored -> {
+            if (modStoreListDialog == dialog) modStoreListDialog = null;
+        });
+        dialog.show();
+    }
+
+    private void dismissModStoreList() {
+        if (modStoreListDialog != null) {
+            AlertDialog dialog = modStoreListDialog;
+            modStoreListDialog = null;
+            dialog.dismiss();
+        }
     }
 
     private void showModStoreDetails(ModStore.Mod mod, boolean installed) {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(22), dp(18), dp(22), dp(12));
+        panel.setBackgroundColor(Color.rgb(15, 15, 18));
+
+        TextView description = text(mod.description, 15, Color.rgb(210, 210, 216));
+        description.setLineSpacing(0, 1.15f);
+        panel.addView(description, matchWrap(dp(18)));
+
+        TextView details = text(
+            "Version " + mod.version + "\nDownload: " + humanBytes(mod.downloadSize()) +
+            "\nStatus: " + (installed ? "Installed" : "Not installed") +
+            "\n\nAfter installation, choose the character in RB + Start > Mods.",
+            13, Color.rgb(150, 150, 160));
+        details.setLineSpacing(0, 1.16f);
+        panel.addView(details, matchWrap(0));
+
         AlertDialog.Builder dialog = new AlertDialog.Builder(this)
             .setTitle(mod.name)
-            .setMessage(mod.description + "\n\nVersion " + mod.version +
-                        "\nDownload: " + humanBytes(mod.downloadSize()) +
-                        "\nStatus: " + (installed ? "Installed" : "Not installed") +
-                        "\n\nChoose the character in RB + Start > Mods after installation.")
+            .setView(panel)
             .setNegativeButton("Close", null)
             .setPositiveButton(installed ? "Reinstall" : "Install",
                 (ignored, which) -> installStoreMod(mod));
