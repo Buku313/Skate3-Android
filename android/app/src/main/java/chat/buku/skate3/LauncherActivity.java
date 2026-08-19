@@ -39,6 +39,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -534,9 +535,9 @@ public class LauncherActivity extends Activity {
     private void configureSeiyuInstallButton(File activeGame) {
         boolean assetsInstalled = seiyuAssetsInstalled(activeGame);
         String label = assetsInstalled
-            ? "SEIYU MOD FILES: INSTALLED"
-            : "OPTIONAL: ADD SEIYU MOD FILES";
-        setButton(characterButton, label, view -> explainSeiyuInstall(), false);
+            ? "MOD STORE  •  SEIYU INSTALLED"
+            : "MOD STORE  •  1 MOD AVAILABLE";
+        setButton(characterButton, label, view -> openModStore(), false);
     }
 
     private static boolean seiyuAssetsInstalled(File activeGame) {
@@ -550,6 +551,147 @@ public class LauncherActivity extends Activity {
             return gameDirectory;
         }
         return new File("/storage/emulated/0/skate3");
+    }
+
+    private void openModStore() {
+        if (busy) return;
+        setBusy("OPENING MOD STORE", "Loading the latest available mods...", true);
+        worker.execute(() -> {
+            try {
+                List<ModStore.Mod> mods = ModStore.loadCatalog();
+                Path gameRoot = activeGameDirectory().toPath();
+                boolean[] installed = new boolean[mods.size()];
+                for (int index = 0; index < mods.size(); ++index) {
+                    installed[index] = ModStore.isInstalled(gameRoot, mods.get(index));
+                }
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setVisibility(View.GONE);
+                    refreshInterface();
+                    showModStoreList(mods, installed);
+                });
+            } catch (Exception exception) {
+                appendLog("Mod Store catalog failed: " + stackTrace(exception));
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setVisibility(View.GONE);
+                    refreshInterface();
+                    new AlertDialog.Builder(this)
+                        .setTitle("Mod Store unavailable")
+                        .setMessage("The online catalog could not be loaded: " +
+                                    cleanMessage(exception) +
+                                    "\n\nYou can still import Seiyu's files manually.")
+                        .setNegativeButton("Close", null)
+                        .setPositiveButton("Import files", (dialog, which) -> pickSeiyuModel())
+                        .show();
+                });
+            }
+        });
+    }
+
+    private void showModStoreList(List<ModStore.Mod> mods, boolean[] installed) {
+        String[] labels = new String[mods.size()];
+        for (int index = 0; index < mods.size(); ++index) {
+            ModStore.Mod mod = mods.get(index);
+            labels[index] = mod.name + "\n" +
+                (installed[index] ? "INSTALLED" : "AVAILABLE") + "  •  " +
+                humanBytes(mod.downloadSize());
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("MOD STORE")
+            .setMessage("One-tap character mods for Skate 3 Mobile. Downloads are verified before installation.")
+            .setItems(labels, (dialog, which) -> showModStoreDetails(mods.get(which),
+                                                                    installed[which]))
+            .setNegativeButton("Close", null)
+            .show();
+    }
+
+    private void showModStoreDetails(ModStore.Mod mod, boolean installed) {
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+            .setTitle(mod.name)
+            .setMessage(mod.description + "\n\nVersion " + mod.version +
+                        "\nDownload: " + humanBytes(mod.downloadSize()) +
+                        "\nStatus: " + (installed ? "Installed" : "Not installed") +
+                        "\n\nChoose the character in RB + Start > Mods after installation.")
+            .setNegativeButton("Close", null)
+            .setPositiveButton(installed ? "Reinstall" : "Install",
+                (ignored, which) -> installStoreMod(mod));
+        if (installed) {
+            dialog.setNeutralButton("Remove", (ignored, which) -> confirmRemoveStoreMod(mod));
+        } else if (mod.id.equals("seiyu-paradise-penguin")) {
+            dialog.setNeutralButton("Import files", (ignored, which) -> pickSeiyuModel());
+        }
+        dialog.show();
+    }
+
+    private void installStoreMod(ModStore.Mod mod) {
+        if (busy) return;
+        setBusy("INSTALLING " + mod.name.toUpperCase(Locale.US),
+                "Starting verified download...", true);
+        worker.execute(() -> {
+            try {
+                ModStore.install(activeGameDirectory().toPath(), mod,
+                    (copied, total, message) -> showDownloadProgress(copied, total, message));
+                appendLog("Mod Store installed " + mod.name + " " + mod.version + ".");
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    progressBar.setProgress(1000);
+                    Toast.makeText(this, mod.name +
+                        " installed. Select it in RB + Start > Mods.",
+                        Toast.LENGTH_LONG).show();
+                    refreshInterface();
+                });
+            } catch (Exception exception) {
+                showModStoreFailure("Could not install " + mod.name + ": " +
+                                    cleanMessage(exception), exception);
+            }
+        });
+    }
+
+    private void confirmRemoveStoreMod(ModStore.Mod mod) {
+        new AlertDialog.Builder(this)
+            .setTitle("Remove " + mod.name + "?")
+            .setMessage("This removes only the downloaded mod files. Your game installation and original skater are not changed.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Remove", (dialog, which) -> removeStoreMod(mod))
+            .show();
+    }
+
+    private void removeStoreMod(ModStore.Mod mod) {
+        if (busy) return;
+        setBusy("REMOVING MOD", "Removing " + mod.name + "...", false);
+        worker.execute(() -> {
+            try {
+                ModStore.uninstall(activeGameDirectory().toPath(), mod);
+                appendLog("Mod Store removed " + mod.name + ".");
+                runOnUiThread(() -> {
+                    busy = false;
+                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    Toast.makeText(this, mod.name + " removed.", Toast.LENGTH_SHORT).show();
+                    refreshInterface();
+                });
+            } catch (Exception exception) {
+                showModStoreFailure("Could not remove " + mod.name + ": " +
+                                    cleanMessage(exception), exception);
+            }
+        });
+    }
+
+    private void showModStoreFailure(String message, Exception exception) {
+        appendLog(message + "\n" + stackTrace(exception));
+        runOnUiThread(() -> {
+            busy = false;
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            progressBar.setVisibility(View.GONE);
+            new AlertDialog.Builder(this)
+                .setTitle("Mod Store needs attention")
+                .setMessage(message + "\n\nYour existing game and mod files were not changed.")
+                .setPositiveButton("OK", (dialog, which) -> refreshInterface())
+                .show();
+        });
     }
 
     private void explainSeiyuInstall() {

@@ -162,8 +162,8 @@ below full speed, return to the Performance profile.
 
 ## Optional SEIYU PARADISE PENGUIN MOD
 
-Use the mod-files button in the Skate 3 Mobile launcher to select these two
-user-supplied mod assets:
+Open **Mod Store** in the Skate 3 Mobile launcher and install Seiyu with one
+tap. The store downloads and verifies these two assets:
 
 ```text
 base.obj
@@ -172,6 +172,6 @@ texture_diffuse.png
 
 The launcher copies them into the active installation. Press **RB + Start** in
 game and open **Mods > Playable Character** to switch live between Seiyu and the
-original skater. The renderer
-automatically rigs Seiyu to the live skater skeleton while preserving the
-skateboard. The assets themselves are intentionally not part of the repository.
+original skater. The renderer automatically rigs Seiyu to the live skater
+skeleton while preserving the skateboard. A manual ZIP is also available on
+the [Mod Store website](https://buku313.github.io/Skate3-Mobile/mods/).

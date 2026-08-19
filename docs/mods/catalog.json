@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "mods": [
+    {
+      "id": "seiyu-paradise-penguin",
+      "name": "Seiyu Paradise Penguin",
+      "version": "1.0.0",
+      "description": "Put Seiyu on the board as a fully animated playable character. The runtime rig maps his feet and flippers to the live skater skeleton while keeping the skateboard visible.",
+      "assets": [
+        {
+          "path": "mods/penguin/base.obj",
+          "url": "https://buku313.github.io/Skate3-Mobile/mods/seiyu/base.obj",
+          "sha256": "a2c2ea56e2136d68cd1b65b07a77d263976100f5638e104c2082a3bb150435fb",
+          "size": 920451
+        },
+        {
+          "path": "mods/penguin/texture_diffuse.png",
+          "url": "https://buku313.github.io/Skate3-Mobile/mods/seiyu/texture_diffuse.png",
+          "sha256": "aaae6cb98b9819ef2a032808945bfabdbb908947c3ee2f01354861138567ef52",
+          "size": 2156122
+        }
+      ]
+    }
+  ]
+}

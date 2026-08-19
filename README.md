@@ -47,10 +47,10 @@ downloads and verifies the new APK inside the app. Android still asks you to
 approve the installation, but you do not need to return to GitHub or reinstall
 your game files.
 
-The original skater is selected by default. If you have the optional Seiyu
-Paradise Penguin files, use the launcher to import `base.obj` and
-`texture_diffuse.png`. In game, press **RB + Start**, open **Mods**, and switch
-between **Original Skater** and **Seiyu Paradise Penguin** instantly.
+The original skater is selected by default. Open **Mod Store** in the launcher
+to download and install Seiyu Paradise Penguin with one tap. In game, press
+**RB + Start**, open **Mods**, and switch between **Original Skater** and
+**Seiyu Paradise Penguin** instantly.
 
 ## How it works and how it was developed
 
@@ -237,8 +237,10 @@ setup are documented in [android/README.md](android/README.md).
 
 ## SEIYU PARADISE PENGUIN MOD
 
-On Android, use the mod-files button in the launcher to import the user-supplied
-Seiyu model and texture. The files are stored under the active game install:
+On Android, open **Mod Store** in the launcher and install Seiyu. The catalog,
+manual download, and verified source assets are published on the
+[Mod Store website](https://buku313.github.io/Skate3-Mobile/mods/). The files
+are stored under the active game install:
 
 ```text
 mods/penguin/base.obj
@@ -247,7 +249,6 @@ mods/penguin/texture_diffuse.png
 
 Choose Seiyu from **RB + Start > Mods > Playable Character**. The mod rigs Seiyu
 to the live skater skeleton and keeps the skateboard visible.
-The model and texture are not included in this repository.
 
 ## Credits
 

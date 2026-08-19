@@ -150,6 +150,7 @@
     .number { color: var(--orange); font-weight: 1000; font-size: 2rem; }
     h3 { margin: 12px 0 8px; font-size: 1.18rem; }
     .step p, .card p { color: var(--muted); margin: 0; }
+    .card a { color: white; font-weight: 850; }
     .requirements { margin-top: 22px; padding: 20px 22px; border-left: 4px solid var(--cyan); background: #10161a; color: #d8e9ef; }
     .updates-head {
       display: flex;
@@ -195,7 +196,7 @@
       .download-panel .button { width: 100%; }
       .updates-head { align-items: flex-start; flex-direction: column; }
       .nav-links { gap: 12px; font-size: .84rem; }
-      .nav-links .source-link { display: none; }
+      .nav-links .source-link, .nav-links .report-link { display: none; }
     }
   </style>
 </head>
@@ -204,9 +205,10 @@
     <nav>
       <a class="brand" href="#top">SKATE 3 <span>MOBILE</span></a>
       <div class="nav-links">
+        <a class="github" href="mods/">Mods</a>
         <a class="github" href="releases.html">Releases</a>
         <a class="github" href="updates.html">Updates</a>
-        <a class="github" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">Report a bug</a>
+        <a class="github report-link" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">Report a bug</a>
         <a class="github source-link" href="https://github.com/Buku313/Skate3-Mobile">Source on GitHub</a>
       </div>
     </nav>
@@ -281,7 +283,7 @@
         <div class="cards">
           <article class="card"><h3>Native Vulkan rendering</h3><p>Static ARM64 recompilation with a native scene renderer. This is not conventional Xbox 360 emulation.</p></article>
           <article class="card"><h3>Touch or controller</h3><p>Use the built-in multitouch overlay on a phone, or keep using a physical or built-in gamepad. Toggle touch controls from the top of the game.</p></article>
-          <article class="card"><h3>Original or Seiyu</h3><p>The original skater is the default. Import the optional Seiyu files, then switch characters live from the RB + Start Mods menu.</p></article>
+          <article class="card"><h3>One-tap Mod Store</h3><p>Install Seiyu Paradise Penguin directly from the launcher, then switch characters live from the RB + Start Mods menu. <a href="mods/">Browse available mods.</a></p></article>
           <article class="card"><h3>Your game stays yours</h3><p>No retail game assets are included. The installer reads your own ISO locally, never uploads it, and does not request All files access.</p></article>
           <article class="card"><h3>Easy app updates</h3><p>The launcher checks for new signed builds, verifies the APK, and opens Android's installer. Your extracted game files stay in place.</p></article>
         </div>
@@ -297,7 +299,7 @@
   </main>
 
   <footer class="wrap">
-    This is an experimental developer build and unofficial fan project. It is not affiliated with Electronic Arts, Black Box, Microsoft, Google, or Android. Skate 3 and related properties belong to their respective owners. <a href="releases.html">Browse releases</a>, <a href="updates.html">read updates</a>, or <a href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">report a bug</a>.
+    This is an experimental developer build and unofficial fan project. It is not affiliated with Electronic Arts, Black Box, Microsoft, Google, or Android. Skate 3 and related properties belong to their respective owners. <a href="mods/">Browse mods</a>, <a href="releases.html">browse releases</a>, <a href="updates.html">read updates</a>, or <a href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">report a bug</a>.
   </footer>
   <script>
     fetch("update.json", { cache: "no-store" })

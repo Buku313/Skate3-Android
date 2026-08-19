@@ -12,10 +12,11 @@ You do not need to build anything for ordinary setup:
 5. The app downloads and verifies Title Update 3 automatically.
 6. Tap **Play Skate 3**.
 
-The original skater is the default. To use the optional Seiyu Paradise Penguin
-Mod, tap the mod-files button and choose your user-supplied `base.obj` and
-`texture_diffuse.png`. In game, press **RB + Start** and use **Mods > Playable
-Character** to switch between Seiyu and the original skater.
+The original skater is the default. To use Seiyu Paradise Penguin, open **Mod
+Store** in the launcher and tap **Install**. In game, press **RB + Start** and
+use **Mods > Playable Character** to switch between Seiyu and the original
+skater. Older builds can use the
+[manual mod download](https://buku313.github.io/Skate3-Mobile/mods/).
 
 No laptop, ISO extraction app, file-manager folder setup, or command line is
 needed. Your ISO is never modified or uploaded. Keep about 8 GiB free for the
