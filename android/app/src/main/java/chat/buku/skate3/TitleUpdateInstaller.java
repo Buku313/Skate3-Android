@@ -22,6 +22,8 @@ final class TitleUpdateInstaller {
     private static final int MAX_PACKAGE_SIZE = 256 * 1024 * 1024;
     private static final int BLOCK_SIZE = 0x1000;
     private static final int END_OF_CHAIN = 0xFFFFFF;
+    private static final int DOWNLOAD_ATTEMPTS = 3;
+    private static final long RETRY_DELAY_MS = 1_500;
 
     private static final Payload[] PAYLOADS = {
         new Payload("default.xexp", 1_701_888,
@@ -63,6 +65,35 @@ final class TitleUpdateInstaller {
     private TitleUpdateInstaller() {}
 
     static void downloadAndInstall(Path gameRoot, ProgressListener listener) throws IOException {
+        IOException lastFailure = null;
+        for (int attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; ++attempt) {
+            if (attempt > 1) {
+                if (listener != null) {
+                    listener.onProgress(0, -1,
+                        "Retrying Title Update download (" + attempt + " of " +
+                        DOWNLOAD_ATTEMPTS + ")");
+                }
+                try {
+                    Thread.sleep(RETRY_DELAY_MS);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Title Update download was interrupted.", exception);
+                }
+            }
+            try {
+                downloadAndInstallOnce(gameRoot, listener);
+                return;
+            } catch (IOException exception) {
+                lastFailure = exception;
+            }
+        }
+        throw new IOException(
+            "The Title Update server is temporarily unavailable. The app tried 3 times. " +
+            "Try again later, or use Select Title Update File.", lastFailure);
+    }
+
+    private static void downloadAndInstallOnce(Path gameRoot, ProgressListener listener)
+            throws IOException {
         HttpURLConnection connection = (HttpURLConnection) new URL(DOWNLOAD_URL).openConnection();
         connection.setConnectTimeout(15_000);
         connection.setReadTimeout(30_000);

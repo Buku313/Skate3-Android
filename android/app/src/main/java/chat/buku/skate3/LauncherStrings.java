@@ -49,6 +49,9 @@ final class LauncherStrings {
         put("INSTALLING TITLE UPDATE 3", "INSTALANDO TITLE UPDATE 3");
         put("VERIFYING TITLE UPDATE 3", "VERIFICANDO TITLE UPDATE 3");
         put("Downloading and verifying 1.7 MB...", "Baixando e verificando 1,7 MB...");
+        put("The Title Update server is temporarily unavailable. The app tried 3 times. Try again later, or use Select Title Update File.",
+            "O servidor da Title Update está temporariamente indisponível. O aplicativo tentou 3 vezes. Tente novamente mais tarde ou use Selecionar Arquivo da Title Update.");
+        put("Title Update download was interrupted.", "O download da Title Update foi interrompido.");
         put("INSTALLATION COMPLETE", "INSTALAÇÃO CONCLUÍDA");
         put("Your files were verified and stayed on this device.", "Seus arquivos foram verificados e permaneceram neste dispositivo.");
         put("Game installation needs repair.", "A instalação do jogo precisa ser reparada.");
@@ -146,6 +149,19 @@ final class LauncherStrings {
         if (english.startsWith("Starting ")) return "Iniciando " + english.substring(9);
         if (english.startsWith("Downloading Skate 3 ")) {
             return "Baixando Skate 3 " + english.substring("Downloading Skate 3 ".length());
+        }
+        if (english.startsWith("Retrying Title Update download (")) {
+            return english.replace("Retrying Title Update download (",
+                "Tentando baixar a Title Update novamente (")
+                .replace(" of ", " de ");
+        }
+        if (english.startsWith("Title Update setup stopped: ")) {
+            return "A instalação da Title Update foi interrompida: " +
+                text(context, english.substring("Title Update setup stopped: ".length()));
+        }
+        if (english.startsWith("Setup stopped: ")) {
+            return "A instalação foi interrompida: " +
+                text(context, english.substring("Setup stopped: ".length()));
         }
         if (english.contains(" of ")) return english.replace(" of ", " de ");
         return english;
