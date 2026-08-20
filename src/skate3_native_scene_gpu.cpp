@@ -90,6 +90,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_identity);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_palette);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_macro);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_rtt_passes);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_sync_compilation);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_unsuppress);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_pause_native);
@@ -159,6 +160,7 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_2d_async_px);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_detail_hold);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_hdr_debug);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_fmv_yield_max_ms);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_menu_rtt_scope);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_mesh_decode_budget);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_mesh_store_mb);
@@ -5643,11 +5645,14 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
     // boxes are ONE-SHOT renders: pieces skipped during a first-run compile
     // are baked into the portrait forever (the armless/torso-less
     // skaters; later runs are fine because the
-    // shader/pipeline disk storage is warm). Menus tolerate the one-time
-    // compile stalls invisibly.
+    // shader/pipeline disk storage is warm). Desktop keeps this completeness
+    // tradeoff; Android defaults to asynchronous compilation because some
+    // mobile drivers block the transition for tens of seconds.
     static bool s_async_forced = false;
     static bool s_async_saved = false;
-    if (want && !s_async_forced) {
+    const bool want_sync =
+        want && REXCVAR_GET(skate3_native_render_scene_menu_sync_compilation);
+    if (want_sync && !s_async_forced) {
       s_async_saved = REXCVAR_GET(async_shader_compilation);
       if (s_async_saved) {
         REXCVAR_SET(async_shader_compilation, false);
@@ -5656,7 +5661,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
             "(one-shot portrait renders can't skip still-compiling pieces)");
       }
       s_async_forced = true;
-    } else if (!want && s_async_forced) {
+    } else if (!want_sync && s_async_forced) {
       if (s_async_saved) {
         REXCVAR_SET(async_shader_compilation, true);
       }
@@ -5810,8 +5815,12 @@ bool YieldForMovie() {
   // grace window.
   static int64_t s_fresh_since = -1;
   static bool s_yielding = false;
+  static bool s_yield_timed_out = false;
+  static int64_t s_yield_started_ns = -1;
   if (!active) {
     s_fresh_since = -1;
+    s_yield_timed_out = false;
+    s_yield_started_ns = -1;
     if (s_yielding) {
       s_yielding = false;
       REXLOG_INFO("native-scene: FMV ended - native output resumes");
@@ -5820,13 +5829,31 @@ bool YieldForMovie() {
   } else if (s_fresh_since < 0) {
     s_fresh_since = now_ns;
   }
+  if (s_yield_timed_out) {
+    return false;
+  }
   // Once fallback presentation begins, RenderScene intentionally returns
   // before replaying its 2D list. That means g_movie_quad_last_ns cannot be
   // refreshed while yielded. Re-evaluating quad freshness every frame made
   // the yield cancel itself after 500 ms, render one native frame, see the
   // quad again, and yield again forever. Latch the fallback for the decoder
-  // session and release it only after a genuine heartbeat timeout.
+  // session. Android also applies a generous hard bound: several firmware
+  // audio stacks pace the decoder heartbeat even after useful movie output
+  // has stopped, and an unbounded latch then presents black forever.
   if (s_yielding) {
+    const int32_t max_ms =
+        REXCVAR_GET(skate3_native_render_scene_fmv_yield_max_ms);
+    if (max_ms > 0 && s_yield_started_ns >= 0 &&
+        now_ns - s_yield_started_ns >= int64_t(max_ms) * 1'000'000) {
+      s_yielding = false;
+      s_yield_timed_out = true;
+      s_yield_started_ns = -1;
+      REXLOG_WARN(
+          "native-scene: FMV fallback exceeded {} ms - resuming native "
+          "output until this decoder session ends",
+          max_ms);
+      return false;
+    }
     return true;
   }
   const int64_t native_ns = g_movie_native_last_ns.load(std::memory_order_relaxed);
@@ -5846,9 +5873,10 @@ bool YieldForMovie() {
                      (native_ns < 0 || last_ns - native_ns > 1'000'000'000);
   if (yield) {
     s_yielding = true;
+    s_yield_started_ns = now_ns;
     REXLOG_INFO(
         "native-scene: FMV playing - yielding to emulated output "
-        "(latched until MovieDecoder heartbeat ends)");
+        "(decoder-session latch with safety timeout)");
   }
   return s_yielding;
 }

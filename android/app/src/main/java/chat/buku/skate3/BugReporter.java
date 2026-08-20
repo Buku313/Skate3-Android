@@ -43,11 +43,11 @@ final class BugReporter {
     static void show(Activity activity) {
         Diagnostic diagnostic = collect(activity);
         new AlertDialog.Builder(activity)
-            .setTitle("Report a developer-build bug")
-            .setMessage("GitHub will open with this device's safe technical details already filled in. The same details will be copied so you can paste them if the browser removes a field.\n\nNo ISO, game file, save, account name, or private path is included.")
-            .setNegativeButton("Cancel", null)
-            .setNeutralButton("Copy only", (dialog, which) -> copy(activity, diagnostic.report))
-            .setPositiveButton("Open GitHub", (dialog, which) -> {
+            .setTitle(LauncherStrings.text(activity, "Report a developer-build bug"))
+            .setMessage(LauncherStrings.text(activity, "GitHub will open with this device's safe technical details already filled in. The same details will be copied so you can paste them if the browser removes a field.\n\nNo ISO, game file, save, account name, or private path is included."))
+            .setNegativeButton(LauncherStrings.text(activity, "Cancel"), null)
+            .setNeutralButton(LauncherStrings.text(activity, "Copy only"), (dialog, which) -> copy(activity, diagnostic.report))
+            .setPositiveButton(LauncherStrings.text(activity, "Open GitHub"), (dialog, which) -> {
                 copy(activity, diagnostic.report);
                 open(activity, diagnostic);
             })
@@ -392,6 +392,8 @@ final class BugReporter {
                       lower.contains("abort") || lower.contains("failed") ||
                       lower.contains("error") || lower.contains("adreno") ||
                       lower.contains("gpu") || lower.contains("guest address space") ||
+                      lower.contains("sdl audio") || lower.contains("audio stats") ||
+                      lower.contains("audio device") ||
                       lower.contains("shared memory") || lower.contains("sparse residency"))) {
                     continue;
                 }
@@ -402,7 +404,7 @@ final class BugReporter {
                     if (tail.size() > 72) tail.remove(0);
                 }
             }
-            if (head.isEmpty() && tail.isEmpty()) return "- no relevant Vulkan lines found";
+            if (head.isEmpty() && tail.isEmpty()) return "- no relevant runtime lines found";
             StringBuilder out = new StringBuilder();
             for (String line : head) out.append(line).append('\n');
             if (!tail.isEmpty()) {
@@ -471,7 +473,7 @@ final class BugReporter {
     private static void copy(Context context, String report) {
         ClipboardManager clipboard = context.getSystemService(ClipboardManager.class);
         clipboard.setPrimaryClip(ClipData.newPlainText("Skate 3 diagnostics", report));
-        Toast.makeText(context, "Device diagnostics copied.", Toast.LENGTH_SHORT).show();
+        Toast.makeText(context, LauncherStrings.text(context, "Device diagnostics copied."), Toast.LENGTH_SHORT).show();
     }
 
     private static void open(Activity activity, Diagnostic diagnostic) {
@@ -489,7 +491,7 @@ final class BugReporter {
         try {
             activity.startActivity(new Intent(Intent.ACTION_VIEW, uri));
         } catch (ActivityNotFoundException exception) {
-            Toast.makeText(activity, "No browser is available. The diagnostics are copied.",
+            Toast.makeText(activity, LauncherStrings.text(activity, "No browser is available. The diagnostics are copied."),
                            Toast.LENGTH_LONG).show();
         }
     }

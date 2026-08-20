@@ -5,14 +5,41 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Skate 3 Mobile | Native Android Port</title>
   <meta name="description" content="Play Skate 3 natively on supported Android phones and handhelds. Download one APK, select your own Xbox 360 ISO, and skate.">
+  <meta name="robots" content="index,follow,max-image-preview:large,max-video-preview:-1">
+  <meta name="application-name" content="Skate 3 Mobile">
+  <meta name="keywords" content="Skate 3 Android, Skate 3 Mobile, native Android port, ARM64 recompilation, Vulkan Android game, Android handheld gaming, RG406V, AYN Odin, Retroid Pocket">
   <meta name="theme-color" content="#ff6518">
   <meta property="og:title" content="Skate 3 Mobile">
   <meta property="og:description" content="Native ARM64 Skate 3 on Android. Download the APK, select your own ISO, and play.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://buku313.github.io/Skate3-Mobile/">
   <meta property="og:image" content="https://buku313.github.io/Skate3-Mobile/skate3-android-social-preview.jpg">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:locale:alternate" content="pt_BR">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Skate 3 Mobile | Native Android Port">
+  <meta name="twitter:description" content="Native ARM64 Skate 3 on Android. Download the APK, select your own ISO, and play.">
+  <meta name="twitter:image" content="https://buku313.github.io/Skate3-Mobile/skate3-android-social-preview.jpg">
   <link rel="canonical" href="https://buku313.github.io/Skate3-Mobile/">
+  <link rel="alternate" hreflang="en" href="https://buku313.github.io/Skate3-Mobile/?lang=en">
+  <link rel="alternate" hreflang="pt-BR" href="https://buku313.github.io/Skate3-Mobile/pt-br/">
+  <link rel="alternate" hreflang="x-default" href="https://buku313.github.io/Skate3-Mobile/">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Skate 3 Mobile",
+    "applicationCategory": "GameApplication",
+    "operatingSystem": "Android 13 or newer, ARM64",
+    "softwareVersion": "2.0.17",
+    "description": "Experimental native ARM64 Android port using static recompilation and Vulkan. No retail game data is included.",
+    "downloadUrl": "https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk",
+    "codeRepository": "https://github.com/Buku313/Skate3-Mobile",
+    "license": "https://github.com/Buku313/Skate3-Mobile/blob/main/LICENSE",
+    "image": "https://buku313.github.io/Skate3-Mobile/skate3-android-social-preview.jpg",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+  }
+  </script>
   <style>
     :root {
       color-scheme: dark;
@@ -50,6 +77,22 @@
     .nav-links { display: flex; align-items: center; gap: 18px; }
     .github { color: var(--muted); font-weight: 750; text-decoration: none; }
     .github:hover { color: white; }
+    .language-toggle {
+      display: inline-flex;
+      align-items: center;
+      min-height: 40px;
+      padding: 0 13px;
+      border: 1px solid rgba(255,255,255,.2);
+      border-radius: 999px;
+      background: #202027;
+      color: white;
+      font: inherit;
+      font-size: .86rem;
+      font-weight: 900;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .language-toggle:hover { border-color: var(--orange); background: #292930; }
     .dev-banner {
       padding: 10px 16px;
       border: 1px solid rgba(255,101,24,.4);
@@ -178,6 +221,22 @@
     .step p, .card p { color: var(--muted); margin: 0; }
     .card a { color: white; font-weight: 850; }
     .requirements { margin-top: 22px; padding: 20px 22px; border-left: 4px solid var(--cyan); background: #10161a; color: #d8e9ef; }
+    .qa-panel {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 28px;
+      align-items: center;
+      padding: clamp(24px, 5vw, 42px);
+      border: 1px solid rgba(65,215,255,.42);
+      border-radius: 22px;
+      background: linear-gradient(135deg, rgba(65,215,255,.12), rgba(23,23,28,.94));
+    }
+    .qa-panel h2 { margin-bottom: 8px; }
+    .qa-panel p { max-width: 720px; margin: 0; color: #c9c9d2; }
+    .qa-label { display: inline-flex; margin-bottom: 10px; color: var(--cyan); font-size: .78rem; font-weight: 950; letter-spacing: .12em; }
+    .qa-actions { display: flex; flex-direction: column; gap: 9px; min-width: 230px; }
+    .qa-actions .button { min-height: 52px; }
+    .qa-note { color: var(--muted); font-size: .78rem; text-align: center; }
     .updates-head {
       display: flex;
       align-items: end;
@@ -222,8 +281,12 @@
       .download-panel { align-items: flex-start; flex-direction: column; }
       .download-panel .button { width: 100%; }
       .updates-head { align-items: flex-start; flex-direction: column; }
+      .qa-panel { grid-template-columns: 1fr; }
+      .qa-actions { width: 100%; }
       .nav-links { gap: 12px; font-size: .84rem; }
       .nav-links .source-link, .nav-links .report-link { display: none; }
+      .language-toggle { min-height: 38px; padding: 0 11px; }
+      .nav-links > a:not(.report-link):not(.source-link) { display: none; }
     }
   </style>
 </head>
@@ -232,6 +295,7 @@
     <nav>
       <a class="brand" href="#top">SKATE 3 <span>MOBILE</span></a>
       <div class="nav-links">
+        <a class="language-toggle" id="language-toggle" href="pt-br/" aria-label="Mudar o site para português do Brasil">🇧🇷 Português</a>
         <a class="github" href="mods/">Mods</a>
         <a class="github" href="releases.html">Releases</a>
         <a class="github" href="updates.html">Updates</a>
@@ -260,6 +324,21 @@
         <div class="status">PLAYABLE · DEV BUILD</div>
       </div>
     </div>
+
+    <section id="qa-testing">
+      <div class="wrap qa-panel">
+        <div>
+          <span class="qa-label">OPT-IN QA TESTING · v2.0.18 QA 1</span>
+          <h2>Help test the next compatibility build.</h2>
+          <p>This separate QA app will not replace stable v2.0.17. Test cold launches, loading, audio, Samsung, AYN, Retroid, and Brazilian Portuguese. It contains no game files and requires your own legally obtained dump.</p>
+        </div>
+        <div class="qa-actions">
+          <a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/download/v2.0.18-qa1/Skate3-Mobile-QA.apk">DOWNLOAD QA APK</a>
+          <a class="button secondary" href="https://github.com/Buku313/Skate3-Mobile/releases/tag/v2.0.18-qa1">QA NOTES / NOTAS</a>
+          <span class="qa-note">Installs beside the stable app</span>
+        </div>
+      </div>
+    </section>
 
     <section id="galaxy-s25-plus">
       <div class="wrap performance-showcase">
@@ -347,6 +426,131 @@
     This is an experimental developer build and unofficial fan project. It is not affiliated with Electronic Arts, Black Box, Microsoft, Google, or Android. Skate 3 and related properties belong to their respective owners. <a href="mods/">Browse mods</a>, <a href="releases.html">browse releases</a>, <a href="updates.html">read updates</a>, or <a href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">report a bug</a>.
   </footer>
   <script>
+    const englishText = new WeakMap();
+    const ptBR = {
+      "Mods": "Mods",
+      "Releases": "Versões",
+      "Updates": "Atualizações",
+      "Report a bug": "Relatar um bug",
+      "Source on GitHub": "Código no GitHub",
+      "DEVELOPER BUILD · EXPERIMENTAL SOFTWARE · EXPECT BUGS AND DEVICE-SPECIFIC PROBLEMS": "VERSÃO DE DESENVOLVIMENTO · SOFTWARE EXPERIMENTAL · ESPERE BUGS E PROBLEMAS ESPECÍFICOS DO DISPOSITIVO",
+      "v2.0.17 DEVELOPER BUILD · NATIVE ARM64 ANDROID PORT": "v2.0.17 VERSÃO DE DESENVOLVIMENTO · PORT NATIVO ARM64 PARA ANDROID",
+      "ANYWHERE.": "EM QUALQUER LUGAR.",
+      "Skate 3 running natively on supported Android phones and handhelds. Download one APK, select an ISO dumped from your own copy, and start skating.": "Skate 3 rodando nativamente em celulares e consoles portáteis Android compatíveis. Baixe um APK, selecione uma ISO extraída da sua própria cópia e comece a andar de skate.",
+      "DOWNLOAD APK": "BAIXAR APK",
+      "HOW TO INSTALL": "COMO INSTALAR",
+      "BUG REPORT": "RELATAR BUG",
+      "Android 13+ · ARM64 · Vulkan · Touch controls included": "Android 13+ · ARM64 · Vulkan · Controles de toque incluídos",
+      "PLAYABLE · DEV BUILD": "JOGÁVEL · VERSÃO DEV",
+      "OPT-IN QA TESTING · v2.0.18 QA 1": "TESTE QA OPCIONAL · v2.0.18 QA 1",
+      "Help test the next compatibility build.": "Ajude a testar a próxima versão de compatibilidade.",
+      "This separate QA app will not replace stable v2.0.17. Test cold launches, loading, audio, Samsung, AYN, Retroid, and Brazilian Portuguese. It contains no game files and requires your own legally obtained dump.": "Este aplicativo QA separado não substitui a versão estável v2.0.17. Teste inicialização, carregamento, áudio, Samsung, AYN, Retroid e português do Brasil. Ele não contém arquivos do jogo e exige sua própria cópia obtida legalmente.",
+      "DOWNLOAD QA APK": "BAIXAR APK QA",
+      "Installs beside the stable app": "Instala junto com o aplicativo estável",
+      "REAL DEVICE CAPTURE": "GRAVAÇÃO EM DISPOSITIVO REAL",
+      "Beautiful on Galaxy S25+.": "Incrível no Galaxy S25+.",
+      "This complete uncut recording is from a Samsung Galaxy S25+. The AYN Thor has separately been confirmed running the game around 90 FPS.": "Esta gravação completa e sem cortes foi feita em um Samsung Galaxy S25+. O AYN Thor também foi confirmado rodando o jogo por volta de 90 FPS.",
+      "Experimental developer build. Frame rate changes with scene, settings, temperature, and device power mode.": "Versão experimental de desenvolvimento. A taxa de quadros varia conforme a cena, as configurações, a temperatura e o modo de energia do dispositivo.",
+      "Three steps. No computer.": "Três passos. Sem computador.",
+      "The app handles extraction and the verified Title Update locally. Your ISO stays on your device and is never uploaded.": "O aplicativo faz a extração e instala a atualização verificada localmente. Sua ISO permanece no dispositivo e nunca é enviada para a internet.",
+      "Install the APK": "Instale o APK",
+      "Download Skate 3 Mobile and allow your browser to install this one app when Android asks.": "Baixe o Skate 3 Mobile e permita que o navegador instale este aplicativo quando o Android solicitar.",
+      "Select your ISO": "Selecione sua ISO",
+      "Open the app and choose an Xbox 360 Skate 3 ISO dumped from your own supported copy.": "Abra o aplicativo e escolha uma ISO de Skate 3 para Xbox 360 extraída da sua própria cópia compatível.",
+      "Wait, then skate": "Aguarde e comece a jogar",
+      "The app extracts and verifies the files, installs Title Update 3, and gives you a Play button.": "O aplicativo extrai e verifica os arquivos, instala a Title Update 3 e libera o botão Jogar.",
+      "Before downloading:": "Antes de baixar:",
+      "allow roughly 8 GiB free after the ISO is already available. The current build supports Android 13 or newer, 64-bit ARM, Vulkan, touch controls, and physical controllers. It does not support iPhone or 32-bit Android devices.": "tenha aproximadamente 8 GiB livres além do espaço ocupado pela ISO. A versão atual suporta Android 13 ou mais recente, ARM de 64 bits, Vulkan, controles de toque e controles físicos. iPhone e dispositivos Android de 32 bits não são compatíveis.",
+      "Latest updates.": "Atualizações mais recentes.",
+      "Follow new builds, compatibility work, fixes, and known limitations as development moves fast.": "Acompanhe novas versões, melhorias de compatibilidade, correções e limitações conhecidas enquanto o desenvolvimento avança rapidamente.",
+      "VIEW ALL UPDATES": "VER TODAS AS ATUALIZAÇÕES",
+      "FMV and handheld compatibility fixes": "Correções de vídeos e compatibilidade com portáteis",
+      "Stops repeated FMV renderer handoffs, targets confirmed Samsung and AYN callback crashes, and makes optional GPU driver controls visible on more vendor themes.": "Interrompe trocas repetidas do renderizador durante vídeos, corrige falhas identificadas em Samsung e AYN e torna os controles opcionais de driver de GPU visíveis em mais interfaces.",
+      "IN TESTING": "EM TESTES",
+      "More device reports needed": "Precisamos de mais testes em dispositivos",
+      "System Driver is recommended. Custom Turnip packages are optional experiments under Advanced Options and are never enabled automatically.": "O Driver do Sistema é recomendado. Pacotes Turnip personalizados são testes opcionais em Opções Avançadas e nunca são ativados automaticamente.",
+      "RECENT": "RECENTE",
+      "Touch controls and app updates": "Controles de toque e atualizações do aplicativo",
+      "Play with the multitouch Xbox-style overlay, then download verified signed APK updates without replacing your extracted game files.": "Jogue com o controle multitoque no estilo Xbox e baixe atualizações APK assinadas e verificadas sem substituir os arquivos extraídos do jogo.",
+      "Built for players.": "Feito para jogadores.",
+      "Performance mode targets handheld hardware such as the RG406V. The AYN Thor has now demonstrated around 90 FPS, and Quality mode is included for stronger devices.": "O modo Desempenho foi criado para portáteis como o RG406V. O AYN Thor já demonstrou cerca de 90 FPS, e o modo Qualidade está disponível para dispositivos mais potentes.",
+      "Native Vulkan rendering": "Renderização Vulkan nativa",
+      "Static ARM64 recompilation with a native scene renderer. This is not conventional Xbox 360 emulation.": "Recompilação estática ARM64 com renderizador de cena nativo. Isto não é emulação convencional de Xbox 360.",
+      "Touch or controller": "Toque ou controle físico",
+      "Use the built-in multitouch overlay on a phone, or keep using a physical or built-in gamepad. Toggle touch controls from the top of the game.": "Use o controle multitoque integrado no celular ou um gamepad físico ou embutido. Ative ou desative os controles de toque na parte superior do jogo.",
+      "Characters and Mod Store": "Personagens e Loja de Mods",
+      "Switch between the original skater and included Seiyu from the RB + Start Mods menu.": "Alterne entre o skatista original e o Seiyu incluído pelo menu Mods com RB + Start.",
+      "Browse mods": "Ver mods",
+      "submit your character": "envie seu personagem",
+      "Your game stays yours": "Seu jogo continua sendo seu",
+      "No retail game assets are included. The installer reads your own ISO locally, never uploads it, and does not request All files access.": "Nenhum arquivo comercial do jogo está incluído. O instalador lê sua própria ISO localmente, nunca a envia e não solicita acesso a todos os arquivos.",
+      "Easy app updates": "Atualizações fáceis",
+      "The launcher checks for new signed builds, verifies the APK, and opens Android's installer. Your extracted game files stay in place.": "O launcher procura novas versões assinadas, verifica o APK e abre o instalador do Android. Os arquivos extraídos do jogo permanecem no lugar.",
+      "Ready to test?": "Pronto para testar?",
+      "Grab the latest signed developer build. Expect bugs, report what you find, and check the Updates page before installing.": "Baixe a versão de desenvolvimento assinada mais recente. Espere bugs, relate o que encontrar e confira a página de Atualizações antes de instalar.",
+      "GET SKATE 3 MOBILE": "BAIXAR SKATE 3 MOBILE",
+      "This is an experimental developer build and unofficial fan project. It is not affiliated with Electronic Arts, Black Box, Microsoft, Google, or Android. Skate 3 and related properties belong to their respective owners.": "Esta é uma versão experimental de desenvolvimento e um projeto não oficial de fãs. Não possui afiliação com Electronic Arts, Black Box, Microsoft, Google ou Android. Skate 3 e propriedades relacionadas pertencem aos seus respectivos proprietários.",
+      "browse releases": "ver versões",
+      "read updates": "ler atualizações",
+      "report a bug": "relatar um bug",
+      "Your browser does not support embedded MP4 video.": "Seu navegador não suporta vídeo MP4 incorporado."
+    };
+
+    const pageMeta = {
+      en: {
+        title: "Skate 3 Mobile | Native Android Port",
+        description: "Play Skate 3 natively on supported Android phones and handhelds. Download one APK, select your own Xbox 360 ISO, and skate."
+      },
+      "pt-BR": {
+        title: "Skate 3 Mobile | Port nativo para Android",
+        description: "Jogue Skate 3 nativamente em celulares e portáteis Android compatíveis. Baixe o APK, selecione sua própria ISO de Xbox 360 e jogue."
+      }
+    };
+
+    function translatableTextNodes() {
+      const nodes = [];
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const parent = node.parentElement;
+        if (!parent || parent.closest("script, style, #language-toggle")) continue;
+        if (node.nodeValue.trim()) nodes.push(node);
+      }
+      return nodes;
+    }
+
+    function applyLanguage(language) {
+      const selected = language === "pt-BR" ? "pt-BR" : "en";
+      translatableTextNodes().forEach(node => {
+        if (!englishText.has(node)) englishText.set(node, node.nodeValue);
+        const original = englishText.get(node);
+        const key = original.trim();
+        const translated = selected === "pt-BR" && ptBR[key] ? ptBR[key] : key;
+        node.nodeValue = original.replace(key, translated);
+      });
+      document.documentElement.lang = selected === "pt-BR" ? "pt-BR" : "en";
+      document.title = pageMeta[selected].title;
+      document.querySelector('meta[name="description"]').content = pageMeta[selected].description;
+      document.querySelector('meta[property="og:description"]').content = pageMeta[selected].description;
+      const toggle = document.getElementById("language-toggle");
+      toggle.textContent = selected === "pt-BR" ? "🇺🇸 English" : "🇧🇷 Português";
+      toggle.setAttribute("aria-label", selected === "pt-BR"
+        ? "Switch the website to English"
+        : "Mudar o site para português do Brasil");
+      localStorage.setItem("skate3-language", selected);
+    }
+
+    const requestedLanguage = new URLSearchParams(location.search).get("lang");
+    const savedLanguage = localStorage.getItem("skate3-language");
+    const initialLanguage = requestedLanguage === "pt-BR" || requestedLanguage === "en"
+      ? requestedLanguage
+      : (savedLanguage || (navigator.language.toLowerCase().startsWith("pt") ? "pt-BR" : "en"));
+    applyLanguage(initialLanguage);
+    document.getElementById("language-toggle").addEventListener("click", event => {
+      event.preventDefault();
+      location.href = document.documentElement.lang === "pt-BR" ? "./?lang=en" : "pt-br/";
+    });
+
     fetch("update.json", { cache: "no-store" })
       .then(response => response.ok ? response.json() : Promise.reject())
       .then(update => document.querySelectorAll("[data-current-version]").forEach(

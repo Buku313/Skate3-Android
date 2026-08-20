@@ -69,6 +69,7 @@ public class LauncherActivity extends Activity {
     private TextView statusText;
     private TextView detailText;
     private ProgressBar progressBar;
+    private Button languageButton;
     private Button primaryButton;
     private Button characterButton;
     private Button gpuDriverButton;
@@ -148,6 +149,11 @@ public class LauncherActivity extends Activity {
             0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         content.addView(brandRow, matchWrap(dp(8)));
 
+        languageButton = actionButton(false);
+        setButton(languageButton, LauncherStrings.languageButton(this),
+                  view -> showLanguagePicker(), false);
+        content.addView(languageButton, matchFixed(dp(44), dp(12)));
+
         TextView eyebrow = text("PHONE-ONLY INSTALLER", 13, Color.rgb(255, 112, 28));
         eyebrow.setGravity(Gravity.CENTER);
         content.addView(eyebrow, matchWrap(dp(4)));
@@ -208,6 +214,25 @@ public class LauncherActivity extends Activity {
         setContentView(scroll);
     }
 
+    private void showLanguagePicker() {
+        String[] languages = { "🇺🇸 English", "🇧🇷 Português (Brasil)" };
+        int selected = LauncherStrings.isPortuguese(this) ? 1 : 0;
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle(localize("Launcher language"))
+            .setSingleChoiceItems(languages, selected, null)
+            .setNegativeButton(localize("Cancel"), null)
+            .create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getListView().setOnItemClickListener((parent, view, position, id) -> {
+                LauncherStrings.setLanguage(this,
+                    position == 1 ? LauncherStrings.PORTUGUESE_BRAZIL : LauncherStrings.ENGLISH);
+                dialog.dismiss();
+                recreate();
+            });
+        });
+        dialog.show();
+    }
+
     private void refreshInterface() {
         if (busy) {
             return;
@@ -216,8 +241,8 @@ public class LauncherActivity extends Activity {
         progressBar.setVisibility(View.GONE);
         String unsupported = compatibilityProblem();
         if (unsupported != null) {
-            statusText.setText("DEVICE NOT SUPPORTED");
-            detailText.setText(unsupported);
+            setLocalizedText(statusText, "DEVICE NOT SUPPORTED");
+            setLocalizedText(detailText, unsupported);
             setButton(primaryButton, "CLOSE", view -> finish(), true);
             hide(characterButton);
             hide(gpuDriverButton);
@@ -231,8 +256,8 @@ public class LauncherActivity extends Activity {
         if (scopedReady || legacyReady) {
             File activeGame = scopedReady ? gameDirectory : new File("/storage/emulated/0/skate3");
             if (ensureBundledSeiyu(activeGame)) return;
-            statusText.setText("READY TO SKATE");
-            detailText.setText(Build.MODEL + "\nGame files: " + activeGame.getAbsolutePath());
+            setLocalizedText(statusText, "READY TO SKATE");
+            setLocalizedText(detailText, Build.MODEL + "\nGame files: " + activeGame.getAbsolutePath());
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
             configureSeiyuInstallButton(activeGame);
             configureAdvancedButton();
@@ -246,8 +271,8 @@ public class LauncherActivity extends Activity {
         }
 
         if (isExtractionComplete()) {
-            statusText.setText("GAME EXTRACTED");
-            detailText.setText("Finish by downloading the verified 1.7 MB Title Update 3, or select the package yourself.");
+            setLocalizedText(statusText, "GAME EXTRACTED");
+            setLocalizedText(detailText, "Finish by downloading the verified 1.7 MB Title Update 3, or select the package yourself.");
             setButton(primaryButton, "FINISH SETUP AUTOMATICALLY", view -> finishSetupOnline(), true);
             hide(characterButton);
             hide(gpuDriverButton);
@@ -256,9 +281,10 @@ public class LauncherActivity extends Activity {
             return;
         }
 
-        statusText.setText("ONE FILE NEEDED");
-        detailText.setText("Select your Skate 3 Xbox 360 ISO. It can be in Downloads, on an SD card, or on a connected USB drive.\n\nFree space: " +
-                           humanBytes(new StatFs(storageRoot.getAbsolutePath()).getAvailableBytes()));
+        setLocalizedText(statusText, "ONE FILE NEEDED");
+        setLocalizedText(detailText,
+            "Select your Skate 3 Xbox 360 ISO. It can be in Downloads, on an SD card, or on a connected USB drive.\n\nFree space: " +
+            humanBytes(new StatFs(storageRoot.getAbsolutePath()).getAvailableBytes()));
         setButton(primaryButton, "SELECT MY SKATE 3 ISO", view -> pickIso(), true);
         hide(characterButton);
         hide(gpuDriverButton);
@@ -348,7 +374,7 @@ public class LauncherActivity extends Activity {
                             ", but only " + humanBytes(available) + " is available.");
                     }
                     runOnUiThread(() -> {
-                        statusText.setText("EXTRACTING GAME");
+                        setLocalizedText(statusText, "EXTRACTING GAME");
                         progressBar.setVisibility(View.VISIBLE);
                     });
                     XboxIsoExtractor.extract(channel, inspection, partialDirectory.toPath(),
@@ -387,8 +413,8 @@ public class LauncherActivity extends Activity {
 
     private void installTitleUpdateOnlineAndFinalize() throws IOException {
         runOnUiThread(() -> {
-            statusText.setText("INSTALLING TITLE UPDATE 3");
-            detailText.setText("Downloading and verifying 1.7 MB...");
+            setLocalizedText(statusText, "INSTALLING TITLE UPDATE 3");
+            setLocalizedText(detailText, "Downloading and verifying 1.7 MB...");
             progressBar.setProgress(0);
             progressBar.setVisibility(View.VISIBLE);
         });
@@ -439,8 +465,8 @@ public class LauncherActivity extends Activity {
             busy = false;
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             progressBar.setProgress(1000);
-            statusText.setText("INSTALLATION COMPLETE");
-            detailText.setText("Your files were verified and stayed on this device.");
+            setLocalizedText(statusText, "INSTALLATION COMPLETE");
+            setLocalizedText(detailText, "Your files were verified and stayed on this device.");
             setButton(primaryButton, "PLAY SKATE 3", view -> launchGame(), true);
             configureSeiyuInstallButton(gameDirectory);
             configureAdvancedButton();
@@ -458,8 +484,8 @@ public class LauncherActivity extends Activity {
         int progress = total > 0 ? (int) Math.min(1000, copied * 1000 / total) : 0;
         runOnUiThread(() -> {
             progressBar.setProgress(progress);
-            detailText.setText(humanBytes(copied) + " of " + humanBytes(total) +
-                               "\n" + currentFile);
+            setLocalizedText(detailText, humanBytes(copied) + " of " + humanBytes(total) +
+                                             "\n" + currentFile);
         });
     }
 
@@ -467,14 +493,14 @@ public class LauncherActivity extends Activity {
         int progress = total > 0 ? (int) Math.min(1000, copied * 1000 / total) : 0;
         runOnUiThread(() -> {
             progressBar.setProgress(progress);
-            detailText.setText(message + "\n" + humanBytes(copied) +
-                               (total > 0 ? " of " + humanBytes(total) : ""));
+            setLocalizedText(detailText, message + "\n" + humanBytes(copied) +
+                                         (total > 0 ? " of " + humanBytes(total) : ""));
         });
     }
 
     private void launchGame() {
         if (!isGameReady(gameDirectory.toPath()) && !legacyGameReady()) {
-            Toast.makeText(this, "Game installation needs repair.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, localize("Game installation needs repair."), Toast.LENGTH_LONG).show();
             refreshInterface();
             return;
         }
@@ -486,7 +512,7 @@ public class LauncherActivity extends Activity {
         if (checkingUpdate || busy) return;
         checkingUpdate = true;
         updateButton.setEnabled(false);
-        updateButton.setText("CHECKING FOR UPDATES...");
+        updateButton.setText(localize("CHECKING FOR UPDATES..."));
         worker.execute(() -> {
             try {
                 AppUpdater.UpdateInfo result = AppUpdater.check(this);
@@ -498,7 +524,7 @@ public class LauncherActivity extends Activity {
                         updatePromptShown = true;
                         showUpdatePrompt(result);
                     } else if (result == null && manual) {
-                        Toast.makeText(this, "You already have the newest build.",
+                        Toast.makeText(this, localize("You already have the newest build."),
                                        Toast.LENGTH_SHORT).show();
                     }
                 });
@@ -507,7 +533,7 @@ public class LauncherActivity extends Activity {
                 runOnUiThread(() -> {
                     checkingUpdate = false;
                     updateButton.setEnabled(true);
-                    updateButton.setText("CHECK FOR APP UPDATES");
+                    updateButton.setText(localize("CHECK FOR APP UPDATES"));
                     if (manual) {
                         Toast.makeText(this, "Could not check for updates: " +
                                        cleanMessage(exception), Toast.LENGTH_LONG).show();
@@ -529,9 +555,9 @@ public class LauncherActivity extends Activity {
     private void showUpdatePrompt(AppUpdater.UpdateInfo info) {
         new AlertDialog.Builder(this)
             .setTitle("Skate 3 " + info.versionName)
-            .setMessage(info.notes + "\n\nThe app will verify the download, then Android will ask you to tap Install. Your game files and settings stay in place.")
-            .setNegativeButton("Later", null)
-            .setPositiveButton("Download update", (dialog, which) -> downloadAppUpdate(info))
+            .setMessage(info.notes + "\n\n" + localize("The app will verify the download, then Android will ask you to tap Install. Your game files and settings stay in place."))
+            .setNegativeButton(localize("Later"), null)
+            .setPositiveButton(localize("Download update"), (dialog, which) -> downloadAppUpdate(info))
             .show();
     }
 
@@ -548,14 +574,14 @@ public class LauncherActivity extends Activity {
                     busy = false;
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     progressBar.setProgress(1000);
-                    statusText.setText("UPDATE VERIFIED");
-                    detailText.setText("Android will now open the installer. Your game files stay in place.");
+                    setLocalizedText(statusText, "UPDATE VERIFIED");
+                    setLocalizedText(detailText, "Android will now open the installer. Your game files stay in place.");
                     setButtonsEnabled(true);
                     boolean opened = AppUpdater.install(this, apk);
                     awaitingInstallPermission = !opened;
                     if (opened) pendingUpdateApk = null;
                     else Toast.makeText(this,
-                        "Allow installs from Skate 3, then return here.",
+                        localize("Allow installs from Skate 3, then return here."),
                         Toast.LENGTH_LONG).show();
                 });
             } catch (Exception exception) {
@@ -1254,19 +1280,19 @@ public class LauncherActivity extends Activity {
 
     private void confirmReinstall() {
         new AlertDialog.Builder(this)
-            .setTitle("Repair or reinstall?")
-            .setMessage("This removes the extracted game files from this app, then lets you select your ISO again. Your original ISO is not changed.")
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Continue", (dialog, which) -> startOver())
+            .setTitle(localize("Repair or reinstall?"))
+            .setMessage(localize("This removes the extracted game files from this app, then lets you select your ISO again. Your original ISO is not changed."))
+            .setNegativeButton(localize("Cancel"), null)
+            .setPositiveButton(localize("Continue"), (dialog, which) -> startOver())
             .show();
     }
 
     private void confirmStartOver() {
         new AlertDialog.Builder(this)
-            .setTitle("Discard partial setup?")
-            .setMessage("Only the incomplete copy created by this installer will be removed. Your original ISO is not changed.")
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Start over", (dialog, which) -> startOver())
+            .setTitle(localize("Discard partial setup?"))
+            .setMessage(localize("Only the incomplete copy created by this installer will be removed. Your original ISO is not changed."))
+            .setNegativeButton(localize("Cancel"), null)
+            .setPositiveButton(localize("Start over"), (dialog, which) -> startOver())
             .show();
     }
 
@@ -1288,7 +1314,7 @@ public class LauncherActivity extends Activity {
     }
 
     private void showLog() {
-        String contents = "No setup log has been written yet.";
+        String contents = localize("No setup log has been written yet.");
         try {
             if (setupLog.isFile()) {
                 contents = new String(Files.readAllBytes(setupLog.toPath()), StandardCharsets.UTF_8);
@@ -1297,7 +1323,7 @@ public class LauncherActivity extends Activity {
             contents = cleanMessage(exception);
         }
         new AlertDialog.Builder(this)
-            .setTitle("Setup log")
+            .setTitle(localize("Setup log"))
             .setMessage(contents)
             .setPositiveButton("OK", null)
             .show();
@@ -1306,8 +1332,8 @@ public class LauncherActivity extends Activity {
     private void setBusy(String status, String detail, boolean progressVisible) {
         busy = true;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        statusText.setText(status);
-        detailText.setText(detail);
+        setLocalizedText(statusText, status);
+        setLocalizedText(detailText, detail);
         progressBar.setProgress(0);
         progressBar.setVisibility(progressVisible ? View.VISIBLE : View.GONE);
         setButtonsEnabled(false);
@@ -1320,8 +1346,8 @@ public class LauncherActivity extends Activity {
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             progressBar.setVisibility(View.GONE);
             new AlertDialog.Builder(this)
-                .setTitle("Setup needs attention")
-                .setMessage(message + "\n\nYour original ISO was not changed.")
+                .setTitle(localize("Setup needs attention"))
+                .setMessage(localize(message) + "\n\n" + localize("Your original ISO was not changed."))
                 .setPositiveButton("OK", (dialog, which) -> refreshInterface())
                 .show();
         });
@@ -1356,10 +1382,11 @@ public class LauncherActivity extends Activity {
             }
         } catch (Exception ignored) {
         }
-        return "selected file";
+        return localize("selected file");
     }
 
     private void setButtonsEnabled(boolean enabled) {
+        languageButton.setEnabled(enabled);
         primaryButton.setEnabled(enabled);
         characterButton.setEnabled(enabled);
         gpuDriverButton.setEnabled(enabled);
@@ -1371,7 +1398,7 @@ public class LauncherActivity extends Activity {
 
     private void setButton(Button button, String label, View.OnClickListener listener,
                            boolean primary) {
-        button.setText(label);
+        button.setText(localize(label));
         button.setOnClickListener(listener);
         button.setVisibility(View.VISIBLE);
         button.setEnabled(true);
@@ -1397,7 +1424,7 @@ public class LauncherActivity extends Activity {
 
     private TextView text(String value, int size, int color) {
         TextView text = new TextView(this);
-        text.setText(value);
+        text.setText(localize(value));
         text.setTextSize(size);
         text.setTextColor(color);
         return text;
@@ -1410,7 +1437,7 @@ public class LauncherActivity extends Activity {
         brand.setPadding(0, dp(8), 0, dp(8));
         brand.setClickable(true);
         brand.setFocusable(true);
-        brand.setContentDescription(label + ", open Buku313 on GitHub");
+        brand.setContentDescription(label + ", " + localize("Open Buku313 on GitHub"));
         brand.setOnClickListener(view -> openBukuGitHub());
         return brand;
     }
@@ -1441,6 +1468,14 @@ public class LauncherActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private String localize(String english) {
+        return LauncherStrings.text(this, english);
+    }
+
+    private void setLocalizedText(TextView view, String english) {
+        view.setText(localize(english));
     }
 
     private static String humanBytes(long bytes) {

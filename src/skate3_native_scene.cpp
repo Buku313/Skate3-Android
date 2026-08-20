@@ -599,8 +599,23 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_yield, true, "Skate 3",
                     "the emulated frame is complete and correct there, same class as "
                     "the photo editor. Detected via the MovieDecoder::Decode "
                     "heartbeat; fallback presentation is latched for the active "
-                    "decoder session so slow Android devices cannot alternate "
-                    "between native and emulated output mid-video.")
+                    "decoder session so slow devices cannot alternate between "
+                    "native and emulated output mid-video. Android applies a "
+                    "bounded latch to prevent permanent black screens.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_fmv_yield_max_ms,
+#if REX_PLATFORM_ANDROID
+    6000,
+#else
+    0,
+#endif
+    "Skate 3",
+    "Maximum time to keep the emulated FMV presentation latched while the "
+    "MovieDecoder heartbeat remains active. 0 keeps the latch until the "
+    "decoder ends. Android uses a bounded fallback so a stale or firmware-"
+    "paced decoder cannot leave the player on a permanent black screen.")
+    .range(0, 120000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cas_yield, false, "Skate 3",
                     "Yield to the emulated output while the create-a-skater editor "
@@ -648,6 +663,19 @@ REXCVAR_DEFINE_INT32(
     "gameplay-proven mode-2 suppression (lightmap pages + <= 512 "
     "composites still execute).")
     .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_menu_sync_compilation,
+#if REX_PLATFORM_ANDROID
+    false,
+#else
+    true,
+#endif
+    "Skate 3",
+    "Compile shaders synchronously during one-shot menu portrait windows. "
+    "This preserves complete first-run portraits on desktop, but Android "
+    "defaults off because mobile drivers may block startup for tens of "
+    "seconds while compiling the entire portrait pipeline family.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_menu_unsuppress, false, "Skate 3",

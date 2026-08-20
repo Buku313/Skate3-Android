@@ -646,15 +646,20 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
       {"skate3_draw_distance_scale", "1.0"},
       {"skate3_lod_distance_scale", "1.0"},
       {"skate3_draw_distance_stream_probe", "100"},
-      {"skate3_native_render_scene_msaa", "2"},
+      // Keep the quality profile visually rich without making optional mobile
+      // driver features part of the boot contract. Adreno 810 rejected the
+      // HDR tonemap PSO, and compiling the HDR + 2x MSAA family blocked its
+      // first menu transition for 19 seconds. Users can still enable these
+      // experimental effects individually after reaching stable gameplay.
+      {"skate3_native_render_scene_msaa", "1"},
       {"skate3_native_render_scene_shadows", "true"},
       {"skate3_native_render_scene_shadow_static_casters", "true"},
       {"skate3_native_render_scene_shadow_pcss", "false"},
       {"skate3_native_render_scene_ssao", "true"},
       {"skate3_native_render_scene_ssr", "false"},
-      {"skate3_native_render_scene_hdr", "true"},
-      {"skate3_native_render_scene_bloom", "true"},
-      {"skate3_native_render_scene_shafts", "true"},
+      {"skate3_native_render_scene_hdr", "false"},
+      {"skate3_native_render_scene_bloom", "false"},
+      {"skate3_native_render_scene_shafts", "false"},
       {"skate3_native_render_scene_haze", "true"},
       {"skate3_native_render_scene_smooth_camera", "true"},
       {"skate3_native_render_scene_selection_outline", "true"},
@@ -693,7 +698,8 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
     apply_profile(kHighEndPreset);
     REXLOG_INFO(
         "Android device profile: High-End / Quality (1280x720, original "
-        "world/LOD, full materials and effects)");
+        "world/LOD, full materials, shadows and SSAO; portable 1x classic "
+        "output)");
   }
 #endif
   Skate3InitializeFieldOfViewOverride();

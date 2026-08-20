@@ -147,6 +147,10 @@ else()
         "Generic release builds must not require SSE4.2 CRC32" FORCE)
     set(SNAPPY_HAVE_BMI2 0 CACHE INTERNAL
         "Generic release builds must not require BMI2" FORCE)
+    if(ANDROID)
+        set(SNAPPY_HAVE_NEON_CRC32 0 CACHE INTERNAL
+            "Android arm64-v8a baseline must not require the optional ARM CRC extension" FORCE)
+    endif()
 endif()
 
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" SKATE3_SOURCE_DIR_CONFIG)

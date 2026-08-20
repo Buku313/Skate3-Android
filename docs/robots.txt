@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://buku313.github.io/Skate3-Mobile/sitemap.xml
