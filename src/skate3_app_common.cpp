@@ -645,7 +645,13 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
       {"skate3_native_render_lw_update_refresh", "1"},
       {"skate3_draw_distance_scale", "1.0"},
       {"skate3_lod_distance_scale", "1.0"},
-      {"skate3_draw_distance_stream_probe", "100"},
+      // Keep the game's vanilla world-stream focus. The experimental
+      // neighbouring-cell probe can publish extra streamed objects into the
+      // guest render dispatcher; on an RP5 / Adreno 650 this reached an
+      // unregistered virtual target in sub_828DF518 after selecting Quality.
+      // Quality still restores the original draw and LOD ranges, vegetation,
+      // materials and its 720-line scene target.
+      {"skate3_draw_distance_stream_probe", "0"},
       // Keep the quality profile visually rich without making optional mobile
       // driver features part of the boot contract. Adreno 810 rejected the
       // HDR tonemap PSO, and compiling the HDR + 2x MSAA family blocked its
