@@ -67,6 +67,8 @@
     .button.secondary { background:#24242b; color:#fff; }
     .badge { display:inline-flex; align-items:center; padding:0 11px; border:1px solid rgba(255,255,255,.18); border-radius:999px; background:#202027; font-size:.76rem; font-weight:900; }
     .fine { color:var(--muted); font-size:.86rem; }
+    .download-count { display:inline-flex; align-items:baseline; gap:8px; margin-top:16px; padding:8px 12px; border:1px solid rgba(65,215,255,.28); border-radius:999px; background:rgba(65,215,255,.07); color:#b9bbc5; font-size:.72rem; font-weight:900; letter-spacing:.09em; }
+    .download-count strong { color:var(--cyan); font-size:1.05rem; letter-spacing:0; }
     section { padding:76px 0; border-top:1px solid rgba(255,255,255,.08); }
     .qa { display:grid; grid-template-columns:1fr auto; gap:28px; align-items:center; padding:clamp(24px,5vw,42px); border:1px solid rgba(65,215,255,.42); border-radius:22px; background:linear-gradient(135deg,rgba(65,215,255,.12),rgba(23,23,28,.94)); }
     .qa-label { color:var(--cyan); }
@@ -94,6 +96,7 @@
         <p class="lede">Skate 3 rodando nativamente em celulares e consoles portáteis Android compatíveis. Baixe o APK, selecione uma ISO extraída da sua própria cópia e comece a jogar.</p>
         <div class="actions"><a class="button" href="https://github.com/Buku313/Skate3-Mobile/releases/latest/download/Skate3-Mobile-Android.apk">BAIXAR APK ESTÁVEL</a><span class="badge">v2.0.17 DEV</span><a class="button secondary" href="#instalar">COMO INSTALAR</a></div>
         <div class="fine">Android 13+ · ARM64 · Vulkan · Controles de toque incluídos</div>
+        <div class="download-count"><strong data-apk-downloads>5.868</strong><span>DOWNLOADS DO APK</span></div>
       </div>
       <div class="cover"><img src="../skate3-android-cover.png" alt="Mascote Android andando de skate diante do logotipo Skate 3"></div>
     </div>
@@ -127,5 +130,18 @@
     </section>
   </main>
   <footer class="wrap">Esta é uma versão experimental e um projeto não oficial de fãs. Não possui afiliação com Electronic Arts, Black Box, Microsoft, Google ou Android. Skate 3 e propriedades relacionadas pertencem aos respectivos proprietários. Nenhum arquivo comercial do jogo é distribuído.</footer>
+  <script>
+    fetch("https://api.github.com/repos/Buku313/Skate3-Mobile/releases?per_page=100", {
+      headers: { Accept: "application/vnd.github+json" }
+    })
+      .then(response => response.ok ? response.json() : Promise.reject())
+      .then(releases => releases.reduce((total, release) => total + (release.assets || [])
+        .filter(asset => asset.name.toLowerCase().endsWith(".apk"))
+        .reduce((releaseTotal, asset) => releaseTotal + asset.download_count, 0), 0))
+      .then(total => {
+        if (total) document.querySelector("[data-apk-downloads]").textContent = total.toLocaleString("pt-BR");
+      })
+      .catch(() => {});
+  </script>
 </body>
 </html>

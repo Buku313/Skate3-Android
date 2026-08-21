@@ -156,6 +156,21 @@
     .button.secondary { background: #24242b; color: white; box-shadow: none; }
     .button.report { background: transparent; color: #fff; border: 1px solid #454550; box-shadow: none; }
     .fine { color: var(--muted); font-size: .86rem; }
+    .download-count {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-top: 16px;
+      padding: 8px 12px;
+      border: 1px solid rgba(65,215,255,.28);
+      border-radius: 999px;
+      background: rgba(65,215,255,.07);
+      color: #b9bbc5;
+      font-size: .72rem;
+      font-weight: 900;
+      letter-spacing: .09em;
+    }
+    .download-count strong { color: var(--cyan); font-size: 1.05rem; letter-spacing: 0; }
     .cover {
       position: relative;
       padding: 16px;
@@ -319,6 +334,7 @@
           <a class="button report" href="https://github.com/Buku313/Skate3-Mobile/issues/new?template=bug_report.yml">BUG REPORT</a>
         </div>
         <div class="fine">Android 13+ · ARM64 · Vulkan · Touch controls included</div>
+        <div class="download-count"><strong data-apk-downloads>5,868</strong><span>APK DOWNLOADS</span></div>
       </div>
       <div class="cover">
         <img src="skate3-android-cover.png" alt="Android mascot skateboarding in front of the Skate 3 logo">
@@ -442,6 +458,7 @@
       "HOW TO INSTALL": "COMO INSTALAR",
       "BUG REPORT": "RELATAR BUG",
       "Android 13+ · ARM64 · Vulkan · Touch controls included": "Android 13+ · ARM64 · Vulkan · Controles de toque incluídos",
+      "APK DOWNLOADS": "DOWNLOADS DO APK",
       "PLAYABLE · DEV BUILD": "JOGÁVEL · VERSÃO DEV",
       "QA BUILD": "VERSÃO QA",
       "Try the latest test build.": "Teste a versão mais recente.",
@@ -557,6 +574,21 @@
       .then(response => response.ok ? response.json() : Promise.reject())
       .then(update => document.querySelectorAll("[data-current-version]").forEach(
         element => { element.textContent = "v" + update.versionName + " DEV"; }))
+      .catch(() => {});
+
+    fetch("https://api.github.com/repos/Buku313/Skate3-Mobile/releases?per_page=100", {
+      headers: { Accept: "application/vnd.github+json" }
+    })
+      .then(response => response.ok ? response.json() : Promise.reject())
+      .then(releases => releases.reduce((total, release) => total + (release.assets || [])
+        .filter(asset => asset.name.toLowerCase().endsWith(".apk"))
+        .reduce((releaseTotal, asset) => releaseTotal + asset.download_count, 0), 0))
+      .then(total => {
+        if (!total) return;
+        const locale = document.documentElement.lang === "pt-BR" ? "pt-BR" : "en-US";
+        document.querySelectorAll("[data-apk-downloads]").forEach(
+          element => { element.textContent = total.toLocaleString(locale); });
+      })
       .catch(() => {});
   </script>
 </body>
