@@ -4574,13 +4574,14 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     g_r.hdr_scene_format = hdr_fmt_want;
     g_r.msaa = msaa_want;
     g_r.showcase_shaders = g_r.showcase_shaders_want;
-    // The Android performance profile never executes these optional passes.
-    // Avoid sending their shader families through the Adreno compiler during
-    // the sensitive transition from menus into gameplay. Quality mode still
-    // creates the complete renderer pipeline set.
+    // A lean Android scene never executes these optional passes. Follow the
+    // scene feature flag instead of the profile number: QA compatibility
+    // builds deliberately pair Quality's 720p target with Performance's lean
+    // feature set. Keying this to profile 0 still compiled the full optional
+    // PSO family on profile 1, making RP5 startup depend on shader-cache timing.
 #if REX_PLATFORM_ANDROID
     const bool lean_android_pipelines =
-        std::clamp(REXCVAR_GET(skate3_android_quality_profile), 0, 1) == 0;
+        REXCVAR_GET(skate3_native_render_scene_handheld_potato);
 #else
     constexpr bool lean_android_pipelines = false;
 #endif
@@ -12199,10 +12200,11 @@ void ResetSceneFailure() {
 void Install() {
 #if REX_PLATFORM_ANDROID
   // The app layer applies the selected Android profile after loading saved
-  // settings. Keep the native renderer mandatory on both profiles, and retain
-  // the conservative duplicate guard only for the RG406V profile.
+  // settings. Keep the native renderer mandatory on both profiles. Apply the
+  // conservative duplicate guard whenever the active scene preset is lean,
+  // including QA builds that test the Quality resolution with lean features.
   REXCVAR_SET(skate3_native_render_scene, true);
-  if (std::clamp(REXCVAR_GET(skate3_android_quality_profile), 0, 1) == 0) {
+  if (REXCVAR_GET(skate3_native_render_scene_handheld_potato)) {
     REXCVAR_SET(skate3_native_render_scene_handheld_potato, true);
     REXCVAR_SET(skate3_native_render_scene_msaa, 1);
     REXCVAR_SET(skate3_native_render_scene_shadows, false);
