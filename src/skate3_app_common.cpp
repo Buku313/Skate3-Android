@@ -597,9 +597,9 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   rex::cvar::SetFlagByName("draw_resolution_scale_y", "1");
 
   // Apply a coherent profile after loading settings. The performance profile
-  // keeps the known-good RG406V budget. The quality profile restores the full
-  // material/entity pipeline and original world range for stronger phones;
-  // its 720p scene target is selected by the renderer from the same profile.
+  // keeps the known-good RG406V budget. During the QA 4 isolation test, the
+  // quality profile uses the same lean scene configuration while selecting
+  // its separate 720p scene target inside the renderer.
   constexpr std::pair<std::string_view, std::string_view> kPerformancePreset[] = {
       {"skate3_native_render_scene_handheld_potato", "true"},
       {"native_render_suppress_mode", "1"},
@@ -639,48 +639,44 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
       {"show_fps_counter", "true"},
   };
   constexpr std::pair<std::string_view, std::string_view> kHighEndPreset[] = {
-      {"skate3_native_render_scene_handheld_potato", "false"},
+      // QA compatibility baseline: use the exact scene feature set already
+      // proven on the RP5 Performance profile while the renderer selects the
+      // Quality profile's 720-line target. QA 3 removed the unsafe world
+      // stream probe but the RP5 still produced audio behind a black native
+      // frame before any gameplay/pipeline-success line. Isolating resolution
+      // from content/pipeline expansion lets device testing identify whether
+      // the 720p target itself is safe before features return in small groups.
+      {"skate3_native_render_scene_handheld_potato", "true"},
       {"native_render_suppress_mode", "1"},
-      {"skate3_native_render_guest_static_refresh", "1"},
+      {"skate3_native_render_guest_static_refresh", "8"},
       {"skate3_native_render_lw_update_refresh", "1"},
-      {"skate3_draw_distance_scale", "1.0"},
-      {"skate3_lod_distance_scale", "1.0"},
-      // Keep the game's vanilla world-stream focus. The experimental
-      // neighbouring-cell probe can publish extra streamed objects into the
-      // guest render dispatcher; on an RP5 / Adreno 650 this reached an
-      // unregistered virtual target in sub_828DF518 after selecting Quality.
-      // Quality still restores the original draw and LOD ranges, vegetation,
-      // materials and its 720-line scene target.
+      {"skate3_draw_distance_scale", "0.5"},
+      {"skate3_lod_distance_scale", "0.5"},
       {"skate3_draw_distance_stream_probe", "0"},
-      // Keep the quality profile visually rich without making optional mobile
-      // driver features part of the boot contract. Adreno 810 rejected the
-      // HDR tonemap PSO, and compiling the HDR + 2x MSAA family blocked its
-      // first menu transition for 19 seconds. Users can still enable these
-      // experimental effects individually after reaching stable gameplay.
       {"skate3_native_render_scene_msaa", "1"},
-      {"skate3_native_render_scene_shadows", "true"},
-      {"skate3_native_render_scene_shadow_static_casters", "true"},
+      {"skate3_native_render_scene_shadows", "false"},
+      {"skate3_native_render_scene_shadow_static_casters", "false"},
       {"skate3_native_render_scene_shadow_pcss", "false"},
-      {"skate3_native_render_scene_ssao", "true"},
+      {"skate3_native_render_scene_ssao", "false"},
       {"skate3_native_render_scene_ssr", "false"},
       {"skate3_native_render_scene_hdr", "false"},
       {"skate3_native_render_scene_bloom", "false"},
       {"skate3_native_render_scene_shafts", "false"},
-      {"skate3_native_render_scene_haze", "true"},
-      {"skate3_native_render_scene_smooth_camera", "true"},
-      {"skate3_native_render_scene_selection_outline", "true"},
-      {"skate3_native_render_scene_lightmaps", "true"},
-      {"skate3_native_render_scene_macro", "true"},
-      {"skate3_native_render_scene_decals", "true"},
-      {"skate3_native_render_scene_sort_opaque", "true"},
-      {"skate3_native_render_scene_splines", "true"},
-      {"skate3_native_render_scene_ropa_blend", "true"},
-      {"skate3_native_render_scene_entity_fade", "true"},
-      {"skate3_native_render_scene_lw_fade", "true"},
-      {"skate3_native_render_scene_lw_gap_fill", "true"},
-      {"skate3_native_render_scene_lw_identity", "true"},
-      {"skate3_native_render_scene_lw_palette", "true"},
-      {"skate3_native_render_scene_prewarm_budget_ms", "32"},
+      {"skate3_native_render_scene_haze", "false"},
+      {"skate3_native_render_scene_smooth_camera", "false"},
+      {"skate3_native_render_scene_selection_outline", "false"},
+      {"skate3_native_render_scene_lightmaps", "false"},
+      {"skate3_native_render_scene_macro", "false"},
+      {"skate3_native_render_scene_decals", "false"},
+      {"skate3_native_render_scene_sort_opaque", "false"},
+      {"skate3_native_render_scene_splines", "false"},
+      {"skate3_native_render_scene_ropa_blend", "false"},
+      {"skate3_native_render_scene_entity_fade", "false"},
+      {"skate3_native_render_scene_lw_fade", "false"},
+      {"skate3_native_render_scene_lw_gap_fill", "false"},
+      {"skate3_native_render_scene_lw_identity", "false"},
+      {"skate3_native_render_scene_lw_palette", "false"},
+      {"skate3_native_render_scene_prewarm_budget_ms", "8"},
       {"skate3_native_render_scene_occlusion_cull", "true"},
       {"skate3_native_render_scene_occlusion_cull_build", "true"},
       {"skate3_native_render_scene_occlusion_cull_guest", "true"},
@@ -703,9 +699,8 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   } else {
     apply_profile(kHighEndPreset);
     REXLOG_INFO(
-        "Android device profile: High-End / Quality (1280x720, original "
-        "world/LOD, full materials, shadows and SSAO; portable 1x classic "
-        "output)");
+        "Android device profile: High-End / Quality compatibility baseline "
+        "(1280x720 target, verified lean scene feature set)");
   }
 #endif
   Skate3InitializeFieldOfViewOverride();
