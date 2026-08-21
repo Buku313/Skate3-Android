@@ -5473,8 +5473,18 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   if (flags2d != 0 && SceneEnabled() && REXCVAR_GET(skate3_native_render_scene_2d)) {
     if (func == 2) {
       const uint32_t device = g_device.load(std::memory_order_relaxed);
-      if (device != 0 && r7 >= 0x10000 && r5 != 0 && r5 <= 65536 && r6 >= 8 &&
-          r6 <= 256 && (r6 & 3) == 0) {
+      const bool supported_primitive = r4 == 4 || r4 == 5 || r4 == 13;
+      const bool supported_stride = r6 == 16 || r6 == 20 || r6 == 24 || r6 == 28;
+      const uint64_t payload_bytes = uint64_t(r5) * uint64_t(r6);
+      // Only admit layouts Publish2dDraws can normalize. The old broad
+      // 8..256-byte stride / 65536-vertex gate captured transient register
+      // garbage during early boot, then copied and byteswapped a large bogus
+      // guest range before eventually rejecting its layout. RP5 reports show
+      // the guest render thread occasionally stopping at exactly this stage
+      // while audio remains alive.
+      if (device != 0 && r7 >= 0x10000 && supported_primitive &&
+          supported_stride && r5 != 0 && r5 <= 32768 &&
+          payload_bytes <= (1u << 20)) {
         Draw2d d;
         d.prim = r4;
         d.count = r5;
@@ -5496,6 +5506,17 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         } else {
           g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
         }
+      } else {
+        static std::atomic<uint32_t> s_invalid_2d_capture{0};
+        const uint32_t n =
+            s_invalid_2d_capture.fetch_add(1, std::memory_order_relaxed);
+        if (n < 12 || (n & 2047u) == 0) {
+          REXLOG_INFO(
+              "native-scene: rejected unsafe 2D capture "
+              "(prim={} count={} stride={} addr={:08X} bytes={}) (n={})",
+              r4, r5, r6, r7, payload_bytes, n);
+        }
+        g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
       }
     } else {
       g_draws_2d_other.fetch_add(1, std::memory_order_relaxed);
@@ -7959,6 +7980,7 @@ void Publish2dDraws(uint8_t* base) {
   static thread_local std::vector<uint8_t> scratch_2d;
   std::vector<Draw2d> published;
   published.reserve(frame_2d.size());
+  size_t source_bytes_this_frame = 0;
   for (Draw2d& d : frame_2d) {
     // OFFSCREEN COMPOSITION draws: bracket bits carrying ONLY SimpleDraw
     // (0x20) / font (0x10) with none of the screen-pass brackets (bit 0
@@ -7986,7 +8008,30 @@ void Publish2dDraws(uint8_t* base) {
       g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
-    const uint32_t bytes = d.count * d.stride;
+    const bool supported_primitive = d.prim == 4 || d.prim == 5 || d.prim == 13;
+    const bool supported_stride =
+        d.stride == 16 || d.stride == 20 || d.stride == 24 || d.stride == 28;
+    const uint64_t bytes64 = uint64_t(d.count) * uint64_t(d.stride);
+    constexpr size_t kMax2dBytesPerDraw = 1u << 20;
+    constexpr size_t kMax2dBytesPerFrame = 8u << 20;
+    if (!supported_primitive || !supported_stride || d.count == 0 ||
+        d.count > 32768 || bytes64 > kMax2dBytesPerDraw ||
+        source_bytes_this_frame + size_t(bytes64) > kMax2dBytesPerFrame) {
+      static std::atomic<uint32_t> s_unsafe_publish{0};
+      const uint32_t n = s_unsafe_publish.fetch_add(1, std::memory_order_relaxed);
+      if (n < 12 || (n & 2047u) == 0) {
+        REXLOG_INFO(
+            "native-scene: rejected unsafe 2D publish "
+            "(prim={} count={} stride={} addr={:08X} bytes={} frame_bytes={}) "
+            "(n={})",
+            d.prim, d.count, d.stride, d.addr, bytes64,
+            source_bytes_this_frame, n);
+      }
+      g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    const uint32_t bytes = uint32_t(bytes64);
+    source_bytes_this_frame += bytes;
     scratch_2d.resize(bytes);
     if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
       continue;
@@ -8582,6 +8627,19 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
   {
     const auto t0 = PerfClock::now();
+    if (g_guest_frame <= 12) {
+      size_t pending_2d = 0;
+      size_t pending_spline = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_2d_mutex);
+        pending_2d = g_frame_2d.size();
+        pending_spline = g_frame_spline.size();
+      }
+      REXLOG_INFO(
+          "native-scene: startup capture frame {} begin "
+          "(records={} pending_2d={} pending_spline={})",
+          g_guest_frame, count, pending_2d, pending_spline);
+    }
     Publish2dDraws(base);
     const auto t1 = PerfClock::now();
     PublishSplineDraws(base);
@@ -8592,6 +8650,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
     g_pw_b2d.Add(g_frame_b2d_ns);
     g_pw_bspl.Add(g_frame_bspl_ns);
+    if (g_guest_frame <= 12) {
+      REXLOG_INFO(
+          "native-scene: startup capture frame {} complete "
+          "(2d={:.3f}ms spline={:.3f}ms)",
+          g_guest_frame, double(g_frame_b2d_ns) * 1e-6,
+          double(g_frame_bspl_ns) * 1e-6);
+    }
   }
   // Take this frame's hook-time dynamic items regardless of how we exit,
   // leaving them in place across an early return (no perspective view, empty
