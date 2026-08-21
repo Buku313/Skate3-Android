@@ -48,6 +48,18 @@ REXCVAR_DEFINE_INT32(skate3_demo_path_input_delay_ms, 600, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_intro_movie_skip, true, "Skate 3",
                     "Skip the frontend intro movie when A or Start is pressed "
                     "(the default keyboard bindings make that Space and Enter)");
+REXCVAR_DEFINE_INT32(
+    skate3_boot_movie_watchdog_ms,
+#if defined(__ANDROID__)
+    4000,
+#else
+    0,
+#endif
+    "Skate 3",
+    "Complete the first continuously-running frontend movie after this many "
+    "milliseconds. Android uses this boot-only watchdog to recover firmware "
+    "movie-decoder stalls; later career movies are never affected. 0 disables it.")
+    .range(0, 15000);
 
 namespace skate3::demo_path {
 namespace {
@@ -417,7 +429,44 @@ bool ShouldForceIntroMovieComplete() {
     }
     return true;
   }
-  return UserRequestedMovieSkip();
+
+  // The RP5 and AYN Thor reports show a live guest and audio thread trapped
+  // in the first frontend movie for minutes. Preserve the normal input skip,
+  // then apply one narrowly-scoped watchdog to the first continuous movie
+  // session only. A natural end creates a gap between Update calls and
+  // permanently disarms the watchdog, so later career movies stay intact.
+  using Clock = std::chrono::steady_clock;
+  static Clock::time_point s_first_update;
+  static Clock::time_point s_last_update;
+  static bool s_started = false;
+  static bool s_consumed = false;
+  const Clock::time_point now = Clock::now();
+  if (!s_consumed && s_started && now - s_last_update > std::chrono::seconds(1)) {
+    s_consumed = true;
+    REXLOG_INFO("Skate 3: boot movie watchdog disarmed after a natural movie end");
+  }
+  if (!s_consumed && !s_started) {
+    s_started = true;
+    s_first_update = now;
+    REXLOG_INFO("Skate 3: boot movie watchdog armed");
+  }
+  s_last_update = now;
+
+  if (UserRequestedMovieSkip()) {
+    s_consumed = true;
+    return true;
+  }
+
+  const int32_t watchdog_ms = REXCVAR_GET(skate3_boot_movie_watchdog_ms);
+  if (!s_consumed && watchdog_ms > 0 &&
+      now - s_first_update >= std::chrono::milliseconds(watchdog_ms)) {
+    s_consumed = true;
+    REXLOG_WARN(
+        "Skate 3: boot movie exceeded {} ms; completing it to recover startup",
+        watchdog_ms);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace skate3::demo_path

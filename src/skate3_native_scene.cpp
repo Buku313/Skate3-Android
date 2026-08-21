@@ -563,13 +563,21 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_loading_native, true, "Skate 3",
                     "arming) is unchanged; only the presented pixels switch source. "
                     "The boot flow before the first gameplay stays emulated.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_boot_native, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_boot_native,
+#if REX_PLATFORM_ANDROID
+                    false,
+#else
+                    true,
+#endif
+                    "Skate 3",
                     "Extend native rendering to the game startup flow (intro videos, "
                     "boot frontend, the first load); i.e. drop the first-gameplay "
                     "prerequisite from the native menu/loading modes, and render the "
                     "pre-takeover boot frames as native 2D-over-black instead of "
-                    "yielding. With this and the pause/loading modes on, the emulated "
-                    "GPU output is never presented.")
+                    "yielding. Android defaults this off so frontend movies use the "
+                    "complete emulated output and native pipeline compilation waits "
+                    "for real world-load evidence. With this and the pause/loading "
+                    "modes on, the emulated GPU output is never presented.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_fmv_native,
 #if REX_PLATFORM_ANDROID

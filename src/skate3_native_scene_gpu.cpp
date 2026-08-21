@@ -5514,7 +5514,13 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   // in-place rewrites of UI textures (the one-shot skater-portrait resolves)
   // heal within a couple of frames instead of up to 16.
   g_in_menus_frame.store(in_menus, std::memory_order_relaxed);
-  if (!in_menus) {
+  // The presence context briefly reports gameplay during the boot frontend
+  // on RP5 and AYN Thor, before a world scene exists. Treating that pulse as
+  // real gameplay made the following EA/FMVs enter native loading mode and
+  // compile the whole pipeline in the middle of the movie. A completed
+  // native takeover is the authoritative first-gameplay signal: the gate is
+  // cleared only after a fresh scene reaches warmup_min_items.
+  if (!in_menus && !g_warmup_armed.load(std::memory_order_relaxed)) {
     s_seen_gameplay = true;
   }
   // In-game pause menu: the presence context reads 0, but the world keeps
@@ -5728,10 +5734,18 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
       std::lock_guard<std::mutex> lock(g_scene_mutex);
       g_warmup_fresh_generation = (g_scene ? g_scene->generation : 0) + 1;
     }
-    // Build the pipelines / render targets behind the loading screen so
-    // the one-time PSO compilation (~200 ms) never lands on a gameplay
-    // frame.
-    if (!g_r.failed && g_r.pso == nullptr) {
+    // Build the pipelines / render targets behind a REAL world loading
+    // screen so the one-time PSO compilation never lands on gameplay. On
+    // Android the boot frontend remains emulated; RP5 and AYN Thor can take
+    // seconds to compile Vulkan PSOs, and doing that during the EA/FMVs made
+    // a healthy guest look permanently frozen. The first world registration
+    // queues prewarm work, which is the safe signal to start compilation.
+    bool world_load_evidence = s_seen_gameplay || boot_native;
+    if (!world_load_evidence) {
+      std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+      world_load_evidence = !g_prewarm_queue.empty() || !g_miss_queue.empty();
+    }
+    if (world_load_evidence && !g_r.failed && g_r.pso == nullptr) {
       EnsurePipeline(context);
     }
     if (loading_native) {
